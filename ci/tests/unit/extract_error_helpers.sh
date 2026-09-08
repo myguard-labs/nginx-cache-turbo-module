@@ -51,6 +51,7 @@ extract_function() {
 	for fn in \
 		ngx_http_cache_turbo_redis_backoff_fail \
 		ngx_http_cache_turbo_redis_read_drain \
+		ngx_http_cache_turbo_redis_sscan_advance \
 		ngx_http_cache_turbo_redis_read_sscan \
 		ngx_http_cache_turbo_redis_walk_finish \
 		ngx_http_cache_turbo_redis_get_finish \
@@ -72,6 +73,7 @@ for symbol in \
 	ngx_http_cache_turbo_mc_op_fail \
 	ngx_http_cache_turbo_redis_backoff_fail \
 	ngx_http_cache_turbo_redis_read_drain \
+	ngx_http_cache_turbo_redis_sscan_advance \
 	ngx_http_cache_turbo_redis_read_sscan \
 	ngx_http_cache_turbo_redis_walk_finish \
 	ngx_http_cache_turbo_redis_get_finish \

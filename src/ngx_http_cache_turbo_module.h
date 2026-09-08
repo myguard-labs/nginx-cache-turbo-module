@@ -2490,6 +2490,18 @@ typedef struct {
      * driven off one connection's read handler and an async timer would not
      * hold the page boundary. 0/unset = no hold. */
     ngx_int_t                test_scan_page_hold_ms;
+    /* TODO-UNLINK-REPLY-WINDOW: make the tag purge's per-page UNLINK FAIL AT
+     * THE SERVER while still being launched and answered. That distinction is
+     * precisely what this item changed and it has no black-box trigger: a
+     * reachable Redis accepts every UNLINK, and killing the server instead
+     * fails the SSCAN walk itself, so the walk never reaches the page callback
+     * whose gating is under test. With this set, the awaited delete is sent as
+     * a deliberately unknown command, so Redis frames a real `-ERR unknown
+     * command` reply -- a launched, answered, FAILED delete, the exact state
+     * the pre-fix code mistook for success. Only the AWAITED (del_many_cb)
+     * path is affected; fire-and-forget deletes are untouched, so the fault is
+     * scoped to the behaviour under test. 0/unset = off. */
+    ngx_int_t                test_unlink_reply_fail;
     /* S231-SIE-MIDBODY: no production signal for "the upstream died after
      * sending headers but before last_buf" is reliable enough to trigger the
      * rescue from (see the body filter comment at the rescue site for the
@@ -3233,6 +3245,60 @@ ngx_int_t ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *c
  * NULL `setkey` is NOT a no-op: it returns NGX_ERROR, because a caller that
  * built no set key has nothing to SREM from and the paginated tag walk treats
  * a non-NGX_OK return as "abandon the walk". */
+/*
+ * TODO-UNLINK-REPLY-WINDOW: del_many, but AWAITING the server's REPLY.
+ *
+ * del_many is fire-and-forget: it reports only whether the UNLINK was LAUNCHED.
+ * A delete that leaves the box and then fails at Redis -- a `-ERR`, a
+ * connection dropped mid-flight, a read timeout -- is indistinguishable from a
+ * success to its caller. For the paginated tag purge that is a data-loss
+ * window, not a cosmetic one: tag membership is the ONLY pointer to an L2
+ * object, so SREMing a page whose UNLINK silently failed strands a live object
+ * that is unreachable by every later purge of that tag and occupies L2 until
+ * its own TTL, behind an HTTP reply that claimed the purge succeeded.
+ *
+ * Returns:
+ *   NGX_DONE  - launched; `done` fires EXACTLY ONCE, later, from the event
+ *               loop, with NGX_OK only when every pipelined reply framed
+ *               cleanly and none was a RESP error.
+ *   NGX_OK    - nothing was sent (L2 disabled, or every key empty), which is
+ *               vacuously a successful delete. `done` will NEVER fire; the
+ *               caller may proceed immediately.
+ *   NGX_ERROR - the command never launched. `done` will NEVER fire.
+ */
+ngx_int_t ngx_http_cache_turbo_redis_del_many_cb(
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *keys, ngx_uint_t nkeys,
+    void (*done)(void *, ngx_int_t), void *done_data);
+
+/*
+ * TODO-UNLINK-REPLY-WINDOW: SUSPEND the SSCAN tag walk currently delivering a
+ * page, and obtain the continuation that resumes it.
+ *
+ * Callable ONLY from inside a members_pt page delivery (walk == NULL,
+ * nmembers > 0), and only for the SSCAN tag walk. On success it writes the
+ * resume callback and its opaque data to *done / *done_data and returns NGX_OK;
+ * the callback must then return NGX_AGAIN to park the walk, and exactly one
+ * later call of *done decides the page's fate: NGX_OK resumes the walk at the
+ * next page, anything else abandons it as INCOMPLETE and RETAINS the tag key.
+ *
+ * Returns NGX_DECLINED when there is no suspendable walk in flight (no page
+ * delivery in progress, or a walk already suspended), in which case the caller
+ * MUST fall back to a synchronous decision and must NOT return NGX_AGAIN --
+ * doing so would park a walk nothing will ever resume.
+ */
+ngx_int_t ngx_http_cache_turbo_redis_walk_suspend(
+    void (**done)(void *, ngx_int_t), void **done_data);
+
+/*
+ * TODO-UNLINK-REPLY-WINDOW: cancel a suspension obtained from walk_suspend
+ * WITHOUT resuming the walk. `opaque` is the done_data walk_suspend handed
+ * back. Used by a page callback that suspended in anticipation of an
+ * asynchronous delete and then discovered none was launched: at that moment the
+ * walk has not yet saved its cursor, so calling the resume would advance it on
+ * unset state -- the callback must unsuspend and answer synchronously instead.
+ */
+void ngx_http_cache_turbo_redis_walk_unsuspend(void *opaque);
+
 ngx_int_t ngx_http_cache_turbo_redis_srem_many(
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *setkey,
     ngx_str_t *members, ngx_uint_t nmembers);
@@ -3648,6 +3714,30 @@ typedef struct {
      * already-dropped key is a no-op), so the count may over-report on a set
      * that was rehashed mid-walk. Documented for operators in README.md. */
     ngx_uint_t                         purged;
+
+    /* TODO-UNLINK-REPLY-WINDOW: state for the page whose UNLINK is currently
+     * in flight, carried from the page delivery that launched it to the reply
+     * completion that decides whether its members may be SREMed.
+     *
+     * `page_pool` is the page's scratch pool. It used to be destroyed before
+     * the delivery returned; now it must outlive the delivery, because
+     * It is destroyed by the completion, on every outcome, so the walk's
+     * footprint is still one page's scratch at a time -- what pagination
+     * bought is preserved. The tag key is NOT in it: tp->sscan_key is built
+     * once at launch from r->pool (#491) and survives the whole walk, which is
+     * what lets the awaited SREM run after this scratch is gone.
+     *
+     * `page_members` points into the TRANSPORT's per-page reply buffer, not
+     * into page_pool. That buffer belongs to the walk op's rpool, which
+     * sscan_advance rotates only AFTER the walk resumes -- i.e. strictly after
+     * this completion has run -- so the members are still valid when the SREM
+     * copies them. This ordering is the whole reason the walk suspends rather
+     * than merely deferring the SREM. */
+    ngx_pool_t                        *page_pool;
+    ngx_str_t                         *page_members;
+    ngx_uint_t                         page_nmembers;
+    void                             (*page_resume)(void *, ngx_int_t);
+    void                              *page_resume_data;
 } ngx_http_cache_turbo_tagpurge_t;
 
 ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,

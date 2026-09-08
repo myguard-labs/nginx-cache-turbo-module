@@ -71,6 +71,13 @@ typedef struct {
     int  token;
 } ngx_addr_t;
 
+/* Minimal stand-in for nginx's ngx_peer_connection_t. sscan_advance reads the
+ * op's connection through op->peer.connection rather than through an event, so
+ * the mock op needs the same shape for the extracted function to compile. */
+typedef struct {
+    ngx_connection_t  *connection;
+} ngx_peer_connection_t;
+
 typedef struct {
     ngx_addr_t  redis_addr;
     ngx_msec_t  redis_connect_backoff;
@@ -115,6 +122,7 @@ typedef ngx_int_t (*ngx_http_cache_turbo_redis_members_pt)(
     ngx_uint_t nmembers, const ngx_http_cache_turbo_redis_walk_t *walk);
 
 typedef struct {
+    ngx_peer_connection_t                  peer;
     ngx_http_cache_turbo_loc_conf_t       *clcf;
     ngx_http_request_t                    *request;
     ngx_http_cache_turbo_ctx_t            *ctx;
@@ -146,7 +154,25 @@ typedef struct {
     size_t                                 reply_max;
     size_t                                 frame_off;
     ngx_uint_t                             frame_depth;
+    /* TODO-UNLINK-REPLY-WINDOW: the awaited-reply completion on a drained op,
+     * and the SSCAN walk's suspend/resume state. Like the rotation fields
+     * above these are not EXERCISED here (the stubbed parse_scan always yields
+     * cursor "0", so no page ever suspends) -- they exist so the extracted
+     * readers compile against the mock op exactly as they do against the real
+     * one, which is what keeps this shim from silently drifting into testing a
+     * different function than the one that ships. */
+    void                                 (*drain_cb)(void *, ngx_int_t);
+    void                                  *drain_data;
+    unsigned                               drain_done:1;
+    unsigned                               drain_failed:1;
+    unsigned                               suspended:1;
+    unsigned                               resume_doomed:1;
+    ngx_str_t                              resume_cursor;
+    u_char                                 resume_cursor_buf[64];
 } ngx_http_cache_turbo_redis_op_t;
+
+/* Matching the real file's file-scope "page delivery on the stack" pointer. */
+static ngx_http_cache_turbo_redis_op_t  *ngx_http_cache_turbo_redis_delivering;
 
 extern ngx_uint_t  ngx_test_log_calls;
 extern ngx_int_t   ngx_test_log_level;

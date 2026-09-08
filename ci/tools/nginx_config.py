@@ -1013,6 +1013,18 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
+        # TODO-UNLINK-REPLY-WINDOW: the per-page UNLINK is sent as an unknown
+        # command, so Redis answers a real `-ERR` -- a delete that LAUNCHED and
+        # was ANSWERED but FAILED. Same production bounds as /_cache_sscan
+        # otherwise, so the only variable is the delete's fate at the server.
+        location = /_cache_sscanunlinkfail {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=8 prefix=ctsscan: timeout=2s;
+            cache_turbo_test_unlink_reply_fail on;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         location = /_cache_sscandeadline {{
             cache_turbo_admin    main;
             cache_turbo_redis    127.0.0.1:{redis_port} db=8 prefix=ctsscan: timeout=2s scan_deadline=5ms;

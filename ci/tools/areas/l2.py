@@ -2287,6 +2287,103 @@ def test_l2_tag_purge_sscan_deadline_keeps_tag_key(
     _sscan_db(redis, "FLUSHDB")
 
 
+def test_l2_tag_purge_sscan_unlink_reply_failure_keeps_tag(
+        ng: Nginx, redis: RedisServer) -> None:
+    """TODO-UNLINK-REPLY-WINDOW: a per-page UNLINK that LAUNCHES and is then
+    ANSWERED WITH A FAILURE must not have its members SREMed, and the purge must
+    report INCOMPLETE.
+
+    Before this change the per-page SREM was gated only on the UNLINK having
+    been LAUNCHED. The UNLINK was fire-and-forget, so a delete that left the box
+    and then failed at Redis still let the SREM strip the only pointer to a live
+    L2 object: the object stayed resident and serving until its own TTL,
+    unreachable by every later purge of that tag, behind an HTTP reply that said
+    the purge succeeded. The fix AWAITS the reply and folds a failed one into
+    the walk's INCOMPLETE outcome.
+
+    The observable that discriminates the fix from its absence is the STRANDING,
+    not the status code, so this asserts all three halves of it:
+
+      1. the objects are STILL IN L2 (the failed UNLINK deleted nothing) -- this
+         is what makes the tag pointer load-bearing rather than redundant;
+      2. the tag set STILL CONTAINS them, i.e. the SREM did NOT run. This is the
+         assertion the change exists for and the one that goes red when the
+         gating is reverted: unpatched, the SREM proceeds, the set empties, and
+         the objects in (1) become unreachable by tag forever;
+      3. the reply says "l2":"incomplete" with a 500, so the operator is not
+         told a failed purge succeeded.
+
+    A NEGATIVE CONTROL runs the identical body against /_cache_sscan, where the
+    UNLINK really succeeds: there the objects are gone, the set empties and the
+    reply is a clean 200. Without it every assertion here would also pass on a
+    build that simply never purged anything."""
+    _sscan_db(redis, "FLUSHDB")
+
+    # --- control: the same walk with a WORKING UNLINK completes cleanly ---
+    ok_tag = "sscan-unlink-ok"
+    ok_members = _sscan_fill(redis, ok_tag, 6)
+    s, ok = _sscan_purge(ng, "/_cache_sscan", ok_tag)
+    assert s == 200, f"a purge whose UNLINK succeeds must complete: {s} {ok}"
+    assert "l2" not in ok, f"a successful purge reported incomplete: {ok}"
+    assert wait_for(
+        lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(ok_tag)) == "0"), \
+        "a COMPLETE walk must empty and retire the tag key"
+    assert wait_for(
+        lambda: _sscan_db(redis, "EXISTS", ok_members[0]) == "0"), \
+        ("the control purge did not actually delete its L2 objects -- every "
+         "assertion below would then pass vacuously")
+
+    # --- the case under test: the UNLINK is answered with -ERR ---
+    tag = "sscan-unlink-fail"
+    n = 6
+    members = _sscan_fill(redis, tag, n)
+    tkey = _sscan_tag_key(tag)
+    assert _sscan_db(redis, "SCARD", tkey) == str(n), "fixture did not load"
+
+    s, body = _sscan_purge(ng, "/_cache_sscanunlinkfail", tag)
+
+    # 3. the purge must not claim success.
+    assert s == 500, \
+        (f"a purge whose per-page UNLINK was REFUSED by the server reported "
+         f"success: {s} {body}")
+    assert body.get("l2") == "incomplete", \
+        (f"a failed per-page delete was not folded into the walk's INCOMPLETE "
+         f"outcome: {body}")
+
+    # 1. the objects are still in L2 -- the failed UNLINK deleted nothing, so
+    #    the tag pointer is the ONLY way back to them.
+    alive = [m for m in members if _sscan_db(redis, "EXISTS", m) == "1"]
+    assert len(alive) == n, \
+        (f"the refused UNLINK deleted {n - len(alive)} objects anyway; the "
+         f"fault injection is not producing a FAILED delete and this test "
+         f"cannot discriminate the fix")
+
+    # 2. THE assertion this test exists for. Poll rather than read once: the
+    #    unpatched build's SREM is fire-and-forget on a separate connection and
+    #    can land AFTER the HTTP reply, so a single immediate read could see the
+    #    set still full and call a stranding build correct.
+    stranded = wait_for(
+        lambda: int(_sscan_db(redis, "SCARD", tkey)) < n, timeout=5.0)
+    assert not stranded, \
+        (f"the page's members were SREMed even though their UNLINK was "
+         f"REFUSED: {_sscan_db(redis, 'SCARD', tkey)}/{n} left in the tag set. "
+         f"Those {n} objects are still resident in L2 and are now unreachable "
+         f"by every later purge of this tag -- stranded until their own TTL.")
+    assert _sscan_db(redis, "EXISTS", tkey) == "1", \
+        "the tag key was retired over a purge that deleted nothing"
+
+    # And the retained pointer is worth something: re-purging through the
+    # HEALTHY endpoint now converges, which is the operator's way out.
+    s2, body2 = _sscan_purge(ng, "/_cache_sscan", tag)
+    assert s2 == 200, f"the retry through a healthy UNLINK failed: {s2} {body2}"
+    assert wait_for(lambda: _sscan_db(redis, "EXISTS", tkey) == "0"), \
+        "the retry completed but left the tag key behind"
+    assert wait_for(lambda: _sscan_db(redis, "EXISTS", members[0]) == "0"), \
+        "the retry reported success without deleting the objects"
+
+    _sscan_db(redis, "FLUSHDB")
+
+
 def test_l2_tag_purge_sscan_empty_set(ng: Nginx, redis: RedisServer) -> None:
     """TODO-REDIS-PAGINATION (e): purging a tag that does not exist is a clean,
     complete, zero-member success -- not an error and not an incomplete walk.

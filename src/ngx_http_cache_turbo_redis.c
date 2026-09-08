@@ -118,6 +118,21 @@ typedef struct {
      * once ALL of them are fully framed (STAB-1). DEL = 1, tag_add = 3. */
     ngx_uint_t                   expected_replies;
 
+    /* TODO-UNLINK-REPLY-WINDOW: optional REPLY completion for a drained op.
+     * Fire-and-forget ops leave this NULL and keep the historic behaviour (the
+     * reply is framed only to decide poolability, and its content is ignored).
+     * When set, read_drain invokes it EXACTLY ONCE from every terminal path
+     * with NGX_OK only when every expected reply framed cleanly and none was a
+     * RESP error; a timeout, a short/oversized/malformed reply, a peer close
+     * mid-flight and a `-ERR` reply all deliver NGX_ERROR. That distinction is
+     * what lets the paginated tag purge gate its per-page SREM on the UNLINK
+     * having actually SUCCEEDED at the server, rather than merely having been
+     * written to a socket. */
+    void                       (*drain_cb)(void *data, ngx_int_t rc);
+    void                        *drain_data;
+    unsigned                     drain_done:1;   /* drain_cb already fired */
+    unsigned                     drain_failed:1; /* a framed reply was -ERR */
+
     /* COR5-PURGE-VARIDX-RACE: this op incremented the zone's varidx_inflight
      * counter before launch and owes it a decrement in op_done. Only the
      * auto-Vary variant-index tag_add sets it; every other op leaves it 0 so
@@ -172,6 +187,25 @@ typedef struct {
      * SCAN-del walk, which needs no key argument. */
     ngx_str_t                    sscan_key;
 
+    /* TODO-UNLINK-REPLY-WINDOW: SSCAN walk suspension. When the per-page
+     * callback returns NGX_AGAIN it has started an asynchronous sub-operation
+     * (the page's UNLINK) and owns the walk until it calls sscan_resume(). The
+     * cursor for the NEXT page normally points into op->rbuf and is consumed
+     * immediately after the callback returns; across a suspension it must
+     * instead survive into the resume, so it is COPIED into op->pool here.
+     * op->pool is the walk's own pool and is not rotated per page, so the copy
+     * outlives the suspension by construction. `suspended` exists so a stray or
+     * duplicate resume is rejected rather than driving the walk twice. */
+    unsigned                     suspended:1;
+    /* Set when the walk decided to abandon while a sub-operation was still in
+     * flight holding `op`. The walk cannot be torn down at that moment (the
+     * pending completion would read freed memory), so the decision is deferred
+     * to sscan_resume, which is the first point at which nothing references the
+     * op any more. */
+    unsigned                     resume_doomed:1;
+    ngx_str_t                    resume_cursor;
+    u_char                       resume_cursor_buf[64];
+
     unsigned                     scan_deadline_hit:1; /* S231-L2-SCANTIME: walk
                                               * abandoned by the wall-clock
                                               * deadline, not the page cap —
@@ -188,6 +222,9 @@ static void ngx_http_cache_turbo_redis_read_preamble(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev);
+static void ngx_http_cache_turbo_redis_sscan_advance(
+    ngx_http_cache_turbo_redis_op_t *op, ngx_str_t cursor);
+static void ngx_http_cache_turbo_redis_sscan_resume(void *opaque, ngx_int_t rc);
 static void ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_lock_finish(
@@ -1463,7 +1500,7 @@ ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
 static ngx_int_t
 ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_str_t *lead, ngx_uint_t nlead, ngx_str_t *keys, ngx_uint_t nkeys,
-    ngx_uint_t keep_empty)
+    ngx_uint_t keep_empty, void (*done)(void *, ngx_int_t), void *done_data)
 {
     ngx_uint_t                        i, m, emitted, j;
     size_t                            total;
@@ -1471,7 +1508,13 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_redis_op_t  *op;
 
     if (!clcf->redis_enable || nkeys == 0 || nlead == 0) {
-        return NGX_OK;                    /* nothing asked for is not a failure */
+        /* Nothing asked for is not a failure -- and `done` is NOT invoked,
+         * because no op was created and none will complete. The contract is
+         * "done fires iff this function returned NGX_OK after a successful
+         * launch"; a caller that needs the callback must therefore treat
+         * NGX_OK-without-a-launch as already-complete. redis_del_many_cb below
+         * distinguishes the two for its one caller. */
+        return NGX_OK;
     }
 
     op = ngx_http_cache_turbo_redis_op_create(clcf);
@@ -1537,7 +1580,23 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
         }
     }
 
+    if (emitted == 0) {
+        /* Every key was empty and keep_empty is off, so nothing was encoded.
+         * Launching would send a zero-byte command and then wait for a reply
+         * that read_drain's `expected_replies ? : 1` fallback insists on,
+         * parking the op until its read timeout -- and, for an awaited caller,
+         * delivering a spurious NGX_ERROR for a delete that had nothing to do.
+         * Sending nothing is vacuously a successful delete, so report it as the
+         * no-op it is. `done` is deliberately NOT invoked: the contract is that
+         * it fires only after a launch, and del_many_cb turns this NGX_OK into
+         * its own already-complete answer. */
+        ngx_destroy_pool(op->pool);
+        return NGX_OK;
+    }
+
     op->expected_replies = emitted;       /* one integer reply per command */
+    op->drain_cb = done;                  /* NULL keeps fire-and-forget */
+    op->drain_data = done_data;
 
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
@@ -1546,7 +1605,13 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
         return NGX_ERROR;
     }
 
-    return NGX_OK;
+    /* NGX_DONE, not NGX_OK: the op is in flight and `done`, if any, WILL fire.
+     * Every early NGX_OK above is a "nothing was sent" no-op for which it will
+     * not, and the awaited caller has to tell the two apart -- a caller that
+     * parked on a callback that is never coming hangs until its read timeout.
+     * The fire-and-forget wrappers collapse both back to NGX_OK, so their
+     * callers are unaffected. */
+    return NGX_DONE;
 }
 
 
@@ -1559,7 +1624,63 @@ ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     lead[0].data = (u_char *) "UNLINK";
     lead[0].len = sizeof("UNLINK") - 1;
 
-    return ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 1, keys, nkeys, 0);
+    /* Fire-and-forget: a launch and a nothing-to-send are both success. */
+    return ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 1, keys, nkeys, 0,
+                                               NULL, NULL) == NGX_ERROR
+               ? NGX_ERROR : NGX_OK;
+}
+
+
+/*
+ * TODO-UNLINK-REPLY-WINDOW: del_many, but AWAITING the server's reply.
+ *
+ * del_many is fire-and-forget: it reports only whether the UNLINK was LAUNCHED.
+ * A delete that leaves the box and then fails at Redis -- a `-ERR`, a
+ * connection dropped mid-flight, a read timeout -- is indistinguishable from a
+ * success to its caller. For the paginated tag purge that is a data-loss
+ * window, not a cosmetic one: tag membership is the ONLY pointer to an L2
+ * object, so SREMing a page whose UNLINK silently failed strands a live object
+ * that is unreachable by every later purge of that tag and occupies L2 until
+ * its own TTL, behind an HTTP reply that claimed the purge succeeded.
+ *
+ * `done` is invoked EXACTLY ONCE, later and from the event loop, with NGX_OK
+ * only when every pipelined reply framed cleanly and none was a RESP error.
+ * It is invoked if and only if this function returns NGX_DONE. NGX_OK means
+ * there was nothing to send (L2 disabled, or every key was empty), so the
+ * caller may proceed immediately; NGX_ERROR means the command never launched
+ * and `done` will never fire.
+ */
+ngx_int_t
+ngx_http_cache_turbo_redis_del_many_cb(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_str_t *keys, ngx_uint_t nkeys, void (*done)(void *, ngx_int_t),
+    void *done_data)
+{
+    ngx_str_t  lead[1];
+
+    lead[0].data = (u_char *) "UNLINK";
+    lead[0].len = sizeof("UNLINK") - 1;
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    if (clcf->test_unlink_reply_fail) {
+        /* An unknown verb: launched and written exactly like the real one, and
+         * answered by a real `-ERR unknown command` frame. That is a delete
+         * that FAILED AT THE SERVER while looking, to everything upstream of
+         * the reply, indistinguishable from one that worked -- the state the
+         * pre-fix code SREMed over. */
+        lead[0].data = (u_char *) "CACHETURBONOSUCHCOMMAND";
+        lead[0].len = sizeof("CACHETURBONOSUCHCOMMAND") - 1;
+    }
+#endif
+
+    /* cmd_many's tri-state IS this function's contract, relayed unchanged:
+     * NGX_DONE launched (done fires exactly once, later), NGX_OK nothing was
+     * sent (done never fires; vacuously a successful delete), NGX_ERROR never
+     * launched (done never fires). Re-deriving "was anything sent?" here by
+     * re-scanning the keys would duplicate cmd_many's own emptiness filter and
+     * silently diverge from it the first time either side changed. */
+    return ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 1, keys, nkeys, 0,
+                                               done, done_data);
 }
 
 
@@ -1596,8 +1717,10 @@ ngx_http_cache_turbo_redis_srem_many(ngx_http_cache_turbo_loc_conf_t *clcf,
     lead[0].len = sizeof("SREM") - 1;
     lead[1] = *setkey;
 
+    /* Fire-and-forget: a launch and a nothing-to-send are both success. */
     return ngx_http_cache_turbo_redis_cmd_many(clcf, lead, 2, members,
-                                              nmembers, 1);
+                                               nmembers, 1, NULL, NULL)
+               == NGX_ERROR ? NGX_ERROR : NGX_OK;
 }
 
 
@@ -2546,6 +2669,12 @@ ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev)
                 return;
             }
             if (*p == '-') {
+                /* TODO-UNLINK-REPLY-WINDOW: a RESP error is a framed, complete
+                 * reply, so the connection stays poolable -- but the COMMAND
+                 * failed. Record it so a drain_cb consumer (the tag purge's
+                 * per-page UNLINK) reports NGX_ERROR rather than treating
+                 * "the server answered" as "the delete happened". */
+                op->drain_failed = 1;
                 ngx_log_error(NGX_LOG_INFO, c->log, 0,
                               "cache_turbo: redis command error: %*s",
                               (size_t) (next - p > 64 ? 64 : next - p), p);
@@ -3607,20 +3736,88 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
  * and — critically — does NOT delete the tag set key. Retaining it is what
  * keeps an abandoned purge retryable and its unvisited objects discoverable.
  */
-static void
-ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
-{
-    ngx_str_t                         cursor, *members;
-    ngx_uint_t                        nmembers, max_pages;
-    ngx_int_t                         rc;
-    ngx_buf_t                        *send;
-    u_char                           *rbuf;
-    ngx_pool_t                       *np, *old;
-    ngx_connection_t                 *c;
-    ngx_http_cache_turbo_redis_op_t  *op;
+/*
+ * TODO-UNLINK-REPLY-WINDOW: the SSCAN walk whose page delivery is on the stack
+ * RIGHT NOW, or NULL. Set only around the members_cb call in read_sscan and
+ * cleared immediately after it returns, so it is live for exactly the duration
+ * of one synchronous callback invocation and can never name a walk that has
+ * already been torn down.
+ *
+ * A single scalar is sufficient and correct: nginx workers are single-threaded
+ * and a page delivery never re-enters read_sscan (the callback does all its I/O
+ * asynchronously and unwinds), so at most one page delivery is ever on the
+ * stack in a worker. It exists so a page callback -- which is handed only the
+ * request and its own data, deliberately, so purge policy stays out of the
+ * transport -- can still reach its own walk to suspend it.
+ */
+static ngx_http_cache_turbo_redis_op_t  *ngx_http_cache_turbo_redis_delivering;
 
-    c = rev->data;
-    op = c->data;
+
+ngx_int_t
+ngx_http_cache_turbo_redis_walk_suspend(void (**done)(void *, ngx_int_t),
+    void **done_data)
+{
+    ngx_http_cache_turbo_redis_op_t  *op = ngx_http_cache_turbo_redis_delivering;
+
+    /* No page delivery on the stack, or this walk is already parked: there is
+     * nothing to suspend. Say so rather than handing back a continuation, so
+     * the caller falls back to a synchronous decision instead of returning
+     * NGX_AGAIN and parking a walk nothing will resume. */
+    if (op == NULL || op->suspended) {
+        return NGX_DECLINED;
+    }
+
+    op->suspended = 1;
+    *done = ngx_http_cache_turbo_redis_sscan_resume;
+    *done_data = op;
+
+    return NGX_OK;
+}
+
+
+void
+ngx_http_cache_turbo_redis_walk_unsuspend(void *opaque)
+{
+    ngx_http_cache_turbo_redis_op_t  *op = opaque;
+
+    if (op != NULL) {
+        op->suspended = 0;
+    }
+}
+
+
+/*
+ * TODO-UNLINK-REPLY-WINDOW: advance the SSCAN tag walk past a page that has
+ * been FULLY handled, given the cursor the server returned with it.
+ *
+ * Factored out of read_sscan so the resume path can reach it. The walk now has
+ * two ways to finish a page: synchronously, straight out of read_sscan's parse
+ * loop when the page callback handled it inline, and asynchronously, when the
+ * callback awaited its UNLINK reply and resumed us afterwards. Both must apply
+ * the SAME page accounting, page cap, wall-clock deadline and next-page
+ * rotation, so there is exactly one copy of them.
+ *
+ * ⚠ This is the SSCAN walk's advance and issues sscan_cmd against
+ * op->sscan_key. The SCAN-del keyspace walk keeps its own copy in read_scan and
+ * must NOT be routed here: the two walks differ in the command they re-issue,
+ * and sending SCAN on a tag-purge connection would walk the whole keyspace
+ * instead of the tag set.
+ *
+ * `cursor` may point into op->rbuf (synchronous call) or into op->pool's saved
+ * copy (resume). Either way sscan_cmd COPIES the bytes into the new page's send
+ * buffer before op->rbuf is rotated, so neither outlives this call.
+ *
+ * Terminal on every path except the one that posts the next page's write.
+ */
+static void
+ngx_http_cache_turbo_redis_sscan_advance(
+    ngx_http_cache_turbo_redis_op_t *op, ngx_str_t cursor)
+{
+    ngx_uint_t         max_pages;
+    ngx_buf_t         *send;
+    u_char            *rbuf;
+    ngx_pool_t        *np, *old;
+    ngx_connection_t  *c = op->peer.connection;
 
     max_pages = NGX_HTTP_CACHE_TURBO_REDIS_SCAN_MAX_PAGES;
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
@@ -3631,6 +3828,158 @@ ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
         max_pages = (ngx_uint_t) op->clcf->test_scan_max_pages;
     }
 #endif
+
+    op->scan_pages++;
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    /* Same page-boundary hold as read_scan, and placed BEFORE the
+     * cursor==0 return for the same reason: that return is what makes the
+     * deadline unreachable on a walk that finishes. */
+    if (op->clcf->test_scan_page_hold_ms > 0) {
+        ngx_msleep((ngx_msec_t) op->clcf->test_scan_page_hold_ms);
+        ngx_time_update();
+    }
+#endif
+
+    if (cursor.len == 1 && cursor.data[0] == '0') {
+        /* Whole set walked: the terminal callback deletes the tag key and
+         * emits the reply. */
+        op->scan_status = NGX_OK;
+        ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+        return;
+    }
+
+    if (op->scan_pages >= max_pages) {
+        /* Non-termination guard, as read_scan: a server that never hands
+         * back cursor "0" would otherwise walk forever (each page's write
+         * re-arms the read timeout). Abandon and report INCOMPLETE. */
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "cache_turbo: L2 tag purge abandoned after %ui SSCAN "
+                      "pages without the cursor returning to 0; purge is "
+                      "INCOMPLETE", op->scan_pages);
+        op->scan_status = NGX_ABORT;
+        ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+        return;
+    }
+
+    /* Wall-clock ceiling on the WHOLE walk. ngx_current_msec wraps, so
+     * compare with the signed-difference idiom, never a plain '>'.
+     * 0 = disabled (page-cap only). */
+    if (op->clcf->redis_scan_deadline > 0
+        && (ngx_msec_int_t) (ngx_current_msec
+                              - (op->scan_start
+                                 + op->clcf->redis_scan_deadline)) > 0)
+    {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "cache_turbo: L2 tag purge abandoned after %ui SSCAN "
+                      "pages, wall-clock deadline %Mms exceeded; purge is "
+                      "INCOMPLETE", op->scan_pages,
+                      op->clcf->redis_scan_deadline);
+        op->scan_status = NGX_ABORT;
+        op->scan_deadline_hit = 1;
+        ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+        return;
+    }
+
+    /* Next page out of a FRESH pool. encode copies the cursor bytes (which
+     * point into the old rbuf) into the new send buffer, so the old pool is
+     * safe to drop right after -- and must be, or the walk grows without
+     * bound. op->sscan_key lives in op->pool and survives the rotation. */
+    np = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
+    if (np == NULL) {
+        ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+        return;
+    }
+
+    send = ngx_http_cache_turbo_redis_sscan_cmd(np, &op->sscan_key, &cursor);
+    rbuf = send ? ngx_pnalloc(np,
+                ngx_min(ngx_pagesize * 4, op->reply_max)) : NULL;
+    if (rbuf == NULL) {
+        ngx_destroy_pool(np);
+        ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+        return;
+    }
+
+    old = op->rpool;
+    op->rpool = np;
+    op->send = send;
+    op->command = send;                /* old buffer dies with `old` */
+    op->rbuf = rbuf;
+    op->rcap = ngx_min(ngx_pagesize * 4, op->reply_max);
+    op->rlen = 0;
+    /* frame_off/frame_remain/frame_depth index into the OLD rbuf being
+     * replaced right here -- reset before the new page's first fill(). */
+    op->frame_off = 0;
+    op->frame_depth = 0;
+    ngx_destroy_pool(old);
+
+    ngx_post_event(c->write, &ngx_posted_events);
+}
+
+
+/*
+ * TODO-UNLINK-REPLY-WINDOW: resume a walk suspended by its page callback.
+ *
+ * `rc` is the callback's verdict on the page it was still handling when it
+ * returned NGX_AGAIN: NGX_OK if the page is now fully handled (its UNLINK was
+ * acknowledged by the server AND its members were SREMed), anything else if it
+ * was not. A non-OK verdict abandons the walk with scan_status left non-OK, so
+ * the terminal call reports "l2":"incomplete" and RETAINS the tag key --
+ * byte-identical to the launch-failure outcome that already existed, which is
+ * the point: a delete that failed at the server must be as visible as one that
+ * never left the box.
+ *
+ * Rejecting a resume on a walk that is not suspended is not defensive noise: a
+ * duplicate resume would drive the walk twice from one page, issuing two SSCANs
+ * on one connection and desynchronising the reply stream.
+ *
+ * ⚠ REENTRANCY. This runs from redis_op_done, i.e. from the UNLINK op's own
+ * event handler, never from inside the page callback's own stack frame: the
+ * callback returns NGX_AGAIN to read_sscan and unwinds long before any reply
+ * lands. The walk therefore never recurses through itself, and sscan_advance's
+ * next page is POSTED (ngx_post_event), not run inline, so even the launch of
+ * the following page unwinds to the event loop first.
+ */
+static void
+ngx_http_cache_turbo_redis_sscan_resume(void *opaque, ngx_int_t rc)
+{
+    ngx_http_cache_turbo_redis_op_t  *op = opaque;
+
+    if (op == NULL || !op->suspended) {
+        return;
+    }
+    op->suspended = 0;
+
+    if (rc != NGX_OK || op->resume_doomed) {
+        /* scan_status only ever becomes NGX_OK at cursor "0", which this walk
+         * has not reached, so it is already non-OK here. Set it explicitly
+         * anyway: the invariant is load-bearing enough that relying on it
+         * implicitly is how a later edit turns a failed purge into a 200. */
+        op->scan_status = NGX_ERROR;
+        ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+        return;
+    }
+
+    ngx_http_cache_turbo_redis_sscan_advance(op, op->resume_cursor);
+}
+
+
+static void
+ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
+{
+    ngx_str_t                         cursor, *members;
+    ngx_uint_t                        nmembers;
+    ngx_int_t                         rc;
+    ngx_connection_t                 *c;
+    ngx_http_cache_turbo_redis_op_t  *op;
+
+    c = rev->data;
+    op = c->data;
+
+    /* The page cap, the wall-clock deadline and the next-page rotation moved
+     * into sscan_advance, which both this reader and the suspended-walk resume
+     * path share. */
 
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
@@ -3687,105 +4036,100 @@ ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
          * dishonesty the walk-status contract exists to prevent. scan_status
          * is already NGX_ERROR here (it only becomes NGX_OK at cursor "0"), so
          * the terminal call reports INCOMPLETE and keeps the key. */
-        if (nmembers > 0
-            && op->members_cb(op->request, op->members_data, members,
-                              nmembers, NULL) == NGX_ERROR)
-        {
-            ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                          "cache_turbo: L2 tag purge abandoned at SSCAN page "
-                          "%ui: could not drop the page; purge is INCOMPLETE",
-                          op->scan_pages + 1);
-            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
-            return;
+        if (nmembers > 0) {
+            ngx_int_t  prc;
+
+            /* Publish this walk for the duration of the callback so it can
+             * reach walk_suspend(). Cleared unconditionally on return: a walk
+             * must never be suspendable from outside its own page delivery. */
+            ngx_http_cache_turbo_redis_delivering = op;
+            prc = op->members_cb(op->request, op->members_data, members,
+                                 nmembers, NULL);
+            ngx_http_cache_turbo_redis_delivering = NULL;
+
+            if (prc == NGX_ERROR) {
+                ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                              "cache_turbo: L2 tag purge abandoned at SSCAN "
+                              "page %ui: could not drop the page; purge is "
+                              "INCOMPLETE", op->scan_pages + 1);
+                ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+                return;
+            }
+
+            /* TODO-UNLINK-REPLY-WINDOW: NGX_AGAIN means the page callback has
+             * launched an asynchronous sub-operation (the page's UNLINK) and
+             * will not have finished handling this page until its reply lands.
+             * Park the walk: save the cursor -- it points into op->rbuf, which
+             * this function would otherwise rotate away underneath the pending
+             * callback -- and return without advancing. The callback resumes us
+             * through sscan_resume() with its verdict.
+             *
+             * A cursor longer than the buffer cannot come from Redis (cursors
+             * are decimal u64 text, at most 20 bytes), but a desynchronised or
+             * hostile reply could claim one, so it is rejected as a malformed
+             * page rather than truncated into a cursor that would silently
+             * restart or skip part of the walk. */
+            if (prc == NGX_AGAIN) {
+                /* NGX_AGAIN is only legal after a successful walk_suspend(),
+                 * which is what sets op->suspended. A callback that returns it
+                 * without suspending has parked a walk nothing will resume, so
+                 * treat that as the abandoned page it really is rather than
+                 * hanging the request until the read timeout. */
+                if (!op->suspended) {
+                    ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                                  "cache_turbo: L2 tag purge abandoned at "
+                                  "SSCAN page %ui: the page callback parked "
+                                  "the walk without suspending it; purge is "
+                                  "INCOMPLETE", op->scan_pages + 1);
+                    op->scan_status = NGX_ERROR;
+                    ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+                    return;
+                }
+
+                /* Save the cursor for the NEXT page. It points into op->rbuf,
+                 * which sscan_advance rotates away, and the pending UNLINK's
+                 * reply lands long after this stack frame is gone -- so the
+                 * bytes must be COPIED somewhere that outlives the suspension.
+                 * resume_cursor_buf is inline in the op struct, which lives in
+                 * op->pool and is destroyed only by walk_finish, i.e. strictly
+                 * after any resume.
+                 *
+                 * A cursor longer than the buffer cannot come from Redis
+                 * (cursors are decimal u64 text, at most 20 bytes), but a
+                 * desynchronised or hostile reply could claim one. Reject it as
+                 * a malformed page rather than truncating it into a DIFFERENT
+                 * valid-looking cursor, which would silently restart the walk
+                 * or skip an arbitrary span of the set. Note the pending UNLINK
+                 * still owns a resume, so clear `suspended` first -- otherwise
+                 * that resume would run against a freed op. */
+                if (cursor.len > sizeof(op->resume_cursor_buf)) {
+                    ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                                  "cache_turbo: L2 tag purge abandoned: SSCAN "
+                                  "cursor of %uz bytes is not a cursor",
+                                  cursor.len);
+                    /* ⚠ Do NOT finish the walk here. The page's UNLINK is
+                     * ALREADY in flight and holds `op` as its completion data;
+                     * walk_finish destroys op->pool, which `op` itself is
+                     * allocated from, so finishing now would leave that pending
+                     * completion pointing at freed memory -- a use-after-free
+                     * fired from the event loop some milliseconds later, which
+                     * is strictly worse than the stranding this whole change
+                     * exists to prevent. Instead mark the walk doomed and stay
+                     * suspended: the resume is guaranteed to come (del_many_cb
+                     * fires `done` exactly once from every terminal path), and
+                     * sscan_resume sees resume_doomed and finishes the walk
+                     * then -- at which point nothing is in flight any more. */
+                    op->resume_doomed = 1;
+                    return;
+                }
+                ngx_memcpy(op->resume_cursor_buf, cursor.data, cursor.len);
+                op->resume_cursor.data = op->resume_cursor_buf;
+                op->resume_cursor.len = cursor.len;
+                return;
+            }
         }
 
-        op->scan_pages++;
-
-#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
-    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-        /* Same page-boundary hold as read_scan, and placed BEFORE the
-         * cursor==0 return for the same reason: that return is what makes the
-         * deadline unreachable on a walk that finishes. */
-        if (op->clcf->test_scan_page_hold_ms > 0) {
-            ngx_msleep((ngx_msec_t) op->clcf->test_scan_page_hold_ms);
-            ngx_time_update();
-        }
-#endif
-
-        if (cursor.len == 1 && cursor.data[0] == '0') {
-            /* Whole set walked: the terminal callback deletes the tag key and
-             * emits the reply. */
-            op->scan_status = NGX_OK;
-            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
-            return;
-        }
-
-        if (op->scan_pages >= max_pages) {
-            /* Non-termination guard, as read_scan: a server that never hands
-             * back cursor "0" would otherwise walk forever (each page's write
-             * re-arms the read timeout). Abandon and report INCOMPLETE. */
-            ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                          "cache_turbo: L2 tag purge abandoned after %ui SSCAN "
-                          "pages without the cursor returning to 0; purge is "
-                          "INCOMPLETE", op->scan_pages);
-            op->scan_status = NGX_ABORT;
-            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
-            return;
-        }
-
-        /* Wall-clock ceiling on the WHOLE walk. ngx_current_msec wraps, so
-         * compare with the signed-difference idiom, never a plain '>'.
-         * 0 = disabled (page-cap only). */
-        if (op->clcf->redis_scan_deadline > 0
-            && (ngx_msec_int_t) (ngx_current_msec
-                                  - (op->scan_start
-                                     + op->clcf->redis_scan_deadline)) > 0)
-        {
-            ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                          "cache_turbo: L2 tag purge abandoned after %ui SSCAN "
-                          "pages, wall-clock deadline %Mms exceeded; purge is "
-                          "INCOMPLETE", op->scan_pages,
-                          op->clcf->redis_scan_deadline);
-            op->scan_status = NGX_ABORT;
-            op->scan_deadline_hit = 1;
-            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
-            return;
-        }
-
-        /* Next page out of a FRESH pool. encode copies the cursor bytes (which
-         * point into the old rbuf) into the new send buffer, so the old pool is
-         * safe to drop right after -- and must be, or the walk grows without
-         * bound. op->sscan_key lives in op->pool and survives the rotation. */
-        np = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
-        if (np == NULL) {
-            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
-            return;
-        }
-
-        send = ngx_http_cache_turbo_redis_sscan_cmd(np, &op->sscan_key,
-                                                    &cursor);
-        rbuf = send ? ngx_pnalloc(np,
-                    ngx_min(ngx_pagesize * 4, op->reply_max)) : NULL;
-        if (rbuf == NULL) {
-            ngx_destroy_pool(np);
-            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
-            return;
-        }
-
-        old = op->rpool;
-        op->rpool = np;
-        op->send = send;
-        op->command = send;                /* old buffer dies with `old` */
-        op->rbuf = rbuf;
-        op->rcap = ngx_min(ngx_pagesize * 4, op->reply_max);
-        op->rlen = 0;
-        /* frame_off/frame_remain/frame_depth index into the OLD rbuf being
-         * replaced right here -- reset before the new page's first fill(). */
-        op->frame_off = 0;
-        op->frame_depth = 0;
-        ngx_destroy_pool(old);
-
-        ngx_post_event(c->write, &ngx_posted_events);
+        ngx_http_cache_turbo_redis_sscan_advance(op, cursor);
         return;
     }
 }
@@ -3861,6 +4205,32 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
 {
     ngx_pool_t        *pool = op->pool;
     ngx_connection_t  *c = op->peer.connection;
+
+    /* TODO-UNLINK-REPLY-WINDOW: deliver the REPLY outcome before anything is
+     * torn down. Every terminal path of a drained op funnels here -- read_drain
+     * calls op_done directly from all six of its returns, and a connect/send
+     * failure reaches op_fail's else-arm, which calls op_done too -- so firing
+     * from this one place is what makes the delivery EXACTLY-ONCE and total.
+     * drain_done guards a re-entry that cannot happen today but would silently
+     * double-report if a future path ever called op_done twice.
+     *
+     * The verdict is NGX_OK only when read_drain reached its clean-boundary
+     * return (op->clean) AND no framed reply was a RESP `-ERR`. A timeout, a
+     * peer close before the last reply framed, a malformed or oversized reply
+     * and a write-path failure all leave clean == 0 and therefore report
+     * NGX_ERROR. Treating a dropped connection as success is precisely the
+     * silent-stranding bug this callback exists to close.
+     *
+     * The callback runs BEFORE the pool is destroyed, but it must not assume
+     * anything it touches lives in op->pool -- its own data is the caller's. */
+    if (op->drain_cb != NULL && !op->drain_done) {
+        void  (*dcb)(void *, ngx_int_t) = op->drain_cb;
+        void   *ddata = op->drain_data;
+        ngx_int_t  drc = (op->clean && !op->drain_failed) ? NGX_OK : NGX_ERROR;
+
+        op->drain_done = 1;
+        dcb(ddata, drc);
+    }
 
     /* COR5-PURGE-VARIDX-RACE: release this op's in-flight account. Every
      * completion AND every failure funnels through here -- read_drain's six
