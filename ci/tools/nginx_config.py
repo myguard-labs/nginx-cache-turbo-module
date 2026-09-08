@@ -1083,6 +1083,17 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
+        # mem_058c6ab1eff44d89b7425ac24c68e77c: the ?tag= (SSCAN) mirror of
+        # /_cache_scandown above -- same never-bound redis_dead offset, so the
+        # connect is refused before any SSCAN page is read. Its own prefix so a
+        # stray success here cannot disturb another sscan test.
+        location = /_cache_sscandown {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{port + PORT_OFFSETS["redis_dead"]} prefix=ctsscandown: timeout=250ms;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
         # O4.4-i L2 half. Mirrors /brkion/ and /brkioff/, but with a Redis L2
         # configured so the breaker fallback is served from the L2 blob path --
         # the arming call site the L1 pair above provably cannot reach. Their own
