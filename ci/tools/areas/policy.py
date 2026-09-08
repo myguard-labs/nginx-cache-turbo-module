@@ -2647,8 +2647,23 @@ def test_cor5_purge_reports_degraded_enumeration(
     # redis.c) increment inflight, so a fetch cannot report the increment it
     # itself caused -- same skew the drops0/hf_confirm pair above already
     # works around. The counter is zone-scoped, so this later, unrelated
-    # confirm request observes it correctly, and since it is cached HIT
-    # (primed above) it stores nothing and launches no SADD of its own.
+    # confirm request observes it correctly.
+    #
+    # The confirm URI is re-primed and asserted HIT immediately below, so the
+    # poll itself cannot store or launch an index write of its own: line
+    # 2590's fetch was a storing MISS and this location has auto_vary on with
+    # the "en" header carrying vary_bits, so that MISS launched its own SADD,
+    # and cache_turbo_valid 30s means the entry could have expired by now --
+    # relying on it staying a HIT is not something this test may assume.
+    _, confirm0, _ = fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
+                            headers=en)
+    _, confirm1, hconfirm1 = fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
+                                    headers=en)
+    assert hconfirm1.get("x-cache") == "HIT" and confirm1 == confirm0, \
+        (f"degraded-confirm must be a fresh HIT before the inflight gate, "
+         f"else the gate's own polls would store and re-launch a SADD -- "
+         f"got {hconfirm1}")
+
     assert wait_for(
         lambda: _varidx(fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
                                headers=en)[2])["inflight"] == 0,
