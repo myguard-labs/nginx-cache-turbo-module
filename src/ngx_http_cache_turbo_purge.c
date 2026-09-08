@@ -525,8 +525,10 @@ ngx_http_cache_turbo_tag_purge_page_settle(
 
 /*
  * Asynchronous entry point: the transport answering a launched UNLINK. Invoked
- * EXACTLY ONCE per launched page, from the event loop, and always resumes the
- * suspended walk -- so a suspended walk can never be left parked.
+ * EXACTLY ONCE per launched page, from the event loop, and resumes the walk if
+ * one is still suspended -- so a walk parked awaiting this reply can never be
+ * left parked. The resume slot is empty only when the page was already settled
+ * synchronously (unlinked_locally), which cancels the suspension itself.
  */
 static void
 ngx_http_cache_turbo_tag_purge_page_unlinked(void *data, ngx_int_t rc)

@@ -2500,8 +2500,34 @@ typedef struct {
      * command` reply -- a launched, answered, FAILED delete, the exact state
      * the pre-fix code mistook for success. Only the AWAITED (del_many_cb)
      * path is affected; fire-and-forget deletes are untouched, so the fault is
-     * scoped to the behaviour under test. 0/unset = off. */
+     * scoped to the behaviour under test.
+     *
+     * The value is the 1-based ORDINAL of the first awaited delete to fail, so
+     * earlier ones SUCCEED. 1 fails the very first page; a higher N lets N-1
+     * pages complete normally, which is what drives the walk through the
+     * resume -> sscan_advance transition (cursor restored from the saved copy,
+     * next page issued) before the failure lands. A single-page fixture can
+     * never exercise that transition, because its cursor comes back "0" and the
+     * walk finishes instead of advancing. 0/unset = off. */
     ngx_int_t                test_unlink_reply_fail;
+    /* Awaited deletes issued so far by this worker, counted only while
+     * test_unlink_reply_fail is armed. Lives in the conf because the ops it
+     * counts are independent and short-lived and the walk spanning them has no
+     * other per-location home. TEST_FAULTS builds only. */
+    ngx_uint_t               test_unlink_reply_seen;
+    /* TODO-UNLINK-REPLY-WINDOW: milliseconds to hold the awaited per-page
+     * UNLINK before it is launched, so the SSCAN connection's read timeout
+     * elapses WHILE the walk is suspended. That is the only way to reach the
+     * hazard the suspension's disarm exists to close: the write handler arms
+     * ngx_add_timer(c->read, redis_timeout) when it finishes sending a page,
+     * and if that timer survives the park it fires on its own schedule and
+     * re-enters read_sscan, whose walk_finish destroys the op pool and
+     * finalizes the request while the in-flight UNLINK still holds both --
+     * a use-after-free plus a double free of the page pool. Set this above the
+     * location's redis_timeout and a correctly-disarmed walk still completes.
+     * Blocking ngx_msleep for the same reason as test_scan_page_hold_ms: the
+     * walk is driven off one connection's read handler. 0/unset = no hold. */
+    ngx_int_t                test_unlink_launch_hold_ms;
     /* S231-SIE-MIDBODY: no production signal for "the upstream died after
      * sending headers but before last_buf" is reliable enough to trigger the
      * rescue from (see the body filter comment at the rescue site for the

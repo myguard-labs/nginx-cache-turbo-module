@@ -462,6 +462,8 @@ def run_all(ng: Nginx, origin: Origin,
         # are the expensive pair (3000 / 2200 members).
         test_l2_tag_purge_sscan_empty_set(ng, redis)
         test_l2_tag_purge_sscan_unlink_reply_failure_keeps_tag(ng, redis)
+        test_l2_tag_purge_sscan_unlink_failure_on_a_later_page(ng, redis)
+        test_l2_tag_purge_sscan_suspension_disarms_the_read_timer(ng, redis)
         test_l2_tag_purge_sscan_malformed_member_is_skipped(ng, redis)
         test_l2_tag_purge_sscan_duplicate_member_is_idempotent(ng, redis)
         test_l2_tag_purge_sscan_multipage_purges_every_member(ng, redis)

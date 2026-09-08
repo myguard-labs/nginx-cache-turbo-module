@@ -2384,6 +2384,197 @@ def test_l2_tag_purge_sscan_unlink_reply_failure_keeps_tag(
     _sscan_db(redis, "FLUSHDB")
 
 
+def test_l2_tag_purge_sscan_unlink_failure_on_a_later_page(
+        ng: Nginx, redis: RedisServer) -> None:
+    """TODO-UNLINK-REPLY-WINDOW, multi-page: an EARLY page whose UNLINK succeeds
+    must resume the walk and advance it to the next page; a LATER page whose
+    UNLINK is refused must still abandon, keeping its own members in the tag.
+
+    The single-page sibling above cannot reach the code this pins. A six-member
+    tag comes back on ONE SSCAN page with cursor "0", so its suspension resolves
+    straight into the walk's completion -- resume_cursor is never written and
+    never read, and sscan_advance is never entered from the resume. That is the
+    most delicate transition in the change (the cursor for the next page points
+    into a reply buffer the rotation frees, so it has to survive the suspension
+    in the op's own inline copy) and it needs a walk that actually continues.
+
+    So: ~3000 members over ~12 SSCAN pages, with the sixth awaited UNLINK
+    refused. Pages 1-5 succeed, each one suspending, resuming and advancing;
+    page 6 fails. Six rather than two so the visited-member count separates the
+    two behaviours by whole pages rather than by a member or two.
+
+      1. Progress proves the resume->advance path ran: the tag set SHRANK, which
+         is only possible if a suspended page resumed, SREMed and then issued a
+         further SSCAN. A build that failed to advance would abandon at page 1
+         and remove nothing.
+      2. The walk stops there rather than running to completion: the set is NOT
+         empty and the tag key survives, so page 3's members -- still resident
+         in L2, since their UNLINK was refused -- are still reachable by tag.
+      3. The reply is 500 / "l2":"incomplete", not a 200 over a partial purge.
+      4. Re-purging through the healthy endpoint converges, which is what makes
+         the retained pointer worth keeping."""
+    _sscan_db(redis, "FLUSHDB")
+    tag = "sscan-unlink-fail-late"
+    n = 3000                                   # ~12 pages at COUNT 256
+    members = _sscan_fill(redis, tag, n)
+    tkey = _sscan_tag_key(tag)
+    assert _sscan_db(redis, "SCARD", tkey) == str(n), "fixture did not load"
+
+    s, body = _sscan_purge(ng, "/_cache_sscanunlinkfail6", tag)
+
+    # 3. the purge must not claim success.
+    assert s == 500, \
+        (f"a purge whose sixth page UNLINK was REFUSED reported success: "
+         f"{s} {body}")
+    assert body.get("l2") == "incomplete", \
+        f"a failed later page was not folded into the walk's outcome: {body}"
+
+    # 1. THE assertion this variant exists for. `purged` counts members VISITED
+    #    across the walk, so it is the direct readout of how many pages the walk
+    #    actually got through. The fault is armed at the THIRD awaited delete,
+    #    so a walk that resumes and advances correctly visits three pages before
+    #    stopping; one that finishes at its first resume instead of advancing
+    #    reports a single page. At COUNT 256 the two are far apart, and the
+    #    comparison is what makes this test discriminate the resume ->
+    #    sscan_advance transition rather than merely observing that something
+    #    was purged.
+    #
+    #    Compared against a strict lower bound rather than an exact figure:
+    #    SSCAN's COUNT is a hint over hash BUCKETS, so page sizes vary and only
+    #    the "more than one page's worth" claim is guaranteed.
+    assert body["purged"] > 1000, \
+        (f"the walk visited only {body['purged']} members -- about one SSCAN "
+         f"page. The successful early pages never resumed into sscan_advance, "
+         f"so the walk finished at page 1 instead of continuing to the page "
+         f"whose UNLINK was refused.")
+
+    #    ...and the members it visited really left the tag set, which needs the
+    #    resumed page's SREM to have run.
+    assert wait_for(lambda: int(_sscan_db(redis, "SCARD", tkey)) < n,
+                    timeout=10.0), \
+        (f"the walk removed NOTHING ({_sscan_db(redis, 'SCARD', tkey)}/{n}): "
+         f"the successful early pages never resumed into sscan_advance, so the "
+         f"walk never got past page 1")
+    remaining = int(_sscan_db(redis, "SCARD", tkey))
+
+    # 2. ...but it stopped at the refused page rather than completing.
+    assert remaining > 0, \
+        ("the walk ran to completion despite a REFUSED page UNLINK: the "
+         "members of that page are still in L2 and are now unreachable by tag")
+    assert _sscan_db(redis, "EXISTS", tkey) == "1", \
+        "the tag key was retired over a walk that did not complete"
+
+    # The refused page's objects really are still resident -- that is what
+    # makes retaining their tag membership load-bearing rather than tidy.
+    alive = [m for m in members if _sscan_db(redis, "EXISTS", m) == "1"]
+    assert len(alive) >= remaining, \
+        (f"only {len(alive)} objects survive but {remaining} members are still "
+         f"listed: the tag set points at objects that are already gone")
+
+    # 4. the retained pointer converges through a healthy UNLINK.
+    attempts = 0
+    while True:
+        attempts += 1
+        assert attempts <= 40, \
+            f"retrying past a refused page never converged: {remaining} left"
+        st, rbody = _sscan_purge(ng, "/_cache_sscan", tag)
+        if st == 200:
+            assert "l2" not in rbody, f"completing retry reported incomplete: {rbody}"
+            break
+        assert st == 500 and rbody.get("l2") == "incomplete", \
+            f"unexpected retry outcome: {st} {rbody}"
+        assert wait_for(lambda prev=remaining:
+                            int(_sscan_db(redis, "SCARD", tkey)) < prev,
+                        timeout=10.0), \
+            f"a retry made no progress: {_sscan_db(redis, 'SCARD', tkey)} left"
+        remaining = int(_sscan_db(redis, "SCARD", tkey))
+
+    assert wait_for(lambda: _sscan_db(redis, "EXISTS", tkey) == "0",
+                    timeout=10.0), \
+        "the retry that COMPLETED did not delete the emptied tag key"
+    _sscan_db(redis, "FLUSHDB")
+
+
+def test_l2_tag_purge_sscan_suspension_disarms_the_read_timer(
+        ng: Nginx, redis: RedisServer) -> None:
+    """TODO-UNLINK-REPLY-WINDOW: the SSCAN connection's read timer must be
+    DISARMED while the walk is suspended awaiting a page's UNLINK reply.
+
+    The write handler arms ngx_add_timer(c->read, redis_timeout) as soon as it
+    finishes sending a page. Awaiting the UNLINK parks the walk for however long
+    the DELETE takes, which is unrelated to how long the SSCAN connection takes
+    to answer -- so a timer left armed across the park fires on its own
+    schedule, re-enters read_sscan with rev->timedout, and walk_finish then
+    destroys op->pool (the op lives in it) and finalizes the parked request
+    (freeing the tagpurge state). The UNLINK is on a SEPARATE connection and is
+    still in flight holding both: its completion reads a freed op and a freed
+    tp, double-frees the page pool, and may finalize the request a second time.
+
+    The fixture makes that ordering deterministic rather than a race: the
+    endpoint's redis_timeout is 300ms and the awaited UNLINK is held 900ms
+    before it is even launched, so the read timer would expire three times over
+    during the park. The UNLINK itself SUCCEEDS, so the only variable under test
+    is the timer -- a purge that completes cleanly here can only have disarmed
+    it.
+
+    ⚠ WHAT THIS PINS, AND WHAT IT DOES NOT. This is a REGRESSION test, not a
+    reproducer: it holds that a walk parked far past its read timeout still
+    completes cleanly, so an edit that reintroduced the hazard in a form the
+    loop could observe would break it. It does NOT go red against the
+    un-disarmed code today. The only fault hook available here is ngx_msleep,
+    as used by every other *_hold_ms knob, and that blocks the whole worker --
+    so the event loop cannot deliver the pending read timeout while the hold is
+    running, which is precisely the ordering the bug needs (the loop must RUN
+    while the walk is parked). Producing that deterministically would need a
+    slow or stalled Redis on the UNLINK connection specifically, which this
+    harness has no fixture for.
+
+    The armed state itself WAS confirmed directly, which is what justifies the
+    disarm: instrumenting the suspension point on the un-disarmed build logs
+    `timer_set=1 active=1` at every park, i.e. the read timer and read event
+    really do survive into the suspension.
+
+    Run this under the ASan/UBSan build too: the symptom is a use-after-free,
+    and a plain build can read freed pool memory that still holds plausible
+    bytes and report a pass over a corrupt heap."""
+    _sscan_db(redis, "FLUSHDB")
+    tag = "sscan-unlink-hold"
+    n = 700                                    # ~3 pages at COUNT 256
+    members = _sscan_fill(redis, tag, n)
+    tkey = _sscan_tag_key(tag)
+    assert _sscan_db(redis, "SCARD", tkey) == str(n), "fixture did not load"
+
+    # Each page is parked ~900ms against a 300ms read timeout.
+    s, body = _sscan_purge(ng, "/_cache_sscanunlinkhold", tag)
+
+    assert s == 200, \
+        (f"a purge whose pages were held past the SSCAN read timeout did not "
+         f"complete: {s} {body}. The suspension left the read timer armed, so "
+         f"the timeout tore the walk down while its UNLINK was still in "
+         f"flight -- the use-after-free this disarm exists to prevent.")
+    assert "l2" not in body, \
+        f"the held purge reported an incomplete walk: {body}"
+    assert body["purged"] == n, \
+        f"the held purge visited {body['purged']} of {n} members: {body}"
+
+    # It really purged, rather than completing by doing nothing. The objects
+    # are the honest oracle here: their UNLINK is the AWAITED op, so by the time
+    # the walk reports complete every one of them has been acknowledged deleted.
+    # The tag SET is deliberately not asserted on -- its SREM is
+    # fire-and-forget on a separate connection, and with every page's delete
+    # held 900ms the last one can still be in flight when the reply lands, which
+    # would make this test flaky about something it is not testing.
+    assert wait_for(lambda: _sscan_db(redis, "EXISTS", members[0]) == "0",
+                    timeout=30.0), \
+        "the walk reported success without deleting its L2 objects"
+    assert wait_for(lambda: _sscan_db(redis, "EXISTS", members[-1]) == "0",
+                    timeout=30.0), \
+        ("the walk reported success but the LAST page's objects survive: it "
+         "did not really reach the end of the set")
+
+    _sscan_db(redis, "FLUSHDB")
+
+
 def test_l2_tag_purge_sscan_empty_set(ng: Nginx, redis: RedisServer) -> None:
     """TODO-REDIS-PAGINATION (e): purging a tag that does not exist is a clean,
     complete, zero-member success -- not an error and not an incomplete walk.

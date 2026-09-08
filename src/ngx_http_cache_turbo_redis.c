@@ -1662,7 +1662,10 @@ ngx_http_cache_turbo_redis_del_many_cb(ngx_http_cache_turbo_loc_conf_t *clcf,
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
-    if (clcf->test_unlink_reply_fail) {
+    if (clcf->test_unlink_reply_fail > 0
+        && ++clcf->test_unlink_reply_seen
+               >= (ngx_uint_t) clcf->test_unlink_reply_fail)
+    {
         /* An unknown verb: launched and written exactly like the real one, and
          * answered by a real `-ERR unknown command` frame. That is a delete
          * that FAILED AT THE SERVER while looking, to everything upstream of
@@ -1670,6 +1673,18 @@ ngx_http_cache_turbo_redis_del_many_cb(ngx_http_cache_turbo_loc_conf_t *clcf,
          * pre-fix code SREMed over. */
         lead[0].data = (u_char *) "CACHETURBONOSUCHCOMMAND";
         lead[0].len = sizeof("CACHETURBONOSUCHCOMMAND") - 1;
+    }
+
+    if (clcf->test_unlink_launch_hold_ms > 0) {
+        /* Burn wall-clock time with the walk ALREADY SUSPENDED (the page
+         * callback suspends before calling us), so the SSCAN connection's read
+         * timer -- armed when its page was sent -- would expire during the
+         * park. If the suspension failed to disarm it, the event loop delivers
+         * that timeout to read_sscan on the next iteration and the walk is torn
+         * down under this still-unlaunched UNLINK. ngx_time_update so the
+         * cached clock really advances across the hold. */
+        ngx_msleep((ngx_msec_t) clcf->test_unlink_launch_hold_ms);
+        ngx_time_update();
     }
 #endif
 
@@ -3743,12 +3758,19 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
  * of one synchronous callback invocation and can never name a walk that has
  * already been torn down.
  *
- * A single scalar is sufficient and correct: nginx workers are single-threaded
- * and a page delivery never re-enters read_sscan (the callback does all its I/O
- * asynchronously and unwinds), so at most one page delivery is ever on the
- * stack in a worker. It exists so a page callback -- which is handed only the
- * request and its own data, deliberately, so purge policy stays out of the
- * transport -- can still reach its own walk to suspend it.
+ * A single scalar is sufficient and correct. nginx workers are single-threaded,
+ * and -- the load-bearing half -- redis_launch POSTS the write event on every
+ * path it takes (keepalive reuse, immediate connect, connect-in-progress) and
+ * never runs a handler inline, so no sub-operation the callback starts can
+ * complete inside members_cb. The callback therefore always unwinds before any
+ * reply is processed, and at most one page delivery is ever on the stack in a
+ * worker. (The weaker claim, that the callback merely does its I/O
+ * asynchronously, would still permit an inline completion on a synchronous
+ * failure path; it is the unconditional post that rules that out.)
+ *
+ * It exists so a page callback -- which is handed only the request and its own
+ * data, deliberately, so purge policy stays out of the transport -- can still
+ * reach its own walk to suspend it.
  */
 static ngx_http_cache_turbo_redis_op_t  *ngx_http_cache_turbo_redis_delivering;
 
@@ -3913,6 +3935,23 @@ ngx_http_cache_turbo_redis_sscan_advance(
     op->frame_off = 0;
     op->frame_depth = 0;
     ngx_destroy_pool(old);
+
+    /* RE-ARM after a suspension. The NGX_AGAIN branch in read_sscan drops this
+     * connection's read event (and its timer) for the duration of the park, so
+     * a resumed walk has to put the read event back before the next page's
+     * reply can be noticed. The read TIMER needs nothing here: redis_write
+     * re-arms ngx_add_timer(c->read, op->timeout) as soon as it finishes
+     * sending, which is what bounds each page individually.
+     *
+     * Harmless on the synchronous path, where the event was never dropped:
+     * ngx_handle_read_event on an already-active level-triggered event is a
+     * no-op, and re-adding an edge-triggered one is idempotent. Doing it
+     * unconditionally keeps the two entry paths from needing different
+     * teardown state. */
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+        return;
+    }
 
     ngx_post_event(c->write, &ngx_posted_events);
 }
@@ -4099,9 +4138,15 @@ ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
                  * desynchronised or hostile reply could claim one. Reject it as
                  * a malformed page rather than truncating it into a DIFFERENT
                  * valid-looking cursor, which would silently restart the walk
-                 * or skip an arbitrary span of the set. Note the pending UNLINK
-                 * still owns a resume, so clear `suspended` first -- otherwise
-                 * that resume would run against a freed op. */
+                 * or skip an arbitrary span of the set.
+                 *
+                 * Rejecting it must NOT clear `suspended`: the pending UNLINK
+                 * still owns a resume, and sscan_resume ignores a resume for a
+                 * walk that is not suspended -- so clearing it here would drop
+                 * the only call that can ever tear this walk down, leaking the
+                 * op pool, the connection and the parked request for the life
+                 * of the worker. Stay suspended and record the verdict instead;
+                 * see the resume_doomed comment below. */
                 if (cursor.len > sizeof(op->resume_cursor_buf)) {
                     ngx_log_error(NGX_LOG_ERR, c->log, 0,
                                   "cache_turbo: L2 tag purge abandoned: SSCAN "
@@ -4122,6 +4167,44 @@ ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
                     op->resume_doomed = 1;
                     return;
                 }
+                /* ⚠ DISARM THIS CONNECTION for the duration of the parking.
+                 * The write handler armed ngx_add_timer(c->read, op->timeout)
+                 * when it finished sending this SSCAN, and nothing has deleted
+                 * it. Left armed across the suspension it fires on its own
+                 * schedule -- entirely unrelated to how long the UNLINK takes
+                 * -- and re-enters read_sscan with rev->timedout, whose
+                 * walk_finish destroys op->pool and finalizes the parked
+                 * request while the UNLINK op still holds both. That is a
+                 * use-after-free plus a double-free of the page pool and a
+                 * second finalize, fired from the event loop.
+                 *
+                 * Disarming is also the honest accounting: redis_timeout bounds
+                 * how long this connection may take to ANSWER, and time spent
+                 * waiting on a different operation on a different connection is
+                 * not that. sscan_advance re-arms it before the next page's
+                 * write, so the bound applies to every page exactly as before.
+                 * The read event is dropped too, so a peer close arriving
+                 * during the park cannot drive the reader either; the resume
+                 * re-establishes both. */
+                if (rev->timer_set) {
+                    ngx_del_timer(rev);
+                }
+                /* ngx_del_event, NOT ngx_handle_read_event(NGX_CLOSE_EVENT):
+                 * the latter keeps the descriptor registered so a peer close is
+                 * still reported, which is precisely the wakeup that must not
+                 * happen here -- it re-enters read_sscan while the walk is
+                 * parked. Take the event off the poller outright; sscan_advance
+                 * puts it back before the next page. */
+                if (rev->active
+                    && ngx_del_event(rev, NGX_READ_EVENT, 0) != NGX_OK)
+                {
+                    /* Cannot disarm, so the hazard above stands. Abandon --
+                     * still deferred, because the UNLINK is already in flight
+                     * and holds this op. */
+                    op->resume_doomed = 1;
+                    return;
+                }
+
                 ngx_memcpy(op->resume_cursor_buf, cursor.data, cursor.len);
                 op->resume_cursor.data = op->resume_cursor_buf;
                 op->resume_cursor.len = cursor.len;

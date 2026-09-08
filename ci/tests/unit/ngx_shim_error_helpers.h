@@ -46,6 +46,12 @@ struct ngx_event_s {
     void      (*handler)(ngx_event_t *ev);
     unsigned    timedout:1;
     unsigned    timer_set:1;
+    /* TODO-UNLINK-REPLY-WINDOW: read_sscan's suspension takes the read event
+     * off the poller, which needs `active` and ngx_del_event below. Not
+     * exercised here (the stubbed parse_scan always yields cursor "0", so no
+     * page ever suspends) -- present so the extracted reader compiles against
+     * the mock exactly as it does against the real event. */
+    unsigned    active:1;
 };
 
 struct ngx_connection_s {
@@ -429,6 +435,21 @@ ngx_del_timer(ngx_event_t *ev)
 {
     ev->timer_set = 0;
     ngx_test_del_timer_calls++;
+}
+
+
+#define NGX_READ_EVENT   0
+#define NGX_WRITE_EVENT  1
+
+/* Mirrors nginx's poller de-registration: the suspension calls this to stop the
+ * SSCAN connection waking while the walk is parked. */
+static ngx_int_t
+ngx_del_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
+{
+    (void) event;
+    (void) flags;
+    ev->active = 0;
+    return NGX_OK;
 }
 
 static ngx_int_t
