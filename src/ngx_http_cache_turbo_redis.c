@@ -3435,10 +3435,57 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
         /* PERF-1: drop the whole page in one pipelined UNLINK connection rather
          * than a fresh fire-and-forget connection per key (an FD/timer storm on
          * a large keyspace). Keys point into rbuf; del_many copies them before
-         * the next SCAN resets rbuf. */
-        ngx_http_cache_turbo_redis_del_many(op->clcf, keys, nkeys);
+         * the next SCAN resets rbuf.
+         *
+         * There is no tag set here (this is the whole-keyspace ?all=1 walk,
+         * not the by-tag SSCAN walk), so a page whose UNLINK never launched
+         * strands nothing invisible -- the keys stay enumerable on the next
+         * SCAN of this same cursor range. But letting the walk carry on to
+         * cursor "0" would still report a clean purge over objects that were
+         * never dropped, which is exactly the under-reporting AUD-SCAN1
+         * already refuses for the page-cap/deadline/malformed-reply paths.
+         * Mirror read_sscan's contract: abandon the walk and let the terminal
+         * callback report INCOMPLETE rather than clean. scan_status is
+         * already NGX_ERROR here (it only becomes NGX_OK at cursor "0"). */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+        /* GRIND-C6-READSCAN: force this page's del_many to report failure
+         * deterministically, without taking Redis down (which would also
+         * kill the SCAN side of the walk and prove nothing about this
+         * specific branch). Skip the real call rather than launch-then-
+         * override: del_many's UNLINK is fire-and-forget over a live
+         * connection, so calling it for real and only overwriting the
+         * return value would still delete every key in this page while
+         * claiming the walk never dropped them -- exactly the dishonesty
+         * this fault is meant to simulate, not exempt itself from. */
+        if (op->clcf->test_scan_del_fail) {
+            rc = NGX_ERROR;
+        } else {
+            rc = ngx_http_cache_turbo_redis_del_many(op->clcf, keys, nkeys);
+        }
+#else
+        rc = ngx_http_cache_turbo_redis_del_many(op->clcf, keys, nkeys);
+#endif
 
+        /* The SCAN side of this page DID land (we have a parsed cursor/keys
+         * reply in hand) even when del_many's launch failed, so this page
+         * counts toward scan_pages either way. Without this the very first
+         * page's del_many failure reports walk->pages == 0 at walk_finish,
+         * which admin.c's all_purge_complete() reads as "the walk never
+         * ran" (l2:"unavailable") rather than "it ran and stopped early"
+         * (l2:"incomplete") -- a milder, wrong report for a purge that DID
+         * enumerate a page and then fail to drop it. */
         op->scan_pages++;
+
+        if (rc != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "cache_turbo: L2 all-purge abandoned at SCAN page "
+                          "%ui: UNLINK never launched; purge is INCOMPLETE",
+                          op->scan_pages);
+            ngx_http_cache_turbo_redis_walk_finish(op, NULL, 0);
+            return;
+        }
+
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS

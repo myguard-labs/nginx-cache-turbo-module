@@ -593,6 +593,16 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_warm_ctx_fail),
       NULL },
 
+    /* GRIND-C6-READSCAN: force the ?all=1 SCAN-del walk's per-page del_many()
+     * to report NGX_ERROR, so the "UNLINK never launched" abandon-and-report-
+     * INCOMPLETE branch is reachable without a real OOM/backoff. */
+    { ngx_string("cache_turbo_test_scan_del_fail"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, test_scan_del_fail),
+      NULL },
+
     /* AUD-SCAN1: lower the SCAN-del page cap so the "abandon the walk and
      * report INCOMPLETE" branch is reachable without a 268M-key keyspace. */
     { ngx_string("cache_turbo_test_scan_max_pages"),
@@ -5749,6 +5759,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->test_l2_promote_hold_ms = NGX_CONF_UNSET;
     conf->test_midbody_abort = NGX_CONF_UNSET;
     conf->test_warm_ctx_fail = NGX_CONF_UNSET;
+    conf->test_scan_del_fail = NGX_CONF_UNSET;
 #endif
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 

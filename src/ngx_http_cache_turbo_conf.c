@@ -1039,6 +1039,8 @@ ngx_http_cache_turbo_merge_cc_and_bypass(
                          prev->test_midbody_abort, 0);
     ngx_conf_merge_value(conf->test_warm_ctx_fail,
                          prev->test_warm_ctx_fail, 0);
+    ngx_conf_merge_value(conf->test_scan_del_fail,
+                         prev->test_scan_del_fail, 0);
 #endif
 }
 

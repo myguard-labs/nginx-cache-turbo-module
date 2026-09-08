@@ -2511,6 +2511,15 @@ typedef struct {
      * feature's own decrement. Without this hook the anonymize arm depends
      * on real pool exhaustion, which is not reproducible on demand. */
     ngx_flag_t               test_warm_ctx_fail;
+    /* GRIND-C6-READSCAN: force the ?all=1 SCAN-del walk's per-page
+     * ngx_http_cache_turbo_redis_del_many() call to report NGX_ERROR, so the
+     * "this page's UNLINK never launched" branch in read_scan is reachable
+     * deterministically. Mirrors test_scan_max_pages/test_scan_page_hold_ms:
+     * real Redis stays reachable (the SCAN side of the walk is unaffected),
+     * only the del_many outcome is overridden, matching how test_varidx_fail
+     * forces one specific transport write to fail without taking the peer
+     * down. 0/unset = no override (real del_many return value is used). */
+    ngx_flag_t               test_scan_del_fail;
 #endif
 
 

@@ -3551,6 +3551,73 @@ def test_scan_walk_page_cap_reports_incomplete(ng: Nginx,
     redis.cli("-n", "7", "FLUSHDB")
 
 
+def test_scan_walk_del_many_failure_reports_incomplete(
+        ng: Nginx, redis: RedisServer) -> None:
+    """GRIND-C6-READSCAN: read_scan (the ?all=1 whole-keyspace walk) used to
+    discard ngx_http_cache_turbo_redis_del_many()'s return value outright --
+    a page whose UNLINK never LAUNCHED (OOM, armed connect backoff) let the
+    walk carry on to cursor "0" and report a clean purge, even though that
+    page's objects were never dropped from L2.
+
+    This is a narrower fault than the by-tag SSCAN purge's equivalent bug
+    (PR #490): there is no tag set here whose membership gets stripped, so a
+    failed page leaves nothing stranded-and-invisible -- the keys stay
+    enumerable on the next SCAN of the same cursor range. But the response
+    still claimed a complete purge over objects that were never touched,
+    which is the same class of under-reporting AUD-SCAN1 already refuses for
+    the page-cap/deadline/malformed-reply paths. The fix mirrors read_sscan's
+    contract: abandon the walk on a non-OK del_many and report INCOMPLETE.
+
+    Two claims, and the first keeps the second from being vacuous:
+
+      1. NEGATIVE CONTROL -- the same request shape against /_cache_scanwalk
+         (del_many succeeds normally) completes at 200 with no "l2" key. If
+         del_many's return value were still ignored, this would look
+         identical to claim 2's outcome would look under the OLD code (also
+         200) -- so claim 2 is what actually discriminates the fix.
+      2. Against /_cache_scandelfail (cache_turbo_test_scan_del_fail forces
+         every page's del_many to report NGX_ERROR while the SCAN side of the
+         walk keeps talking to a live Redis) the request must NOT report
+         success: 500, "l2":"incomplete". reason is "error" (the same label
+         the other non-abort/non-deadline failure paths use), distinct from
+         "page-cap"/"deadline" so this path is not mistaken for either.
+
+    MUTATION THIS CATCHES: reverting to
+    `ngx_http_cache_turbo_redis_del_many(op->clcf, keys, nkeys);` with the
+    return value discarded makes claim 2 answer 200 with no "l2" key --
+    indistinguishable from claim 1 -- and this test goes red."""
+    redis.cli("-n", "7", "FLUSHDB")
+
+    # 1. control: identical request shape, del_many succeeds for real.
+    _scan_fill(redis, 5, "delfail-ctrl")
+    s_ok, ok = _scan_purge(ng, "/_cache_scanwalk")
+    assert s_ok == 200, f"control purge with a working del_many failed: {s_ok} {ok}"
+    assert "l2" not in ok, f"control purge reported an L2 problem: {ok}"
+    redis.cli("-n", "7", "FLUSHDB")
+
+    # 2. the claim: del_many's launch fails on every page.
+    _scan_fill(redis, 5, "delfail-over")
+    s, over = _scan_purge(ng, "/_cache_scandelfail")
+    assert s == 500, \
+        f"a purge whose UNLINK never launched must not report success: {s} {over}"
+    assert over.get("l2") == "incomplete" and over.get("reason") == "error", \
+        f"del_many failure did not disclose the incomplete walk: {over}"
+    assert over.get("scan_pages", 0) >= 1, \
+        f"walk aborted before consuming even one page: {over}"
+    assert isinstance(over.get("purged"), int), \
+        f"failure body dropped the L1 purge count: {over}"
+
+    # The walk never dropped anything (del_many always failed to launch), so
+    # every key this fixture wrote must still be present -- proving the
+    # INCOMPLETE report is honest, not merely present.
+    assert int(redis.cli("-n", "7", "EVAL",
+                         "return #redis.call('KEYS','ctscan:delfail-over:*')",
+                         "0") or 0) == 5, \
+        "del_many-failure purge unexpectedly removed keys it never UNLINKed"
+
+    redis.cli("-n", "7", "FLUSHDB")
+
+
 def test_scan_walk_deadline_reports_incomplete(ng: Nginx,
                                                redis: RedisServer) -> None:
     """S231-L2-SCANTIME: SCAN_MAX_PAGES bounds MEMORY, not TIME -- each page's
