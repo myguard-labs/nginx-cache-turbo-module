@@ -104,3 +104,17 @@ run_mutant CTRL_ERROR_HELPERS_REDIS_SUSPENDED_TIMEOUT \
 run_mutant CTRL_ERROR_HELPERS_REDIS_SUSPENDED_DOOM \
 	'a TIMEOUT on a SUSPENDED walk must record the doom' \
 	'Redis SSCAN suspended-walk timeout doom'
+
+# CT-SSCAN-TERMINATE-LEAK (round 3): the mirrored continuation. Each assertion
+# named here is a COUNT of continuation invocations -- 0 is the leak, 2 is a
+# double teardown of the walk op's pool -- so neither the guarded nor the
+# unguarded path can satisfy it vacuously.
+run_mutant CTRL_ERROR_HELPERS_AWAIT_RESUME \
+	'must run the walk'"'"'s mirrored continuation EXACTLY ONCE' \
+	'terminated await runs the deferred teardown'
+run_mutant CTRL_ERROR_HELPERS_AWAIT_CONSUME \
+	'a second completion must not run the continuation again' \
+	'terminated await consumes its continuation mirror'
+run_mutant CTRL_ERROR_HELPERS_AWAIT_LIVE \
+	'the live arm must consume the token'"'"'s mirror too' \
+	'live await consumes its continuation mirror'

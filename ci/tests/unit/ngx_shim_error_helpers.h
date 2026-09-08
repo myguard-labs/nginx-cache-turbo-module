@@ -106,6 +106,11 @@ typedef struct {
     ngx_msec_t  redis_scan_deadline;
 } ngx_http_cache_turbo_loc_conf_t;
 
+/* CT-SSCAN-TERMINATE-LEAK: the tagpurge names its zone only as a pointer, and
+ * nothing on the completion paths under test dereferences it. An opaque type
+ * keeps the real struct out of this shim without a hand-copy that could drift. */
+typedef struct ngx_http_cache_turbo_zone_s  ngx_http_cache_turbo_zone_t;
+
 typedef struct {
     ngx_int_t   l2_result;
     ngx_uint_t  l2_done;
@@ -399,10 +404,39 @@ ngx_create_pool(size_t size, void *log)
     return NULL;                       /* rotation branch is unreachable here */
 }
 
+/* CT-SSCAN-TERMINATE-LEAK: the page settle, STUBBED.
+ *
+ * The real one walks the page's member array and issues the SREM that strips
+ * tag membership, needing the whole L2 surface. The arm under test -- the
+ * awaited UNLINK's completion arriving on a TERMINATED request -- returns long
+ * before reaching it, and the still-live arm is exercised here only as a
+ * negative control against an over-broad change. Counting the call is
+ * therefore both sufficient and the honest boundary: it says whether the
+ * completion took the live path, without pretending to model the SREM. */
+struct ngx_http_cache_turbo_tagpurge_s;
+static ngx_uint_t  ngx_test_page_settle_calls;
+static ngx_int_t   ngx_test_page_settle_result;
+
+static ngx_int_t
+ngx_http_cache_turbo_tag_purge_page_settle(void *tp, ngx_int_t rc)
+{
+    (void) tp; (void) rc;
+    ngx_test_page_settle_calls++;
+    return ngx_test_page_settle_result;
+}
+
+/* CT-SSCAN-TERMINATE-LEAK: pool destruction is COUNTED, not merely accepted.
+ * The awaited UNLINK's completion must release the page scratch exactly once
+ * whichever arm it takes, and "exactly once" is only assertable if the shim
+ * observes each release. `last_destroyed` lets a test tell WHICH pool went. */
+static ngx_uint_t   ngx_test_destroy_pool_calls;
+static ngx_pool_t  *ngx_test_last_destroyed_pool;
+
 static void
 ngx_destroy_pool(ngx_pool_t *pool)
 {
-    (void) pool;
+    ngx_test_destroy_pool_calls++;
+    ngx_test_last_destroyed_pool = pool;
 }
 
 static void *

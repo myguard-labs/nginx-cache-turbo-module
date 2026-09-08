@@ -3956,9 +3956,17 @@ ngx_http_cache_turbo_redis_walk_disarm_conn(ngx_connection_t *c)
  * tp->page_resume_data. Destroying op->pool here would leave that pending
  * completion pointing at freed memory -- strictly worse than the leak. So the
  * suspended case tears down nothing: it records the doom and lets
- * sscan_resume, which is guaranteed to run (del_many_cb fires its completion
- * exactly once from every terminal path), perform the teardown at the first
- * moment nothing references the op.
+ * sscan_resume perform the teardown at the first moment nothing references the
+ * op.
+ *
+ * ⚠ THAT RESUME IS NOT AUTOMATIC. del_many_cb guarantees its COMPLETION fires
+ * exactly once, but the completion's request-is-gone arm cannot reach
+ * tp->page_resume: the tagpurge holding it died with r->pool. Reading the
+ * guarantee as "so sscan_resume always runs" is how this deferral silently
+ * became the leak it was meant to avoid. What closes it is purge.c mirroring
+ * the continuation into the await token (which lives in the UNLINK op's own
+ * pool) at suspension time, so the completion's !alive arm still calls it. Any
+ * future awaiting caller that suspends a walk owes the same mirror.
  *
  * When the walk is NOT suspended, nothing else holds the op: the connection is
  * this op's own, so disarming it and calling op_done here releases the pool,
@@ -3989,7 +3997,8 @@ ngx_http_cache_turbo_redis_walk_detach(void *data)
     if (op->suspended) {
         /* A page's UNLINK still holds this op. Only the resume may tear it
          * down; sscan_resume sees resume_doomed (and detached) and calls
-         * op_done there. Try to disarm the connection again -- it should
+         * op_done there. The awaiting caller is responsible for keeping that
+         * resume reachable after the request dies -- see the ⚠ above. Try to disarm the connection again -- it should
          * already be quiet from the suspension, and a re-disarm is harmless.
          *
          * The result is deliberately discarded: there is nothing useful to do

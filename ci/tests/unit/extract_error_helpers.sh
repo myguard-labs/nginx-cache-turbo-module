@@ -7,6 +7,8 @@ SRC_DIR="$(realpath "$DIR/../../../src")"
 ADMIN_SRC="$SRC_DIR/ngx_http_cache_turbo_admin.c"
 MC_SRC="$SRC_DIR/ngx_http_cache_turbo_memcached.c"
 REDIS_SRC="$SRC_DIR/ngx_http_cache_turbo_redis.c"
+PURGE_SRC="$SRC_DIR/ngx_http_cache_turbo_purge.c"
+HDR_SRC="$SRC_DIR/ngx_http_cache_turbo_module.h"
 OUT="$DIR/generated_error_helpers.inc"
 
 extract_function() {
@@ -32,6 +34,26 @@ extract_function() {
     ' "$file"
 }
 
+# CT-SSCAN-TERMINATE-LEAK: lift a struct definition VERBATIM out of the real
+# header, rather than hand-copying its fields into the shim. The completion
+# under test reads the await token and the tagpurge, and a hand-copied struct
+# that drifts from the real one is precisely the divergence these extractions
+# exist to rule out.
+extract_struct() {
+	file="$1"
+	end="$2"
+
+	awk -v source_name="$file" -v end="$end" '
+        /^typedef struct/ { start = NR; buf = $0 ORS; next }
+        start { buf = buf $0 ORS }
+        $0 ~ ("^\\} " end ";$") {
+            printf "#line %d \"%s\"\n", start, source_name
+            printf "%s", buf
+            exit
+        }
+    ' "$file"
+}
+
 {
 	extract_function "$ADMIN_SRC" 'static ngx_int_t' \
 		'ngx_http_cache_turbo_warm_file_prereq_error'
@@ -48,6 +70,14 @@ extract_function() {
 		extract_function "$MC_SRC" 'static void' "$fn"
 		printf '\n'
 	done
+	# CT-SSCAN-TERMINATE-LEAK: the real tagpurge and await-token definitions,
+	# lifted verbatim from the header. The awaited UNLINK's completion in
+	# purge.c is extracted below and reads both; copying their fields by hand
+	# would let the mock drift from production silently.
+	extract_struct "$HDR_SRC" 'ngx_http_cache_turbo_tagpurge_t'
+	printf '\n'
+	extract_struct "$HDR_SRC" 'ngx_http_cache_turbo_tagpurge_await_t'
+	printf '\n'
 	# TODO-UNLINK-REPLY-WINDOW: walk_suspend is the API a page callback uses to
 	# park its walk, and the suspension assertions drive read_sscan through it.
 	# Non-static and ngx_int_t, so it needs its own extraction.
@@ -74,6 +104,20 @@ extract_function() {
 		extract_function "$REDIS_SRC" 'static void' "$fn"
 		printf '\n'
 	done
+	# CT-SSCAN-TERMINATE-LEAK: the awaited UNLINK's completion and the r->pool
+	# cleanup that neutralizes it. Extracted AFTER sscan_resume, which the
+	# completion's request-is-gone arm now calls through the token's mirrored
+	# continuation -- the deferred teardown walk_detach hands off to.
+	#
+	# page_settle is NOT extracted: it walks the member array and issues the
+	# SREM, needing the whole L2 surface, and the arm under test returns
+	# before reaching it. The test file supplies a counting stub instead.
+	for fn in \
+		ngx_http_cache_turbo_tag_purge_page_unlinked \
+		ngx_http_cache_turbo_tag_purge_await_gone; do
+		extract_function "$PURGE_SRC" 'static void' "$fn"
+		printf '\n'
+	done
 	printf '#line 1 "%s"\n' "$DIR/test_error_helpers.c"
 } >"$OUT"
 
@@ -96,9 +140,21 @@ for symbol in \
 	ngx_http_cache_turbo_redis_walk_finish \
 	ngx_http_cache_turbo_redis_get_finish \
 	ngx_http_cache_turbo_redis_lock_finish \
-	ngx_http_cache_turbo_redis_op_fail; do
+	ngx_http_cache_turbo_redis_op_fail \
+	ngx_http_cache_turbo_tag_purge_page_unlinked \
+	ngx_http_cache_turbo_tag_purge_await_gone; do
 	if ! grep -qF "$symbol(" "$OUT"; then
 		echo "✗ failed to extract $symbol" >&2
+		rm -f "$OUT"
+		exit 1
+	fi
+done
+
+for struct_name in \
+	ngx_http_cache_turbo_tagpurge_t \
+	ngx_http_cache_turbo_tagpurge_await_t; do
+	if ! grep -qF "} $struct_name;" "$OUT"; then
+		echo "✗ failed to extract struct $struct_name" >&2
 		rm -f "$OUT"
 		exit 1
 	fi
@@ -291,6 +347,46 @@ if [ "${CTRL_ERROR_HELPERS_REDIS_SUSPENDED_DOOM:-0}" = 1 ]; then
 		'if (op->suspended) {' \
 		'op->resume_doomed = 1;' '(void) op;' \
 		'Redis SSCAN suspended-walk timeout doom'
+fi
+
+# CT-SSCAN-TERMINATE-LEAK (round 3) controls. walk_detach's SUSPENDED arm tears
+# down nothing and defers the walk's whole teardown to its continuation, which
+# a terminated request can only reach through the mirror in the await token.
+# That mirror is a THREE-part contract and each part gets its own mutation:
+#
+#   AWAIT_RESUME  - the !alive arm must RUN the mirrored continuation. Without
+#                   it the deferred op_done never happens: the leak, back in
+#                   full, living inside the fix for it.
+#   AWAIT_CONSUME - the !alive arm must CONSUME the mirror. Leaving it set is a
+#                   second op_done, double-destroying the walk op's pool.
+#   AWAIT_LIVE    - the LIVE arm must consume the mirror too. The two arms are
+#                   mutually exclusive and exactly one teardown may survive.
+#
+# Mutations neutralize the statement or compile the call out rather than
+# substituting a constant, so no variable becomes unused and -Werror stays
+# satisfied.
+if [ "${CTRL_ERROR_HELPERS_AWAIT_RESUME:-0}" = 1 ]; then
+	mutate_function_block_exact ngx_http_cache_turbo_tag_purge_page_unlinked \
+		'if (!aw->alive) {' \
+		'resume(rdata, NGX_ERROR);' '(void) rdata;' \
+		'terminated await runs the deferred teardown'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_AWAIT_CONSUME:-0}" = 1 ]; then
+	mutate_function_block_exact ngx_http_cache_turbo_tag_purge_page_unlinked \
+		'if (!aw->alive) {' \
+		'aw->resume = NULL;' '(void) 0;' \
+		'terminated await consumes its continuation mirror'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_AWAIT_LIVE:-0}" = 1 ]; then
+	# The live arm is delimited by its own unique marker (tp = aw->tp, which
+	# only that arm can execute) through the settle call, so the mutation
+	# cannot land on the !alive arm's identically-spelled statement.
+	mutate_function_block_exact ngx_http_cache_turbo_tag_purge_page_unlinked \
+		'tp = aw->tp;' \
+		'aw->resume = NULL;' '(void) 0;' \
+		'live await consumes its continuation mirror'
 fi
 
 if [ "${CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME:-0}" = 1 ]; then

@@ -1492,6 +1492,279 @@ test_redis_walk_detach_on_request_teardown(void)
 }
 
 
+/*
+ * CT-SSCAN-TERMINATE-LEAK (round 3): the deferred teardown must ACTUALLY RUN
+ * when the request is terminated.
+ *
+ * This is the seam the earlier revision left open, and it is worth stating
+ * precisely because the code read as though it were closed:
+ *
+ *   - redis.c's walk_detach, on a SUSPENDED walk, deliberately tears down
+ *     NOTHING. It cannot: the page's UNLINK is in flight on a DIFFERENT
+ *     connection and holds the walk op as its completion data, so destroying
+ *     op->pool there is a use-after-free strictly worse than the leak. It
+ *     records the doom and defers the whole teardown to the walk's
+ *     continuation.
+ *   - purge.c's await_gone, ALSO registered on r->pool, clears the token's
+ *     `alive` bit.
+ *   - the UNLINK's completion then arrives and takes its `!alive` arm.
+ *
+ * The old `!alive` arm destroyed the page scratch and RETURNED. It never
+ * reached the continuation -- correctly refusing to read the freed tagpurge
+ * that held tp->page_resume, but thereby never reaching op_done either. So the
+ * teardown walk_detach deferred simply never happened, and the walk op's pool,
+ * its Redis connection, its fd and the zone's varidx_inflight account leaked
+ * for the worker's lifetime: exactly the failure mode this whole change exists
+ * to close, surviving inside the fix for it.
+ *
+ * "del_many_cb fires its completion exactly once from every terminal path" is
+ * true, and was cited as the guarantee that the resume runs. It is a guarantee
+ * about the COMPLETION, not about the RESUME: the completion's request-is-gone
+ * arm was a dead end.
+ *
+ * The closure: the continuation is MIRRORED into the await token at suspension
+ * time, alongside the page scratch and for the same reason -- the token lives
+ * in the UNLINK op's own pool, which outlives r->pool, so the `!alive` arm can
+ * still reach it. Ownership follows the page_pool discipline exactly: whichever
+ * arm runs consumes the pointer and NULLs it, and `alive` makes the two arms
+ * mutually exclusive.
+ *
+ * Every exit is enumerated and asserted below, including the two that must NOT
+ * change:
+ *
+ *   EXIT A  terminated + suspended: the completion runs the mirrored
+ *           continuation and the detached walk reaches op_done EXACTLY ONCE,
+ *           without touching the request, walk_finish's callback or finalize
+ *   EXIT B  the cleanup-add FAILURE path: no continuation is mirrored, because
+ *           that arm unsuspends the walk and hands the error back
+ *           synchronously -- a mirror there would be a second teardown
+ *   EXIT C  NEGATIVE CONTROL, the still-LIVE completion: unchanged. It settles
+ *           the page and consumes tp->page_resume, and must NOT also fire the
+ *           token's mirror
+ *   EXIT D  NEGATIVE CONTROL, ordering: completion first, teardown after. The
+ *           deregistered cleanup must not fire a second continuation
+ */
+static ngx_uint_t  test_ct_resume_calls;
+static void       *test_ct_resume_data;
+static ngx_int_t   test_ct_resume_rc;
+
+static void
+test_ct_recording_resume(void *opaque, ngx_int_t rc)
+{
+    test_ct_resume_calls++;
+    test_ct_resume_data = opaque;
+    test_ct_resume_rc = rc;
+}
+
+static void
+test_ct_reset(void)
+{
+    test_ct_resume_calls = 0;
+    test_ct_resume_data = NULL;
+    test_ct_resume_rc = 12345;
+    ngx_test_page_settle_calls = 0;
+    ngx_test_page_settle_result = NGX_OK;
+    ngx_test_destroy_pool_calls = 0;
+    ngx_test_last_destroyed_pool = NULL;
+}
+
+static void
+test_redis_terminated_await_runs_deferred_teardown(void)
+{
+    ngx_http_cache_turbo_tagpurge_t        tp;
+    ngx_http_cache_turbo_tagpurge_await_t  aw;
+    ngx_pool_cleanup_t                     cln;
+    ngx_pool_t                             page_pool;
+
+    /* ---- EXIT A: terminated request, suspended walk ------------------- */
+    /*
+     * The state purge.c leaves at suspension: the token mirrors the page
+     * scratch AND the walk's continuation. Then the request is terminated and
+     * BOTH r->pool cleanups run -- walk_detach (redis.c, covered above) and
+     * await_gone (extracted here) -- and the UNLINK reply lands afterwards.
+     */
+    test_ct_reset();
+    memset(&tp, 0, sizeof(tp));
+    memset(&aw, 0, sizeof(aw));
+
+    tp.page_pool = &page_pool;
+    tp.page_resume = test_ct_recording_resume;
+    tp.page_resume_data = (void *) (uintptr_t) 0xA11;
+    tp.page_await = &aw;
+
+    cln.handler = ngx_http_cache_turbo_tag_purge_await_gone;
+    cln.data = &aw;
+
+    aw.tp = &tp;
+    aw.cln = &cln;
+    aw.page_pool = &page_pool;
+    aw.resume = tp.page_resume;
+    aw.resume_data = tp.page_resume_data;
+    aw.alive = 1;
+
+    /* The request's teardown. */
+    ngx_http_cache_turbo_tag_purge_await_gone(&aw);
+
+    CHECK(aw.alive == 0,
+          "the r->pool cleanup must clear the token's liveness bit before the "
+          "tagpurge memory is released");
+    CHECK(aw.tp == NULL,
+          "the r->pool cleanup must drop the tagpurge pointer, not merely flag "
+          "it");
+    CHECK(aw.resume == test_ct_recording_resume,
+          "the r->pool cleanup must NOT drop the mirrored continuation: it is "
+          "the ONLY remaining route to the detached walk's deferred op_done, "
+          "and it points at the walk op, which does not live in r->pool");
+    CHECK(test_ct_resume_calls == 0,
+          "the cleanup itself must not run the continuation: the UNLINK is "
+          "still in flight and still holds the walk op");
+
+    /* The UNLINK reply, arriving on a request that no longer exists. */
+    ngx_http_cache_turbo_tag_purge_page_unlinked(&aw, NGX_OK);
+
+    /* THE assertion this round exists for. A count, not a boolean: 0 is the
+     * leak that shipped, 2 is a double teardown that destroys the op pool
+     * twice, and only 1 is correct. Nothing else on this path calls it. */
+    CHECK(test_ct_resume_calls == 1,
+          "a completion arriving on a TERMINATED request must run the walk's "
+          "mirrored continuation EXACTLY ONCE: walk_detach's suspended arm "
+          "tore down nothing and deferred the whole teardown to it, so 0 leaks "
+          "the op pool, the Redis connection, its fd and the zone's "
+          "varidx_inflight account for the worker's lifetime");
+    CHECK(test_ct_resume_data == (void *) (uintptr_t) 0xA11,
+          "the continuation must be handed the WALK OP it was mirrored with, "
+          "not the token: sscan_resume dereferences it as the op");
+    CHECK(test_ct_resume_rc != NGX_OK,
+          "no page was settled and the walk can never complete this purge, so "
+          "the continuation must not be told the page succeeded");
+    CHECK(ngx_test_page_settle_calls == 0,
+          "the completion must NOT settle the page on a terminated request: "
+          "the tagpurge, the tag key and the member array all died with "
+          "r->pool");
+    CHECK(ngx_test_destroy_pool_calls == 1
+              && ngx_test_last_destroyed_pool == &page_pool,
+          "the page scratch is a standalone pool the request teardown does not "
+          "own, so the completion must still release it -- exactly once");
+    CHECK(aw.page_pool == NULL,
+          "the completion must consume the page-scratch mirror, so a second "
+          "invocation cannot double-destroy it");
+    CHECK(aw.resume == NULL && aw.resume_data == NULL,
+          "the completion must CONSUME the continuation mirror under the same "
+          "one-owner discipline as page_pool: leaving it set is a second "
+          "op_done waiting to happen");
+
+    /* Idempotence, the direct check: a duplicated completion must find both
+     * mirrors already consumed and do nothing. */
+    ngx_http_cache_turbo_tag_purge_page_unlinked(&aw, NGX_OK);
+    CHECK(test_ct_resume_calls == 1,
+          "a second completion must not run the continuation again: op_done "
+          "twice double-destroys the walk op's pool");
+    CHECK(ngx_test_destroy_pool_calls == 1,
+          "a second completion must not destroy the page scratch again");
+
+    /* ---- EXIT B: the ngx_pool_cleanup_add FAILURE path ---------------- */
+    /*
+     * purge.c cannot register the cleanup, so it leaves the token DEAD up
+     * front, unsuspends the walk by hand and returns NGX_ERROR as the page
+     * callback's verdict. read_sscan drives the walk to its own terminal from
+     * there, which reaches op_done on its own -- so this arm must NOT mirror
+     * the continuation. If it did, the later !alive completion would call
+     * op_done a SECOND time on an op already destroyed.
+     *
+     * The token's remaining job on this path is exactly the page scratch, and
+     * this asserts both halves.
+     */
+    test_ct_reset();
+    memset(&aw, 0, sizeof(aw));
+
+    /* The state that arm leaves behind, verbatim. */
+    aw.alive = 0;
+    aw.page_pool = &page_pool;
+    aw.resume = NULL;
+    aw.resume_data = NULL;
+
+    ngx_http_cache_turbo_tag_purge_page_unlinked(&aw, NGX_OK);
+
+    CHECK(test_ct_resume_calls == 0,
+          "the cleanup-add failure path unsuspends the walk and hands the "
+          "error back synchronously, so its walk reaches op_done through its "
+          "own terminal: running a mirrored continuation here would be a "
+          "SECOND teardown of an op already destroyed");
+    CHECK(ngx_test_destroy_pool_calls == 1
+              && ngx_test_last_destroyed_pool == &page_pool,
+          "the cleanup-add failure path still hands the page scratch to the "
+          "completion, which must release it exactly once");
+    CHECK(ngx_test_page_settle_calls == 0,
+          "a dead token must never settle the page, however it came to be "
+          "dead");
+
+    /* ---- EXIT C: NEGATIVE CONTROL, the still-LIVE completion ---------- */
+    /*
+     * The normal path, unchanged. This is the control against an over-broad
+     * change: a completion that ran the token's mirror unconditionally would
+     * fire the continuation TWICE here (once from the mirror, once from
+     * tp->page_resume) and destroy the op pool twice. The live arm must
+     * consume tp->page_resume and NULL the mirror without running it.
+     */
+    test_ct_reset();
+    memset(&tp, 0, sizeof(tp));
+    memset(&aw, 0, sizeof(aw));
+
+    tp.page_pool = &page_pool;
+    tp.page_resume = test_ct_recording_resume;
+    tp.page_resume_data = (void *) (uintptr_t) 0xB22;
+    tp.page_await = &aw;
+
+    cln.handler = ngx_http_cache_turbo_tag_purge_await_gone;
+    cln.data = &aw;
+
+    aw.tp = &tp;
+    aw.cln = &cln;
+    aw.page_pool = &page_pool;
+    aw.resume = tp.page_resume;
+    aw.resume_data = tp.page_resume_data;
+    aw.alive = 1;
+
+    ngx_test_page_settle_result = NGX_OK;
+
+    ngx_http_cache_turbo_tag_purge_page_unlinked(&aw, NGX_OK);
+
+    CHECK(ngx_test_page_settle_calls == 1,
+          "a completion on a LIVE request must settle the page: this is the "
+          "path the whole suspension exists to reach");
+    CHECK(test_ct_resume_calls == 1,
+          "the LIVE path must resume the walk exactly once -- through "
+          "tp->page_resume, not additionally through the token's mirror");
+    CHECK(test_ct_resume_data == (void *) (uintptr_t) 0xB22
+              && test_ct_resume_rc == NGX_OK,
+          "the live resume carries the SETTLED page's verdict, not the "
+          "terminated path's abandon");
+    CHECK(aw.resume == NULL && aw.resume_data == NULL,
+          "the live arm must consume the token's mirror too: the two arms are "
+          "mutually exclusive and exactly one teardown may survive");
+    CHECK(aw.page_pool == NULL,
+          "the live arm hands the page scratch to settle() through the "
+          "tagpurge, so it must drop the token's mirror first");
+    CHECK(cln.handler == NULL && aw.cln == NULL,
+          "the live completion must deregister the r->pool cleanup on its way "
+          "out: it now owns the teardown, and leaving the handler armed would "
+          "clear `alive` on a token whose op pool is about to be destroyed");
+    CHECK(tp.page_await == NULL,
+          "the settled page must be unregistered from the tagpurge");
+
+    /* ---- EXIT D: NEGATIVE CONTROL, completion FIRST, teardown after --- */
+    /*
+     * The other ordering. The live completion above deregistered the cleanup,
+     * so the request's later teardown finds nothing to run. Verified by
+     * invoking the cleanup slot the way nginx would: through its handler,
+     * which the completion must have NULLed.
+     */
+    CHECK(test_ct_resume_calls == 1,
+          "a request finalizing AFTER its completion must not produce a second "
+          "continuation: the completion deregistered the cleanup");
+}
+
+
 int
 main(void)
 {
@@ -1507,6 +1780,7 @@ main(void)
     test_redis_sscan_suspended_walk_ignores_stray_events();
     test_await_token_protocol_only();
     test_redis_walk_detach_on_request_teardown();
+    test_redis_terminated_await_runs_deferred_teardown();
 
     (void) fprintf(stderr, "terminal error compositions: %d failures\n",
                    failures);

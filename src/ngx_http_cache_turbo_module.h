@@ -3818,6 +3818,25 @@ typedef struct ngx_http_cache_turbo_tagpurge_await_s {
      * NOT a child of r->pool, so the request teardown does not free it and
      * this is the only owner either way. */
     ngx_pool_t                       *page_pool;
+    /* CT-SSCAN-TERMINATE-LEAK: the suspended walk's continuation, mirrored here
+     * for exactly the same reason as page_pool above.
+     *
+     * It normally lives in the tagpurge as tp->page_resume/page_resume_data,
+     * and the live completion consumes it from there. But a TERMINATED request
+     * frees the tagpurge, and redis.c's walk_detach DEFERS the detached walk's
+     * whole teardown (op_done) to that continuation -- it cannot tear the op
+     * down itself while this UNLINK still holds it. If the continuation were
+     * reachable only through the freed tagpurge, the !alive arm would have no
+     * way to run it and the op's pool, its Redis connection, its fd and the
+     * zone's varidx_inflight account would leak for the worker's lifetime.
+     *
+     * `resume_data` is the walk op, which lives in the op's OWN pool (not
+     * r->pool), so it stays valid across the request's death. Ownership is the
+     * page_pool discipline exactly: whichever arm runs consumes the pointer and
+     * NULLs it, and `alive` makes the two arms mutually exclusive, so the
+     * continuation runs exactly once. */
+    void                            (*resume)(void *, ngx_int_t);
+    void                             *resume_data;
     unsigned                          alive:1;
 } ngx_http_cache_turbo_tagpurge_await_t;
 

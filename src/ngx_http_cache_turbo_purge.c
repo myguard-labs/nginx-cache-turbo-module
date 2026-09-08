@@ -547,16 +547,47 @@ ngx_http_cache_turbo_tag_purge_page_unlinked(void *data, ngx_int_t rc)
      * r->main->count++ park. When that happened, the cleanup handler
      * registered on r->pool has already cleared `alive`.
      *
-     * There is then nothing left to do and nothing safe to do: the tagpurge,
-     * the tag key, the member array and the walk op are all gone or going, and
-     * the walk that would have been resumed no longer exists. Release the page
-     * scratch through the token (it is a standalone pool, not a child of
-     * r->pool, so nobody else owns it) and return. */
+     * The tagpurge, the tag key and the member array are all gone, so nothing
+     * that lived in r->pool may be touched. The WALK OP is not: it lives in its
+     * own pool, and redis.c's walk_detach deliberately tore down NOTHING for a
+     * suspended walk -- destroying op->pool there would have freed the memory
+     * this very completion is holding. It deferred the teardown to the walk's
+     * continuation, and this arm is the only remaining path that can reach it,
+     * which is why the token mirrors it (see the header comment on
+     * ngx_http_cache_turbo_tagpurge_await_t).
+     *
+     * So: release the page scratch through the token (it is a standalone pool,
+     * not a child of r->pool, so nobody else owns it), then run the
+     * continuation.
+     *
+     * ORDER MATTERS. The pool goes FIRST. The continuation is sscan_resume,
+     * which for a detached walk calls op_done -- destroying the op pool that
+     * `aw` itself is allocated from. Reading aw->page_pool afterwards would be
+     * a use-after-free, so the token must be fully consumed before control
+     * leaves for the continuation. The two are independent otherwise: the page
+     * scratch is nobody else's memory and the walk never reads it. */
     if (!aw->alive) {
+        void  (*resume)(void *, ngx_int_t) = aw->resume;
+        void   *rdata = aw->resume_data;
+
         if (aw->page_pool) {
             ngx_destroy_pool(aw->page_pool);
             aw->page_pool = NULL;
         }
+
+        /* Consume the mirror: exactly one teardown, whichever arm runs. */
+        aw->resume = NULL;
+        aw->resume_data = NULL;
+
+        if (resume) {
+            /* rc is deliberately NGX_ERROR: no page was settled and the walk
+             * can never complete this purge. sscan_resume's detached arm
+             * reaches op_done without touching the request (op->request and
+             * members_cb were both NULLed by walk_detach) and without going
+             * near walk_finish's callback or finalize. */
+            resume(rdata, NGX_ERROR);
+        }
+
         return;
     }
 
@@ -577,8 +608,14 @@ ngx_http_cache_turbo_tag_purge_page_unlinked(void *data, ngx_int_t rc)
      * token's mirror of it first so there is exactly ONE owner on this path --
      * the mirror exists only for the !alive arm above, where the tagpurge is
      * unreachable. The two arms are mutually exclusive (alive is cleared by
-     * whichever runs first), so the pool is released exactly once either way. */
+     * whichever runs first), so the pool is released exactly once either way.
+     *
+     * The continuation mirror goes with it, for the same reason and under the
+     * same discipline: this arm consumes tp->page_resume below, so the token's
+     * copy must not survive to be run a second time. */
     aw->page_pool = NULL;
+    aw->resume = NULL;
+    aw->resume_data = NULL;
 
     verdict = ngx_http_cache_turbo_tag_purge_page_settle(tp, rc);
 
@@ -611,9 +648,13 @@ ngx_http_cache_turbo_tag_purge_page_unlinked(void *data, ngx_int_t rc)
  * tag purge. This handler stays narrow because that job belongs to the op's own
  * cleanup, not to the await token.
  *
- * The page scratch is left to the pending completion, which is guaranteed to
- * run, since del_many_cb fires its completion exactly once from every terminal
- * path.
+ * The page scratch, and the walk's deferred teardown, are both left to the
+ * pending completion -- which IS guaranteed to run, since del_many_cb fires its
+ * completion exactly once from every terminal path. Note that the guarantee is
+ * about the COMPLETION, not about the walk's resume: on this path the
+ * completion takes its !alive arm and can no longer reach tp->page_resume, so
+ * it runs the copy mirrored into the token instead (aw->resume). That is what
+ * makes the walk's deferred op_done actually happen.
  */
 static void
 ngx_http_cache_turbo_tag_purge_await_gone(void *data)
@@ -831,6 +872,20 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
                     aw->alive = 0;
                     aw->page_pool = tmp;
                     tp->page_pool = NULL;
+
+                    /* The continuation is NOT mirrored into the token here.
+                     * This arm UNSUSPENDS the walk and returns NGX_ERROR, so
+                     * the walk is not parked: read_sscan takes that NGX_ERROR
+                     * as the page callback's verdict and drives the walk to its
+                     * own terminal, which reaches op_done on its own. Mirroring
+                     * the resume would give the later !alive completion a
+                     * second teardown of an op that is already finished -- and
+                     * sscan_resume would in any case reject it, the walk no
+                     * longer being suspended. The token's remaining job on this
+                     * path is exactly the page scratch. */
+                    aw->resume = NULL;
+                    aw->resume_data = NULL;
+
                     ngx_http_cache_turbo_redis_walk_unsuspend(
                         tp->page_resume_data);
                     tp->page_resume = NULL;
@@ -844,6 +899,19 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
                 aw->tp = tp;
                 aw->cln = cln;
                 aw->page_pool = tmp;
+
+                /* CT-SSCAN-TERMINATE-LEAK: mirror the walk's continuation into
+                 * the token, alongside the page scratch and for the same
+                 * reason. A terminated request frees the tagpurge holding
+                 * tp->page_resume, but walk_detach's suspended arm defers the
+                 * detached walk's ENTIRE teardown to that continuation. Without
+                 * this copy the completion's !alive arm could not reach it and
+                 * the op pool, the Redis connection, its fd and the zone's
+                 * varidx_inflight account would leak. resume_data is the walk
+                 * op, which lives in its own pool and outlives r->pool. */
+                aw->resume = tp->page_resume;
+                aw->resume_data = tp->page_resume_data;
+
                 aw->alive = 1;
                 tp->page_await = aw;
 
