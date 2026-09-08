@@ -2466,10 +2466,15 @@ def test_l2_tag_purge_sscan_unlink_failure_on_a_later_page(
 
     # The refused page's objects really are still resident -- that is what
     # makes retaining their tag membership load-bearing rather than tidy.
-    alive = [m for m in members if _sscan_db(redis, "EXISTS", m) == "1"]
-    assert len(alive) >= remaining, \
-        (f"only {len(alive)} objects survive but {remaining} members are still "
-         f"listed: the tag set points at objects that are already gone")
+    # One EXISTS over every key, not one per key: _sscan_db spawns a redis-cli
+    # SUBPROCESS per call, so the per-member loop this replaced started ~3000 of
+    # them. EXISTS is variadic and returns the count of keys that exist, which
+    # is exactly the number this asserts on. The 3000-key argv is ~219KB, well
+    # under the ~2MB limit.
+    alive_count = int(_sscan_db(redis, "EXISTS", *members))
+    assert alive_count >= remaining, \
+        (f"only {alive_count} objects survive but {remaining} members are "
+         f"still listed: the tag set points at objects that are already gone")
 
     # 4. the retained pointer converges through a healthy UNLINK.
     attempts = 0
@@ -2554,7 +2559,12 @@ def test_l2_tag_purge_sscan_suspension_disarms_the_read_timer(
          f"flight -- the use-after-free this disarm exists to prevent.")
     assert "l2" not in body, \
         f"the held purge reported an incomplete walk: {body}"
-    assert body["purged"] == n, \
+    # >= n, not == n. `purged` counts member VISITS, not distinct members, and
+    # SSCAN may return a member more than once when the set changes during the
+    # cursor walk -- so an exact match makes this timer test fail on a
+    # duplicate that is protocol-legal and unrelated to what it measures. The
+    # claim that matters is that every member was reached at least once.
+    assert body["purged"] >= n, \
         f"the held purge visited {body['purged']} of {n} members: {body}"
 
     # It really purged, rather than completing by doing nothing. The objects
