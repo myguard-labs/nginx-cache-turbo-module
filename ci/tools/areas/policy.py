@@ -2620,20 +2620,6 @@ def test_cor5_purge_reports_degraded_enumeration(
     assert counts["reissues"] >= counts["drops"], \
         f"self-heal did not catch up before the baseline check: {counts}"
 
-    # drops/reissues alone is necessary but NOT sufficient: purge.c's
-    # completeness snapshot (ngx_http_cache_turbo_purge.c:171-174) is
-    # varidx_inflight + varidx_drops - varidx_reissues. A SADD that redis_launch()
-    # already accepted for /cor5sh/full is not a drop and never touches
-    # drops/reissues, yet until L2 acks it (op_done) the index set the baseline
-    # PURGE below is about to SMEMBERS may still be short that variant --
-    # exactly the false "degraded" this baseline is meant to rule out. Poll
-    # varidx_inflight to 0 (bounded; fail loudly, not silently) so the zone is
-    # genuinely quiescent on all three terms before asserting completeness.
-    assert wait_for(
-        lambda: _varidx(fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
-                               headers=en)[2])["inflight"] == 0
-    ), "varidx_inflight never drained to 0 -- zone not quiescent for baseline"
-
     # Baseline (no outstanding drop anywhere in the zone): a fully-enumerated
     # purge must NOT claim degraded.
     en_full = {"Accept-Language": "en"}
@@ -2644,6 +2630,30 @@ def test_cor5_purge_reports_degraded_enumeration(
     _, h0, _ = fetch(ng.port, "/cor5sh/full?v=al", headers=fr_full)
     _, h1, hh1 = fetch(ng.port, "/cor5sh/full?v=al", headers=fr_full)
     assert hh1.get("x-cache") == "HIT" and h1 == h0, "fr variant should cache"
+
+    # drops/reissues alone is necessary but NOT sufficient: purge.c's
+    # completeness snapshot (ngx_http_cache_turbo_purge.c:171-174) is
+    # varidx_inflight + varidx_drops - varidx_reissues. The SADDs redis_launch()
+    # just accepted for the two /cor5sh/full fetches above are not drops and
+    # never touch drops/reissues, yet until L2 acks them (op_done) the index
+    # set the PURGE below is about to SMEMBERS may still be short a variant --
+    # exactly the false "degraded" this baseline is meant to rule out. This
+    # gate must run here, after that priming (it is what launches the
+    # inflight writes -- polling any earlier only drains unrelated, already-
+    # settled work) and immediately before the PURGE (the last point that can
+    # still observe writes the priming caused). Poll a SEPARATE, later
+    # request rather than either /cor5sh/full response: the varidx header is
+    # stamped by the header filter before the body filter's store path (and
+    # redis.c) increment inflight, so a fetch cannot report the increment it
+    # itself caused -- same skew the drops0/hf_confirm pair above already
+    # works around. The counter is zone-scoped, so this later, unrelated
+    # confirm request observes it correctly, and since it is cached HIT
+    # (primed above) it stores nothing and launches no SADD of its own.
+    assert wait_for(
+        lambda: _varidx(fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
+                               headers=en)[2])["inflight"] == 0,
+        timeout=10.0,
+    ), "varidx_inflight never drained to 0 -- zone not quiescent for baseline"
 
     s2, b2, _ = fetch_raw(ng.port, "/cor5sh/full?v=al", method="PURGE")
     assert s2 == 200, f"PURGE status {s2}"
