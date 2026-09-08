@@ -2362,9 +2362,9 @@ def test_l2_tag_purge_sscan_unlink_reply_failure_keeps_tag(
     #    unpatched build's SREM is fire-and-forget on a separate connection and
     #    can land AFTER the HTTP reply, so a single immediate read could see the
     #    set still full and call a stranding build correct.
-    stranded = wait_for(
+    sremmed = wait_for(
         lambda: int(_sscan_db(redis, "SCARD", tkey)) < n, timeout=5.0)
-    assert not stranded, \
+    assert not sremmed, \
         (f"the page's members were SREMed even though their UNLINK was "
          f"REFUSED: {_sscan_db(redis, 'SCARD', tkey)}/{n} left in the tag set. "
          f"Those {n} objects are still resident in L2 and are now unreachable "

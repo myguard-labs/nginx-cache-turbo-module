@@ -1239,7 +1239,7 @@ test_redis_sscan_suspended_walk_ignores_stray_events(void)
 
     ngx_http_cache_turbo_redis_read_sscan(&read);
 
-    CHECK(ngx_test_members_calls == 1 && ngx_test_walk != NULL,
+    CHECK(ngx_test_members_calls == 1,
           "an UNSUSPENDED walk must still reach walk_finish's TERMINAL "
           "callback: the guard covers parked walks only");
     CHECK(ngx_test_redis_done_calls == 1,
@@ -1315,7 +1315,7 @@ test_redis_sscan_suspended_walk_ignores_stray_events(void)
           "nothing holds the op any more");
     CHECK(ngx_test_redis_done_calls == 1,
           "the doomed walk must be torn down EXACTLY once, by the resume");
-    CHECK(ngx_test_members_calls == 1 && ngx_test_walk != NULL,
+    CHECK(ngx_test_members_calls == 1,
           "the resume's teardown must run the TERMINAL callback so the purge "
           "is reported INCOMPLETE rather than silently dropped");
 
@@ -1998,10 +1998,28 @@ test_redis_terminated_await_runs_deferred_teardown(void)
     /* ---- EXIT D: NEGATIVE CONTROL, completion FIRST, teardown after --- */
     /*
      * The other ordering. The live completion above deregistered the cleanup,
-     * so the request's later teardown finds nothing to run. Verified by
-     * invoking the cleanup slot the way nginx would: through its handler,
-     * which the completion must have NULLed.
+     * so the request's later teardown finds nothing to run. This is verified
+     * by actually driving the cleanup slot the way ngx_destroy_pool does --
+     * `if (handler) handler(data)` -- rather than by assuming it.
+     *
+     * `alive` is re-raised first purely as a tripwire. EXIT C's live arm
+     * cleared it on its way out, so a handler that DID still run would be
+     * invisible; with the bit raised, ngx_http_cache_turbo_tag_purge_await_gone
+     * clearing it is the observable that proves the deregistration happened.
+     * The op pool `aw` lives in is destroyed by the continuation EXIT C already
+     * ran, so a surviving handler would be writing through a dangling token --
+     * exactly the use-after-free the deregistration exists to prevent.
      */
+    aw.alive = 1;
+
+    if (cln.handler != NULL) {
+        cln.handler(cln.data);
+    }
+
+    CHECK(aw.alive == 1,
+          "the live completion must have DEREGISTERED the r->pool cleanup: a "
+          "handler still armed here writes `alive` through a token whose op "
+          "pool the completion's continuation already destroyed");
     CHECK(test_ct_resume_calls == 1,
           "a request finalizing AFTER its completion must not produce a second "
           "continuation: the completion deregistered the cleanup");

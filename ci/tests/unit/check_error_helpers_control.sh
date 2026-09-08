@@ -118,6 +118,13 @@ run_mutant CTRL_ERROR_HELPERS_AWAIT_CONSUME \
 run_mutant CTRL_ERROR_HELPERS_AWAIT_LIVE \
 	'the live arm must consume the token'"'"'s mirror too' \
 	'live await consumes its continuation mirror'
+# EXIT D: the deregistration. The assertion is reached by driving the cleanup
+# slot the way ngx_destroy_pool does -- `if (handler) handler(data)` -- against
+# a token whose `alive` bit was re-raised as a tripwire, so a handler left armed
+# is observable and one correctly NULLed is a no-op.
+run_mutant CTRL_ERROR_HELPERS_AWAIT_DEREG \
+	'the live completion must have DEREGISTERED the r->pool cleanup' \
+	'live await deregisters its r->pool cleanup'
 
 # GRIND-C7 (re-arm): the assertion named here is ngx_test_add_event_calls -- a
 # count of GENUINE ngx_add_event registrations. The shim's

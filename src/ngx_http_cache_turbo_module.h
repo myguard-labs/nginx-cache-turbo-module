@@ -3758,7 +3758,10 @@ typedef struct {
      * completion that decides whether its members may be SREMed.
      *
      * `page_pool` is the page's scratch pool. It used to be destroyed before
-     * the delivery returned; now it must outlive the delivery, because
+     * the delivery returned; now it must outlive the delivery, because the
+     * page is not settled until the awaited UNLINK's reply lands -- long after
+     * the delivering frame is gone.
+     *
      * It is destroyed by the completion, on every outcome, so the walk's
      * footprint is still one page's scratch at a time -- what pagination
      * bought is preserved. The tag key is NOT in it: tp->sscan_key is built

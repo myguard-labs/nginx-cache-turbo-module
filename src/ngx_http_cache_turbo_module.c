@@ -626,15 +626,6 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_scan_page_hold_ms),
       NULL },
 
-    /* TODO-UNLINK-REPLY-WINDOW: send the tag purge's per-page UNLINK as an
-     * unknown command so Redis answers `-ERR`. A launched-and-answered-but-
-     * FAILED delete has no black-box trigger otherwise, and it is the exact
-     * state the pre-fix code treated as success before SREMing away the only
-     * pointer to the still-live objects. Awaited deletes only.
-     *
-     * The value is the 1-based ordinal of the first awaited delete to fail, so
-     * N > 1 lets earlier pages complete and drives the walk through its
-     * resume -> next-page transition before the failure. 0/unset = off. */
     /* TODO-UNLINK-REPLY-WINDOW: hold the awaited per-page UNLINK before launch
      * so the SSCAN connection's read timeout elapses while the walk is
      * suspended. Set above the location's redis_timeout to prove the
@@ -647,6 +638,15 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_unlink_launch_hold_ms),
       NULL },
 
+    /* TODO-UNLINK-REPLY-WINDOW: send the tag purge's per-page UNLINK as an
+     * unknown command so Redis answers `-ERR`. A launched-and-answered-but-
+     * FAILED delete has no black-box trigger otherwise, and it is the exact
+     * state the pre-fix code treated as success before SREMing away the only
+     * pointer to the still-live objects. Awaited deletes only.
+     *
+     * The value is the 1-based ordinal of the first awaited delete to fail, so
+     * N > 1 lets earlier pages complete and drives the walk through its
+     * resume -> next-page transition before the failure. 0/unset = off. */
     { ngx_string("cache_turbo_test_unlink_reply_fail"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_num_slot,

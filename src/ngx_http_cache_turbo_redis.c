@@ -1581,7 +1581,20 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
         total += ngx_http_cache_turbo_redis_encode_len(argv, nlead + m);
     }
 
-    if (emitted == 0) {                   /* nothing to send */
+    if (emitted == 0) {
+        /* Every key was empty and keep_empty is off, so nothing would be
+         * encoded. Launching would send a zero-byte command and then wait for a
+         * reply that read_drain's `expected_replies ? : 1` fallback insists on,
+         * parking the op until its read timeout -- and, for an awaited caller,
+         * delivering a spurious NGX_ERROR for a delete that had nothing to do.
+         * Sending nothing is vacuously a successful delete, so report it as the
+         * no-op it is. `done` is deliberately NOT invoked: the contract is that
+         * it fires only after a launch, and del_many_cb turns this NGX_OK into
+         * its own already-complete answer.
+         *
+         * This is the ONLY zero check needed: the encode loop below re-walks
+         * the same keys but never touches `emitted`, so a second check after it
+         * would be dead. */
         ngx_destroy_pool(op->pool);
         return NGX_OK;
     }
@@ -1606,20 +1619,6 @@ ngx_http_cache_turbo_redis_cmd_many(ngx_http_cache_turbo_loc_conf_t *clcf,
             op->send->last = ngx_http_cache_turbo_redis_encode_into(
                                   op->send->last, argv, nlead + m);
         }
-    }
-
-    if (emitted == 0) {
-        /* Every key was empty and keep_empty is off, so nothing was encoded.
-         * Launching would send a zero-byte command and then wait for a reply
-         * that read_drain's `expected_replies ? : 1` fallback insists on,
-         * parking the op until its read timeout -- and, for an awaited caller,
-         * delivering a spurious NGX_ERROR for a delete that had nothing to do.
-         * Sending nothing is vacuously a successful delete, so report it as the
-         * no-op it is. `done` is deliberately NOT invoked: the contract is that
-         * it fires only after a launch, and del_many_cb turns this NGX_OK into
-         * its own already-complete answer. */
-        ngx_destroy_pool(op->pool);
-        return NGX_OK;
     }
 
     op->expected_replies = emitted;       /* one integer reply per command */

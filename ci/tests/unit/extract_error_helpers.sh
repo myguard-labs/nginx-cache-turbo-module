@@ -361,6 +361,10 @@ fi
 #                   second op_done, double-destroying the walk op's pool.
 #   AWAIT_LIVE    - the LIVE arm must consume the mirror too. The two arms are
 #                   mutually exclusive and exactly one teardown may survive.
+#   AWAIT_DEREG   - the LIVE arm must DEREGISTER the r->pool cleanup. Left
+#                   armed, the request's later teardown runs the handler and
+#                   clears `alive` through a token whose op pool the
+#                   completion's continuation has already destroyed.
 #
 # Mutations neutralize the statement or compile the call out rather than
 # substituting a constant, so no variable becomes unused and -Werror stays
@@ -387,6 +391,15 @@ if [ "${CTRL_ERROR_HELPERS_AWAIT_LIVE:-0}" = 1 ]; then
 		'tp = aw->tp;' \
 		'aw->resume = NULL;' '(void) 0;' \
 		'live await consumes its continuation mirror'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_AWAIT_DEREG:-0}" = 1 ]; then
+	# Same delimiting trick as AWAIT_LIVE: `tp = aw->tp;` is reachable only
+	# from the live arm, so the mutation cannot land elsewhere.
+	mutate_function_block_exact ngx_http_cache_turbo_tag_purge_page_unlinked \
+		'if (aw->cln) {' \
+		'aw->cln->handler = NULL;' '(void) 0;' \
+		'live await deregisters its r->pool cleanup'
 fi
 
 # GRIND-C7 (re-arm) controls. A resumed walk has to put its read event back on
