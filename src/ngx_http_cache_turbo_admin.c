@@ -396,6 +396,18 @@ ngx_http_cache_turbo_admin_purge_tag(ngx_http_request_t *r,
     }
     ngx_memcpy(tp->tag.data, arg->data, arg->len);
 
+    /* TODO-REDIS-PAGINATION: build the tag set key once here, reuse it
+     * across every page instead of rebuilding on each one. Allocated from
+     * r->pool which survives the walk. */
+    tp->sscan_key.data = ngx_pnalloc(r->pool,
+                            clcf->redis_prefix.len + sizeof("tag:") - 1
+                            + tp->tag.len);
+    if (tp->sscan_key.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    tp->sscan_key.len = clcf->backend->tagkey(&clcf->redis_prefix,
+                           tp->tag.data, tp->tag.len, tp->sscan_key.data);
+
     rc = clcf->backend->purge_tag(r, clcf,
              tp->tag.data, tp->tag.len,
              ngx_http_cache_turbo_tag_purge_complete, tp);

@@ -114,6 +114,8 @@ typedef struct {
     ngx_int_t (*purge_tag)(ngx_http_request_t *r,
         ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
         ngx_http_cache_turbo_redis_members_pt cb, void *data);
+    size_t (*tagkey)(ngx_str_t *prefix, u_char *name, size_t name_len,
+        u_char *buf);
 } ngx_cache_turbo_backend_t;
 
 struct ngx_http_cache_turbo_loc_conf_s {
@@ -122,12 +124,14 @@ struct ngx_http_cache_turbo_loc_conf_s {
     ngx_shm_zone_t                *shm_zone;
     ngx_uint_t                     auto_vary;
     ngx_int_t                      stale_mult;
+    ngx_str_t                      redis_prefix;
 };
 
 typedef struct {
     ngx_http_cache_turbo_loc_conf_t  *clcf;
     ngx_http_cache_turbo_zone_t      *zone;
     ngx_str_t                         tag;
+    ngx_str_t                         sscan_key;
     unsigned                          is_auto_vary:1;
     ngx_uint_t                        pending_at_launch;
 } ngx_http_cache_turbo_tagpurge_t;

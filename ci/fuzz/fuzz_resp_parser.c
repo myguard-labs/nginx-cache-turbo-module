@@ -153,7 +153,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         ngx_fuzz_pool_reset(&pool);
     }
 
-    /* 4) STAB-3 pre-framer. Unlike the three above it takes raw pointers rather
+    /* 3) STAB-3 pre-framer. Unlike the two above it takes raw pointers rather
      * than an op, reports progress through *next, and is the module's ONLY
      * recursive parser: a `*<count>` array recurses per element, bounded by
      * FRAME_MAX_DEPTH. It is the pre-framer for read_smembers/read_scan and,
@@ -192,7 +192,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         ngx_fuzz_pool_reset(&pool);
     }
 
-    /* 5) SPLIT DELIVERY. Everything above hands the parser one buffer holding
+    /* 4) SPLIT DELIVERY. Everything above hands the parser one buffer holding
      * the whole reply, which is the single case a real socket does NOT
      * guarantee: a Redis reply arrives in as many recv()s as the network feels
      * like, and read_get()/read_smembers()/read_scan() drive their parser in a
@@ -501,9 +501,15 @@ check_scan_split_fixture(const char *name, const u_char *wire, size_t wire_len,
         failures += check_str(name, &cursor_one, want_cursor);
         failures += check_str(name, &cursor_split, want_cursor);
         for (i = 0; i < nkeys_one && i < nkeys_split; i++) {
+            /* A nil array element (RESP `$-1`) is decoded as a zero-length
+             * string with a NULL data pointer. memcmp() is declared nonnull,
+             * so calling it with those pointers is UB even for len == 0 and
+             * UBSan flags it; compare the length first and only touch the
+             * bytes when there are any. */
             if (keys_one[i].len != keys_split[i].len
-                || memcmp(keys_one[i].data, keys_split[i].data,
-                          keys_one[i].len) != 0)
+                || (keys_one[i].len > 0
+                    && memcmp(keys_one[i].data, keys_split[i].data,
+                              keys_one[i].len) != 0))
             {
                 fprintf(stderr, "%s: key %lu changed under split delivery\n",
                         name, (unsigned long) i);
@@ -561,7 +567,7 @@ main(void)
         (const u_char *) "*2\r\n$1\r\n0\r\n*2\r\n$-1\r\n$3\r\ntwo\r\n",
         sizeof("*2\r\n$1\r\n0\r\n*2\r\n$-1\r\n$3\r\ntwo\r\n") - 1,
         NGX_OK, "0", 2, array_nil);
-    failures += check_scan_split_fixture("sscan malformed member",
+    failures += check_scan_split_fixture("sscan truncated member",
         (const u_char *) "*2\r\n$1\r\n0\r\n*1\r\n$3\r\none\n",
         sizeof("*2\r\n$1\r\n0\r\n*1\r\n$3\r\none\n") - 1,
         NGX_AGAIN, "", 0, NULL);
