@@ -2664,10 +2664,17 @@ def test_cor5_purge_reports_degraded_enumeration(
          f"else the gate's own polls would store and re-launch a SADD -- "
          f"got {hconfirm1}")
 
+    # timeout=5.0, not 10.0: wait_for scales the timeout by
+    # sanitizer_time_scale() (2.0 under ASan), so 10.0 would give the gate a
+    # 20s deadline against the 30s cache_turbo_valid of the entry re-primed
+    # just above -- a gate running near its deadline would be polling an
+    # entry close to expiry. 5.0 scales to 10s and keeps that margin wide.
+    # Draining takes milliseconds when the SADDs are acked normally; this
+    # bound only has to cover a slow L2, not a hung one.
     assert wait_for(
         lambda: _varidx(fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
                                headers=en)[2])["inflight"] == 0,
-        timeout=10.0,
+        timeout=5.0,
     ), "varidx_inflight never drained to 0 -- zone not quiescent for baseline"
 
     s2, b2, _ = fetch_raw(ng.port, "/cor5sh/full?v=al", method="PURGE")
