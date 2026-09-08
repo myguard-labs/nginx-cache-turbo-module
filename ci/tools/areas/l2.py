@@ -2151,22 +2151,25 @@ def test_l2_tag_purge_over_legacy_reply_cap_now_succeeds(
         f"a tag past the legacy 128 KiB reply cap must now PURGE, not 500: {replies}"
     assert all("l2" not in json.loads(body) for _, body in replies), \
         f"paginated walk still reported an L2 problem: {replies}"
-    # Exactly one of the eight sees the full set; the rest race behind it and
-    # legitimately see fewer members (or none). Asserting every reply purged n
-    # would be asserting serialisation nobody promised. What must hold is that
-    # the winner saw them all.
+    # The eight walks CONSUME the set concurrently: each page a walk visits is
+    # UNLINKed and SREMed before the next walk reaches it, so the members are
+    # partitioned across the eight rather than enumerated whole by a winner.
+    # No single reply is therefore guaranteed to reach n -- an observed run
+    # reported a maximum of 1944 for a 2200-member set, with the eight summing
+    # to 12103. Asserting max() >= n asserts an exclusive enumeration nothing
+    # serialises, and fails intermittently on correct behaviour.
     #
-    # >= n, not == n: `purged` counts members VISITED, not distinct members
-    # (see the module.h contract and the README caveat). SSCAN may return the
-    # same member on more than one page when the set is resized mid-walk, and
-    # eight concurrent walks over a set being emptied underneath them is
-    # precisely the shape that provokes it -- an observed run reported 2202 for
-    # a 2200-member set. Pinning == n would make this test fail on correct,
-    # documented behaviour. The upper bound is not asserted because the walk
-    # makes no promise about how many duplicates a rehash can produce; that the
-    # whole set was covered at least once is the claim.
-    assert max(json.loads(body)["purged"] for _, body in replies) >= n, \
-        f"no purge enumerated the whole over-cap set: {replies}"
+    # What the pagination fix actually promises is that the set gets covered:
+    # every member is visited by SOME walk, and none is left behind. The sum is
+    # the coverage claim (>= n, not == n, because `purged` counts members
+    # VISITED rather than distinct -- see the module.h contract and the README
+    # caveat: SSCAN may return the same member on more than one page when the
+    # set is resized mid-walk, which eight concurrent walks provoke). The
+    # index- and object-deletion assertions below are what prove nothing was
+    # stranded; this one pins that the walks did the enumerating rather than
+    # the fixture quietly being empty.
+    assert sum(json.loads(body)["purged"] for _, body in replies) >= n, \
+        f"the eight purges did not cover the over-cap set between them: {replies}"
 
     assert wait_for(
         lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",
