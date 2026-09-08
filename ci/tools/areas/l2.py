@@ -2085,9 +2085,11 @@ def test_l2_tag_purge_sscan_reports_incomplete_when_backend_is_down(
          validation replies admin_purge_tag sends for other failures), so both
          status and field are pinned.
 
-    "purged" must still be present and numeric in the failure body: it is the
-    walk's own visited-count accounting (0 here, since no page was ever read),
-    not a dropped field."""
+    "purged" must still be present in the failure body AND be exactly 0: it is
+    the walk's own visited-count accounting, and the connect is refused before
+    the first SSCAN page, so any other count means the counter advanced for a
+    page that was never read. `type(...) is int` rather than isinstance, since
+    isinstance(True, int) is also true."""
     # 1. control: identical request shape, live backend
     _sscan_db(redis, "FLUSHDB")
     ctrl_tag = "sscandown-ctrl"
@@ -2105,8 +2107,10 @@ def test_l2_tag_purge_sscan_reports_incomplete_when_backend_is_down(
         (f"tag purge with L2 down did not disclose the walk outcome as "
          f"INCOMPLETE (this transport has no separate 'unavailable' state -- "
          f"see mem_058c6ab1eff44d89b7425ac24c68e77c): {down}")
-    assert isinstance(down.get("purged"), int), \
-        f"failure body dropped the purge count: {down}"
+    assert type(down.get("purged")) is int and down["purged"] == 0, \
+        (f"the connect is refused before the first SSCAN page, so the failed "
+         f"walk must report EXACTLY 0 purged -- any other count means the "
+         f"counter advanced for a page that was never read: {down}")
 
 
 def test_l2_tag_purge_over_legacy_reply_cap_now_succeeds(
