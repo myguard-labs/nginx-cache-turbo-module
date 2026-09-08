@@ -54,9 +54,16 @@ extract_function() {
 	extract_function "$REDIS_SRC" 'ngx_int_t' \
 		ngx_http_cache_turbo_redis_walk_suspend
 	printf '\n'
+	# CT-SSCAN-TERMINATE-LEAK: the shared connection disarm. static ngx_int_t,
+	# so it needs its own extraction, and it must precede walk_detach and
+	# walk_finish, both of which call it.
+	extract_function "$REDIS_SRC" 'static ngx_int_t' \
+		ngx_http_cache_turbo_redis_walk_disarm_conn
+	printf '\n'
 	for fn in \
 		ngx_http_cache_turbo_redis_backoff_fail \
 		ngx_http_cache_turbo_redis_read_drain \
+		ngx_http_cache_turbo_redis_walk_detach \
 		ngx_http_cache_turbo_redis_sscan_advance \
 		ngx_http_cache_turbo_redis_sscan_resume \
 		ngx_http_cache_turbo_redis_read_sscan \
@@ -80,6 +87,8 @@ for symbol in \
 	ngx_http_cache_turbo_mc_op_fail \
 	ngx_http_cache_turbo_redis_backoff_fail \
 	ngx_http_cache_turbo_redis_read_drain \
+	ngx_http_cache_turbo_redis_walk_detach \
+	ngx_http_cache_turbo_redis_walk_disarm_conn \
 	ngx_http_cache_turbo_redis_sscan_advance \
 	ngx_http_cache_turbo_redis_sscan_resume \
 	ngx_http_cache_turbo_redis_walk_suspend \
@@ -207,6 +216,48 @@ if [ "${CTRL_ERROR_HELPERS_REDIS_DRAIN_CLEAR:-0}" = 1 ]; then
 	mutate_function_exact ngx_http_cache_turbo_redis_read_drain \
 		'op->unconnected = 0;' 'op->unconnected = 1;' \
 		'Redis drain first-byte clear'
+fi
+
+# CT-SSCAN-TERMINATE-LEAK controls. The detached teardown is a GUARD with five
+# distinct exits, and each gets its own mutation: covering only the primary one
+# is not coverage of the guard.
+#
+#   DETACH_REQUEST  - walk_detach must CLEAR op->request (the dangling pointer)
+#   DETACH_TEARDOWN - walk_detach's unsuspended arm must reach op_done
+#   DETACH_DEFER    - walk_detach's SUSPENDED arm must NOT tear down inline
+#   FINISH_DETACHED - walk_finish's detached guard must skip cb + finalize
+#   RESUME_DETACHED - sscan_resume's detached arm must op_done, not walk_finish
+#
+# Mutations compile the whole guard OFF (`0 &&`) or neutralize the statement,
+# rather than substituting a constant, so no variable becomes unused and
+# -Werror stays satisfied.
+if [ "${CTRL_ERROR_HELPERS_REDIS_DETACH_REQUEST:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_walk_detach \
+		'op->request = NULL;' '(void) 0;' 'Redis detach clears op->request'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_REDIS_DETACH_TEARDOWN:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_walk_detach \
+		'ngx_http_cache_turbo_redis_op_done(op);' '(void) op;' \
+		'Redis detach unsuspended teardown'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_REDIS_DETACH_DEFER:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_walk_detach \
+		'if (op->suspended) {' 'if (0 && op->suspended) {' \
+		'Redis detach defers a suspended walk'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_REDIS_FINISH_DETACHED:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_walk_finish \
+		'if (op->detached) {' 'if (0 && op->detached) {' \
+		'Redis walk-finish detached guard'
+fi
+
+if [ "${CTRL_ERROR_HELPERS_REDIS_RESUME_DETACHED:-0}" = 1 ]; then
+	mutate_function_exact ngx_http_cache_turbo_redis_sscan_resume \
+		'if (op->detached) {' 'if (0 && op->detached) {' \
+		'Redis sscan-resume detached arm'
 fi
 
 if [ "${CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME:-0}" = 1 ]; then

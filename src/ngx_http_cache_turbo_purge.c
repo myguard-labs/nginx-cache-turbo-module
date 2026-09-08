@@ -598,11 +598,22 @@ ngx_http_cache_turbo_tag_purge_page_unlinked(void *data, ngx_int_t rc)
  * flight. Registered on r->pool at suspension time and run by the request's own
  * teardown, BEFORE the memory holding the tagpurge is released.
  *
- * It only clears the token's liveness bit. It must not touch the walk op (which
- * walk_finish owns and which the terminate path tears down on its own schedule)
- * and must not free the page scratch, because the pending completion is the one
- * that will do that -- and it is guaranteed to run, since del_many_cb fires its
- * completion exactly once from every terminal path.
+ * It only clears the token's liveness bit. It must not touch the walk op and
+ * must not free the page scratch.
+ *
+ * The walk op has its OWN r->pool cleanup -- redis.c's
+ * ngx_http_cache_turbo_redis_walk_detach, registered by redis_sscan (see
+ * CT-SSCAN-TERMINATE-LEAK there) -- which is what clears op->request, marks the
+ * walk detached and drives its request-free teardown. An earlier revision of
+ * this comment claimed the terminate path tore the walk down "on its own
+ * schedule"; no code did that, and the walk leaked its pool, its Redis
+ * connection, its fd and the zone's varidx_inflight account on every terminated
+ * tag purge. This handler stays narrow because that job belongs to the op's own
+ * cleanup, not to the await token.
+ *
+ * The page scratch is left to the pending completion, which is guaranteed to
+ * run, since del_many_cb fires its completion exactly once from every terminal
+ * path.
  */
 static void
 ngx_http_cache_turbo_tag_purge_await_gone(void *data)

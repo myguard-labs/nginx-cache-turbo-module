@@ -835,7 +835,13 @@ test_redis_sscan_suspension_disarms_connection(void)
  * token's `alive` bit during teardown, before the memory goes. The completion
  * reads `alive` FIRST and, when clear, touches nothing that lived in r->pool.
  *
- * ⚠ SCOPE. This asserts the token PROTOCOL, not the production completion.
+ * ⚠ SCOPE -- and the NAME says so. This asserts the token PROTOCOL only, using
+ * test-local stand-ins (test_await_gone / test_await_completion); it does NOT
+ * exercise the production completion. An earlier name,
+ * `test_redis_await_token_survives_request_teardown`, read as though it did.
+ * The production wiring is covered by the black-box runtime tests, and the walk
+ * op's own request-teardown path now has direct unit coverage in
+ * test_redis_walk_detach_on_request_teardown below.
  * ngx_http_cache_turbo_tag_purge_page_unlinked lives in purge.c, which this
  * shim does not extract; reaching it would need the real tagpurge_t, whose
  * fields this shim would have to redeclare by hand -- and a hand-copied struct
@@ -885,7 +891,7 @@ test_await_completion(void *data)
 }
 
 static void
-test_redis_await_token_survives_request_teardown(void)
+test_await_token_protocol_only(void)
 {
     test_await_t  aw;
     int           tp_object = 0;
@@ -930,6 +936,296 @@ test_redis_await_token_survives_request_teardown(void)
 }
 
 
+/*
+ * CT-SSCAN-TERMINATE-LEAK: the walk op must survive its request being
+ * TERMINATED, and must release everything it owns when it does.
+ *
+ * redis_sscan builds the walk op from its OWN ngx_create_pool (not a child of
+ * r->pool), sets op->request = r and parks the request with r->main->count++.
+ * ngx_http_terminate_handler does NOT honour that park -- it forces r->count = 1
+ * and frees the request regardless -- so before this fix the walk was left in
+ * one of two wrong states:
+ *
+ *   (1) NOT suspended: the read timeout fired and walk_finish called
+ *       cb(r, ...) + ngx_http_finalize_request(r, rc) on the freed request. A
+ *       use-after-free.
+ *   (2) SUSPENDED (after the disarm landed): the read timer was deleted and the
+ *       read event taken off the poller, removing the last two wakeups that
+ *       could drive the op to walk_finish -> op_done. The op pool, the Redis
+ *       connection, its fd and the zone's varidx_inflight account leaked for
+ *       the worker's lifetime, and op->request dangled.
+ *
+ * Both are closed by ONE r->pool cleanup, walk_detach, and one `detached` flag
+ * every terminal path consults. That flag is a GUARD WITH FOUR EXITS, and each
+ * is asserted separately below -- covering only the primary path is not
+ * coverage of the guard.
+ *
+ * ⚠ op_done is STUBBED in this shim (it counts calls), so "reached op_done
+ * exactly once" is what is observable here and what is asserted. That the real
+ * op_done releases the pool, the connection/fd and varidx_inflight is its own
+ * contract, already covered by its existing call sites; what this test pins is
+ * that the detached walk REACHES it, exactly once, on every exit -- which is
+ * precisely what was missing.
+ */
+static void
+test_redis_walk_detach_on_request_teardown(void)
+{
+    ngx_http_cache_turbo_loc_conf_t  clcf;
+    ngx_http_cache_turbo_ctx_t       ctx;
+    ngx_http_cache_turbo_redis_op_t  op;
+    ngx_http_request_t               request;
+    ngx_connection_t                 connection;
+    ngx_pool_t                       pool;
+    ngx_event_t                      read, write;
+    ngx_pool_cleanup_t               cln;
+
+    /* ---- EXIT 1: an UNSUSPENDED walk is torn down INLINE ---------------- */
+
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = suspending_members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.is_scan = 1;
+    op.peer.connection = &connection;
+    connection.data = &op;
+    cln.handler = ngx_http_cache_turbo_redis_walk_detach;
+    cln.data = &op;
+    op.req_cln = &cln;
+    reset_observations();
+
+    /* The state redis_write leaves behind: a live read timer and a registered
+     * read event on the walk's own connection. */
+    read.timer_set = 1;
+    read.active = 1;
+
+    ngx_http_cache_turbo_redis_walk_detach(&op);
+
+    CHECK(op.detached == 1,
+          "the request-teardown cleanup must MARK the walk detached: that flag "
+          "is what every terminal path consults to skip the callback and the "
+          "finalize");
+    CHECK(op.request == NULL,
+          "the request-teardown cleanup must CLEAR op->request: the request is "
+          "about to be freed, and every walk terminal reads this pointer");
+    CHECK(op.members_cb == NULL && op.members_data == NULL,
+          "the page callback and its data live in the freed r->pool, so both "
+          "must be dropped, not merely flagged");
+    CHECK(op.scan_status != NGX_OK,
+          "a detached walk can never have completed its purge, so it must "
+          "never report the tag as fully purged");
+
+    /* Nothing else holds the op, so the teardown is IMMEDIATE -- this is what
+     * releases the op pool, the Redis connection, its fd and the zone's
+     * varidx_inflight account. */
+    CHECK(ngx_test_redis_done_calls == 1,
+          "an UNSUSPENDED detached walk must reach op_done exactly once and "
+          "inline: nothing else holds the op, so deferring here is the leak "
+          "this fix exists to close");
+
+    /* And it must never reach the request. */
+    CHECK(ngx_test_members_calls == 0,
+          "a detached walk must NEVER call the page callback: its data lives "
+          "in the freed r->pool");
+    CHECK(ngx_test_finalize_calls == 0,
+          "a detached walk must NEVER finalize a request: the request that "
+          "parked it has already been freed");
+
+    /* The connection must be quiet before op_done closes it: a timer still
+     * armed on a closed connection's read event is a use-after-free of its
+     * own. */
+    CHECK(read.timer_set == 0,
+          "the detach must delete the walk's read TIMER before op_done closes "
+          "the connection");
+    CHECK(read.active == 0,
+          "the detach must take the walk's read EVENT off the poller before "
+          "op_done closes the connection");
+
+    /* The cleanup is running, so nginx has already removed the record: the op
+     * must not keep a pointer op_done would later dereference. */
+    CHECK(op.req_cln == NULL,
+          "the running cleanup must drop its own record from the op, so a "
+          "later op_done cannot neutralize a record nginx already released");
+
+    /* Idempotence: a second run (a duplicated cleanup, a re-entry) must not
+     * double-free by reaching op_done twice. */
+    ngx_http_cache_turbo_redis_walk_detach(&op);
+    CHECK(ngx_test_redis_done_calls == 1,
+          "the detach must be idempotent: a second invocation must NOT reach "
+          "op_done again, which would double-destroy the op pool");
+
+    /* ---- EXIT 2: a SUSPENDED walk DEFERS its teardown ------------------- */
+    /*
+     * The ordering hazard. A page's UNLINK is in flight on a DIFFERENT
+     * connection and holds this op as its completion data through
+     * tp->page_resume_data. Destroying op->pool here would leave that pending
+     * completion pointing at freed memory -- strictly worse than the leak. So
+     * this arm records the doom and tears down NOTHING; sscan_resume, which is
+     * guaranteed to run, does it at the first moment nothing references the op.
+     */
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = suspending_members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.is_scan = 1;
+    op.peer.connection = &connection;
+    connection.data = &op;
+    cln.handler = ngx_http_cache_turbo_redis_walk_detach;
+    cln.data = &op;
+    op.req_cln = &cln;
+    op.suspended = 1;                    /* a page's UNLINK is in flight */
+    reset_observations();
+    read.timer_set = 1;
+    read.active = 1;
+
+    ngx_http_cache_turbo_redis_walk_detach(&op);
+
+    CHECK(op.detached == 1,
+          "a suspended walk must be marked detached too: the request is gone "
+          "either way");
+    CHECK(op.request == NULL,
+          "a suspended walk's op->request must be cleared as well -- the "
+          "pending completion's resume runs long after the request is freed");
+    CHECK(ngx_test_redis_done_calls == 0,
+          "a SUSPENDED detached walk must NOT be torn down inline: the page's "
+          "UNLINK still holds the op through page_resume_data, and freeing it "
+          "here is a use-after-free strictly worse than the leak");
+    CHECK(op.suspended == 1,
+          "the detach must leave the walk SUSPENDED, so the guaranteed resume "
+          "is not dropped as a resume for an unsuspended walk");
+    CHECK(op.resume_doomed == 1,
+          "the detach must record the doom for the resume to act on");
+
+    /* ---- EXIT 3: the deferred teardown actually happens at the resume --- */
+
+    ngx_http_cache_turbo_redis_sscan_resume(&op, NGX_OK);
+
+    CHECK(ngx_test_redis_done_calls == 1,
+          "the resume of a DETACHED walk must reach op_done exactly once: this "
+          "is the deferred teardown, and skipping it is the leak");
+    CHECK(ngx_test_members_calls == 0,
+          "the resume of a detached walk must not call the page callback");
+    CHECK(ngx_test_finalize_calls == 0,
+          "the resume of a detached walk must not finalize a request: there "
+          "is none");
+    CHECK(op.suspended == 0,
+          "the resume must clear the suspension it consumed");
+
+    /* ---- EXIT 3b: the resume's detached arm must not DEPEND on the doom ---
+     *
+     * The case above cannot discriminate on its own, and saying so matters.
+     * walk_detach sets resume_doomed, so with the detached arm compiled out the
+     * resume falls through to walk_finish -- whose OWN detached guard reaches
+     * op_done once anyway. Identical observables: vacuous.
+     *
+     * The observable unique to the resume's detached arm is what it does for a
+     * detached walk that is NOT doomed. That state is reachable: read_sscan
+     * suspends a page and saves its cursor (resume_doomed stays 0), and the
+     * request is terminated afterwards -- walk_detach's suspended arm is the
+     * only writer of resume_doomed here, so clearing it models a walk detached
+     * through any future path that does not set it. Without the detached arm,
+     * rc == NGX_OK and resume_doomed == 0 route this straight into
+     * sscan_advance, which issues ANOTHER SSCAN page on a connection that is
+     * being torn down, for a request that no longer exists -- and never reaches
+     * op_done at all. That is the leak, back in full. */
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = suspending_members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.is_scan = 1;
+    op.peer.connection = &connection;
+    connection.data = &op;
+    reset_observations();
+
+    /* The post-detach state, with the doom deliberately absent. */
+    op.detached = 1;
+    op.request = NULL;
+    op.members_cb = NULL;
+    op.members_data = NULL;
+    op.suspended = 1;
+    op.resume_doomed = 0;
+    op.resume_cursor.data = op.resume_cursor_buf;
+    op.resume_cursor.len = 2;
+    op.resume_cursor_buf[0] = '1';
+    op.resume_cursor_buf[1] = '7';
+
+    ngx_http_cache_turbo_redis_sscan_resume(&op, NGX_OK);
+
+    CHECK(ngx_test_redis_done_calls == 1,
+          "a DETACHED walk's resume must reach op_done even when it is not "
+          "doomed: the detached check has to precede the rc/doom check, or an "
+          "undoomed detached walk advances to another page instead of being "
+          "torn down and leaks its pool, connection and fd");
+    /* THE discriminating assertion. op_done alone cannot separate the two: an
+     * advance that fails to build its next page falls into walk_finish, whose
+     * detached guard reaches op_done once anyway -- identical count, vacuous.
+     * scan_pages is incremented by sscan_advance and by nothing else, so it is
+     * the one observable that says whether the walk ADVANCED at all. */
+    CHECK(op.scan_pages == 0,
+          "a DETACHED walk's resume must NOT enter sscan_advance: it counts "
+          "another page and tries to issue another SSCAN on a connection being "
+          "torn down, for a request that no longer exists");
+    CHECK(ngx_test_finalize_calls == 0,
+          "an undoomed detached resume must still not finalize a request");
+
+    /* ---- EXIT 4: walk_finish, reached by any other terminal path -------- */
+    /*
+     * read_sscan's timeout, a malformed reply, a peer close, op_fail: every
+     * remaining terminal path in the file routes through walk_finish. Its
+     * detached guard is the ONE edit that makes "a detached walk never calls
+     * the callback and never finalizes" total.
+     */
+    init_request(&request, &connection, &pool, &read, &write);
+    init_redis(&op, &clcf, &ctx, &request, &pool);
+    op.members_cb = suspending_members_callback;
+    op.members_data = (void *) (uintptr_t) 0x51;
+    op.is_scan = 1;
+    op.peer.connection = &connection;
+    connection.data = &op;
+    reset_observations();
+    read.timer_set = 1;
+    read.active = 1;
+
+    /* The state the cleanup leaves behind, reached now by a LATER wakeup.
+     *
+     * ⚠ members_cb is deliberately left SET here, even though walk_detach also
+     * clears it. Two reasons, and both matter:
+     *   - it makes the mutant OBSERVABLE. With the guard compiled out,
+     *     walk_finish calls cb(r, ...) and the assertion below counts it and
+     *     reports; with members_cb NULLed the mutant would segfault on the
+     *     call instead, and a crash is not a named assertion going red.
+     *   - it is the STRONGER contract. `detached` alone must be sufficient to
+     *     stop walk_finish -- the guard must not be relying on members_cb
+     *     having been cleared as well, or a future path that sets detached
+     *     without clearing the callback silently reopens the hole.
+     *
+     * op.request likewise stays pointing at the live stack request rather than
+     * being NULLed as walk_detach leaves it. Same reason: `detached` must be
+     * sufficient ON ITS OWN, and a mutant that runs off a NULL r crashes
+     * inside walk_finish before any assertion can be reported -- a segfault is
+     * not a named test going red. Keeping r live lets the mutated walk_finish
+     * complete, so the callback call and the finalize are both COUNTED and the
+     * assertions below name exactly what went wrong. */
+    op.detached = 1;
+
+    ngx_http_cache_turbo_redis_walk_finish(&op, NULL, 0);
+
+    CHECK(ngx_test_members_calls == 0,
+          "walk_finish on a DETACHED walk must not call the page callback: it "
+          "was cleared with the request, and calling through it is the "
+          "use-after-free this guard exists to prevent");
+    CHECK(ngx_test_finalize_calls == 0,
+          "walk_finish on a DETACHED walk must not finalize: op->request is "
+          "NULL and the request memory is already gone");
+    CHECK(ngx_test_redis_done_calls == 1,
+          "walk_finish on a detached walk must STILL reach op_done exactly "
+          "once -- skipping the callback must not also skip the teardown, or "
+          "the guard trades the use-after-free back for the leak");
+    CHECK(read.timer_set == 0 && read.active == 0,
+          "walk_finish's detached arm must disarm the connection before "
+          "op_done closes it");
+}
+
+
 int
 main(void)
 {
@@ -942,7 +1238,8 @@ main(void)
     test_redis_sscan_requires_exact_frame();
     test_redis_drain_ownership();
     test_redis_sscan_suspension_disarms_connection();
-    test_redis_await_token_survives_request_teardown();
+    test_await_token_protocol_only();
+    test_redis_walk_detach_on_request_teardown();
 
     (void) fprintf(stderr, "terminal error compositions: %d failures\n",
                    failures);

@@ -69,6 +69,24 @@ run_mutant CTRL_ERROR_HELPERS_REDIS_SMEMBERS_FAIL \
 run_mutant CTRL_ERROR_HELPERS_REDIS_DRAIN_CLEAR \
 	'Redis drain first reply byte must clear, never arm, backoff state' \
 	'Redis drain first-byte clear'
+run_mutant CTRL_ERROR_HELPERS_REDIS_DETACH_REQUEST \
+	'the request-teardown cleanup must CLEAR op->request' \
+	'Redis detach clears op->request'
+run_mutant CTRL_ERROR_HELPERS_REDIS_DETACH_TEARDOWN \
+	'an UNSUSPENDED detached walk must reach op_done exactly once' \
+	'Redis detach unsuspended teardown'
+run_mutant CTRL_ERROR_HELPERS_REDIS_DETACH_DEFER \
+	'a SUSPENDED detached walk must NOT be torn down inline' \
+	'Redis detach defers a suspended walk'
+run_mutant CTRL_ERROR_HELPERS_REDIS_FINISH_DETACHED \
+	'walk_finish on a DETACHED walk must not call the page callback' \
+	'Redis walk-finish detached guard'
+# The discriminating assertion, not the op_done count: with the detached arm
+# compiled out, an advance that cannot build its next page still falls into
+# walk_finish and reaches op_done once. scan_pages is what separates them.
+run_mutant CTRL_ERROR_HELPERS_REDIS_RESUME_DETACHED \
+	"a DETACHED walk's resume must NOT enter sscan_advance" \
+	'Redis sscan-resume detached arm'
 run_mutant CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME \
 	'SSCAN must reject trailing RESP bytes before parsing' \
 	'Redis SSCAN exact-frame gate'

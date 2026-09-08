@@ -79,6 +79,16 @@ typedef struct {
     int  token;
 } ngx_addr_t;
 
+/* CT-SSCAN-TERMINATE-LEAK: the r->pool cleanup record. redis_sscan registers
+ * one holding walk_detach, and op_done cancels it by neutralizing the handler
+ * -- so the shim needs the real field shape for both the extracted detach and
+ * the extracted op_done to compile and behave identically. */
+typedef struct ngx_pool_cleanup_s  ngx_pool_cleanup_t;
+struct ngx_pool_cleanup_s {
+    void  (*handler)(void *data);
+    void   *data;
+};
+
 /* Minimal stand-in for nginx's ngx_peer_connection_t. sscan_advance reads the
  * op's connection through op->peer.connection rather than through an event, so
  * the mock op needs the same shape for the extracted function to compile. */
@@ -177,6 +187,11 @@ typedef struct {
     unsigned                               drain_failed:1;
     unsigned                               suspended:1;
     unsigned                               resume_doomed:1;
+    /* CT-SSCAN-TERMINATE-LEAK: the request-teardown detach state. EXERCISED --
+     * the detach test drives walk_detach through both its suspended and its
+     * unsuspended exit and asserts on both fields. */
+    unsigned                               detached:1;
+    ngx_pool_cleanup_t                    *req_cln;
     ngx_str_t                              resume_cursor;
     u_char                                 resume_cursor_buf[64];
 } ngx_http_cache_turbo_redis_op_t;

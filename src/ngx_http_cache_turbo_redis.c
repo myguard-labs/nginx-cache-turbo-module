@@ -203,6 +203,30 @@ typedef struct {
      * to sscan_resume, which is the first point at which nothing references the
      * op any more. */
     unsigned                     resume_doomed:1;
+
+    /* CT-SSCAN-TERMINATE-LEAK: the walk parks its request with
+     * r->main->count++, but a TERMINATE (worker shutdown, client abort) does
+     * NOT honour that refcount -- ngx_http_terminate_handler forces
+     * r->count = 1 and frees the request regardless. Nothing on the request
+     * side used to reach this op at all, so a terminate either left the op
+     * pool, the Redis connection, its fd and this zone's varidx_inflight
+     * account stranded for the worker's lifetime (while op->request dangled at
+     * freed memory), or -- before the suspension disarm existed -- let the read
+     * timeout drive walk_finish into cb()/ngx_http_finalize_request() on the
+     * already-freed request.
+     *
+     * req_cln is the r->pool cleanup that closes both. It clears op->request,
+     * sets `detached`, and drives a request-free teardown. op_done cancels it
+     * (handler = NULL) on every normal completion, because the cleanup outlives
+     * the op otherwise and would run against freed memory.
+     *
+     * `detached` is the flag every terminal path consults: a detached walk must
+     * never call members_cb and never call ngx_http_finalize_request -- there is
+     * no request left -- but must still reach op_done EXACTLY ONCE so the pool,
+     * the connection/fd and varidx_inflight are all released. */
+    unsigned                     detached:1;
+    ngx_pool_cleanup_t          *req_cln;
+
     ngx_str_t                    resume_cursor;
     u_char                       resume_cursor_buf[64];
 
@@ -225,6 +249,9 @@ static void ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_sscan_advance(
     ngx_http_cache_turbo_redis_op_t *op, ngx_str_t cursor);
 static void ngx_http_cache_turbo_redis_sscan_resume(void *opaque, ngx_int_t rc);
+static void ngx_http_cache_turbo_redis_walk_detach(void *data);
+static ngx_int_t ngx_http_cache_turbo_redis_walk_disarm_conn(
+    ngx_connection_t *c);
 static void ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_lock_finish(
@@ -2376,6 +2403,7 @@ ngx_http_cache_turbo_redis_sscan(ngx_http_request_t *r,
     ngx_http_cache_turbo_redis_members_pt cb, void *data)
 {
     ngx_str_t                         cursor0 = ngx_string("0");
+    ngx_pool_cleanup_t               *cln;
     ngx_http_cache_turbo_redis_op_t  *op;
 
     if (!clcf->redis_enable) {
@@ -2433,16 +2461,50 @@ ngx_http_cache_turbo_redis_sscan(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
+    /* CT-SSCAN-TERMINATE-LEAK: register the request-teardown detach BEFORE the
+     * launch. The walk op is built from its OWN pool, not a child of r->pool,
+     * and the r->main->count++ park below does not survive a TERMINATE, so
+     * without this cleanup the request can be freed with the walk still live:
+     * op->request dangles, and (once the suspension disarm removed the last
+     * wakeups that could drive the op to walk_finish) the op pool, the Redis
+     * connection, its fd and this zone's varidx_inflight account leak for the
+     * worker's lifetime.
+     *
+     * Registering it before the launch is deliberate: a failed launch reaches
+     * op_fail -> walk_finish, which would otherwise leave a cleanup pointing at
+     * a destroyed op. op_done cancels the cleanup on every path that destroys
+     * the op, so the ordering is safe in both directions -- but only because
+     * the cleanup exists by the time any teardown can run.
+     *
+     * A cleanup slot that cannot be allocated is fatal to the walk: proceeding
+     * would reinstate exactly the leak/use-after-free this closes. */
+    cln = ngx_pool_cleanup_add(r->pool, 0);
+    if (cln == NULL) {
+        ngx_destroy_pool(op->rpool);
+        op->rpool = op->pool;
+        ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
+    }
+    cln->handler = ngx_http_cache_turbo_redis_walk_detach;
+    cln->data = op;
+    op->req_cln = cln;
+
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_sscan) != NGX_OK)
     {
+        /* The op is being destroyed here, not through op_done, so cancel the
+         * cleanup by hand. */
+        cln->handler = NULL;
+        op->req_cln = NULL;
         ngx_destroy_pool(op->rpool);
         op->rpool = op->pool;
         ngx_destroy_pool(op->pool);
         return NGX_ERROR;
     }
 
-    /* Parked: released by ngx_http_finalize_request in walk_finish. */
+    /* Parked: released by ngx_http_finalize_request in walk_finish -- unless the
+     * request is TERMINATED first, in which case walk_detach above takes over
+     * and the walk tears itself down without ever touching the request. */
     r->main->count++;
 
     return NGX_DONE;
@@ -3833,6 +3895,117 @@ ngx_http_cache_turbo_redis_walk_unsuspend(void *opaque)
 
 
 /*
+ * CT-SSCAN-TERMINATE-LEAK: take this walk's Redis connection off the poller and
+ * cancel its read timer.
+ *
+ * Factored out of read_sscan's suspension block so the request-teardown detach
+ * can reuse exactly the same disarm. Both callers need the identical thing and
+ * for the identical reason: a read timer or a registered read event outliving
+ * the moment the walk stops being drivable re-enters read_sscan on its own
+ * schedule and tears the op down under whatever still holds it.
+ *
+ * Returns NGX_OK when the connection is quiet, NGX_ERROR when ngx_del_event
+ * refused -- the caller decides what an undisarmable connection means, because
+ * the two call sites differ: the suspension must stay parked for its in-flight
+ * UNLINK, while the detach has no request left to protect.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_walk_disarm_conn(ngx_connection_t *c)
+{
+    ngx_event_t  *rev;
+
+    if (c == NULL) {
+        return NGX_OK;
+    }
+
+    rev = c->read;
+
+    if (rev->timer_set) {
+        ngx_del_timer(rev);
+    }
+
+    /* ngx_del_event, NOT ngx_handle_read_event(NGX_CLOSE_EVENT): the latter
+     * keeps the descriptor registered so a peer close is still reported, which
+     * is precisely the wakeup that must not happen. */
+    if (rev->active && ngx_del_event(rev, NGX_READ_EVENT, 0) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+/*
+ * CT-SSCAN-TERMINATE-LEAK: the r->pool cleanup registered by redis_sscan. Runs
+ * from the request's OWN teardown -- including ngx_http_terminate_handler,
+ * which ignores the walk's r->main->count++ park -- strictly before the memory
+ * holding the request is released.
+ *
+ * Its whole job is to make the walk survivable without a request:
+ *
+ *   - op->request is cleared, so no later path can dereference freed memory.
+ *     Every walk terminal reads it, so clearing it is the single edit that
+ *     makes the dangling-pointer class impossible rather than merely unlikely.
+ *   - members_cb is cleared for the same reason: it is a purge-policy callback
+ *     whose data lives in r->pool.
+ *   - `detached` is set, which is what walk_finish consults to skip the
+ *     callback and the finalize while still reaching op_done.
+ *
+ * ORDERING HAZARD. When the walk is SUSPENDED, a page's UNLINK is in flight on
+ * a DIFFERENT connection and holds this op as its completion data through
+ * tp->page_resume_data. Destroying op->pool here would leave that pending
+ * completion pointing at freed memory -- strictly worse than the leak. So the
+ * suspended case tears down nothing: it records the doom and lets
+ * sscan_resume, which is guaranteed to run (del_many_cb fires its completion
+ * exactly once from every terminal path), perform the teardown at the first
+ * moment nothing references the op.
+ *
+ * When the walk is NOT suspended, nothing else holds the op: the connection is
+ * this op's own, so disarming it and calling op_done here releases the pool,
+ * the connection, its fd and this zone's varidx_inflight account immediately.
+ */
+static void
+ngx_http_cache_turbo_redis_walk_detach(void *data)
+{
+    ngx_http_cache_turbo_redis_op_t  *op = data;
+
+    if (op == NULL || op->detached) {
+        return;
+    }
+
+    op->detached = 1;
+    op->request = NULL;
+    op->members_cb = NULL;
+    op->members_data = NULL;
+    op->ctx = NULL;
+
+    /* The cleanup is running: nginx removes it from the list itself, so the
+     * pointer must not be reused by op_done afterwards. */
+    op->req_cln = NULL;
+
+    /* Whatever happens next, this walk can never complete a purge. */
+    op->scan_status = NGX_ERROR;
+
+    if (op->suspended) {
+        /* A page's UNLINK still holds this op. Only the resume may tear it
+         * down; sscan_resume sees resume_doomed (and detached) and calls
+         * op_done there. Leave the connection disarmed either way -- it was
+         * already disarmed at suspension time, and a re-disarm is harmless. */
+        op->resume_doomed = 1;
+        (void) ngx_http_cache_turbo_redis_walk_disarm_conn(op->peer.connection);
+        return;
+    }
+
+    /* Nothing else holds the op: release everything now. The disarm must
+     * happen first -- op_done closes the connection, and a timer still armed
+     * on a closed connection's read event is a use-after-free of its own. */
+    (void) ngx_http_cache_turbo_redis_walk_disarm_conn(op->peer.connection);
+
+    ngx_http_cache_turbo_redis_op_done(op);
+}
+
+
+/*
  * TODO-UNLINK-REPLY-WINDOW: advance the SSCAN tag walk past a page that has
  * been FULLY handled, given the cursor the server returned with it.
  *
@@ -4014,6 +4187,19 @@ ngx_http_cache_turbo_redis_sscan_resume(void *opaque, ngx_int_t rc)
     }
     op->suspended = 0;
 
+    /* CT-SSCAN-TERMINATE-LEAK: the request died while this page's UNLINK was in
+     * flight. This resume is the first moment nothing references the op any
+     * more -- the completion that called us is unwinding -- so it is where the
+     * deferred teardown belongs. NOT walk_finish: there is no request to
+     * finalize and no callback to call, and walk_finish would dereference both.
+     * op_done alone still releases the op pool, the Redis connection and its
+     * fd, and this zone's varidx_inflight account. */
+    if (op->detached) {
+        (void) ngx_http_cache_turbo_redis_walk_disarm_conn(op->peer.connection);
+        ngx_http_cache_turbo_redis_op_done(op);
+        return;
+    }
+
     if (rc != NGX_OK || op->resume_doomed) {
         /* scan_status only ever becomes NGX_OK at cursor "0", which this walk
          * has not reached, so it is already non-OK here. Set it explicitly
@@ -4186,18 +4372,11 @@ ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
                  * not that. sscan_advance re-arms it before the next page's
                  * write, so the bound applies to every page exactly as before.
                  */
-                if (rev->timer_set) {
-                    ngx_del_timer(rev);
-                }
-
-                /* ngx_del_event, NOT ngx_handle_read_event(NGX_CLOSE_EVENT):
-                 * the latter keeps the descriptor registered so a peer close is
-                 * still reported, which is precisely the wakeup that must not
-                 * happen here. Take the event off the poller outright;
-                 * sscan_advance puts it back before the next page. */
-                if (rev->active
-                    && ngx_del_event(rev, NGX_READ_EVENT, 0) != NGX_OK)
-                {
+                /* The disarm itself lives in walk_disarm_conn, shared with
+                 * the request-teardown detach: both need the read timer gone
+                 * and the read event off the poller, for the identical reason.
+                 * sscan_advance puts the event back before the next page. */
+                if (ngx_http_cache_turbo_redis_walk_disarm_conn(c) != NGX_OK) {
                     ngx_log_error(NGX_LOG_ERR, c->log, 0,
                                   "cache_turbo: L2 tag purge abandoned: the "
                                   "SSCAN connection could not be disarmed for "
@@ -4297,6 +4476,25 @@ ngx_http_cache_turbo_redis_walk_finish(
     ngx_http_cache_turbo_redis_walk_t       walk;
     ngx_int_t                               rc;
 
+    /* CT-SSCAN-TERMINATE-LEAK: the request this walk was parked on is GONE --
+     * walk_detach ran from r->pool's teardown. There is nothing to report the
+     * walk outcome to and nothing to finalize: cb lives in the freed r->pool
+     * and r is freed memory. Every remaining terminal path in this file routes
+     * through here, so this ONE guard is what makes "a detached walk never
+     * calls the callback and never finalizes a request" total -- and op_done
+     * still runs, so the pool, the connection/fd and varidx_inflight are
+     * released exactly as on any other terminal path. */
+    if (op->detached) {
+        /* The backoff classification is deliberately NOT consumed here. A
+         * terminated request says nothing about whether the peer is healthy,
+         * and arming the connect backoff off a client abort would penalize
+         * every later L2 op in this worker for a fault Redis never had. Every
+         * ATTACHED terminal below still consumes it, exactly as before. */
+        (void) ngx_http_cache_turbo_redis_walk_disarm_conn(op->peer.connection);
+        ngx_http_cache_turbo_redis_op_done(op);
+        return;
+    }
+
     /* Every successful/malformed reply passes through redis_fill(), which
      * clears unconnected on its first byte. A still-set flag here therefore
      * means the direct SMEMBERS/SCAN reader ended without any peer reply. */
@@ -4330,6 +4528,17 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
 {
     ngx_pool_t        *pool = op->pool;
     ngx_connection_t  *c = op->peer.connection;
+
+    /* CT-SSCAN-TERMINATE-LEAK: this op is about to die, so its r->pool cleanup
+     * must not survive it. Left registered, walk_detach would run at the
+     * request's own teardown against an op whose pool this call destroys.
+     * Neutralizing the handler is how the rest of this module cancels a pool
+     * cleanup (purge.c does the same for the UNLINK await token); the cleanup
+     * record itself belongs to r->pool and is released with it. */
+    if (op->req_cln != NULL) {
+        op->req_cln->handler = NULL;
+        op->req_cln = NULL;
+    }
 
     /* TODO-UNLINK-REPLY-WINDOW: deliver the REPLY outcome before anything is
      * torn down. Every terminal path of a drained op funnels here -- read_drain
