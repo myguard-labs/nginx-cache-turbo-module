@@ -1,5 +1,56 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Security: on nginx before 1.23 a response carrying duplicate
+       Content-Length, duplicate Transfer-Encoding, or both Content-Length
+       and Transfer-Encoding is no longer stored. Those versions accept such
+       ambiguous framing instead of rejecting it, so an origin or an
+       intermediary that disagreed with nginx about the message length could
+       have its interpretation cached and replayed to later clients. nginx
+       1.23 and newer reject these responses themselves and are unaffected.
+       The admin warm thread-completion path also again compiles and behaves
+       correctly against nginx before 1.25.4, which has no
+       r->main->terminated field.
+
+    *) Bugfix: a by-tag purge of a large tag index no longer fails outright.
+       The tag members were enumerated with a single SMEMBERS, so once the
+       reply exceeded the 128 KiB bounded-iteration ceiling -- roughly 1,800
+       members at the default key length -- the purge returned 500 with
+       {"purged":0,"l2":"incomplete"} and deleted nothing, permanently, until
+       the set shrank on its own. The walk is now a paginated SSCAN cursor
+       that deletes each page as it goes, under the same page cap and
+       wall-clock deadline as the whole-keyspace walk. Two deliberate
+       contract changes: an incomplete walk now reports the members it
+       actually dropped rather than 0, and because SSCAN may return a member
+       more than once and may miss a member added mid-walk, "purged" counts
+       members visited rather than distinct members. The status code, the
+       "l2":"incomplete" field, and a healthy purge's {"purged":N} reply are
+       unchanged, and an abandoned walk still retains the tag set key so the
+       purge stays retryable.
+
+    *) Bugfix: a by-tag purge now waits for each page's UNLINK reply before
+       removing that page's members from the tag index. The delete was
+       previously fire-and-forget, so a delete that reached Redis and then
+       failed -- an error reply, a connection dropped in flight, a read
+       timeout -- was indistinguishable from success. Tag membership is the
+       only pointer to an L2 object, so those objects were left resident and
+       serving, unreachable by every later purge of that tag, behind an HTTP
+       reply that reported success. A failed delete now abandons the walk and
+       retains the tag key, reporting 500 with "l2":"incomplete".
+
+    *) Bugfix: the whole-keyspace ?all=1 purge no longer reports success
+       when a page's delete never launched. The walk discarded the delete's
+       return value, so a page lost to an allocation failure or an armed
+       connect backoff still advanced the cursor to completion and reported a
+       clean purge while those objects remained in L2. Such a page now
+       abandons the walk and reports 500 with "l2":"incomplete".
+
+    *) Bugfix: a by-tag or whole-keyspace purge whose request is terminated
+       mid-walk no longer touches the freed request. The walk parks the
+       request with its own reference count, which nginx's termination
+       handler does not honour, so the remaining walk wakeups completed
+       against freed memory. The walk now detaches from the request when the
+       request pool is destroyed and tears itself down instead.
+
     *) Security: the built-in cache key again uses the validated Host plus the
        raw, unparsed request URI. An undocumented normalized default stripped
        session-like query parameters including sid and sessionid, so origins
@@ -18,9 +69,9 @@ Changes with the nginx-cache-turbo-module (unreleased)
        or future pagination. cache_turbo_max_size now consistently covers
        serialized metadata and headers as well as the body, and its accepted
        range is 1 byte through 64 MiB (`0` is rejected). Affects: all versions
-       through 1.2.0 when Redis is configured; a compromised or faulty Redis peer could
-       otherwise drive roughly 192 MiB of live pool/request allocations per
-       public L1 miss with a near-64 MiB value.
+       through 1.1.0 when Redis is configured; a compromised or faulty Redis
+       peer could otherwise drive roughly 192 MiB of live pool/request
+       allocations per public L1 miss with a near-64 MiB value.
 
     *) Security: GET and HEAD requests with a non-empty or chunked request
        body now bypass both cache lookup and storage. Requests carrying
