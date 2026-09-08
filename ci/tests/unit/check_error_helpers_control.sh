@@ -87,6 +87,20 @@ run_mutant CTRL_ERROR_HELPERS_REDIS_FINISH_DETACHED \
 run_mutant CTRL_ERROR_HELPERS_REDIS_RESUME_DETACHED \
 	"a DETACHED walk's resume must NOT enter sscan_advance" \
 	'Redis sscan-resume detached arm'
+# CT-SCANDEL-TERMINATE-LEAK: the SCAN-del walk's registration. Each assertion
+# named here is written by ONE exit of the guard -- the record count, the
+# handler the record carries, and the handler the failed-launch arm clears --
+# so none can be satisfied by the path the mutation leaves in place.
+run_mutant CTRL_ERROR_HELPERS_REDIS_SCANDEL_REGISTER \
+	'scan_del must register EXACTLY ONE r->pool cleanup' \
+	'Redis scan_del registers the request-teardown detach'
+run_mutant CTRL_ERROR_HELPERS_REDIS_SCANDEL_HANDLER \
+	'the registered record must carry walk_detach' \
+	'Redis scan_del arms the record with walk_detach'
+run_mutant CTRL_ERROR_HELPERS_REDIS_SCANDEL_CANCEL \
+	'a failed launch must NEUTRALIZE the record it registered' \
+	'Redis scan_del cancels its record on a failed launch'
+
 run_mutant CTRL_ERROR_HELPERS_REDIS_EXACT_FRAME \
 	'SSCAN must reject trailing RESP bytes before parsing' \
 	'Redis SSCAN exact-frame gate'
