@@ -2159,15 +2159,15 @@ def test_l2_tag_purge_over_legacy_reply_cap_now_succeeds(
     # to 12103. Asserting max() >= n asserts an exclusive enumeration nothing
     # serialises, and fails intermittently on correct behaviour.
     #
-    # What the pagination fix actually promises is that the set gets covered:
-    # every member is visited by SOME walk, and none is left behind. The sum is
-    # the coverage claim (>= n, not == n, because `purged` counts members
-    # VISITED rather than distinct -- see the module.h contract and the README
-    # caveat: SSCAN may return the same member on more than one page when the
-    # set is resized mid-walk, which eight concurrent walks provoke). The
-    # index- and object-deletion assertions below are what prove nothing was
-    # stranded; this one pins that the walks did the enumerating rather than
-    # the fixture quietly being empty.
+    # `purged` counts members VISITED rather than distinct (SSCAN may return
+    # the same member on more than one page when the set is resized mid-walk,
+    # which eight concurrent walks provoke -- see the module.h contract and
+    # the README caveat), so the sum can only be a floor, not a coverage
+    # proof: a run that double-counted heavily would still pass it without
+    # having enumerated the set. It has wide slack -- an observed run summed
+    # 12103 against n=2200 -- and exists only to reject a near-total failure
+    # to enumerate. What actually proves nothing was stranded is below: the
+    # tag key EXISTS check and the per-member object-deletion probes.
     assert sum(json.loads(body)["purged"] for _, body in replies) >= n, \
         f"the eight purges did not cover the over-cap set between them: {replies}"
 
@@ -2175,7 +2175,8 @@ def test_l2_tag_purge_over_legacy_reply_cap_now_succeeds(
         lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",
         timeout=10.0), \
         "the tag index survived: an over-cap tag is still unpurgeable"
-    for probe in (members[0], members[-1]):
+    probes = sorted(set(members[::200]) | {members[0], members[-1]})
+    for probe in probes:
         assert wait_for(lambda p=probe: _sscan_db(redis, "EXISTS", p) == "0",
                         timeout=10.0), \
             f"member {probe} survived: the over-cap purge did not delete objects"
