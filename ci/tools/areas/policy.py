@@ -2620,6 +2620,16 @@ def test_cor5_purge_reports_degraded_enumeration(
     assert counts["reissues"] >= counts["drops"], \
         f"self-heal did not catch up before the baseline check: {counts}"
 
+    # ORDERING DEPENDENCY: test_cor5_purge_reports_inflight_index_write must
+    # not have run yet in this zone. That test arms X-Cache-Turbo-Test-Varidx-Hold
+    # with no corresponding decrement, permanently pinning varidx_inflight >= 1.
+    # The enforcement point is the straight-line call order in run_all()
+    # (ci/tools/test_runtime.py), which calls this test before the inflight one
+    # and carries its own load-bearing-order comment -- not file order, and not
+    # a collection order: there is no pytest collection or shuffle here. If the
+    # two calls are ever swapped, the inflight gate below times out
+    # unconditionally, so the gate's failure message names this cause.
+
     # Baseline (no outstanding drop anywhere in the zone): a fully-enumerated
     # purge must NOT claim degraded.
     en_full = {"Accept-Language": "en"}
@@ -2630,6 +2640,72 @@ def test_cor5_purge_reports_degraded_enumeration(
     _, h0, _ = fetch(ng.port, "/cor5sh/full?v=al", headers=fr_full)
     _, h1, hh1 = fetch(ng.port, "/cor5sh/full?v=al", headers=fr_full)
     assert hh1.get("x-cache") == "HIT" and h1 == h0, "fr variant should cache"
+
+    # drops/reissues alone is necessary but NOT sufficient: purge.c's
+    # completeness snapshot (tp->pending_at_launch in ngx_http_cache_turbo_purge.c) is
+    # varidx_inflight + varidx_drops - varidx_reissues. The SADDs redis_launch()
+    # just accepted for the two /cor5sh/full fetches above are not drops and
+    # never touch drops/reissues, yet until L2 acks them (op_done) the index
+    # set the PURGE below is about to SMEMBERS may still be short a variant --
+    # exactly the false "degraded" this baseline is meant to rule out. This
+    # gate must run here, after that priming (it is what launches the
+    # inflight writes -- polling any earlier only drains unrelated, already-
+    # settled work) and immediately before the PURGE (the last point that can
+    # still observe writes the priming caused). Poll a SEPARATE, later
+    # request rather than either /cor5sh/full response: the varidx header is
+    # stamped by the header filter before the body filter's store path (and
+    # redis.c) increment inflight, so a fetch cannot report the increment it
+    # itself caused -- same skew the drops0/hf_confirm pair above already
+    # works around. The counter is zone-scoped, so this later, unrelated
+    # confirm request observes it correctly.
+    #
+    # The confirm URI is re-primed and asserted HIT immediately below. The
+    # re-prime is not itself inert: if the entry had expired, its MISS is a
+    # storing fetch that adds one varidx_inflight of its own. That is fine --
+    # this is a zone-quiescence gate, not a "drain exactly the /cor5sh/full
+    # writes" gate, so it drains that write too.
+    #
+    # What makes the *polls* inert is varidx_pending, not the HIT status: a
+    # fresh HIT on a node with the pending bit armed does launch a re-issue.
+    # This location is never fetched with the drop header, so the bit is never
+    # set here; it also self-limits, clearing atomically on the first
+    # consuming hit.
+    _, confirm0, _ = fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
+                            headers=en)
+    _, confirm1, hconfirm1 = fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
+                                    headers=en)
+    assert hconfirm1.get("x-cache") == "HIT" and confirm1 == confirm0, \
+        (f"degraded-confirm must be a fresh HIT before the inflight gate "
+         f"(varidx_pending is not armed here, so the HIT suppresses re-issues) -- "
+         f"got {hconfirm1}")
+
+    # timeout=5.0: wait_for scales the timeout by sanitizer_time_scale()
+    # (2.0 under ASan), so 5.0 becomes 10s -- ample headroom for drain latency.
+    # Normal draining takes milliseconds when SADDs are acked; this bound only
+    # has to cover slow L2 replication, not hung connections. The cache_turbo_valid
+    # 30s TTL is not the binding constraint (an expired poll would just become a
+    # storing MISS and the gate would converge one interval later), but it is an
+    # observable interaction if L2 latency demands raising this timeout later.
+    # last[0] carries the gate's final observation into the failure message, so
+    # the number reported is the one the gate actually gave up on rather than a
+    # fresh sample taken afterwards.
+    last = [-1]
+
+    def _drained() -> bool:
+        last[0] = _varidx(fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
+                                 headers=en)[2])["inflight"]
+        return last[0] == 0
+
+    assert wait_for(_drained, timeout=5.0), (
+        f"varidx_inflight never drained to 0 (last observed "
+        f"{last[0]}) -- zone not quiescent for baseline. Most likely "
+        f"cause: test_cor5_purge_reports_inflight_index_write ran before this "
+        f"test in the same zone. Its Hold fault increments varidx_inflight and "
+        f"deliberately never decrements it, pinning the counter permanently, so "
+        f"this gate can never drain. run_all() in ci/tools/test_runtime.py "
+        f"orders this test first; check that ordering before suspecting a "
+        f"module regression."
+    )
 
     s2, b2, _ = fetch_raw(ng.port, "/cor5sh/full?v=al", method="PURGE")
     assert s2 == 200, f"PURGE status {s2}"
@@ -2705,17 +2781,18 @@ def test_cor5_purge_reports_inflight_index_write(
 
 
 def _varidx(headers: dict) -> dict:
-    """Parse X-Cache-Turbo-Test-Varidx ("drops=<n>,reissues=<n>", TEST_FAULTS
-    only) into ints. A MISSING header is a hard failure, never a silent zero --
-    a test-only counter that vanished would otherwise read as "nothing
-    happened" and turn every assertion above into a tautology."""
+    """Parse X-Cache-Turbo-Test-Varidx ("drops=<n>,reissues=<n>,inflight=<n>",
+    TEST_FAULTS only) into ints. A MISSING header is a hard failure, never a
+    silent zero -- a test-only counter that vanished would otherwise read as
+    "nothing happened" and turn every assertion above into a tautology."""
     raw = headers.get("x-cache-turbo-test-varidx")
     assert raw, "X-Cache-Turbo-Test-Varidx header absent (non-TEST_FAULTS build?)"
     out = {}
     for field in raw.split(","):
         k, _, v = field.partition("=")
         out[k.strip()] = int(v)
-    assert "drops" in out and "reissues" in out, f"malformed varidx header: {raw!r}"
+    assert "drops" in out and "reissues" in out and "inflight" in out, \
+        f"malformed varidx header: {raw!r}"
     return out
 
 

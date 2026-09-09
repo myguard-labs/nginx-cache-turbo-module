@@ -2151,31 +2151,65 @@ def test_l2_tag_purge_over_legacy_reply_cap_now_succeeds(
         f"a tag past the legacy 128 KiB reply cap must now PURGE, not 500: {replies}"
     assert all("l2" not in json.loads(body) for _, body in replies), \
         f"paginated walk still reported an L2 problem: {replies}"
-    # Exactly one of the eight sees the full set; the rest race behind it and
-    # legitimately see fewer members (or none). Asserting every reply purged n
-    # would be asserting serialisation nobody promised. What must hold is that
-    # the winner saw them all.
+    # The eight walks CONSUME the set concurrently: each page a walk visits is
+    # UNLINKed and SREMed before the next walk reaches it, so the members are
+    # partitioned across the eight rather than enumerated whole by a winner.
+    # No single reply is therefore guaranteed to reach n -- an observed run
+    # reported a maximum of 1944 for a 2200-member set, with the eight summing
+    # to 12103.
     #
-    # >= n, not == n: `purged` counts members VISITED, not distinct members
-    # (see the module.h contract and the README caveat). SSCAN may return the
-    # same member on more than one page when the set is resized mid-walk, and
-    # eight concurrent walks over a set being emptied underneath them is
-    # precisely the shape that provokes it -- an observed run reported 2202 for
-    # a 2200-member set. Pinning == n would make this test fail on correct,
-    # documented behaviour. The upper bound is not asserted because the walk
-    # makes no promise about how many duplicates a rehash can produce; that the
-    # whole set was covered at least once is the claim.
-    assert max(json.loads(body)["purged"] for _, body in replies) >= n, \
-        f"no purge enumerated the whole over-cap set: {replies}"
+    # `purged` counts members VISITED rather than distinct (SSCAN may return
+    # the same member on more than one page when the set is resized mid-walk,
+    # which eight concurrent walks provoke -- see the module.h contract and
+    # the README caveat), so the sum can only be a floor, not a coverage
+    # proof: a run that double-counted heavily would still pass it without
+    # having enumerated the set. Its slack is wide by design and it exists
+    # only to reject a near-total failure to enumerate. What actually proves
+    # nothing was stranded is the tag key
+    # EXISTS check below and the per-member object-deletion probes via batched
+    # Redis EXISTS calls: we verify EVERY member in chunked batches to avoid
+    # 2200 individual round-trips while catching any stranded objects.
+    assert sum(json.loads(body)["purged"] for _, body in replies) >= n, \
+        f"the eight purges did not cover the over-cap set between them: {replies}"
 
     assert wait_for(
         lambda: _sscan_db(redis, "EXISTS", _sscan_tag_key(tag)) == "0",
         timeout=10.0), \
         "the tag index survived: an over-cap tag is still unpurgeable"
-    for probe in (members[0], members[-1]):
-        assert wait_for(lambda p=probe: _sscan_db(redis, "EXISTS", p) == "0",
-                        timeout=10.0), \
-            f"member {probe} survived: the over-cap purge did not delete objects"
+
+    # Batched because `_sscan_db` spawns a redis-cli SUBPROCESS per call: 2200
+    # single-key EXISTS calls would cost seconds per poll and could exhaust the
+    # deadline before the async deletions settle. On failure, report a bounded
+    # sample of survivors for debugging.
+    batch_size = 200
+    def check_all_members_deleted() -> bool:
+        for i in range(0, len(members), batch_size):
+            batch = members[i:i + batch_size]
+            # Redis EXISTS is variadic and returns count of existing keys
+            count = int(_sscan_db(redis, "EXISTS", *batch))
+            if count > 0:
+                return False
+        return True
+
+    def get_survivor_sample(limit: int = 10) -> list[str]:
+        # Scan ALL members in batches, not a prefix: a stranded member is as
+        # likely to sit at index 1900 as at index 3, and a prefix-only scan
+        # would report "Survivors: []" on precisely the failure this message
+        # exists to diagnose. Only the reported list is bounded.
+        survivors: list[str] = []
+        for i in range(0, len(members), batch_size):
+            batch = members[i:i + batch_size]
+            if int(_sscan_db(redis, "EXISTS", *batch)) == 0:
+                continue
+            for m in batch:
+                if _sscan_db(redis, "EXISTS", m) == "1":
+                    survivors.append(m)
+                    if len(survivors) >= limit:
+                        return survivors
+        return survivors
+
+    assert wait_for(check_all_members_deleted, timeout=10.0), \
+        f"some members survived: the over-cap purge did not delete all objects. Survivors: {get_survivor_sample()}"
     _sscan_db(redis, "FLUSHDB")
 
 
