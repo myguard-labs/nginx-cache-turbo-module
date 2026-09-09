@@ -779,9 +779,20 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
 
     s0, body0, h0 = fetch(ng.port, uri, headers)
     assert s0 == 200 and h0.get("x-ct-status") == "MISS", (s0, h0)
-    _s1, body1, h1 = fetch(ng.port, uri, headers)
-    assert h1.get("x-ct-status") == "HIT" and body1 == body0, (h1, body1, body0)
-    time.sleep(1.3)
+
+    def _warm_to_hit() -> bool:
+        """Establish a fresh HIT to prime the cache slot for the stale test."""
+        _status, body, response_headers = fetch(ng.port, uri, headers)
+        return (response_headers.get("x-ct-status") == "HIT"
+                and body == body0)
+
+    assert wait_for(_warm_to_hit, timeout=2.0, interval=0.05), \
+        "warm-up fetch never became a HIT"
+
+    # Sleep past the 1s TTL to cross the freshness boundary and trigger SWR.
+    # Scale the sleep through sanitizer_time_scale() so the stale window is
+    # crossed on ASan just as it is locally.
+    time.sleep(1.3 * sanitizer_time_scale())
 
     def _refresh_fired() -> bool:
         if origin.hits_for(path) > base + 1:
