@@ -1,8 +1,16 @@
-# sync-sha: 4ce150ea38729696deebe2a775367479cf61550c6e1899b52eac9b718480488f
+# sync-sha: c6f1951c670f1a923d256111d2f425b93dc6e3e4d9fc92daa852e299e26b7dd6
 name: Bump versions
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Ephemeral keyring for this job only, inside the workspace. The imported
+  # bump-bot key is created here instead of the runner's persistent
+  # ~/.gnupg, so disposal is deleting this directory rather than a
+  # fingerprint-targeted delete that can be skipped (see cleanup step).
+  # Scoped per run/attempt: github.workspace is stable across runs on this
+  # self-hosted runner, and cancel-in-progress means a superseded run's
+  # always()-gated cleanup can still be executing when the next run starts.
+  GNUPGHOME: ${{ github.workspace }}/.gnupg-bump-${{ github.run_id }}-${{ github.run_attempt }}
 
 on:
   schedule:
@@ -33,19 +41,88 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.BUMP_PR_TOKEN }}
         run: bash .github/scripts/compute-versions.sh
 
+      - name: Check for pin changes
+        id: check_changes
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- .github/versions.env; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "pins already current"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create ephemeral GNUPGHOME
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$GNUPGHOME"
+          chmod 0700 "$GNUPGHOME"
+
+      - name: Require the bump-bot signing key
+        # git commit -S below has no key to sign with unless one is imported
+        # first. Fail loudly and by name here instead of letting gpg hit a
+        # bare "No secret key" 128 deep inside the next step. The secrets are
+        # read via env, never interpolated into the script body, so the value
+        # never appears as a literal argv token. Gated on has_changes so a
+        # no-op week never touches the signing key at all.
+        if: steps.check_changes.outputs.has_changes == 'true'
+        env:
+          BUMP_GPG_PRIVATE_KEY: ${{ secrets.BUMP_GPG_PRIVATE_KEY }}
+          BUMP_GPG_PASSPHRASE: ${{ secrets.BUMP_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BUMP_GPG_PRIVATE_KEY" ]; then
+            echo "::error::secrets.BUMP_GPG_PRIVATE_KEY is not set; the bump job cannot produce a signed commit and will not fall back to an unsigned one." >&2
+            exit 1
+          fi
+          if [ -z "$BUMP_GPG_PASSPHRASE" ]; then
+            echo "::error::secrets.BUMP_GPG_PASSPHRASE is not set; the bump job cannot produce a signed commit and will not fall back to an unsigned one." >&2
+            exit 1
+          fi
+
+      - name: Import bump-bot signing key
+        id: import_gpg
+        if: steps.check_changes.outputs.has_changes == 'true'
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
+        with:
+          gpg_private_key: ${{ secrets.BUMP_GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.BUMP_GPG_PASSPHRASE }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+
       - name: Open update PR
+        if: steps.check_changes.outputs.has_changes == 'true'
         env:
           GH_TOKEN: ${{ secrets.BUMP_PR_TOKEN }}
           BUMP_PR_TOKEN: ${{ secrets.BUMP_PR_TOKEN }}
+          KEY_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
         run: |
           set -euo pipefail
-          git diff --quiet -- .github/versions.env && { echo "pins already current"; exit 0; }
           branch="bump/versions-$(date -u +%Y%m%d)"
-          git config user.name myguard-bump-bot
-          git config user.email actions@users.noreply.github.com
           git switch -c "$branch"
           git add .github/versions.env
           git commit -S -m "chore: refresh upstream version pins"
+          # verify-commit only proves *some* keyring key signed HEAD, not that
+          # it was the key we imported: a wrong-signer commit passes with rc=0
+          # and %G?=G. Hence the fingerprint comparison below. It runs second
+          # deliberately -- verify-commit failing first is what makes the
+          # empty-fingerprint case unreachable.
+          if ! git verify-commit HEAD; then
+            echo "::error::HEAD commit signature does not verify (bad, expired, or revoked key); refusing to push an unsigned bump commit." >&2
+            exit 1
+          fi
+          signer_fpr="$(git log -1 --format=%GF HEAD)"
+          primary_fpr="$(git log -1 --format=%GP HEAD)"
+          expected="$(printf '%s' "$KEY_FINGERPRINT" | tr '[:lower:]' '[:upper:]')"
+          signer_up="$(printf '%s' "$signer_fpr" | tr '[:lower:]' '[:upper:]')"
+          primary_up="$(printf '%s' "$primary_fpr" | tr '[:lower:]' '[:upper:]')"
+          # %GF is the signing (sub)key, %GP the primary key that owns it.
+          # A primary-key fingerprint can therefore match through %GP.
+          if [ "$signer_up" != "$expected" ] && [ "$primary_up" != "$expected" ]; then
+            echo "::error::HEAD commit was signed by fingerprint '$signer_fpr' (primary '$primary_fpr'), not the imported bump-bot key '$KEY_FINGERPRINT'; refusing to push a commit signed by an unexpected key." >&2
+            exit 1
+          fi
           askpass="$(mktemp)"
           trap 'rm -f "$askpass"' EXIT
           # Expanded when the generated helper runs, not while it is written.
@@ -58,3 +135,16 @@ jobs:
           [ -n "$existing" ] || gh pr create -R myguard-labs/nginx-cache-turbo-module --base main --head "$branch" \
             --title "chore: refresh upstream version pins" \
             --body "Automated weekly refresh of version and SHA-256 pins."
+
+      - name: Clean up imported signing key
+        # Runs on every path, including a cancelled or failed run: reaps the
+        # per-run gpg-agent and removes this run's ephemeral keyring. Nothing
+        # global is written any more, so there is no runner-wide config to
+        # unwind here.
+        if: always()
+        run: |
+          set -euo pipefail
+          # The agent holds the preset passphrase and unlocked key in memory.
+          # Deleting GNUPGHOME does not stop it, so kill it first.
+          gpgconf --kill gpg-agent || true
+          rm -rf "$GNUPGHOME"
