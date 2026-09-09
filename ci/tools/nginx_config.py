@@ -4282,6 +4282,24 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $request_uri;
             cache_turbo_valid    1s;
+            # Wide stale window: test_swr_preserves_auto_vary_language's
+            # multi-slot dance (priming two auto-Vary representations,
+            # sleeping past TTL, polling both) needs the object to stay
+            # inside its stale-serveable window the whole time -- past
+            # stale_until it falls to NGX_HTTP_CACHE_TURBO_ST_EXPIRED,
+            # which refetches SYNCHRONOUSLY on the client request instead
+            # of via the SWR background subrequest this test is about.
+            cache_turbo_stale_mult 8;  # max allowed
+            # This is the OTHER, unrelated way in past this same window:
+            # the c-2 PURGE-generation marker recheck (default 2s) fires
+            # independently of TTL/staleness whenever an already-resolved
+            # auto-Vary variant marker is older than this age, and ALSO
+            # forces the request down the ST_EXPIRED/L2-consult fall-through
+            # (ctx->vary_marker_revalidate) -- bypassing warm_one() just
+            # like a real expiry would, for a reason that has nothing to do
+            # with SWR. Off (0) here so only true TTL/stale_mult staleness
+            # drives this test's timing.
+            cache_turbo_vary_marker_revalidate 0;
             cache_turbo_beta     5000;
             cache_turbo_background_update on;
             cache_turbo_auto_vary on;

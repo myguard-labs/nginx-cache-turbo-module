@@ -771,17 +771,29 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     """ADMIN-WARM-AUTH-FORWARD boundary: the strict header allowlist is for
     admin warms only. An SWR refresh must retain Accept-Language so its response
     replaces the stale `en` variant rather than populating the absent-language
-    slot. A later `en` read must become a fresh HIT of the new generation."""
+    slot. A later `en` read must become a fresh HIT of the new generation --
+    and the absent-language slot, primed independently on the same key, must
+    NOT silently receive that refresh.
+
+    A single-language test cannot see this: with only `en` ever requested, a
+    refresh landing in either slot produces the same MISS -> HIT -> stale ->
+    refresh -> fresh-HIT sequence the assertions below observe. Priming a
+    second, absent-Accept-Language representation on the same cache key gives
+    slot segregation an observable: the `en` reader must see the NEW
+    generation while the absent-language reader keeps seeing its OWN,
+    untouched generation."""
     path = "/langswr?v=al"
     uri = "/avswr" + path
     headers = {"Accept-Language": "en"}
+    no_lang_headers: dict[str, str] = {}
     base = origin.hits_for(path)
 
     s0, body0, h0 = fetch(ng.port, uri, headers)
     assert s0 == 200 and h0.get("x-ct-status") == "MISS", (s0, h0)
 
     def _warm_to_hit() -> bool:
-        """Establish a fresh HIT to prime the cache slot for the stale test."""
+        """Establish a fresh HIT to prime the `en` cache slot for the stale
+        test."""
         _status, body, response_headers = fetch(ng.port, uri, headers)
         return (response_headers.get("x-ct-status") == "HIT"
                 and body == body0)
@@ -789,28 +801,97 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     assert wait_for(_warm_to_hit, timeout=2.0, interval=0.05), \
         "warm-up fetch never became a HIT"
 
+    # Prime the SECOND, absent-Accept-Language slot on the same cache key,
+    # WITHOUT letting it sit and cross its own staleness boundary: this fetch
+    # runs right before the `en` slot's sleep/refresh dance below, and is
+    # checked again immediately after, so its own SWR dice never gets an
+    # independent window to fire (that would legitimately refresh the
+    # absent-language slot to a NEW generation on its own, which is a
+    # different, correct behaviour this test is not about and must not
+    # confuse with a leak from the `en` refresh).
+    s0n, body0n, h0n = fetch(ng.port, uri, no_lang_headers)
+    assert s0n == 200 and h0n.get("x-ct-status") == "MISS", (s0n, h0n)
+    assert body0n != body0, \
+        ("absent-language priming fetch shared the `en` slot's body -- "
+         "auto-Vary is not segregating by Accept-Language at all", body0n, body0)
+
     # Sleep past the 1s TTL to cross the freshness boundary and trigger SWR.
     # Scale the sleep through sanitizer_time_scale() so the stale window is
-    # crossed on ASan just as it is locally.
+    # crossed on ASan just as it is locally. /avswr/ sets a generous
+    # cache_turbo_stale_mult so this stays well inside the stale-serveable
+    # window -- see the NOT-MISS-OR-EXPIRED guard below for why that matters.
     time.sleep(1.3 * sanitizer_time_scale())
 
+    def _not_expired_or_miss(response_headers: dict) -> None:
+        """`en`'s slot must stay on the SWR stale-serve/background-refresh
+        path for the whole test. Two other statuses look superficially
+        similar but are NOT that path, and would make the mutation-B control
+        (dropping Accept-Language in warm_rebuild_headers) silently
+        untestable:
+
+        MISS: the slot was evicted from L1 entirely (a true cold miss).
+
+        EXPIRED (NGX_HTTP_CACHE_TURBO_ST_EXPIRED, access.c): the entry was
+        found PAST its own stale_until -- past the whole stale-serveable
+        window, not just past the fresh TTL -- so access_l1 falls through to
+        the L2-consult/origin path and refetches SYNCHRONOUSLY on the
+        client's own request. That path never calls warm_one() /
+        warm_rebuild_headers() at all, so it cannot exercise (or catch a
+        regression of) the header-forwarding this test's docstring is
+        about."""
+        status = response_headers.get("x-ct-status")
+        assert status not in ("MISS", "EXPIRED"), \
+            (f"the `en` slot left the SWR stale-serve window (status="
+             f"{status!r}) and took a synchronous refetch path instead of "
+             "the background-refresh path this test needs -- tighten the "
+             "timing (TTL/stale window/poll cadence) so the object never "
+             "leaves the stale-serveable window", response_headers)
+
     def _refresh_fired() -> bool:
-        if origin.hits_for(path) > base + 1:
-            return True
-        fetch(ng.port, uri, headers)
-        return origin.hits_for(path) > base + 1
+        _status, _body, response_headers = fetch(ng.port, uri, headers)
+        _not_expired_or_miss(response_headers)
+        return origin.hits_for(path) > base + 2
 
     assert wait_for(_refresh_fired, timeout=2.0, interval=0.1), \
         "Accept-Language SWR refresh never reached the origin"
 
+    fresh_language_body: list[bytes] = []
+
     def _fresh_language_hit() -> bool:
         _status, body, response_headers = fetch(ng.port, uri, headers)
-        return (response_headers.get("x-ct-status") == "HIT"
-                and body != body0)
+        _not_expired_or_miss(response_headers)
+        if response_headers.get("x-ct-status") == "HIT" and body != body0:
+            fresh_language_body.append(body)
+            return True
+        return False
 
     assert wait_for(_fresh_language_hit, timeout=2.0, interval=0.1), \
         ("SWR refreshed a different auto-Vary slot; the `en` variant never "
          "became a fresh HIT")
+    body_en_fresh = fresh_language_body[-1]
+
+    # The oracle the docstring promises: the absent-language slot must NEVER
+    # receive the `en` refresh's body. If the refresh dropped Accept-Language
+    # and populated the absent-language slot instead of (or as well as) the
+    # `en` slot, this fetch would return body_en_fresh instead of the
+    # absent-language generation.
+    #
+    # This is checked as "never body_en_fresh", not "always body0n": the
+    # absent-language slot crossed the same 1s TTL as `en` by the time we
+    # reach here, so it is independently eligible for the SAME SWR dice on
+    # ITS OWN (correct, unrelated) refresh cycle -- a self-refresh that
+    # legitimately replaces body0n with a fresh, still absent-language,
+    # generation is not the leak this test guards against. Only landing the
+    # `en` refresh's own generation into this slot is.
+    s1n, body1n, h1n = fetch(ng.port, uri, no_lang_headers)
+    assert s1n == 200 and h1n.get("x-ct-status") in ("HIT", "STALE"), (s1n, h1n)
+    assert body1n != body_en_fresh, \
+        ("the `en` SWR refresh leaked into the absent-language slot: got "
+         "the `en` refresh's body instead of an absent-language generation",
+         body1n, body_en_fresh)
+    assert body1n != body0, \
+        ("the absent-language slot now matches the ORIGINAL `en` body -- "
+         "the two representations collapsed onto one slot", body1n, body0)
 
 
 def test_auto_vary_language_primary_subtag_shares(ng: Nginx,
