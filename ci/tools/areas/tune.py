@@ -794,6 +794,11 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
 
     s0, body0, h0 = fetch(ng.port, uri, headers)
     assert s0 == 200 and h0.get("x-ct-status") == "MISS", (s0, h0)
+    # The stale-serveable window starts HERE, at entry creation -- not at the
+    # sleep below. Everything between this point and the budget assertion
+    # (the warm-up wait_for and the two priming fetches) eats into it and
+    # must be counted, not just sleep+polls.
+    t_entry = time.monotonic()
 
     def _warm_to_hit() -> bool:
         """Establish a fresh HIT to prime the `en` cache slot for the stale
@@ -841,17 +846,19 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     #     refreshed body becoming a HIT) that complete in well under a second
     #     even instrumented.
     #
-    # Budget then fits with real headroom at BOTH scales:
-    #   scale 1.0: 1.15 + 1.0*2       = 3.15s  vs 8.0s window (4.85s spare)
-    #   scale 2.0: 1.15 + 1.0*2.0*2   = 5.15s  vs 8.0s window (2.85s spare)
-    # Fail loudly, up front, if that ever stops holding, instead of
-    # discovering it later as a flaky EXPIRED.
+    # Budget also counts elapsed_s (the warm-up wait_for plus the two priming
+    # fetches, measured from t_entry above) since that time is spent inside
+    # the same window before the sleep even starts. Fail loudly, up front, if
+    # that ever stops holding, instead of discovering it later as a flaky
+    # EXPIRED.
     sleep_s = 1.15
     poll_timeout_s = 1.0
     poll_budget_s = poll_timeout_s * sanitizer_time_scale() * 2
-    total_budget_s = sleep_s + poll_budget_s
+    elapsed_s = time.monotonic() - t_entry
+    total_budget_s = elapsed_s + sleep_s + poll_budget_s
     assert total_budget_s < AVSWR_STALE_WINDOW_S, \
-        (f"test timing budget ({total_budget_s:.2f}s: sleep={sleep_s:.2f}s + "
+        (f"test timing budget ({total_budget_s:.2f}s: setup={elapsed_s:.2f}s + "
+         f"sleep={sleep_s:.2f}s + "
          f"polls={poll_budget_s:.2f}s at scale "
          f"{sanitizer_time_scale():g}) does not fit inside the "
          f"{AVSWR_STALE_WINDOW_S:.2f}s stale-serveable window (fresh_ttl="
