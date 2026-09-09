@@ -2620,6 +2620,12 @@ def test_cor5_purge_reports_degraded_enumeration(
     assert counts["reissues"] >= counts["drops"], \
         f"self-heal did not catch up before the baseline check: {counts}"
 
+    # ORDERING DEPENDENCY: test_cor5_purge_reports_inflight_index_write must
+    # not have run yet in this zone. That test arms X-Cache-Turbo-Test-Varidx-Hold
+    # with no corresponding decrement, permanently pinning varidx_inflight >= 1.
+    # File order ensures this test runs first; if reordered, the inflight gate
+    # below would time out unconditionally.
+
     # Baseline (no outstanding drop anywhere in the zone): a fully-enumerated
     # purge must NOT claim degraded.
     en_full = {"Accept-Language": "en"}
@@ -2632,7 +2638,7 @@ def test_cor5_purge_reports_degraded_enumeration(
     assert hh1.get("x-cache") == "HIT" and h1 == h0, "fr variant should cache"
 
     # drops/reissues alone is necessary but NOT sufficient: purge.c's
-    # completeness snapshot (ngx_http_cache_turbo_purge.c:171-174) is
+    # completeness snapshot (tp->pending_at_launch in ngx_http_cache_turbo_purge.c) is
     # varidx_inflight + varidx_drops - varidx_reissues. The SADDs redis_launch()
     # just accepted for the two /cor5sh/full fetches above are not drops and
     # never touch drops/reissues, yet until L2 acks them (op_done) the index
@@ -2649,28 +2655,33 @@ def test_cor5_purge_reports_degraded_enumeration(
     # works around. The counter is zone-scoped, so this later, unrelated
     # confirm request observes it correctly.
     #
-    # The confirm URI is re-primed and asserted HIT immediately below, so the
-    # poll itself cannot store or launch an index write of its own: line
-    # 2590's fetch was a storing MISS and this location has auto_vary on with
-    # the "en" header carrying vary_bits, so that MISS launched its own SADD,
-    # and cache_turbo_valid 30s means the entry could have expired by now --
-    # relying on it staying a HIT is not something this test may assume.
+    # The confirm URI is re-primed and asserted HIT immediately below. The
+    # re-prime is not itself inert: if the entry had expired, its MISS is a
+    # storing fetch that adds one varidx_inflight of its own. That is fine --
+    # this is a zone-quiescence gate, not a "drain exactly the /cor5sh/full
+    # writes" gate, so it drains that write too.
+    #
+    # What makes the *polls* inert is varidx_pending, not the HIT status: a
+    # fresh HIT on a node with the pending bit armed does launch a re-issue.
+    # This location is never fetched with the drop header, so the bit is never
+    # set here; it also self-limits, clearing atomically on the first
+    # consuming hit.
     _, confirm0, _ = fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
                             headers=en)
     _, confirm1, hconfirm1 = fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
                                     headers=en)
     assert hconfirm1.get("x-cache") == "HIT" and confirm1 == confirm0, \
-        (f"degraded-confirm must be a fresh HIT before the inflight gate, "
-         f"else the gate's own polls would store and re-launch a SADD -- "
+        (f"degraded-confirm must be a fresh HIT before the inflight gate "
+         f"(varidx_pending is not armed here, so the HIT suppresses re-issues) -- "
          f"got {hconfirm1}")
 
-    # timeout=5.0, not 10.0: wait_for scales the timeout by
-    # sanitizer_time_scale() (2.0 under ASan), so 10.0 would give the gate a
-    # 20s deadline against the 30s cache_turbo_valid of the entry re-primed
-    # just above -- a gate running near its deadline would be polling an
-    # entry close to expiry. 5.0 scales to 10s and keeps that margin wide.
-    # Draining takes milliseconds when the SADDs are acked normally; this
-    # bound only has to cover a slow L2, not a hung one.
+    # timeout=5.0: wait_for scales the timeout by sanitizer_time_scale()
+    # (2.0 under ASan), so 5.0 becomes 10s -- ample headroom for drain latency.
+    # Normal draining takes milliseconds when SADDs are acked; this bound only
+    # has to cover slow L2 replication, not hung connections. The cache_turbo_valid
+    # 30s TTL is not the binding constraint (an expired poll would just become a
+    # storing MISS and the gate would converge one interval later), but it is an
+    # observable interaction if L2 latency demands raising this timeout later.
     assert wait_for(
         lambda: _varidx(fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
                                headers=en)[2])["inflight"] == 0,
