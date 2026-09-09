@@ -2156,17 +2156,16 @@ def test_l2_tag_purge_over_legacy_reply_cap_now_succeeds(
     # partitioned across the eight rather than enumerated whole by a winner.
     # No single reply is therefore guaranteed to reach n -- an observed run
     # reported a maximum of 1944 for a 2200-member set, with the eight summing
-    # to 12103. Asserting max() >= n asserts an exclusive enumeration nothing
-    # serialises, and fails intermittently on correct behaviour.
+    # to 12103.
     #
     # `purged` counts members VISITED rather than distinct (SSCAN may return
     # the same member on more than one page when the set is resized mid-walk,
     # which eight concurrent walks provoke -- see the module.h contract and
     # the README caveat), so the sum can only be a floor, not a coverage
     # proof: a run that double-counted heavily would still pass it without
-    # having enumerated the set. It has wide slack -- an observed run summed
-    # 12103 against n=2200 -- and exists only to reject a near-total failure
-    # to enumerate. What actually proves nothing was stranded is the tag key
+    # having enumerated the set. Its slack is wide by design and it exists
+    # only to reject a near-total failure to enumerate. What actually proves
+    # nothing was stranded is the tag key
     # EXISTS check below and the per-member object-deletion probes via batched
     # Redis EXISTS calls: we verify EVERY member in chunked batches to avoid
     # 2200 individual round-trips while catching any stranded objects.
