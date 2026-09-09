@@ -29,6 +29,27 @@ import pathlib
 # via `ng.memcached_port + 1` -- and only found out ~12 minutes into a CI run
 # via "OSError: [Errno 98] Address already in use". _check_port_registry()
 # turns that into an immediate, named startup failure instead.
+# /avswr/'s SWR timing contract, exported so
+# test_swr_preserves_auto_vary_language() derives its timing-budget assertion
+# from the fixture instead of restating 1s/8 as literals that silently drift
+# when this location is edited. Both values are emitted into the generated
+# config below and re-exported through test_runtime_base.
+#
+# These are WALL-CLOCK seconds inside nginx: they do NOT scale under a
+# sanitizer build, because the module's TTL bookkeeping is real time. That is
+# precisely why the test's own budget (sleep + poll timeouts) must fit inside
+# AVSWR_STALE_WINDOW_S at the LARGEST scale the suite ever runs at, not at
+# scale 1.0.
+AVSWR_FRESH_TTL_S: float = 1.0
+# NGX_HTTP_CACHE_TURBO_STALE_MULT_MAX (src/ngx_http_cache_turbo_module.h) is 8;
+# this is already at that ceiling, so the serveable window CANNOT be widened
+# further by raising the multiplier.
+AVSWR_STALE_MULT: int = 8
+# Serveable window is TOTAL from entry creation -- fresh_ttl * stale_mult, NOT
+# fresh_ttl plus a separate stale budget. See ngx_http_cache_turbo_stale_ttl()
+# (src/ngx_http_cache_turbo_swr.c).
+AVSWR_STALE_WINDOW_S: float = AVSWR_FRESH_TTL_S * AVSWR_STALE_MULT
+
 PORT_OFFSETS: dict[str, int] = {
     "origin": 11,
     "redis": 21,
@@ -4281,7 +4302,7 @@ http {{
         location /avswr/ {{
             cache_turbo          main;
             cache_turbo_key      $request_uri;
-            cache_turbo_valid    1s;
+            cache_turbo_valid    {AVSWR_FRESH_TTL_S:g}s;
             # Wide stale window: test_swr_preserves_auto_vary_language's
             # multi-slot dance (priming two auto-Vary representations,
             # sleeping past TTL, polling both) needs the object to stay
@@ -4289,7 +4310,7 @@ http {{
             # stale_until it falls to NGX_HTTP_CACHE_TURBO_ST_EXPIRED,
             # which refetches SYNCHRONOUSLY on the client request instead
             # of via the SWR background subrequest this test is about.
-            cache_turbo_stale_mult 8;  # max allowed
+            cache_turbo_stale_mult {AVSWR_STALE_MULT};  # max allowed
             # This is the OTHER, unrelated way in past this same window:
             # the c-2 PURGE-generation marker recheck (default 2s) fires
             # independently of TTL/staleness whenever an already-resolved

@@ -447,6 +447,9 @@ def fetch_raw(port: int, path: str, method: str = "GET",
 # `from test_runtime_base import *` chain keeps resolving the bare name --
 # star-import does not chain transitively through this module.
 from nginx_config import (  # re-exported for the areas; F401 via ruff.toml
+    AVSWR_FRESH_TTL_S,
+    AVSWR_STALE_MULT,
+    AVSWR_STALE_WINDOW_S,
     PORT_OFFSETS,
     _errlog_level,
     nginx_config,

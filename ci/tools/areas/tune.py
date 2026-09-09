@@ -822,29 +822,45 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     # /avswr/'s serveable window is TOTAL from entry creation
     # (fresh_ttl * stale_mult), not fresh_ttl PLUS a separate stale budget --
     # see ngx_http_cache_turbo_stale_ttl() (src/ngx_http_cache_turbo_swr.c).
-    # Fail loudly, up front, if this test's own timing budget cannot fit
-    # inside that window instead of discovering it later as a flaky EXPIRED.
-    fresh_ttl_s = 1.0
-    stale_mult = 8.0
-    stale_window_s = fresh_ttl_s * stale_mult
-    sleep_s = 1.3 * sanitizer_time_scale()
-    # Both wait_for() calls below scale their own 2.0s timeout the same way.
-    poll_budget_s = 2.0 * sanitizer_time_scale() * 2
+    # Both constants are imported from the fixture that emits the directives
+    # (AVSWR_* in ci/tools/nginx_config.py), so editing the location updates
+    # this budget instead of letting a restated literal drift out of sync.
+    #
+    # THE WINDOW DOES NOT SCALE. It is nginx wall-clock: under a sanitizer
+    # build the module still expires the entry after AVSWR_STALE_WINDOW_S real
+    # seconds. Anything on this test's side that scales therefore eats the
+    # ASan margin rather than preserving it, so:
+    #
+    #   * the sleep is UNSCALED. Its only job is to cross a wall-clock
+    #     AVSWR_FRESH_TTL_S boundary, and 1.15s crosses a 1s TTL at every
+    #     scale. Scaling it (the pre-fix code used 1.3 * scale) bought nothing
+    #     and cost 1.3s of window under ASan.
+    #   * the two wait_for() timeouts are 1.0s, not 2.0s. wait_for() scales
+    #     its timeout internally, so 1.0s is already 2.0s under ASan for
+    #     operations (a background SWR refresh reaching the origin, and the
+    #     refreshed body becoming a HIT) that complete in well under a second
+    #     even instrumented.
+    #
+    # Budget then fits with real headroom at BOTH scales:
+    #   scale 1.0: 1.15 + 1.0*2       = 3.15s  vs 8.0s window (4.85s spare)
+    #   scale 2.0: 1.15 + 1.0*2.0*2   = 5.15s  vs 8.0s window (2.85s spare)
+    # Fail loudly, up front, if that ever stops holding, instead of
+    # discovering it later as a flaky EXPIRED.
+    sleep_s = 1.15
+    poll_timeout_s = 1.0
+    poll_budget_s = poll_timeout_s * sanitizer_time_scale() * 2
     total_budget_s = sleep_s + poll_budget_s
-    assert total_budget_s < stale_window_s, \
+    assert total_budget_s < AVSWR_STALE_WINDOW_S, \
         (f"test timing budget ({total_budget_s:.2f}s: sleep={sleep_s:.2f}s + "
-         f"polls={poll_budget_s:.2f}s) does not fit inside the "
-         f"{stale_window_s:.2f}s stale-serveable window (fresh_ttl="
-         f"{fresh_ttl_s}s * stale_mult={stale_mult}) -- the object can expire "
-         "mid-test before the assertions below ever run", total_budget_s,
-         stale_window_s)
+         f"polls={poll_budget_s:.2f}s at scale "
+         f"{sanitizer_time_scale():g}) does not fit inside the "
+         f"{AVSWR_STALE_WINDOW_S:.2f}s stale-serveable window (fresh_ttl="
+         f"{AVSWR_FRESH_TTL_S}s * stale_mult={AVSWR_STALE_MULT}) -- the "
+         "object can expire mid-test before the assertions below ever run",
+         total_budget_s, AVSWR_STALE_WINDOW_S)
 
-    # Sleep past the 1s TTL to cross the freshness boundary and trigger SWR.
-    # Scale the sleep through sanitizer_time_scale() so the stale window is
-    # crossed on ASan just as it is locally. /avswr/ sets a generous
-    # cache_turbo_stale_mult so this stays well inside the stale-serveable
-    # window -- see the NOT-MISS-OR-EXPIRED guard below for why that matters,
-    # and the budget assertion above for why that margin actually holds.
+    # Cross the wall-clock fresh boundary to trigger SWR. Deliberately not
+    # scaled -- see the budget block above.
     time.sleep(sleep_s)
 
     def _not_expired_or_miss(response_headers: dict) -> None:
@@ -878,7 +894,7 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
         _not_expired_or_miss(response_headers)
         return origin.hits_for(path) > after_priming
 
-    assert wait_for(_refresh_fired, timeout=2.0, interval=0.1), \
+    assert wait_for(_refresh_fired, timeout=poll_timeout_s, interval=0.1), \
         "Accept-Language SWR refresh never reached the origin"
 
     fresh_language_body: list[bytes] = []
@@ -891,7 +907,7 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
             return True
         return False
 
-    assert wait_for(_fresh_language_hit, timeout=2.0, interval=0.1), \
+    assert wait_for(_fresh_language_hit, timeout=poll_timeout_s, interval=0.1), \
         ("SWR refreshed a different auto-Vary slot; the `en` variant never "
          "became a fresh HIT")
     # The two-representation dance above (priming an absent-language slot,
