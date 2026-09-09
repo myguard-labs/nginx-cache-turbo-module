@@ -811,13 +811,11 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
         "warm-up fetch never became a HIT"
 
     # Prime the SECOND, absent-Accept-Language slot on the same cache key.
-    # This fetch is checked again immediately below (line ~813) before any
-    # time has passed, so at THAT point its own SWR dice has not had an
-    # independent window to fire yet. By the time this slot is re-read after
-    # the sleep/refresh dance further down, it HAS crossed its own 1s TTL and
-    # is independently eligible for its own (correct, unrelated) refresh
-    # cycle -- see the note near that later read for why that self-refresh
-    # must not be confused with a leak from the `en` refresh.
+    # Its ONLY job is the MISS + distinct-body assertion immediately below:
+    # that is what proves auto-Vary segregates the two representations at
+    # all. The slot is never read again -- see the note at the end of this
+    # test for why the later absent-language assertion was dropped -- so its
+    # own independent SWR/TTL behaviour after this point is irrelevant here.
     s0n, body0n, h0n = fetch(ng.port, uri, no_lang_headers)
     assert s0n == 200 and h0n.get("x-ct-status") == "MISS", (s0n, h0n)
     assert body0n != body0, \
@@ -904,15 +902,11 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     assert wait_for(_refresh_fired, timeout=poll_timeout_s, interval=0.1), \
         "Accept-Language SWR refresh never reached the origin"
 
-    fresh_language_body: list[bytes] = []
-
     def _fresh_language_hit() -> bool:
         _status, body, response_headers = fetch(ng.port, uri, headers)
         _not_expired_or_miss(response_headers)
-        if response_headers.get("x-ct-status") == "HIT" and body != body0:
-            fresh_language_body.append(body)
-            return True
-        return False
+        return (response_headers.get("x-ct-status") == "HIT"
+                and body != body0)
 
     assert wait_for(_fresh_language_hit, timeout=poll_timeout_s, interval=0.1), \
         ("SWR refreshed a different auto-Vary slot; the `en` variant never "
