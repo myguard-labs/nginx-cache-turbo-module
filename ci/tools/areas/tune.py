@@ -769,37 +769,161 @@ def test_auto_vary_language(ng: Nginx, origin: Origin) -> None:
 
 def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     """ADMIN-WARM-AUTH-FORWARD boundary: the strict header allowlist is for
-    admin warms only. An SWR refresh must retain Accept-Language so its response
-    replaces the stale `en` variant rather than populating the absent-language
-    slot. A later `en` read must become a fresh HIT of the new generation."""
+    admin warms only. An SWR refresh must retain Accept-Language so its
+    response replaces the stale `en` variant rather than populating the
+    absent-language slot.
+
+    A single-language test cannot see this: with only `en` ever requested, a
+    refresh landing in either slot produces the same MISS -> HIT -> stale ->
+    refresh -> fresh-HIT sequence the assertions below observe. Priming a
+    second, absent-Accept-Language representation on the same cache key gives
+    slot segregation an observable: `_fresh_language_hit` below requires the
+    `en`-header fetch to return a fresh HIT whose body differs from `body0`
+    (the ORIGINAL `en` body). Origin bodies are bare global `gen-{n}`
+    counters with no language identity, so this is satisfied by the `en`
+    slot getting ANY new generation, INCLUDING one that leaked in from the
+    absent-language slot's own refresh -- it is not a standalone leak
+    detector. It still means a refresh landing in the wrong slot (leaving
+    the `en` slot never refreshed) times this test out here, which is the
+    only way this test's timing can actually distinguish "the `en` refresh
+    happened" from "it did not"."""
     path = "/langswr?v=al"
     uri = "/avswr" + path
     headers = {"Accept-Language": "en"}
-    base = origin.hits_for(path)
+    no_lang_headers: dict[str, str] = {}
 
     s0, body0, h0 = fetch(ng.port, uri, headers)
     assert s0 == 200 and h0.get("x-ct-status") == "MISS", (s0, h0)
-    _s1, body1, h1 = fetch(ng.port, uri, headers)
-    assert h1.get("x-ct-status") == "HIT" and body1 == body0, (h1, body1, body0)
-    time.sleep(1.3)
+    # The stale-serveable window starts HERE, at entry creation -- not at the
+    # sleep below. Everything between this point and the budget assertion
+    # (the warm-up wait_for and the two priming fetches) eats into it and
+    # must be counted, not just sleep+polls.
+    t_entry = time.monotonic()
+
+    def _warm_to_hit() -> bool:
+        """Establish a fresh HIT to prime the `en` cache slot for the stale
+        test."""
+        _status, body, response_headers = fetch(ng.port, uri, headers)
+        return (response_headers.get("x-ct-status") == "HIT"
+                and body == body0)
+
+    assert wait_for(_warm_to_hit, timeout=2.0, interval=0.05), \
+        "warm-up fetch never became a HIT"
+
+    # Prime the SECOND, absent-Accept-Language slot on the same cache key.
+    # Its ONLY job is the MISS + distinct-body assertion immediately below:
+    # that is what proves auto-Vary segregates the two representations at
+    # all. The slot is never read again -- see the note at the end of this
+    # test for why the later absent-language assertion was dropped -- so its
+    # own independent SWR/TTL behaviour after this point is irrelevant here.
+    s0n, body0n, h0n = fetch(ng.port, uri, no_lang_headers)
+    assert s0n == 200 and h0n.get("x-ct-status") == "MISS", (s0n, h0n)
+    assert body0n != body0, \
+        ("absent-language priming fetch shared the `en` slot's body -- "
+         "auto-Vary is not segregating by Accept-Language at all", body0n, body0)
+
+    # /avswr/'s serveable window is TOTAL from entry creation
+    # (fresh_ttl * stale_mult), not fresh_ttl PLUS a separate stale budget --
+    # see ngx_http_cache_turbo_stale_ttl() (src/ngx_http_cache_turbo_swr.c).
+    # Both constants are imported from the fixture that emits the directives
+    # (AVSWR_* in ci/tools/nginx_config.py), so editing the location updates
+    # this budget instead of letting a restated literal drift out of sync.
+    #
+    # THE WINDOW DOES NOT SCALE. It is nginx wall-clock: under a sanitizer
+    # build the module still expires the entry after AVSWR_STALE_WINDOW_S real
+    # seconds. Anything on this test's side that scales therefore eats the
+    # ASan margin rather than preserving it, so:
+    #
+    #   * the sleep is UNSCALED. Its only job is to cross a wall-clock
+    #     AVSWR_FRESH_TTL_S boundary, and 1.15s crosses a 1s TTL at every
+    #     scale. Scaling it (the pre-fix code used 1.3 * scale) bought nothing
+    #     and cost 1.3s of window under ASan.
+    #   * the two wait_for() timeouts are 1.0s, not 2.0s. wait_for() scales
+    #     its timeout internally, so 1.0s is already 2.0s under ASan for
+    #     operations (a background SWR refresh reaching the origin, and the
+    #     refreshed body becoming a HIT) that complete in well under a second
+    #     even instrumented.
+    #
+    # Budget also counts elapsed_s (the warm-up wait_for plus the two priming
+    # fetches, measured from t_entry above) since that time is spent inside
+    # the same window before the sleep even starts. Fail loudly, up front, if
+    # that ever stops holding, instead of discovering it later as a flaky
+    # EXPIRED.
+    sleep_s = 1.15
+    poll_timeout_s = 1.0
+    poll_budget_s = poll_timeout_s * sanitizer_time_scale() * 2
+    elapsed_s = time.monotonic() - t_entry
+    total_budget_s = elapsed_s + sleep_s + poll_budget_s
+    assert total_budget_s < AVSWR_STALE_WINDOW_S, \
+        (f"test timing budget ({total_budget_s:.2f}s: setup={elapsed_s:.2f}s + "
+         f"sleep={sleep_s:.2f}s + "
+         f"polls={poll_budget_s:.2f}s at scale "
+         f"{sanitizer_time_scale():g}) does not fit inside the "
+         f"{AVSWR_STALE_WINDOW_S:.2f}s stale-serveable window (fresh_ttl="
+         f"{AVSWR_FRESH_TTL_S}s * stale_mult={AVSWR_STALE_MULT}) -- the "
+         "object can expire mid-test before the assertions below ever run",
+         total_budget_s, AVSWR_STALE_WINDOW_S)
+
+    # Cross the wall-clock fresh boundary to trigger SWR. Deliberately not
+    # scaled -- see the budget block above.
+    time.sleep(sleep_s)
+
+    def _not_expired_or_miss(response_headers: dict) -> None:
+        """`en`'s slot must stay on the SWR stale-serve/background-refresh
+        path for the whole test. Two other statuses look superficially
+        similar but are NOT that path, and would make the mutation-B control
+        (dropping Accept-Language in warm_rebuild_headers) silently
+        untestable:
+
+        MISS: the slot was evicted from L1 entirely (a true cold miss).
+
+        EXPIRED (NGX_HTTP_CACHE_TURBO_ST_EXPIRED, access.c): the entry was
+        found PAST its own stale_until -- past the whole stale-serveable
+        window, not just past the fresh TTL -- so access_l1 falls through to
+        the L2-consult/origin path and refetches SYNCHRONOUSLY on the
+        client's own request. That path never calls warm_one() /
+        warm_rebuild_headers() at all, so it cannot exercise (or catch a
+        regression of) the header-forwarding this test's docstring is
+        about."""
+        status = response_headers.get("x-ct-status")
+        assert status not in ("MISS", "EXPIRED"), \
+            (f"the `en` slot left the SWR stale-serve window (status="
+             f"{status!r}): the object aged out of the stale-serveable "
+             "window and took the synchronous refetch path instead of the "
+             "background-refresh path this test needs", response_headers)
+
+    after_priming = origin.hits_for(path)
 
     def _refresh_fired() -> bool:
-        if origin.hits_for(path) > base + 1:
-            return True
-        fetch(ng.port, uri, headers)
-        return origin.hits_for(path) > base + 1
+        _status, _body, response_headers = fetch(ng.port, uri, headers)
+        _not_expired_or_miss(response_headers)
+        return origin.hits_for(path) > after_priming
 
-    assert wait_for(_refresh_fired, timeout=2.0, interval=0.1), \
+    assert wait_for(_refresh_fired, timeout=poll_timeout_s, interval=0.1), \
         "Accept-Language SWR refresh never reached the origin"
 
     def _fresh_language_hit() -> bool:
         _status, body, response_headers = fetch(ng.port, uri, headers)
+        _not_expired_or_miss(response_headers)
         return (response_headers.get("x-ct-status") == "HIT"
                 and body != body0)
 
-    assert wait_for(_fresh_language_hit, timeout=2.0, interval=0.1), \
+    assert wait_for(_fresh_language_hit, timeout=poll_timeout_s, interval=0.1), \
         ("SWR refreshed a different auto-Vary slot; the `en` variant never "
          "became a fresh HIT")
+    # The two-representation dance above (priming an absent-language slot,
+    # then driving the `en` slot through SWR) is what actually exercises
+    # slot segregation: if the `en` refresh's own generation had leaked into
+    # the absent-language slot, `_fresh_language_hit` above would already
+    # have failed, because that HIT is scoped to the `en`-header fetch and
+    # requires a body distinct from `body0`. A further "does the
+    # absent-language slot carry the `en` refresh's body" assertion here was
+    # measured (by rebuilding with Accept-Language dropped from
+    # warm_rebuild_headers, and separately with cache_turbo_auto_vary off)
+    # to never be reached: both controls already go red earlier, at the
+    # priming MISS assertion and at _fresh_language_hit above respectively.
+    # An assertion that never gets to run is not an oracle, so it is not
+    # kept here -- see PR #498 review for the measurement.
 
 
 def test_auto_vary_language_primary_subtag_shares(ng: Nginx,
