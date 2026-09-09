@@ -2623,8 +2623,12 @@ def test_cor5_purge_reports_degraded_enumeration(
     # ORDERING DEPENDENCY: test_cor5_purge_reports_inflight_index_write must
     # not have run yet in this zone. That test arms X-Cache-Turbo-Test-Varidx-Hold
     # with no corresponding decrement, permanently pinning varidx_inflight >= 1.
-    # File order ensures this test runs first; if reordered, the inflight gate
-    # below would time out unconditionally.
+    # The enforcement point is the straight-line call order in run_all()
+    # (ci/tools/test_runtime.py), which calls this test before the inflight one
+    # and carries its own load-bearing-order comment -- not file order, and not
+    # a collection order: there is no pytest collection or shuffle here. If the
+    # two calls are ever swapped, the inflight gate below times out
+    # unconditionally, so the gate's failure message names this cause.
 
     # Baseline (no outstanding drop anywhere in the zone): a fully-enumerated
     # purge must NOT claim degraded.
@@ -2682,11 +2686,26 @@ def test_cor5_purge_reports_degraded_enumeration(
     # 30s TTL is not the binding constraint (an expired poll would just become a
     # storing MISS and the gate would converge one interval later), but it is an
     # observable interaction if L2 latency demands raising this timeout later.
-    assert wait_for(
-        lambda: _varidx(fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
-                               headers=en)[2])["inflight"] == 0,
-        timeout=5.0,
-    ), "varidx_inflight never drained to 0 -- zone not quiescent for baseline"
+    # last[0] carries the gate's final observation into the failure message, so
+    # the number reported is the one the gate actually gave up on rather than a
+    # fresh sample taken afterwards.
+    last = [-1]
+
+    def _drained() -> bool:
+        last[0] = _varidx(fetch(ng.port, "/cor5sh/degraded-confirm?v=al",
+                                 headers=en)[2])["inflight"]
+        return last[0] == 0
+
+    assert wait_for(_drained, timeout=5.0), (
+        f"varidx_inflight never drained to 0 (last observed "
+        f"{last[0]}) -- zone not quiescent for baseline. Most likely "
+        f"cause: test_cor5_purge_reports_inflight_index_write ran before this "
+        f"test in the same zone. Its Hold fault increments varidx_inflight and "
+        f"deliberately never decrements it, pinning the counter permanently, so "
+        f"this gate can never drain. run_all() in ci/tools/test_runtime.py "
+        f"orders this test first; check that ordering before suspecting a "
+        f"module regression."
+    )
 
     s2, b2, _ = fetch_raw(ng.port, "/cor5sh/full?v=al", method="PURGE")
     assert s2 == 200, f"PURGE status {s2}"
