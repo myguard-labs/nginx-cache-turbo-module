@@ -77,31 +77,56 @@ for f in "${files[@]}"; do
     [ -f "$f" ] || continue
 
     awk -v file="$f" '
-        # Drop comments: the sources discuss "z->shpool->mutex" in prose all
-        # over, and a lint that fires on the explanation of an invariant is a
-        # lint people delete.
-        { line = $0; sub(/\/\/.*/, "", line) }
-        line ~ /^[[:space:]]*\*/   { next }
-        line ~ /^[[:space:]]*\/\*/ { next }
+        # Cut a // line comment, but only where the // is real code: a // inside
+        # a "string" or a char literal (an http:// URL) is not a comment, and
+        # cutting there would hide everything after it on the logical line.
+        # An escaped character inside a literal never closes it.
+        function strip_cmt(s,    i, n, ch, q) {
+            n = length(s); q = ""
+            for (i = 1; i <= n; i++) {
+                ch = substr(s, i, 1)
+                if (q != "") {
+                    if (ch == "\\") i++
+                    else if (ch == q) q = ""
+                } else if (ch == "\"" || ch == "\047") q = ch
+                else if (ch == "/" && substr(s, i + 1, 1) == "/") return substr(s, 1, i - 1)
+            }
+            return s
+        }
+        # C translation phase 2 first: a physical line whose last character is
+        # a backslash (GCC also accepts backslash plus trailing blanks) is
+        # spliced onto the next line. A token split by a continuation
+        # (z->sh\<newline>pool) is therefore seen whole, and a
+        # backslash-continued // comment swallows the next physical line. The
+        # joined logical line is judged once and reported at its FIRST physical
+        # line; a partial logical line left at EOF is flushed in END.
+        function judge(line, lnum,    probe, trimmed) {
+            # Drop comments: the sources discuss "z->shpool->mutex" in prose
+            # all over, and a lint that fires on the explanation of an
+            # invariant is a lint people delete.
+            line = strip_cmt(line)
+            if (line ~ /^[[:space:]]*\*/)   return
+            if (line ~ /^[[:space:]]*\/\*/) return
 
-        # Track whether we are inside shm_init_zone(), the one function that is
-        # allowed to name ->sh / ->shpool -- and only on its resolver-derived
-        # `st`, which the second pattern below still holds it to.
-        /^ngx_http_cache_turbo_shm_init_zone\(/ { in_init = 1 }
-        in_init && /^}/                         { in_init = 0; next }
+            # Track whether we are inside shm_init_zone(), the one function
+            # that is allowed to name ->sh / ->shpool -- and only on its
+            # resolver-derived `st`, which the second pattern below still holds
+            # it to.
+            if (line ~ /^ngx_http_cache_turbo_shm_init_zone\(/) in_init = 1
+            if (in_init && line ~ /^}/) { in_init = 0; return }
 
-        # A bare zone dereference: <ident>->sh or <ident>->shpool where the
-        # identifier is NOT a stripe pointer. Inside init, `st->` is the
-        # sanctioned spelling and is skipped; everywhere else nothing is.
-        # NOTE: no \b anywhere below. POSIX awk (and mawk) have no word-boundary
-        # escape -- gawk silently treats \b as a backspace, so a pattern written
-        # with it matches nothing and the lint reports ok having detected
-        # nothing. That is precisely the vacuous-gate class the header of this file
-        # warns about, and it was caught here by planting all three violations
-        # and watching two of them sail through. Word edges are spelled with
-        # explicit character classes, and the string is padded so a match at the
-        # very start or end of the line still has a neighbour to test.
-        {
+            # A bare zone dereference: <ident>->sh or <ident>->shpool where the
+            # identifier is NOT a stripe pointer. Inside init, `st->` is the
+            # sanctioned spelling and is skipped; everywhere else nothing is.
+            # NOTE: no \b anywhere below. POSIX awk (and mawk) have no
+            # word-boundary escape -- gawk silently treats \b as a backspace, so
+            # a pattern written with it matches nothing and the lint reports ok
+            # having detected nothing. That is precisely the vacuous-gate class
+            # the header of this file warns about, and it was caught here by
+            # planting all three violations and watching two of them sail
+            # through. Word edges are spelled with explicit character classes,
+            # and the string is padded so a match at the very start or end of
+            # the line still has a neighbour to test.
             probe = " " line " "
             # Inside init the sanctioned spelling is `st->sh` / `st->shpool` on
             # the resolver-derived stripe pointer. Blank exactly that out (with
@@ -114,23 +139,49 @@ for f in "${files[@]}"; do
                 trimmed = line
                 sub(/^[[:space:]]+/, "", trimmed)
                 printf "%s:%d: bare zone shm dereference outside the stripe resolver: %s\n", \
-                       file, FNR, trimmed
+                       file, lnum, trimmed
+                bad = 1
+            }
+
+            # Only the resolvers may index the stripe array, and they live in
+            # the header -- so any ->stripes[ in a .c file is a hand-picked pool.
+            if (line ~ /->stripes\[/) {
+                trimmed = line
+                sub(/^[[:space:]]+/, "", trimmed)
+                printf "%s:%d: direct ->stripes[] index outside the resolver: %s\n", \
+                       file, lnum, trimmed
                 bad = 1
             }
         }
 
-        # Only the resolvers may index the stripe array, and they live in the
-        # header -- so any ->stripes[ in a .c file is a hand-picked pool.
-        line ~ /->stripes\[/ {
-            trimmed = line
-            sub(/^[[:space:]]+/, "", trimmed)
-            printf "%s:%d: direct ->stripes[] index outside the resolver: %s\n", \
-                   file, FNR, trimmed
-            bad = 1
+        {
+            if (!have) start = FNR
+            cur = $0
+            if (cur ~ /\\[ \t\r]*$/) {
+                sub(/\\[ \t\r]*$/, "", cur)
+                pending = pending cur
+                have = 1
+                next
+            }
+            judge(pending cur, start)
+            pending = ""; have = 0
         }
 
-        END { exit bad ? 1 : 0 }
-    ' "$f" || status=1
+        END {
+            if (have) judge(pending, start)
+            exit bad ? 1 : 0
+        }
+    ' "$f" && rc=0 || rc=$?
+    # awk exit 0 = clean, 1 = a finding, anything else is an awk runtime
+    # failure -- "could not run" (2), never a finding and never clean.
+    case "$rc" in
+        0) ;;
+        1) status=1 ;;
+        *)
+            echo "lint-stripe-seam: awk failed on $f (exit $rc)" >&2
+            exit 2
+            ;;
+    esac
 done
 
 if [ "$status" -ne 0 ]; then
@@ -191,24 +242,69 @@ pending:ngx_http_cache_turbo_shm_touch_lru
 # open paren is part of the pattern).
 #
 # Prints "yes"/"no". Two failure exits, neither of which is a pass:
-#   2  the function was not found -- moved or renamed, so the ledger is stale;
-#   3  more than one definition matched -- the answer would depend on which one
+#   10 the function was not found -- moved or renamed, so the ledger is stale;
+#   11 more than one definition matched -- the answer would depend on which one
 #      won, and this file already contains one genuinely duplicated symbol name
 #      (shm_count_miss_locked), so ambiguity is a real shape here, not a
 #      hypothetical.
+# (10/11 rather than awk's own 2: a crashing awk exits 2 as well, and that must
+# not be read as "not found".) Any other nonzero exit is an awk failure.
 fn_calls_stripe_of() {
     awk -v fn="$1" '
-        { line = $0; sub(/\/\/.*/, "", line) }
-        line ~ /^[[:space:]]*\*/   { next }
-        line ~ /^[[:space:]]*\/\*/ { next }
+        # Cut a // line comment, but only where the // is real code: a // inside
+        # a "string" or a char literal (an http:// URL) is not a comment, and
+        # cutting there would hide everything after it on the logical line.
+        # An escaped character inside a literal never closes it.
+        function strip_cmt(s,    i, n, ch, q) {
+            n = length(s); q = ""
+            for (i = 1; i <= n; i++) {
+                ch = substr(s, i, 1)
+                if (q != "") {
+                    if (ch == "\\") i++
+                    else if (ch == q) q = ""
+                } else if (ch == "\"" || ch == "\047") q = ch
+                else if (ch == "/" && substr(s, i + 1, 1) == "/") return substr(s, 1, i - 1)
+            }
+            return s
+        }
+        # Phase 2 splice first (see the main scan above): a continued // comment
+        # must not leak its next physical line into the function body, and a
+        # stripe_of token split by a backslash-newline is still a call.
+        function judge(line) {
+            line = strip_cmt(line)
+            if (line ~ /^[[:space:]]*\*/)   return
+            if (line ~ /^[[:space:]]*\/\*/) return
 
-        index(line, fn "(") == 1 { on = 1; ndef++ }
-        on && index(line, "ngx_http_cache_turbo_stripe_of(") > 0 { calls = 1 }
-        on && line ~ /^}/ { on = 0 }
+            if (index(line, fn "(") == 1) { on = 1; ndef++ }
+            if (on && index(line, "ngx_http_cache_turbo_stripe_of(") > 0) calls = 1
+            if (on && line ~ /^}/) on = 0
+        }
+
+        # One awk pass spans every src/*.c, but a compiler never splices or
+        # carries a function body across translation units. At the first line
+        # of each file judge what the previous file left pending (as END
+        # does), then drop all per-file state.
+        FNR == 1 {
+            if (have) judge(pending)
+            pending = ""; have = 0; on = 0
+        }
+
+        {
+            cur = $0
+            if (cur ~ /\\[ \t\r]*$/) {
+                sub(/\\[ \t\r]*$/, "", cur)
+                pending = pending cur
+                have = 1
+                next
+            }
+            judge(pending cur)
+            pending = ""; have = 0
+        }
 
         END {
-            if (ndef == 0) { exit 2 }
-            if (ndef > 1)  { exit 3 }
+            if (have) judge(pending)
+            if (ndef == 0) { exit 10 }
+            if (ndef > 1)  { exit 11 }
             print calls ? "yes" : "no"
         }
     ' src/*.c
@@ -225,7 +321,16 @@ while IFS= read -r row; do
 
     answer="$(fn_calls_stripe_of "$fn")" && rc=0 || rc=$?
 
-    if [ "$rc" -eq 2 ]; then
+    if [ "$rc" -eq 0 ] && [ "$answer" != yes ] && [ "$answer" != no ]; then
+        rc=99
+    fi
+
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 10 ] && [ "$rc" -ne 11 ]; then
+        echo "lint-stripe-seam: awk failed on the ledger scan of $fn (exit $rc)" >&2
+        exit 2
+    fi
+
+    if [ "$rc" -eq 10 ]; then
         echo "$fn: listed in the key-directed ledger but not found in src/*.c" >&2
         echo "    -- it was moved or renamed; update KEY_DIRECTED in $0." >&2
         ledger_status=1
