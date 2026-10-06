@@ -225,6 +225,9 @@ The preset is defence in depth, not a substitute for upgrading Next.js.
 | [GHSA-gp8f-8m3g-qvj9](https://github.com/advisories/GHSA-gp8f-8m3g-qvj9) / CVE-2024-46982 — `x-now-route-matches` | see advisory | `X-Now-Route-Matches` bypasses. |
 | [GHSA-g5qg-72qw-gw5v](https://github.com/advisories/GHSA-g5qg-72qw-gw5v) / CVE-2025-57752 — `/_next/image` key confusion | see advisory | `/_next/image` is never stored (`Vary: Accept`). |
 | CVE-2025-29927 — `x-middleware-subrequest` middleware bypass | < 12.3.5, 13 – < 13.5.9, 14 – < 14.2.25, 15 – < 15.2.3 | `X-Middleware-Subrequest` bypasses so a bypassed response is never shared. It does **not** stop the bypass itself — strip that header at the edge on unpatched versions. |
+| [GHSA-4jqv-mc3x-m676](https://github.com/vercel/next.js/security/advisories/GHSA-4jqv-mc3x-m676) / CVE-2026-94543 — SSG/ISR cache entry replaced by another route (self-hosted, Pages Router) | >= 15.0.0, < 15.5.27; >= 16.0.0, < 16.3.8 | **Not mitigated.** The poisoning happens inside Next.js's own response cache, before cache-turbo sees the response. Upgrade to 15.5.27 / 16.3.8. |
+| [GHSA-mcj8-r9mp-w47p](https://github.com/vercel/next.js/security/advisories/GHSA-mcj8-r9mp-w47p) / CVE-2026-94484 — SSG/ISR shared response cache poisoned via a root catch-all page | >= 15.0.0, < 15.5.27; >= 16.0.0, < 16.3.8 | **Not mitigated.** Same reason; a poisoned response can then also be stored here like any anonymous page. Upgrade to 15.5.27 / 16.3.8. |
+| [GHSA-3w37-wq28-93x7](https://github.com/vercel/next.js/security/advisories/GHSA-3w37-wq28-93x7) / CVE-2026-94544 — pending `use cache` fill leaks Draft Mode content into regular responses and persisted pages | 16.3.0 – < 16.3.8 | **Not mitigated.** The leak is in the origin's render; the editor's `__prerender_bypass` request is bypassed here, but the leak lands on the overlapping regular request. Upgrade to 16.3.8, and purge the cache afterwards. |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -262,11 +265,15 @@ disk; cache-turbo adds little in front of a file. The headers to set:
   Router's default session name. Any cookie containing it bypasses — the safe
   direction.
 - **Breaker fallback with `cache_turbo_bypass_stale_uri`.** On such a
-  location, an open circuit breaker serves its stored HTML copy before the
-  header rows run, so an `RSC: 1` request during an origin outage can receive
-  HTML instead of the RSC payload. Nothing wrong is stored, and the Next.js
-  client falls back to a full page load on a non-RSC content type. Avoid
-  combining the two if that degradation is unacceptable.
+  location an open circuit breaker serves the stored HTML copy (`X-Cache:
+  STALE-BREAKER`) only to requests that pass the header tier. An `RSC: 1`
+  request (or any other router header) is classified before the lookup, so it
+  never receives the stored HTML: it goes to the origin and, during an outage,
+  fails with the origin's error instead of degrading to a full page load. A
+  plain document request on the same URL is still served the fallback. Nothing
+  wrong is stored or served. If client-side navigations must survive an
+  outage too, serve a fallback for them yourself (for example a static error
+  page for the RSC fetch); do not expect cache-turbo to supply one.
 - **Interception routes add `next-url` to `Vary`.** It is one of the satisfied
   headers, so those pages still cache.
 - **Self-hosted Next.js caches too.** Next's own cache handler also stores ISR

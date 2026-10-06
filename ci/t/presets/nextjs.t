@@ -68,6 +68,7 @@ our $NxVary = 'rsc, next-router-state-tree, next-router-prefetch, '
 # counter without the other blocks' entries in it.
 our $HttpConfig = ct_http_config() . <<"EOC";
     cache_turbo_zone nxbs 8m;
+    cache_turbo_zone nxbk 8m;
 
     server {
         listen       127.0.0.1:$NxOriginPort;
@@ -77,6 +78,14 @@ our $HttpConfig = ct_http_config() . <<"EOC";
             add_header Cache-Control "public, max-age=30" always;
             add_header Vary "$NxVary" always;
             return 200 "origin:\$request_uri:\$connection:\$connection_requests:\$msec:rsc=\$http_rsc;ck=\$http_cookie\\n";
+        }
+
+        # TEST 14: a request carrying X-Fail simulates an origin outage (502).
+        location /bk/ {
+            if (\$http_x_fail) { return 502; }
+            add_header Cache-Control "public, max-age=30" always;
+            add_header Vary "$NxVary" always;
+            return 200 "origin:\$request_uri:rsc=\$http_rsc;\n";
         }
 
         location /xv/ {
@@ -126,6 +135,18 @@ our $Config = nx_location('/n/', 'nextjs')
             cache_turbo_key     \$uri;
             cache_turbo_valid   30s;
             cache_turbo_bypass_stale_uri /bs/;
+            proxy_pass http://127.0.0.1:$NxOriginPort;
+        }
+        location /bk/ {
+            cache_turbo         nxbk;
+            cache_turbo_backend nextjs;
+            cache_turbo_key     \$uri;
+            cache_turbo_valid   30s;
+            cache_turbo_breaker             on;
+            cache_turbo_breaker_threshold   1;
+            cache_turbo_breaker_window      60s;
+            cache_turbo_breaker_open        30s;
+            cache_turbo_bypass_stale_uri /bk/;
             proxy_pass http://127.0.0.1:$NxOriginPort;
         }
         location = /_nxbs {
@@ -389,3 +410,29 @@ __DATA__
  qr/"refuse_vary_unsafe":1,.*"used_bytes":[1-9]\d*[,}]/]
 --- error_code eval
 [200, 200, 200, 200, 200]
+
+
+=== TEST 14: an OPEN breaker on a bypass_stale_uri location does not serve stored HTML to RSC: 1
+# The bypass_stale arm falls through on an OPEN breaker (so the lookup can find
+# the breaker-only copy) but auto_skip then runs and `RSC` is in the preset's
+# header tier, so an RSC request declines to the origin BEFORE any lookup. The
+# plain request on the same key is the positive control: it IS served the
+# stored copy (STALE-BREAKER) by the same OPEN breaker, so the RSC request
+# going to the origin (502 during the outage, not the stored HTML) is the
+# header tier and not a closed or absent breaker. 1 primes the breaker-only
+# copy, 2 trips the breaker through a dead origin, 3 is the positive control,
+# 4 is RSC during the outage, 5 is RSC with the origin back (never stored HTML).
+# Mutation: the auto_header_present() call in auto_skip compiled out makes 4
+# a STALE-BREAKER response carrying the stored HTML.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /bk/page", "GET /bk/page", "GET /bk/page", "GET /bk/page", "GET /bk/page"]
+--- more_headers eval
+["", "X-Fail: 1", "X-Fail: 1", "X-Fail: 1\nRSC: 1", "RSC: 1"]
+--- response_headers eval
+["X-Cache: ", "X-Cache: ", "X-Cache: STALE-BREAKER", "X-Cache: ", "X-Cache: "]
+--- response_body_like eval
+[qr/rsc=;/, qr/./, qr/^origin:\/bk\/page:rsc=;/, qr/./, qr/^origin:\/bk\/page:rsc=1;/]
+--- error_code eval
+[200, 502, 200, 502, 200]
