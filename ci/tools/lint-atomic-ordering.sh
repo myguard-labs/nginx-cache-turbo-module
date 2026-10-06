@@ -47,23 +47,38 @@ for f in "${files[@]}"; do
     [ -f "$f" ] || continue
 
     awk -v file="$f" '
-        # Block comments can span lines; prose about the barrier is fine.
+        # Small C lexer: block comments, line comments, string and char
+        # literals. Comment markers inside a literal are NOT comment syntax
+        # (a "/*" string must not swallow the code after it), and a quote
+        # inside a comment is not a literal. State that can legally cross a
+        # line: a block comment, and a string/char/line comment whose line ends
+        # in a backslash continuation. Literal CONTENTS are blanked, so a banned
+        # token spelled only inside a string does not fire; comments are dropped.
         {
             line = $0
+            n = length(line)
             out = ""
-            while (length(line) > 0) {
+            cont = (n > 0 && substr(line, n, 1) == "\\")
+            i = 1
+            while (i <= n) {
+                ch = substr(line, i, 1)
+                two = substr(line, i, 2)
                 if (in_c) {
-                    p = index(line, "*/")
-                    if (p == 0) { line = ""; break }
-                    line = substr(line, p + 2); in_c = 0
-                } else {
-                    p = index(line, "/*")
-                    if (p == 0) { out = out line; line = ""; break }
-                    out = out substr(line, 1, p - 1)
-                    line = substr(line, p + 2); in_c = 1
-                }
+                    if (two == "*/") { in_c = 0; i += 2 } else i++
+                } else if (in_lc) {
+                    i = n + 1
+                } else if (q != "") {
+                    if (ch == "\\") { out = out "  "; i += 2 }
+                    else if (ch == q) { out = out q; q = ""; i++ }
+                    else { out = out " "; i++ }
+                } else if (two == "/*") { in_c = 1; out = out " "; i += 2 }
+                else if (two == "//") { in_lc = 1; i = n + 1 }
+                else if (ch == "\"" || ch == "\047") { q = ch; out = out ch; i++ }
+                else { out = out ch; i++ }
             }
-            sub(/\/\/.*/, "", out)
+            # An unterminated literal or line comment ends with its line unless
+            # a backslash continues it.
+            if (!cont) { q = ""; in_lc = 0 }
             probe = " " out " "
         }
 

@@ -773,6 +773,53 @@ atomic_ordering_weak(void)
 ATOMEOF
 finding_case_ "atomic-ordering: an explicit weak ordering is caught" \
     'weak-ordering atomic or memory barrier: .*__ATOMIC_RELEASE' atomic_ordering_lint
+
+# atomic-ordering: comment markers inside string/char literals are not comment
+# syntax. Each control below went red on the pre-lexer stripper, which dropped
+# the code after a literal "/*" or truncated a line at a literal "//" and so
+# reported ok over a real weak ordering (a fail-open gate hole).
+ao_msg='weak-ordering atomic or memory barrier: .*__ATOMIC_RELAXED'
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+static const char *ct_s = "/*";
+static void ct_tw(int *p){ __atomic_store_n(p, 1, __ATOMIC_RELAXED); }
+ATOMEOF
+finding_case_ "atomic-ordering: a \"/*\" string does not hide later code" \
+    "$ao_msg" atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+static const char *ct_u = "http://x"; static void ct_f(int *p){ __atomic_store_n(p, 1, __ATOMIC_RELAXED); }
+ATOMEOF
+finding_case_ "atomic-ordering: a \"//\" string does not truncate the line" \
+    "$ao_msg" atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+static const char *ct_e = "a\"/*b"; static void ct_g(int *p){ __atomic_store_n(p, 1, __ATOMIC_RELAXED); }
+ATOMEOF
+finding_case_ "atomic-ordering: an escaped quote does not end the literal early" \
+    "$ao_msg" atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+static int ct_c = '/*'; static void ct_i(int *p){ __atomic_store_n(p, 1, __ATOMIC_RELAXED); }
+ATOMEOF
+finding_case_ "atomic-ordering: a char literal holding \"/*\" does not hide later code" \
+    "$ao_msg" atomic_ordering_lint
+# Positive: banned tokens only inside a string literal or comment do not fire,
+# including a "/*" string that is later followed by clean code.
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+static const char *ct_k = "__ATOMIC_RELAXED ngx_memory_barrier /* //";
+static const char *ct_l = "http://x"; /* __ATOMIC_RELEASE */ // memory_order_acquire
+static void ct_m(int *p){ __atomic_store_n(p, 1, __ATOMIC_SEQ_CST); }
+ATOMEOF
+case_ 0 "atomic-ordering: banned tokens only in strings/comments pass" atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+// a continued line comment \
+    ngx_memory_barrier();
+static void ct_j(int *p){ __atomic_store_n(p, 1, __ATOMIC_SEQ_CST); }
+ATOMEOF
+case_ 0 "atomic-ordering: a backslash-continued // comment covers the next line" atomic_ordering_lint
 #
 # THE FIXTURES ARE NOW COMPLETE, WELL-TYPED C. carve-init parses with clang
 # rather than lexing with awk, and clang's error recovery replaces the
