@@ -444,6 +444,7 @@ done
 
 lint_file_wrappers=(
     ci/linter/lint-astgrep.sh
+    ci/linter/lint-atomic-ordering.sh
     ci/linter/lint-c.sh
     ci/linter/lint-carve-init.sh
     ci/linter/lint-ci-cadence.sh
@@ -680,6 +681,7 @@ checkerroot="$(mktemp -d)"
 trap 'rm -rf "$badroot" "$listroot" "$checkerroot"' EXIT
 mkdir -p "$checkerroot/src" "$checkerroot/ci/tools"
 cp ci/tools/lint-shm-lock.sh ci/tools/lint-stripe-seam.sh \
+    ci/tools/lint-atomic-ordering.sh \
     "$checkerroot/ci/tools/"
 : > "$checkerroot/src/control.c"
 for fn in \
@@ -716,6 +718,12 @@ stripe_seam_lint() {
     env -C "$checkerroot" bash ci/tools/lint-stripe-seam.sh
 }
 
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
+atomic_ordering_lint() {
+    # shellcheck disable=SC2317
+    env -C "$checkerroot" bash ci/tools/lint-atomic-ordering.sh
+}
+
 case_ 0 "shm-lock: a clean lock discipline fixture passes" shm_lock_lint
 cat >> "$checkerroot/src/control.c" <<'SHMEOF'
 shm_lock_violation(void)
@@ -737,6 +745,34 @@ stripe_seam_violation(void)
 STRIPEEOF
 finding_case_ "stripe-seam: a bare zone pool dereference is caught" \
     'bare zone shm dereference outside the stripe resolver' stripe_seam_lint
+
+# atomic-ordering: SEQ_CST and prose mentions stay clean; a real barrier or a
+# weak ordering constant is caught.
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+/* ngx_memory_barrier() is discussed here in prose only */
+atomic_ordering_clean(void)
+{
+    __atomic_load_n(&v, __ATOMIC_SEQ_CST);
+}
+ATOMEOF
+case_ 0 "atomic-ordering: SEQ_CST and prose mentions pass" atomic_ordering_lint
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+atomic_ordering_barrier(void)
+{
+    ngx_memory_barrier();
+}
+ATOMEOF
+finding_case_ "atomic-ordering: ngx_memory_barrier is caught" \
+    'weak-ordering atomic or memory barrier: ngx_memory_barrier' atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+atomic_ordering_weak(void)
+{
+    __atomic_store_n(&v, 1, __ATOMIC_RELEASE);
+}
+ATOMEOF
+finding_case_ "atomic-ordering: an explicit weak ordering is caught" \
+    'weak-ordering atomic or memory barrier: .*__ATOMIC_RELEASE' atomic_ordering_lint
 #
 # THE FIXTURES ARE NOW COMPLETE, WELL-TYPED C. carve-init parses with clang
 # rather than lexing with awk, and clang's error recovery replaces the

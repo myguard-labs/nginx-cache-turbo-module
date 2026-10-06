@@ -1,4 +1,4 @@
-# sync-sha: e3a06638e8d17f0b9f5c3dc368c44064fe616f730829a39354cb933d42e2271c
+# sync-sha: d6d8cd7e167504640262cf3d2f9ac54fc2d4d7d15d934aa75854dd1b1f30f37e
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -19,7 +19,7 @@ name: Lint
 # set-equality case exists to catch. It is also cheap (no nginx tree, no TU
 # parse) and its blocking tier is five promoted rules, not the whole ruleset.
 #
-# "shm-lock" and "suite-docs" are this module's own checkers and have no
+# "shm-lock", "atomic-ordering" and "suite-docs" are this module's own checkers and have no
 # skeleton counterpart. They previously ran only from build-test.yml's
 # validation job; they are named here so the hook and the PR gate on the same
 # set. build-test.yml still calls the implementations directly -- that is
@@ -111,5 +111,5 @@ jobs:
           # `sed -n 's/^ *LINT_ONLY: *//p'`, so wrapping it in a folded scalar
           # (`>-`) makes that parser read the literal ">-" and report EVERY
           # checker as missing. Rewrap only by teaching selftest.sh to parse YAML.
-          LINT_ONLY: nginx astgrep sh python perl yaml spelling semgrep-pin ci-runners ci-ports ci-cadence ci-secrets sync-stamp docs-drift shm-lock stripe-seam carve-init suite-docs
+          LINT_ONLY: nginx astgrep sh python perl yaml spelling semgrep-pin ci-runners ci-ports ci-cadence ci-secrets sync-stamp docs-drift shm-lock stripe-seam atomic-ordering carve-init suite-docs
         run: ci/linter/run-all.sh
