@@ -57,6 +57,10 @@ for f in "${files[@]}"; do
         exit 2
     fi
 
+    # awk exits 1 only via END (a finding); any other nonzero exit is a runtime
+    # failure (exit 2 from awk itself, a signal, ...) and must be "could not
+    # run", never the weak-ordering banner.
+    rc=0
     awk -v file="$f" '
         # C translation phase 2 first: a physical line whose last character is
         # a backslash (GCC also accepts backslash plus trailing blanks) is
@@ -123,7 +127,15 @@ for f in "${files[@]}"; do
             if (have) lex(pending, start)
             exit bad ? 1 : 0
         }
-    ' "$f" || status=1
+    ' "$f" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) status=1 ;;
+        *)
+            echo "lint-atomic-ordering: awk failed on $f (exit $rc)" >&2
+            exit 2
+            ;;
+    esac
 done
 
 if [ "$status" -ne 0 ]; then

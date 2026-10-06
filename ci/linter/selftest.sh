@@ -885,6 +885,36 @@ atomic_ordering_explicit_missing() {
     env -C "$checkerroot" bash ci/tools/lint-atomic-ordering.sh src/control.c src/no-such-file.c
 }
 case_ 2 "atomic-ordering: an explicit missing file fails closed" atomic_ordering_explicit_missing
+# An awk runtime failure is "could not run" (2) with its own message, never the
+# weak-ordering banner (exit 1). The trigger is a stub awk first on PATH: it is
+# deterministic as root and non-root (chmod 000 is readable to root) and needs
+# no test hook in the production script.
+mkdir -p "$checkerroot/fakebin"
+printf '#!/bin/sh\nexit %s\n' 2 > "$checkerroot/fakebin/awk"
+chmod +x "$checkerroot/fakebin/awk"
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
+atomic_ordering_awk_failed() {
+    # shellcheck disable=SC2317
+    env -C "$checkerroot" PATH="$checkerroot/fakebin:$PATH" bash ci/tools/lint-atomic-ordering.sh src/control.c
+}
+# shellcheck disable=SC2329,SC2317  # invoked indirectly, by name, via case_()
+atomic_ordering_awk_failed_msg() {
+    local out got
+    out="$(atomic_ordering_awk_failed 2>&1)"; got=$?
+    grep -qE 'lint-atomic-ordering: awk failed on src/control\.c \(exit 2\)' <<< "$out" || return 90
+    if grep -q 'CI-ARM64-NO-LIVE-LANE' <<< "$out"; then return 91; fi
+    return "$got"
+}
+case_ 2 "atomic-ordering: an awk runtime failure is exit 2, not a finding" atomic_ordering_awk_failed
+case_ 2 "atomic-ordering: an awk failure prints its message and no re-open banner" atomic_ordering_awk_failed_msg
+# Other nonzero awk exits (e.g. killed, 137) are also "could not run".
+printf '#!/bin/sh\nexit %s\n' 137 > "$checkerroot/fakebin/awk"
+case_ 2 "atomic-ordering: any other nonzero awk exit is exit 2" atomic_ordering_awk_failed
+# A stub awk exiting 1 still maps to the finding class (the contract for 1).
+printf '#!/bin/sh\nexit %s\n' 1 > "$checkerroot/fakebin/awk"
+finding_case_ "atomic-ordering: awk exit 1 is still the weak-ordering finding" \
+    'CI-ARM64-NO-LIVE-LANE' atomic_ordering_awk_failed
+rm -rf "$checkerroot/fakebin"
 #
 # THE FIXTURES ARE NOW COMPLETE, WELL-TYPED C. carve-init parses with clang
 # rather than lexing with awk, and clang's error recovery replaces the
