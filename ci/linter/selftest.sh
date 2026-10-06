@@ -836,6 +836,47 @@ cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
 static void ct_j(int *p){ __atomic_store_n(p, 1, __ATOMIC_SEQ_CST); }
 ATOMEOF
 case_ 0 "atomic-ordering: a backslash-continued // comment covers the next line" atomic_ordering_lint
+# atomic-ordering: backslash-newline splicing (translation phase 2) happens
+# before lexing, so a token split by a continuation is seen whole and the
+# finding is reported at the logical line's FIRST physical line. Went red on the
+# per-physical-line lexer, which reported ok over a compiling weak ordering.
+bsl=$'\\'
+: > "$checkerroot/src/control.c"
+printf '%s\n' 'int v;' 'void t(void){ __atomic_store_n(&v, 1, __ATOMIC_REL'"$bsl" 'EASE); }' \
+    >> "$checkerroot/src/control.c"
+finding_case_ "atomic-ordering: __ATOMIC_RELEASE split by a splice is caught at its first line" \
+    'src/control.c:2: weak-ordering atomic or memory barrier: .*__ATOMIC_RELEASE' atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+printf '%s\n' 'int v;' 'void t(void){ ngx_memory_'"$bsl" 'barrier(); }' \
+    >> "$checkerroot/src/control.c"
+finding_case_ "atomic-ordering: ngx_memory_barrier split by a splice is caught at its first line" \
+    'src/control.c:2: weak-ordering atomic or memory barrier: .*ngx_memory_barrier' atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+printf '%s\n' 'int v;' 'void t(void){ __atomic_store_n(&v, 1, memory_order_'"$bsl" 'rel'"$bsl" 'ease); }' \
+    >> "$checkerroot/src/control.c"
+finding_case_ "atomic-ordering: a token split over two splices is caught at its first line" \
+    'src/control.c:2: weak-ordering atomic or memory barrier: .*memory_order_release' atomic_ordering_lint
+# Boundary: backslash plus trailing blanks still splices (as GCC does).
+: > "$checkerroot/src/control.c"
+printf '%s\n' 'int v;' 'void t(void){ __atomic_store_n(&v, 1, __ATOMIC_REL\ 	' 'EASE); }' \
+    >> "$checkerroot/src/control.c"
+finding_case_ "atomic-ordering: a backslash with trailing blanks still splices and is caught" \
+    'src/control.c:2: weak-ordering atomic or memory barrier: .*__ATOMIC_RELEASE' atomic_ordering_lint
+# Boundary: a file ending in a backslash with no newline must not crash.
+printf '%s' 'int v; /* x */ '"$bsl" > "$checkerroot/src/control.c"
+case_ 0 "atomic-ordering: a clean file ending in a bare backslash does not crash" atomic_ordering_lint
+printf '%s\n%s' 'int v;' 'void t(void){ ngx_memory_barrier(); } '"$bsl" > "$checkerroot/src/control.c"
+finding_case_ "atomic-ordering: a weak token before a trailing bare backslash is still caught" \
+    'src/control.c:2: weak-ordering atomic or memory barrier: .*ngx_memory_barrier' atomic_ordering_lint
+# Negative: SEQ_CST split by a splice, and banned tokens split by a splice
+# inside a // comment or a string literal, stay clean.
+: > "$checkerroot/src/control.c"
+printf '%s\n' 'int v;' 'void t(void){ __atomic_store_n(&v, 1, __ATOMIC_SEQ_'"$bsl" 'CST); }' \
+    '// __ATOMIC_REL'"$bsl" 'EASE ngx_memory_'"$bsl" 'barrier' \
+    'static const char *s = "__ATOMIC_REL'"$bsl" 'EASE";' \
+    '/* ngx_memory_'"$bsl" 'barrier */' \
+    >> "$checkerroot/src/control.c"
+case_ 0 "atomic-ordering: SEQ_CST and comment/string tokens split by a splice stay clean" atomic_ordering_lint
 # Explicit args: one clean file plus one missing path must fail closed (2),
 # never skip the typo and report ok (no partial scan).
 # shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
