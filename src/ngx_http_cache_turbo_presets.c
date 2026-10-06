@@ -126,6 +126,26 @@ typedef struct {
      * comment used to demand. DO NOT weaken it.
      */
     const char *const  *key_cookies;
+
+    /*
+     * Request-HEADER bypass (tier 4). NULL-terminated list of request header
+     * NAMES (case-insensitive) whose mere PRESENCE, with any value, skips the
+     * cache exactly like a cookie/URI/arg match. This is for a framework that
+     * serves a DIFFERENT representation at the SAME URL depending on a request
+     * header a browser never sends on a document navigation -- the type case
+     * is Next.js, whose client router fetches the React Server Component
+     * payload of /page with `RSC: 1` and gets text/x-component instead of
+     * HTML.
+     *
+     * The same list also SATISFIES a response `Vary` token that names one of
+     * these headers (ngx_http_cache_turbo_classify_vary): every request that
+     * reaches the lookup or the capture has already been checked to carry
+     * none of them, so for every stored and every served representation the
+     * varied header is identically ABSENT -- RFC 9110 12.5.5 is met, not
+     * waived. The capture side re-checks the request it is storing for, so
+     * the argument holds even on a path that runs ahead of auto_skip.
+     */
+    const char *const  *headers;
 } ngx_http_cache_turbo_preset_t;
 
 /*
@@ -1635,84 +1655,142 @@ static const char *const  ct_opencart_args[] = {
     "route=account/authorize", "route=account/success",
     "user_token", "customer_token", NULL };
 
+/*
+ * Next.js (React). Research: memory research-react-nextjs-2026-09-29.md,
+ * verified against next v16.3.7; docs/react.md is the operator guide.
+ *
+ * HEADER TIER, the load-bearing one. The App Router serves the HTML document
+ * and the React Server Component payload (text/x-component) of a page at the
+ * SAME path, selected by the `RSC: 1` request header, and marks every App
+ * Router response `Vary: rsc, next-router-state-tree, next-router-prefetch,
+ * next-router-segment-prefetch` (+ `next-url` with interception routes).
+ * Without this tier auto-Vary refuses every App Router page (unknown axes);
+ * with `cache_turbo_vary_ignore` on those names and no bypass, one `RSC: 1`
+ * request poisons the HTML entry for everyone (GHSA-wfc6-r584-vfw7). Bypassing
+ * on presence of any router header and satisfying the Vary axes (see the
+ * struct comment) caches the HTML document and never the payload. Browsers
+ * send none of these on a document navigation, so the tier costs no HTML hit.
+ * `Next-Action` (Server Actions) is POST-only today; listed as a floor.
+ * `X-Middleware-Prefetch`, `X-Nextjs-Data`, `X-Now-Route-Matches` and
+ * `X-Middleware-Subrequest` are the internal/prefetch headers behind the
+ * data-for-HTML and middleware-bypass advisories (CVE-2024-46982,
+ * CVE-2026-44572, CVE-2025-29927); Next strips some of them, not all, and an
+ * older Next strips fewer.
+ *
+ * `_rsc` is the client's cache-busting arg on every RSC fetch; bypassing on it
+ * keeps a payload URL out of the cache even if a hop dropped the header.
+ *
+ * Cookies: draft/preview mode (`__prerender_bypass`, `__next_preview_data`)
+ * and the SESSION cookie of the common auth libraries -- Auth.js v4/v5
+ * (`next-auth.session-token`, `authjs.session-token`; the substrings also
+ * cover the `__Secure-` prefix and `.0`/`.1` chunks), Clerk (`__session`;
+ * never `__client_uat`, which is set to 0 for signed-out guests), Better Auth
+ * (`better-auth.session_token`) and Supabase (`-auth-token`, which over-matches
+ * the pre-login PKCE verifier: a lost hit, never a leak). `next-auth.` /
+ * `authjs.` alone would match guest-issued csrf/callback cookies.
+ *
+ * `/api/` because Route Handler / API route responses carry no Next-imposed
+ * Cache-Control and commonly read a session; a public API wants its own
+ * location without the preset.
+ */
+static const char *const  ct_nextjs_cookies[] = {
+    "__prerender_bypass", "__next_preview_data", "next-auth.session-token",
+    "authjs.session-token", "__session", "better-auth.session_token",
+    "-auth-token", NULL };
+static const char *const  ct_nextjs_uris[] = { "/api/", NULL };
+static const char *const  ct_nextjs_args[] = { "_rsc", NULL };
+static const char *const  ct_nextjs_headers[] = {
+    "RSC", "Next-Router-State-Tree", "Next-Router-Prefetch",
+    "Next-Router-Segment-Prefetch", "Next-Url", "Next-Action",
+    "X-Middleware-Prefetch", "X-Nextjs-Data", "X-Now-Route-Matches",
+    "X-Middleware-Subrequest", NULL };
+
 const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
-      ct_wp_cookies, ct_wp_uris, ct_wp_args, NULL, NULL },
+      ct_wp_cookies, ct_wp_uris, ct_wp_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE,
-      ct_woo_cookies, ct_woo_uris, ct_woo_args, NULL, NULL },
+      ct_woo_cookies, ct_woo_uris, ct_woo_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA,
-      ct_joomla_cookies, ct_joomla_uris, ct_joomla_args, NULL, NULL },
+      ct_joomla_cookies, ct_joomla_uris, ct_joomla_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_XENFORO,
-      ct_xf_cookies, ct_xf_uris, ct_xf_args, NULL, ct_xf_key_cookies },
+      ct_xf_cookies, ct_xf_uris, ct_xf_args, NULL, ct_xf_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE,
-      ct_discourse_cookies, ct_discourse_uris, ct_discourse_args, NULL, NULL },
+      ct_discourse_cookies, ct_discourse_uris, ct_discourse_args,
+      NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB,
-      ct_phpbb_cookies, ct_phpbb_uris, ct_phpbb_args, ct_phpbb_preds, NULL },
+      ct_phpbb_cookies, ct_phpbb_uris, ct_phpbb_args,
+      ct_phpbb_preds, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL,
-      ct_drupal_cookies, ct_drupal_uris, ct_drupal_args, NULL, NULL },
+      ct_drupal_cookies, ct_drupal_uris, ct_drupal_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_MEDIAWIKI,
-      ct_mw_cookies, ct_mw_uris, ct_mw_args, NULL, NULL },
+      ct_mw_cookies, ct_mw_uris, ct_mw_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_MAGENTO,
       ct_magento_cookies, ct_magento_uris, ct_magento_args, NULL,
-      ct_magento_key_cookies },
+      ct_magento_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_GHOST,
-      ct_ghost_cookies, ct_ghost_uris, ct_ghost_args, NULL, NULL },
+      ct_ghost_cookies, ct_ghost_uris, ct_ghost_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL,
-      ct_wagtail_cookies, ct_wagtail_uris, ct_wagtail_args, NULL, NULL },
+      ct_wagtail_cookies, ct_wagtail_uris, ct_wagtail_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY,
-      ct_kirby_cookies, ct_kirby_uris, ct_kirby_args, NULL, NULL },
+      ct_kirby_cookies, ct_kirby_uris, ct_kirby_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6,
       ct_shopware6_cookies, ct_shopware6_uris, ct_shopware6_args, NULL,
-      ct_shopware6_key_cookies },
+      ct_shopware6_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3,
-      ct_typo3_cookies, ct_typo3_uris, ct_typo3_args, NULL, NULL },
+      ct_typo3_cookies, ct_typo3_uris, ct_typo3_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_INVISION,
       ct_invision_cookies, ct_invision_uris, ct_invision_args,
-      ct_invision_preds, ct_invision_key_cookies },
+      ct_invision_preds, ct_invision_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_SMF,
-      ct_smf_cookies, ct_smf_uris, ct_smf_args, NULL, NULL },
+      ct_smf_cookies, ct_smf_uris, ct_smf_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_VANILLA,
-      ct_vanilla_cookies, ct_vanilla_uris, ct_vanilla_args, NULL, NULL },
+      ct_vanilla_cookies, ct_vanilla_uris, ct_vanilla_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_PUNBB,
-      ct_punbb_cookies, ct_punbb_uris, ct_punbb_args, NULL, NULL },
+      ct_punbb_cookies, ct_punbb_uris, ct_punbb_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_PHORUM,
       ct_phorum_cookies, ct_phorum_uris, ct_phorum_args, NULL,
-      ct_phorum_key_cookies },
+      ct_phorum_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_YABB,
-      ct_yabb_cookies, ct_yabb_uris, ct_yabb_args, NULL, NULL },
+      ct_yabb_cookies, ct_yabb_uris, ct_yabb_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_MYBB,
       ct_mybb_cookies, ct_mybb_uris, ct_mybb_args, ct_mybb_preds,
-      ct_mybb_key_cookies },
+      ct_mybb_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_VBULLETIN,
       ct_vbulletin_cookies, ct_vbulletin_uris, ct_vbulletin_args,
-      ct_vbulletin_preds, ct_vbulletin_key_cookies },
+      ct_vbulletin_preds, ct_vbulletin_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_TEXTPATTERN,
       ct_textpattern_cookies, ct_textpattern_uris, ct_textpattern_args,
-      NULL, NULL },
+      NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_BLUDIT,
-      ct_bludit_cookies, ct_bludit_uris, ct_bludit_args, NULL, NULL },
+      ct_bludit_cookies, ct_bludit_uris, ct_bludit_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_SPIP,
-      ct_spip_cookies, ct_spip_uris, ct_spip_args, ct_spip_preds, NULL },
+      ct_spip_cookies, ct_spip_uris, ct_spip_args, ct_spip_preds, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_BUGZILLA,
-      ct_bugzilla_cookies, ct_bugzilla_uris, ct_bugzilla_args, NULL, NULL },
+      ct_bugzilla_cookies, ct_bugzilla_uris, ct_bugzilla_args,
+      NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_MANTISBT,
       ct_mantisbt_cookies, ct_mantisbt_uris, ct_mantisbt_args,
-      ct_mantisbt_preds, NULL },
+      ct_mantisbt_preds, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_PLONE,
-      ct_plone_cookies, ct_plone_uris, ct_plone_args, NULL, NULL },
+      ct_plone_cookies, ct_plone_uris, ct_plone_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_UMBRACO,
-      ct_umbraco_cookies, ct_umbraco_uris, ct_umbraco_args, NULL, NULL },
+      ct_umbraco_cookies, ct_umbraco_uris, ct_umbraco_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_DOTCLEAR,
-      ct_dotclear_cookies, ct_dotclear_uris, ct_dotclear_args, NULL, NULL },
+      ct_dotclear_cookies, ct_dotclear_uris, ct_dotclear_args,
+      NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS,
-      ct_wikijs_cookies, ct_wikijs_uris, ct_wikijs_args, NULL, NULL },
+      ct_wikijs_cookies, ct_wikijs_uris, ct_wikijs_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_REDMINE,
-      ct_redmine_cookies, ct_redmine_uris, ct_redmine_args, NULL, NULL },
+      ct_redmine_cookies, ct_redmine_uris, ct_redmine_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM,
-      ct_flarum_cookies, ct_flarum_uris, ct_flarum_args, NULL, NULL },
+      ct_flarum_cookies, ct_flarum_uris, ct_flarum_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART,
-      ct_opencart_cookies, ct_opencart_uris, ct_opencart_args, NULL, NULL },
-    { 0, NULL, NULL, NULL, NULL, NULL }
+      ct_opencart_cookies, ct_opencart_uris, ct_opencart_args,
+      NULL, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_NEXTJS,
+      ct_nextjs_cookies, ct_nextjs_uris, ct_nextjs_args, NULL, NULL,
+      ct_nextjs_headers },
+    { 0, NULL, NULL, NULL, NULL, NULL, NULL }
 };
 /* >>> FUZZ-EXTRACT auto-classify END (presets.c portion) <<< */
 

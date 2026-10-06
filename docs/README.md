@@ -52,6 +52,7 @@ One page per `cache_turbo_backend` preset:
 | `redmine` | [redmine.md](redmine.md) | ✅ yes (`_redmine_session`, a hardcoded literal, + `autologin`) — **and `?key=` is a bypass ARG**: it authenticates an Atom/API request with no cookie at all |
 | `flarum` | [flarum.md](flarum.md) | ⚠️ **only with "remember me"** (`flarum_remember`) — `flarum_session` is issued to every guest and is deliberately NOT matched; a login without remember-me is invisible to the cookie tier, `/api` contains most of the exposure |
 | `opencart` | [opencart.md](opencart.md) | ⚠️ defense in depth only on 4.1.0.4 — base controller ARGs are matched, method-qualified routes are not; the global origin `no-store` keeps the default safe but also prevents page-cache hits |
+| `nextjs` | [react.md](react.md) | ✅ yes for Auth.js/NextAuth, Clerk, Better Auth and Supabase session cookies (renamed or other libraries need a local rule) — **plus a request-header tier**: RSC/prefetch requests bypass, so App Router HTML caches while the RSC payload at the same URL never does. Also covers React Router, Gatsby and Vite (no preset) |
 
 `classicpress` is a source-verified alias for `wordpress`; `backdrop` is a
 source-verified alias for `drupal`. See the addenda in [wordpress.md](wordpress.md)

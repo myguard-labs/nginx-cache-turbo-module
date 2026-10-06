@@ -826,7 +826,7 @@ there is no way to opt a single location out.
 > They used to mean `wordpress` + `woocommerce` + `joomla`. That was never a safe
 > default:
 >
-> - it **never covered every backend** — it named 3 of the 34 presets that now
+> - it **never covered every backend** — it named 3 of the 35 presets that now
 >   exist, so `auto` on a Drupal site silently enabled *no* Drupal rules;
 > - its **`woocommerce`** shipped without implying `wordpress`, leaving
 >   `/wp-admin/` cacheable (see [woocommerce.md](docs/woocommerce.md));
@@ -982,6 +982,7 @@ storage; the trade is a lost cache hit, never a cacheable private request.
 | `redmine` † | `/admin`, `/my`, `/login`, `/logout`, `/account`, `/settings`, `/enumerations`, `/roles`, `/trackers`, `/custom_fields`, `/auth_sources`, `/mail_handler` | `key` | `_redmine_session`, `autologin` |
 | `flarum` † | `/admin`, `/api`, `/login`, `/logout`, `/global-logout`, `/register`, `/reset`, `/confirm`, `/settings`, `/notifications` | — | `flarum_remember` **only** — `flarum_session` is guest-issued and deliberately unmatched |
 | `opencart` † | — (all routing is `/index.php?route=`) | base `route=account/…` and `route=checkout/…` values, `user_token`, `customer_token`; method-qualified OpenCart 4 routes rely on origin `no-store` | — (none: `OCSESSID` is guest-issued, login state is server-side only) |
+| `nextjs` † ◇ | `/api/` | `_rsc` | `__prerender_bypass`, `__next_preview_data`, `next-auth.session-token`, `authjs.session-token`, `__session`, `better-auth.session_token`, `-auth-token`; **◇ request headers** `RSC`, `Next-Router-State-Tree`, `Next-Router-Prefetch`, `Next-Router-Segment-Prefetch`, `Next-Url`, `Next-Action`, `X-Middleware-Prefetch`, `X-Nextjs-Data`, `X-Now-Route-Matches`, `X-Middleware-Subrequest` bypass on presence, and satisfy the matching `Vary` axes so App Router HTML caches while RSC payloads never do |
 
 `classicpress` is an alias for `wordpress`, and `backdrop` is an alias for
 `drupal`; the upstream forks retain their base project's cookie and route
@@ -1143,6 +1144,27 @@ preset also matches `be_typo_user` (the backend session) independently — it
 catches an editor previewing the frontend, who carries no `fe_typo_user` at
 all. See [typo3.md](docs/typo3.md).
 
+◇ **A request-HEADER tier, and the only preset that changes what `Vary`
+accepts.** Next.js serves two different bodies at one URL: the HTML document,
+and — when the client router sends `RSC: 1` — the React Server Component
+payload (`text/x-component`). Every App Router response therefore carries
+`Vary: rsc, next-router-state-tree, next-router-prefetch,
+next-router-segment-prefetch`. Default auto-Vary refuses axes it does not know,
+so without this preset no App Router page is ever stored; with
+`cache_turbo_vary_ignore` on those names and no bypass, one `RSC: 1` request
+poisons the HTML entry for every visitor
+([GHSA-wfc6-r584-vfw7](https://github.com/advisories/GHSA-wfc6-r584-vfw7)). The
+preset instead **bypasses every request that carries any of the listed headers
+(any value, even empty)** and treats a `Vary` token naming one of *those*
+headers as satisfied: every stored and every served copy belongs to a request
+where the header is absent, so it is one value of the axis, not an ignored one.
+The capture path re-checks the request it stores for, so even a store that runs
+ahead of the bypass (`cache_turbo_bypass_stale_uri`) refuses an RSC response.
+Any other unknown `Vary` axis still refuses the store, and no other preset or
+preset-free location accepts these axes. Browsers send none of these headers on
+a document navigation, so the tier costs no HTML hit. See
+[react.md](docs/react.md).
+
 So a WordPress admin (`wordpress_logged_in_…` cookie), a `?preview=true` draft, a
 `/wp-json/` API call, a WooCommerce cart cookie, a `/checkout` page, a logged-in
 XenForo member (`xf_user`), a Discourse user (`_t`) or a MediaWiki editor
@@ -1164,7 +1186,7 @@ XenForo member (`xf_user`), a Discourse user (`_t`) or a MediaWiki editor
 > [**Plone**](docs/plone.md) · [**Umbraco**](docs/umbraco.md) ·
 > [**Dotclear**](docs/dotclear.md) · [**Wiki.js**](docs/wikijs.md) ·
 > [**Redmine**](docs/redmine.md) · [**Flarum**](docs/flarum.md) ·
-> [**OpenCart**](docs/opencart.md) —
+> [**OpenCart**](docs/opencart.md) · [**Next.js / React**](docs/react.md) —
 > index at [`docs/`](docs/README.md). Running a framework rather than one of these
 > apps (Django, Laravel, Rails)? [**frameworks.md**](docs/frameworks.md) explains
 > why there is no preset for it and how to derive your own rule.
@@ -2196,7 +2218,7 @@ http {
 |---|---|---|---|
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
 | `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. Takes a zone name and nothing else — the old `auto` shorthand is gone (see `cache_turbo_backend`). |
-| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more application presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `shopware6`, `ghost`, `wagtail`, `kirby`, `typo3`, `invision`, `smf`, `vanilla`, `punbb`, `phorum`, `yabb`, `mybb`, `vbulletin`, `textpattern`, `bludit`, `spip`, `bugzilla`, `mantisbt` (`mantis`), `plone`, `umbraco`, `dotclear`, `wikijs`, `redmine`, `flarum`, `opencart`; aliases: `classicpress` → `wordpress`, `backdrop` → `drupal`; or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips lookup **and storage** and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `\|` (`wordpress\|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). Cookie names that an app lets you rename still need an explicit local rule; see each [application guide](docs/README.md). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)); Jira, Request Tracker and several other session-eager trackers are intentional non-presets ([research](docs/README.md#apps-we-deliberately-do-not-ship-a-preset-for)). |
+| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more application presets: `wordpress`, `woocommerce`, `joomla`, `xenforo`, `discourse`, `phpbb`, `drupal`, `mediawiki`, `magento`, `shopware6`, `ghost`, `wagtail`, `kirby`, `typo3`, `invision`, `smf`, `vanilla`, `punbb`, `phorum`, `yabb`, `mybb`, `vbulletin`, `textpattern`, `bludit`, `spip`, `bugzilla`, `mantisbt` (`mantis`), `plone`, `umbraco`, `dotclear`, `wikijs`, `redmine`, `flarum`, `opencart`, `nextjs`; aliases: `classicpress` → `wordpress`, `backdrop` → `drupal`; or `none`. A matching request (login/session cookie, admin URI, dynamic arg) skips lookup **and storage** and goes straight to origin. **Every preset is opt-in**; names **stack**, separated by spaces or `\|` (`wordpress\|woocommerce` == `wordpress woocommerce`). Implies `cache_turbo_cache_control honor`. **`none`** means no preset here and exists to override one inherited from the `server` block; it is exclusive and does not imply `honor`. **`generic`/`auto` were removed** and are now a config error — the union was never a safe default ([why](#cms-backends-cache_turbo_backend)). Cookie names that an app lets you rename still need an explicit local rule; see each [application guide](docs/README.md). There is **no `django`/`laravel` preset** and never will be ([why](docs/frameworks.md)); Jira, Request Tracker and several other session-eager trackers are intentional non-presets ([research](docs/README.md#apps-we-deliberately-do-not-ship-a-preset-for)). |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | raw | What makes two requests "the same page". The built-in default is the Host header + raw unparsed path/query (not `$host$uri$query_string` — closer to `$host$request_uri`, since `unparsed_uri` is undecoded), with **no argument normalization** and **no scheme/port**. To enable normalized matching, set it to `$host$uri$cache_turbo_normalized_args`; to separate HTTP/HTTPS entries, use `$scheme$host$request_uri`. |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the five knobs below at once (`valid`, `beta`, `lock_ttl`, `stale_mult`, `min_uses`). `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |

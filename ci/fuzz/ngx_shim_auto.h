@@ -112,6 +112,7 @@ struct ngx_http_cache_turbo_loc_conf_s {
 #define NGX_HTTP_CACHE_TURBO_BACKEND_REDMINE      0x80000000ull
 #define NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM       0x100000000ull
 #define NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART     0x200000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_NEXTJS       0x400000000ull
 
 /*
  * Every preset bit, armed together by the driver. There is no GENERIC union any
@@ -158,7 +159,8 @@ struct ngx_http_cache_turbo_loc_conf_s {
      | NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS                                     \
      | NGX_HTTP_CACHE_TURBO_BACKEND_REDMINE                                    \
      | NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM                                     \
-     | NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART)
+     | NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART                                  \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_NEXTJS)
 
 /* ALL must be a gapless run of bits starting at 0x0001 — i.e. ALL+1 is a power
  * of two. An omitted bit inside the run breaks this and fails the fuzz build,

@@ -128,6 +128,7 @@ typedef struct {
     const char *const   *args;     /* "name" (presence) or "name=value"       */
     const ngx_http_cache_turbo_cookie_pred_t  *cookie_preds;
     const char *const  *key_cookies;
+    const char *const  *headers;   /* request header names, presence */
 } ngx_http_cache_turbo_preset_t;
 
 /* Non-static: module.c iterates it (auto_skip / auto_key sites). */
@@ -443,7 +444,7 @@ ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
      | NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504 \
      | NGX_HTTP_CACHE_TURBO_USE_STALE_ANY_5XX)
 
-/* backend preset bits WORDPRESS..OPENCART (module.c only) */
+/* backend preset bits WORDPRESS..NEXTJS (module.c only) */
 /*
  * Auto-classify CMS backend presets (distinct from the stale-window PRESET_*
  * above). A bitmask in loc_conf->backend_presets; each bit pulls in one row of
@@ -513,6 +514,7 @@ ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
 #define NGX_HTTP_CACHE_TURBO_BACKEND_REDMINE      0x80000000ull
 #define NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM       0x100000000ull
 #define NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART     0x200000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_NEXTJS       0x400000000ull
 
 /* ST_/SR_ serve outcome + reason enums (module.c only) */
 /* Per-request serve outcome (ctx.status), surfaced by $cache_turbo_status.
@@ -1220,6 +1222,10 @@ ngx_int_t ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
     ngx_str_t *val_out);
 char *ngx_http_cache_turbo_compile_auto_presets(ngx_conf_t *cf,
     ngx_http_cache_turbo_loc_conf_t *clcf);
+ngx_int_t ngx_http_cache_turbo_auto_header_present(ngx_http_request_t *r,
+    ngx_array_t *names);
+ngx_int_t ngx_http_cache_turbo_req_header_named(ngx_http_request_t *r,
+    u_char *name, size_t len);
 ngx_int_t ngx_http_cache_turbo_cookie_lookup(ngx_http_request_t *r,
     ngx_str_t *name, ngx_str_t *val_out);
 ngx_int_t ngx_http_cache_turbo_bypass_uri_match(ngx_http_request_t *r,
