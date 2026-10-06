@@ -1045,6 +1045,56 @@ finding_case_ "stripe-seam: a stripe_of call in a ledgered body is still seen ac
     'shm_lookup: calls stripe_of\(\) but is ledgered as .pending.' stripe_seam_lint
 rm -f "$checkerroot/src/a.c"
 cp "$checkerroot/ledger.base" "$checkerroot/src/control.c"
+
+# An awk runtime failure in shm-lock or stripe-seam is "could not run" (2) with
+# its own message, never the finding banner (1) and never clean (0). Same stub
+# shape as the atomic-ordering control above. The stripe-seam ledger scan is
+# the one awk call with `-v fn=`; the stub lets every other call reach the real
+# awk so that scan is reached.
+realawk="$(command -v awk)"
+mkdir -p "$checkerroot/fakebin"
+printf '#!/bin/sh\nexit %s\n' 2 > "$checkerroot/fakebin/awk"
+printf '#!/bin/sh\ncase "$*" in *-v\\ fn=*) exit 2 ;; esac\nexec %s "$@"\n' "$realawk" \
+    > "$checkerroot/fakebin/awk-ledger"
+chmod +x "$checkerroot/fakebin/awk" "$checkerroot/fakebin/awk-ledger"
+# shellcheck disable=SC2329,SC2317  # invoked indirectly, by name, via case_()
+awk_failed_msg() {
+    # $1 = checker, $2 = stub, $3 = expected message ERE, $4 = banner that must be absent
+    local out got
+    out="$(env -C "$checkerroot" PATH="$checkerroot/fakebin:$PATH" \
+        bash "ci/tools/$1" src/control.c 2>&1)"; got=$?
+    grep -qE -- "$3" <<< "$out" || return 90
+    if grep -q -- "$4" <<< "$out"; then return 91; fi
+    return "$got"
+}
+# shellcheck disable=SC2329,SC2317  # invoked indirectly, by name, via case_()
+awk_ledger_failed_msg() {
+    local out got
+    mv "$checkerroot/fakebin/awk" "$checkerroot/fakebin/awk.off"
+    cp "$checkerroot/fakebin/awk-ledger" "$checkerroot/fakebin/awk"
+    out="$(env -C "$checkerroot" PATH="$checkerroot/fakebin:$PATH" \
+        bash ci/tools/lint-stripe-seam.sh 2>&1)"; got=$?
+    mv "$checkerroot/fakebin/awk.off" "$checkerroot/fakebin/awk"
+    grep -qE 'lint-stripe-seam: awk failed on the ledger scan of ngx_http_cache_turbo_shm_lookup \(exit 2\)' <<< "$out" || return 90
+    if grep -q 'not found in src' <<< "$out" || grep -q 'FAIL: the key-directed' <<< "$out"; then return 91; fi
+    return "$got"
+}
+case_ 2 "shm-lock: an awk failure is exit 2 with its message and no R7 banner" \
+    awk_failed_msg lint-shm-lock.sh awk 'lint-shm-lock: awk failed on src/control\.c \(exit 2\)' 'FAIL: shm-mutex'
+case_ 2 "stripe-seam: an awk failure in the main scan is exit 2 with its message and no seam banner" \
+    awk_failed_msg lint-stripe-seam.sh awk 'lint-stripe-seam: awk failed on src/control\.c \(exit 2\)' 'FAIL: a site reaches'
+case_ 2 "stripe-seam: an awk failure in the ledger scan is exit 2, not 'not found'" awk_ledger_failed_msg
+# Any other nonzero awk exit is also "could not run".
+printf '#!/bin/sh\nexit %s\n' 137 > "$checkerroot/fakebin/awk"
+case_ 2 "shm-lock: any other nonzero awk exit is exit 2" \
+    awk_failed_msg lint-shm-lock.sh awk 'awk failed on src/control\.c \(exit 137\)' 'FAIL: shm-mutex'
+# An awk exiting 1 is still the finding class (the contract for 1).
+printf '#!/bin/sh\nexit %s\n' 1 > "$checkerroot/fakebin/awk"
+finding_case_ "shm-lock: awk exit 1 is still the R7 finding" 'FAIL: shm-mutex' \
+    env -C "$checkerroot" PATH="$checkerroot/fakebin:$PATH" bash ci/tools/lint-shm-lock.sh src/control.c
+finding_case_ "stripe-seam: awk exit 1 is still the seam finding" 'FAIL: a site reaches' \
+    env -C "$checkerroot" PATH="$checkerroot/fakebin:$PATH" bash ci/tools/lint-stripe-seam.sh src/control.c
+rm -rf "$checkerroot/fakebin"
 rm -f "$checkerroot/src/control.c"
 #
 # THE FIXTURES ARE NOW COMPLETE, WELL-TYPED C. carve-init parses with clang

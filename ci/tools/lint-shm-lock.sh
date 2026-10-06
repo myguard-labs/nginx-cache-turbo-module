@@ -153,7 +153,17 @@ for f in "${files[@]}"; do
             if (have) judge(pending, start)
             exit bad ? 1 : 0
         }
-    ' "$f" || status=1
+    ' "$f" && rc=0 || rc=$?
+    # awk exit 0 = clean, 1 = a finding, anything else is an awk runtime
+    # failure -- "could not run", never a finding and never clean.
+    case "$rc" in
+        0) ;;
+        1) status=1 ;;
+        *)
+            echo "lint-shm-lock: awk failed on $f (exit $rc)" >&2
+            exit 2
+            ;;
+    esac
 done
 
 if [ "$status" -ne 0 ]; then
