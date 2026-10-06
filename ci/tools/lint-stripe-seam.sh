@@ -77,6 +77,22 @@ for f in "${files[@]}"; do
     [ -f "$f" ] || continue
 
     awk -v file="$f" '
+        # Cut a // line comment, but only where the // is real code: a // inside
+        # a "string" or a char literal (an http:// URL) is not a comment, and
+        # cutting there would hide everything after it on the logical line.
+        # An escaped character inside a literal never closes it.
+        function strip_cmt(s,    i, n, ch, q) {
+            n = length(s); q = ""
+            for (i = 1; i <= n; i++) {
+                ch = substr(s, i, 1)
+                if (q != "") {
+                    if (ch == "\\") i++
+                    else if (ch == q) q = ""
+                } else if (ch == "\"" || ch == "\047") q = ch
+                else if (ch == "/" && substr(s, i + 1, 1) == "/") return substr(s, 1, i - 1)
+            }
+            return s
+        }
         # C translation phase 2 first: a physical line whose last character is
         # a backslash (GCC also accepts backslash plus trailing blanks) is
         # spliced onto the next line. A token split by a continuation
@@ -88,7 +104,7 @@ for f in "${files[@]}"; do
             # Drop comments: the sources discuss "z->shpool->mutex" in prose
             # all over, and a lint that fires on the explanation of an
             # invariant is a lint people delete.
-            sub(/\/\/.*/, "", line)
+            line = strip_cmt(line)
             if (line ~ /^[[:space:]]*\*/)   return
             if (line ~ /^[[:space:]]*\/\*/) return
 
@@ -235,11 +251,27 @@ pending:ngx_http_cache_turbo_shm_touch_lru
 # not be read as "not found".) Any other nonzero exit is an awk failure.
 fn_calls_stripe_of() {
     awk -v fn="$1" '
+        # Cut a // line comment, but only where the // is real code: a // inside
+        # a "string" or a char literal (an http:// URL) is not a comment, and
+        # cutting there would hide everything after it on the logical line.
+        # An escaped character inside a literal never closes it.
+        function strip_cmt(s,    i, n, ch, q) {
+            n = length(s); q = ""
+            for (i = 1; i <= n; i++) {
+                ch = substr(s, i, 1)
+                if (q != "") {
+                    if (ch == "\\") i++
+                    else if (ch == q) q = ""
+                } else if (ch == "\"" || ch == "\047") q = ch
+                else if (ch == "/" && substr(s, i + 1, 1) == "/") return substr(s, 1, i - 1)
+            }
+            return s
+        }
         # Phase 2 splice first (see the main scan above): a continued // comment
         # must not leak its next physical line into the function body, and a
         # stripe_of token split by a backslash-newline is still a call.
         function judge(line) {
-            sub(/\/\/.*/, "", line)
+            line = strip_cmt(line)
             if (line ~ /^[[:space:]]*\*/)   return
             if (line ~ /^[[:space:]]*\/\*/) return
 

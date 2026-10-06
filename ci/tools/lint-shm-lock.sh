@@ -73,6 +73,22 @@ status=0
 for f in "${files[@]}"; do
     [ -f "$f" ] || continue
     awk -v file="$f" -v forbidden="$forbidden" '
+        # Cut a // line comment, but only where the // is real code: a // inside
+        # a "string" or a char literal (an http:// URL) is not a comment, and
+        # cutting there would hide everything after it on the logical line.
+        # An escaped character inside a literal never closes it.
+        function strip_cmt(s,    i, n, ch, q) {
+            n = length(s); q = ""
+            for (i = 1; i <= n; i++) {
+                ch = substr(s, i, 1)
+                if (q != "") {
+                    if (ch == "\\") i++
+                    else if (ch == q) q = ""
+                } else if (ch == "\"" || ch == "\047") q = ch
+                else if (ch == "/" && substr(s, i + 1, 1) == "/") return substr(s, 1, i - 1)
+            }
+            return s
+        }
         # C translation phase 2 first: a physical line whose last character is
         # a backslash (GCC also accepts backslash plus trailing blanks) is
         # spliced onto the next line. A token split by a continuation
@@ -87,7 +103,7 @@ for f in "${files[@]}"; do
             # sources keep block-comment bodies on their own lines, so
             # per-line stripping is enough here; no multi-line comment-state
             # machine needed.)
-            sub(/\/\/.*/, "", line)
+            line = strip_cmt(line)
             if (line ~ /^[[:space:]]*\*/)   return   # block comment body
             if (line ~ /^[[:space:]]*\/\*/) return   # block-comment opener line
 

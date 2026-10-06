@@ -1021,6 +1021,67 @@ finding_case_ "stripe-seam: a plain stripe_of call is still seen by the ledger s
 cp "$checkerroot/ledger.base" "$checkerroot/src/control.c"
 case_ 0 "stripe-seam: the ledger base still passes after the splice change" stripe_seam_lint
 
+# shm-lock and stripe-seam: a // inside a string or char literal (an http://
+# URL) is not a comment. The scanners cut each line at the first // regardless,
+# so everything after such a literal on the same logical line became invisible:
+# a yield under the mutex, a bare pool dereference, a ->stripes[ index or a
+# stripe_of( call could hide behind one. The cut is now quote-aware (an escaped
+# character never closes a literal); a real trailing // comment still strips.
+q2='"'
+# shm-lock: a yield after a "http://x" literal on the same line, while locked.
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' 'log("http://x"); ngx_http_finalize_request(r, rc);' \
+    'ngx_shmtx_unlock(&m);' '}'
+finding_case_ "shm-lock: a yield after a // inside a string literal is caught" \
+    "$(at_ 3) yielding call under shm mutex" shm_lock_lint
+# shm-lock: an unlock after the literal still releases (state does not skew).
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' 'log("http://x"); ngx_shmtx_unlock(&m);' \
+    'ngx_http_finalize_request(r, rc);' '}'
+case_ 0 "shm-lock: an unlock after a // inside a string literal releases the mutex" shm_lock_lint
+# Boundary: an escaped quote inside the string does not end it early.
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' \
+    's = '"$q2"'a'"$bsl$q2"'//b'"$q2"'; ngx_http_finalize_request(r, rc);' 'ngx_shmtx_unlock(&m);' '}'
+finding_case_ "shm-lock: a yield after a string with an escaped quote and // is caught" \
+    "$(at_ 3) yielding call under shm mutex" shm_lock_lint
+# Boundary: a char literal holding the two slashes.
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' "c = '//'; ngx_http_finalize_request(r, rc);" \
+    'ngx_shmtx_unlock(&m);' '}'
+finding_case_ "shm-lock: a yield after a char literal holding // is caught" \
+    "$(at_ 3) yielding call under shm mutex" shm_lock_lint
+# Boundary: an escaped-quote char literal does not swallow a real trailing comment.
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' "c = '$bsl''; // ngx_http_finalize_request(r, rc);" \
+    'ngx_shmtx_unlock(&m);' '}'
+case_ 0 "shm-lock: a real comment after an escaped-quote char literal still strips" shm_lock_lint
+# Positive control: a real // comment after a string still strips; the name that
+# appears only in that trailing comment does not fire.
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' 'log("x"); // ngx_http_finalize_request(r, rc);' \
+    'ngx_shmtx_unlock(&m);' '}'
+case_ 0 "shm-lock: a forbidden name only in a // comment after a string does not fire" shm_lock_lint
+
+# stripe-seam main scan: a bare deref after a "//" literal.
+splice_fixture 'void t(void){' 's = "//"; z->shpool = p;' '}'
+finding_case_ "stripe-seam: a bare ->shpool after a // string literal is caught" \
+    "$(at_ 2) bare zone shm dereference outside the stripe resolver" stripe_seam_lint
+splice_fixture 'void t(void){' 'u = "http://x"; y = z->stripes[0];' '}'
+finding_case_ "stripe-seam: a ->stripes[ index after a // string literal is caught" \
+    "$(at_ 2) direct ->stripes\\[\\] index outside the resolver" stripe_seam_lint
+splice_fixture 'void t(void){' \
+    's = '"$q2"'a'"$bsl$q2"'//b'"$q2"'; z->shpool = p;' '}'
+finding_case_ "stripe-seam: a bare deref after a string with an escaped quote and // is caught" \
+    "$(at_ 2) bare zone shm dereference outside the stripe resolver" stripe_seam_lint
+splice_fixture 'void t(void){' "c = '//'; z->shpool = p;" '}'
+finding_case_ "stripe-seam: a bare deref after a char literal holding // is caught" \
+    "$(at_ 2) bare zone shm dereference outside the stripe resolver" stripe_seam_lint
+# Positive control: a real trailing comment after a string still strips.
+splice_fixture 'void t(void){' 's = "x"; // z->shpool = p;' '}'
+case_ 0 "stripe-seam: a bare deref only in a // comment after a string does not fire" stripe_seam_lint
+# stripe-seam ledger scan: a stripe_of( call after a "//" literal is seen.
+in_lookup '    s = "http://x"; ngx_http_cache_turbo_stripe_of(z, k);'
+finding_case_ "stripe-seam: a stripe_of call after a // string literal is seen by the ledger scan" \
+    'shm_lookup: calls stripe_of\(\) but is ledgered as .pending.' stripe_seam_lint
+in_lookup '    s = "x"; // ngx_http_cache_turbo_stripe_of(z, k);'
+case_ 0 "stripe-seam: a stripe_of call only in a // comment after a string is not a call" stripe_seam_lint
+cp "$checkerroot/ledger.base" "$checkerroot/src/control.c"
+
 # Cross-file state: the ledger scan is ONE awk pass over every src/*.c, but a
 # compiler never splices lines or keeps a function body open across translation
 # units. src/a.c sorts before src/control.c, so it is read first.
