@@ -77,31 +77,40 @@ for f in "${files[@]}"; do
     [ -f "$f" ] || continue
 
     awk -v file="$f" '
-        # Drop comments: the sources discuss "z->shpool->mutex" in prose all
-        # over, and a lint that fires on the explanation of an invariant is a
-        # lint people delete.
-        { line = $0; sub(/\/\/.*/, "", line) }
-        line ~ /^[[:space:]]*\*/   { next }
-        line ~ /^[[:space:]]*\/\*/ { next }
+        # C translation phase 2 first: a physical line whose last character is
+        # a backslash (GCC also accepts backslash plus trailing blanks) is
+        # spliced onto the next line. A token split by a continuation
+        # (z->sh\<newline>pool) is therefore seen whole, and a
+        # backslash-continued // comment swallows the next physical line. The
+        # joined logical line is judged once and reported at its FIRST physical
+        # line; a partial logical line left at EOF is flushed in END.
+        function judge(line, lnum,    probe, trimmed) {
+            # Drop comments: the sources discuss "z->shpool->mutex" in prose
+            # all over, and a lint that fires on the explanation of an
+            # invariant is a lint people delete.
+            sub(/\/\/.*/, "", line)
+            if (line ~ /^[[:space:]]*\*/)   return
+            if (line ~ /^[[:space:]]*\/\*/) return
 
-        # Track whether we are inside shm_init_zone(), the one function that is
-        # allowed to name ->sh / ->shpool -- and only on its resolver-derived
-        # `st`, which the second pattern below still holds it to.
-        /^ngx_http_cache_turbo_shm_init_zone\(/ { in_init = 1 }
-        in_init && /^}/                         { in_init = 0; next }
+            # Track whether we are inside shm_init_zone(), the one function
+            # that is allowed to name ->sh / ->shpool -- and only on its
+            # resolver-derived `st`, which the second pattern below still holds
+            # it to.
+            if (line ~ /^ngx_http_cache_turbo_shm_init_zone\(/) in_init = 1
+            if (in_init && line ~ /^}/) { in_init = 0; return }
 
-        # A bare zone dereference: <ident>->sh or <ident>->shpool where the
-        # identifier is NOT a stripe pointer. Inside init, `st->` is the
-        # sanctioned spelling and is skipped; everywhere else nothing is.
-        # NOTE: no \b anywhere below. POSIX awk (and mawk) have no word-boundary
-        # escape -- gawk silently treats \b as a backspace, so a pattern written
-        # with it matches nothing and the lint reports ok having detected
-        # nothing. That is precisely the vacuous-gate class the header of this file
-        # warns about, and it was caught here by planting all three violations
-        # and watching two of them sail through. Word edges are spelled with
-        # explicit character classes, and the string is padded so a match at the
-        # very start or end of the line still has a neighbour to test.
-        {
+            # A bare zone dereference: <ident>->sh or <ident>->shpool where the
+            # identifier is NOT a stripe pointer. Inside init, `st->` is the
+            # sanctioned spelling and is skipped; everywhere else nothing is.
+            # NOTE: no \b anywhere below. POSIX awk (and mawk) have no
+            # word-boundary escape -- gawk silently treats \b as a backspace, so
+            # a pattern written with it matches nothing and the lint reports ok
+            # having detected nothing. That is precisely the vacuous-gate class
+            # the header of this file warns about, and it was caught here by
+            # planting all three violations and watching two of them sail
+            # through. Word edges are spelled with explicit character classes,
+            # and the string is padded so a match at the very start or end of
+            # the line still has a neighbour to test.
             probe = " " line " "
             # Inside init the sanctioned spelling is `st->sh` / `st->shpool` on
             # the resolver-derived stripe pointer. Blank exactly that out (with
@@ -114,22 +123,38 @@ for f in "${files[@]}"; do
                 trimmed = line
                 sub(/^[[:space:]]+/, "", trimmed)
                 printf "%s:%d: bare zone shm dereference outside the stripe resolver: %s\n", \
-                       file, FNR, trimmed
+                       file, lnum, trimmed
+                bad = 1
+            }
+
+            # Only the resolvers may index the stripe array, and they live in
+            # the header -- so any ->stripes[ in a .c file is a hand-picked pool.
+            if (line ~ /->stripes\[/) {
+                trimmed = line
+                sub(/^[[:space:]]+/, "", trimmed)
+                printf "%s:%d: direct ->stripes[] index outside the resolver: %s\n", \
+                       file, lnum, trimmed
                 bad = 1
             }
         }
 
-        # Only the resolvers may index the stripe array, and they live in the
-        # header -- so any ->stripes[ in a .c file is a hand-picked pool.
-        line ~ /->stripes\[/ {
-            trimmed = line
-            sub(/^[[:space:]]+/, "", trimmed)
-            printf "%s:%d: direct ->stripes[] index outside the resolver: %s\n", \
-                   file, FNR, trimmed
-            bad = 1
+        {
+            if (!have) start = FNR
+            cur = $0
+            if (cur ~ /\\[ \t\r]*$/) {
+                sub(/\\[ \t\r]*$/, "", cur)
+                pending = pending cur
+                have = 1
+                next
+            }
+            judge(pending cur, start)
+            pending = ""; have = 0
         }
 
-        END { exit bad ? 1 : 0 }
+        END {
+            if (have) judge(pending, start)
+            exit bad ? 1 : 0
+        }
     ' "$f" || status=1
 done
 
@@ -198,15 +223,33 @@ pending:ngx_http_cache_turbo_shm_touch_lru
 #      hypothetical.
 fn_calls_stripe_of() {
     awk -v fn="$1" '
-        { line = $0; sub(/\/\/.*/, "", line) }
-        line ~ /^[[:space:]]*\*/   { next }
-        line ~ /^[[:space:]]*\/\*/ { next }
+        # Phase 2 splice first (see the main scan above): a continued // comment
+        # must not leak its next physical line into the function body, and a
+        # stripe_of token split by a backslash-newline is still a call.
+        function judge(line) {
+            sub(/\/\/.*/, "", line)
+            if (line ~ /^[[:space:]]*\*/)   return
+            if (line ~ /^[[:space:]]*\/\*/) return
 
-        index(line, fn "(") == 1 { on = 1; ndef++ }
-        on && index(line, "ngx_http_cache_turbo_stripe_of(") > 0 { calls = 1 }
-        on && line ~ /^}/ { on = 0 }
+            if (index(line, fn "(") == 1) { on = 1; ndef++ }
+            if (on && index(line, "ngx_http_cache_turbo_stripe_of(") > 0) calls = 1
+            if (on && line ~ /^}/) on = 0
+        }
+
+        {
+            cur = $0
+            if (cur ~ /\\[ \t\r]*$/) {
+                sub(/\\[ \t\r]*$/, "", cur)
+                pending = pending cur
+                have = 1
+                next
+            }
+            judge(pending cur)
+            pending = ""; have = 0
+        }
 
         END {
+            if (have) judge(pending)
             if (ndef == 0) { exit 2 }
             if (ndef > 1)  { exit 3 }
             print calls ? "yes" : "no"

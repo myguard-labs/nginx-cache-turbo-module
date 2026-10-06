@@ -705,6 +705,7 @@ for fn in \
     ngx_http_cache_turbo_shm_touch_lru; do
     printf '%s(void)\n{\n}\n' "$fn" >> "$checkerroot/src/control.c"
 done
+cp "$checkerroot/src/control.c" "$checkerroot/ledger.base"
 
 # shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
 shm_lock_lint() {
@@ -915,6 +916,111 @@ printf '#!/bin/sh\nexit %s\n' 1 > "$checkerroot/fakebin/awk"
 finding_case_ "atomic-ordering: awk exit 1 is still the weak-ordering finding" \
     'CI-ARM64-NO-LIVE-LANE' atomic_ordering_awk_failed
 rm -rf "$checkerroot/fakebin"
+
+# shm-lock and stripe-seam: backslash-newline splicing (translation phase 2)
+# happens before lexing, so a continued // comment swallows the next physical
+# line and a token split by a continuation is still one token. Both scanners
+# used to judge physical lines, which hid a yield under the mutex (an unlock
+# that is really comment text) and a bare pool dereference (a split token), and
+# raised false findings on the converse shapes. A finding is reported at the
+# logical line's FIRST physical line. Each fixture is the ledger base plus its
+# own lines, so the line numbers below are offsets from base_n.
+bsl=$'\\'
+base_n="$(wc -l < "$checkerroot/ledger.base")"
+splice_fixture() {
+    cp "$checkerroot/ledger.base" "$checkerroot/src/control.c"
+    printf '%s\n' "$@" >> "$checkerroot/src/control.c"
+}
+at_() { echo "src/control.c:$((base_n + $1)):"; }
+
+# shm-lock: a continued // comment hides an unlock, so the yield is still locked.
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' '// note '"$bsl" 'ngx_shmtx_unlock(&m);' \
+    'ngx_http_finalize_request(r, rc);' '}'
+finding_case_ "shm-lock: an unlock inside a continued // comment does not release the mutex" \
+    "$(at_ 5) yielding call under shm mutex" shm_lock_lint
+# shm-lock: a lock split by a splice is still a lock.
+splice_fixture 'void t(void){' 'ngx_shmtx_lo'"$bsl" 'ck(&m);' 'ngx_http_finalize_request(r, rc);' \
+    'ngx_shmtx_unlock(&m);' '}'
+finding_case_ "shm-lock: a ngx_shmtx_lock split by a splice is caught" \
+    "$(at_ 4) yielding call under shm mutex" shm_lock_lint
+# shm-lock: a forbidden call split by a splice is reported at its first line.
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' 'ngx_http_finalize_'"$bsl" 'request(r, rc);' \
+    'ngx_shmtx_unlock(&m);' '}'
+finding_case_ "shm-lock: a forbidden call split by a splice is caught at its first line" \
+    "$(at_ 3) yielding call under shm mutex" shm_lock_lint
+# Boundary: backslash plus trailing blanks still splices (as GCC does).
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' '// note '"$bsl"' 	' 'ngx_shmtx_unlock(&m);' \
+    'ngx_http_finalize_request(r, rc);' '}'
+finding_case_ "shm-lock: a backslash with trailing blanks still splices and is caught" \
+    "$(at_ 5) yielding call under shm mutex" shm_lock_lint
+# Boundary: CRLF after the backslash still splices.
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' '// note '"$bsl"$'\r' 'ngx_shmtx_unlock(&m);' \
+    'ngx_http_finalize_request(r, rc);' '}'
+finding_case_ "shm-lock: a CRLF-terminated backslash still splices and is caught" \
+    "$(at_ 5) yielding call under shm mutex" shm_lock_lint
+# Negative (false positive): an unlock split by a splice is a real unlock.
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' 'ngx_shmtx_un'"$bsl" 'lock(&m);' \
+    'ngx_http_finalize_request(r, rc);' '}'
+case_ 0 "shm-lock: an unlock split by a splice releases the mutex" shm_lock_lint
+# Negative (false positive): a yield inside a continued // comment is prose.
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' '// note '"$bsl" 'ngx_http_finalize_request(r, rc);' \
+    'ngx_shmtx_unlock(&m);' '}'
+case_ 0 "shm-lock: a yield inside a continued // comment is not a call" shm_lock_lint
+# Boundary: a file ending in a bare backslash with no newline must not crash.
+splice_fixture 'void t(void){ ngx_shmtx_lock(&m); ngx_shmtx_unlock(&m); }'
+printf '%s' 'int v; '"$bsl" >> "$checkerroot/src/control.c"
+case_ 0 "shm-lock: a clean file ending in a bare backslash passes" shm_lock_lint
+# Ordinary code still passes clean.
+splice_fixture 'void t(void){' 'ngx_shmtx_lock(&m);' 'x = 1;' 'ngx_shmtx_unlock(&m);' \
+    'ngx_http_finalize_request(r, rc);' '}'
+case_ 0 "shm-lock: ordinary lock discipline still passes after the splice change" shm_lock_lint
+
+# stripe-seam: a bare pool dereference split by a splice is still one token.
+splice_fixture 'void t(void){' 'z->sh'"$bsl" 'pool = p;' '}'
+finding_case_ "stripe-seam: ->shpool split by a splice is caught at its first line" \
+    "$(at_ 2) bare zone shm dereference outside the stripe resolver" stripe_seam_lint
+splice_fixture 'void t(void){' 'x = z->stripes'"$bsl" '[0];' '}'
+finding_case_ "stripe-seam: ->stripes[ split by a splice is caught at its first line" \
+    "$(at_ 2) direct ->stripes\\[\\] index outside the resolver" stripe_seam_lint
+# Boundary: backslash plus trailing blanks, and CRLF, still splice.
+splice_fixture 'void t(void){' 'z->sh'"$bsl"' 	' 'pool = p;' '}'
+finding_case_ "stripe-seam: a backslash with trailing blanks still splices and is caught" \
+    "$(at_ 2) bare zone shm dereference outside the stripe resolver" stripe_seam_lint
+splice_fixture 'void t(void){' 'z->sh'"$bsl"$'\r' 'pool = p;' '}'
+finding_case_ "stripe-seam: a CRLF-terminated backslash still splices and is caught" \
+    "$(at_ 2) bare zone shm dereference outside the stripe resolver" stripe_seam_lint
+# Negative (false positive): a bare dereference inside a continued // comment.
+splice_fixture 'void t(void){' '// note '"$bsl" 'z->shpool = p;' '}'
+case_ 0 "stripe-seam: a bare dereference inside a continued // comment is not code" stripe_seam_lint
+# Negative: a split token that is NOT a bare dereference stays clean.
+splice_fixture 'void t(void){' 'x = ngx_http_cache_turbo_zone_'"$bsl" 'pool(z);' '}'
+case_ 0 "stripe-seam: a resolver call split by a splice stays clean" stripe_seam_lint
+# Boundary: a file ending in a bare backslash with no newline must not crash.
+splice_fixture 'void t(void){ x = 1; }'
+printf '%s' 'int v; '"$bsl" >> "$checkerroot/src/control.c"
+case_ 0 "stripe-seam: a clean file ending in a bare backslash passes" stripe_seam_lint
+# Ledger scan. The ledger rows are all `pending`, so a stripe_of() call in a
+# ledgered body (here: inside the base's first function, shm_lookup) is a
+# disagreement. in_lookup injects its lines after that function's opening brace.
+in_lookup() {
+    printf '%s\n' "$@" > "$checkerroot/inject.txt"
+    sed '2r '"$checkerroot/inject.txt" "$checkerroot/ledger.base" > "$checkerroot/src/control.c"
+}
+# A stripe_of call split by a splice counts as a call.
+in_lookup '    ngx_http_cache_turbo_stripe_'"$bsl" 'of(z, k);'
+finding_case_ "stripe-seam: a stripe_of call split by a splice is seen by the ledger scan" \
+    'shm_lookup: calls stripe_of\(\) but is ledgered as .pending.' stripe_seam_lint
+# A stripe_of call inside a continued // comment is not a call.
+in_lookup '    // note '"$bsl" '    ngx_http_cache_turbo_stripe_of(z, k);'
+case_ 0 "stripe-seam: a stripe_of call inside a continued // comment is not a call" stripe_seam_lint
+# Ordinary: a plain stripe_of call is still seen (the control for the two above).
+in_lookup '    ngx_http_cache_turbo_stripe_of(z, k);'
+finding_case_ "stripe-seam: a plain stripe_of call is still seen by the ledger scan" \
+    'shm_lookup: calls stripe_of\(\) but is ledgered as .pending.' stripe_seam_lint
+# Ordinary code still passes clean.
+cp "$checkerroot/ledger.base" "$checkerroot/src/control.c"
+case_ 0 "stripe-seam: the ledger base still passes after the splice change" stripe_seam_lint
+rm -f "$checkerroot/src/control.c"
 #
 # THE FIXTURES ARE NOW COMPLETE, WELL-TYPED C. carve-init parses with clang
 # rather than lexing with awk, and clang's error recovery replaces the

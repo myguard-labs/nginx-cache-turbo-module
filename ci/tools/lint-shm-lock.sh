@@ -73,26 +73,33 @@ status=0
 for f in "${files[@]}"; do
     [ -f "$f" ] || continue
     awk -v file="$f" -v forbidden="$forbidden" '
-        # Strip // line comments and whole-line /* ... */ comments so a mention
-        # of a forbidden name in prose never trips the lint. (The sources keep
-        # block-comment bodies on their own lines, so per-line stripping is
-        # enough here; no multi-line comment-state machine needed.)
-        {
-            line = $0
+        # C translation phase 2 first: a physical line whose last character is
+        # a backslash (GCC also accepts backslash plus trailing blanks) is
+        # spliced onto the next line. A token split by a continuation
+        # (ngx_shmtx_un\<newline>lock) is therefore seen whole, and a
+        # backslash-continued // comment swallows the next physical line.
+        # The joined logical line is judged once and reported at its FIRST
+        # physical line; a partial logical line left at EOF is flushed in END.
+        function judge(line, lnum,    rest, li, lp, ll, ui, up, ul, pos, len, \
+                       nowlocked, seg, trimmed) {
+            # Strip // line comments and whole-line /* ... */ comments so a
+            # mention of a forbidden name in prose never trips the lint. (The
+            # sources keep block-comment bodies on their own lines, so
+            # per-line stripping is enough here; no multi-line comment-state
+            # machine needed.)
             sub(/\/\/.*/, "", line)
-        }
-        line ~ /^[[:space:]]*\*/      { next }   # continuation of a block comment
-        line ~ /^[[:space:]]*\/\*/    { next }   # block-comment opener line
+            if (line ~ /^[[:space:]]*\*/)   return   # block comment body
+            if (line ~ /^[[:space:]]*\/\*/) return   # block-comment opener line
 
-        # Scan in SOURCE ORDER rather than per-line, so a lock (or unlock) that
-        # shares its line with a forbidden call is still judged. An earlier form
-        # flipped `locked` and did `next`, which skipped the check for the WHOLE
-        # line -- so `ngx_shmtx_lock(&z->shpool->mutex); ngx_http_finalize_request(r, rc);`
-        # passed, as did a forbidden call sitting BEFORE an unlock on one line.
-        # No source does that today, which is exactly why it needed catching by
-        # construction: same empty-selection class as the ../.. bug above, where
-        # the gate reports ok having examined nothing.
-        {
+            # Scan in SOURCE ORDER rather than per-line, so a lock (or unlock)
+            # that shares its line with a forbidden call is still judged. An
+            # earlier form flipped `locked` and did `next`, which skipped the
+            # check for the WHOLE line -- so
+            # `ngx_shmtx_lock(&z->shpool->mutex); ngx_http_finalize_request(r, rc);`
+            # passed, as did a forbidden call sitting BEFORE an unlock on one
+            # line. No source does that today, which is exactly why it needed
+            # catching by construction: same empty-selection class as the ../..
+            # bug above, where the gate reports ok having examined nothing.
             rest = line
             while (rest != "") {
                 li = match(rest, /ngx_shmtx_lock[[:space:]]*\(/)
@@ -122,14 +129,30 @@ for f in "${files[@]}"; do
                     trimmed = line
                     sub(/^[[:space:]]+/, "", trimmed)
                     printf "%s:%d: yielding call under shm mutex: %s\n", \
-                           file, FNR, trimmed
+                           file, lnum, trimmed
                     bad = 1
                 }
 
                 if (pos != 0) { locked = nowlocked }
             }
         }
-        END { exit bad ? 1 : 0 }
+
+        {
+            if (!have) start = FNR
+            cur = $0
+            if (cur ~ /\\[ \t\r]*$/) {
+                sub(/\\[ \t\r]*$/, "", cur)
+                pending = pending cur
+                have = 1
+                next
+            }
+            judge(pending cur, start)
+            pending = ""; have = 0
+        }
+        END {
+            if (have) judge(pending, start)
+            exit bad ? 1 : 0
+        }
     ' "$f" || status=1
 done
 
