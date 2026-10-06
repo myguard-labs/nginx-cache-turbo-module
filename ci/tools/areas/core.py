@@ -1205,6 +1205,11 @@ _COOKIE_NEEDLE_TABLE = {
     "wikijs":      ("/ct-wikijs/", ["jwt=", "connect.sid=", "loginRedirect="]),
     "redmine":     ("/redmine/", ["_redmine_session=", "autologin="]),
     "flarum":      ("/ct-flarum/", ["flarum_remember="]),
+    "nextjs":      ("/ct-nextjs/", ["__prerender_bypass", "__next_preview_data",
+                                     "next-auth.session-token",
+                                     "authjs.session-token", "__session",
+                                     "better-auth.session_token",
+                                     "-auth-token"]),
 }
 
 
@@ -1846,6 +1851,7 @@ _ARG_NEEDLE_TABLE = {
                                       "route=account/tracking", "route=account/payment_method",
                                       "route=account/authorize", "route=account/success",
                                       "user_token", "customer_token"]),
+    "nextjs":      ("/ct-nextjs/", ["_rsc"]),
 }
 
 

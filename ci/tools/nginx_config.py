@@ -3608,6 +3608,16 @@ http {{
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        # nextjs: cookie/arg prefilter mirror rows. The request-header tier and
+        # the App Router Vary handling are covered in ci/t/presets/nextjs.t,
+        # which needs an origin that sends the Next.js Vary.
+        location /ct-nextjs/ {{
+            cache_turbo         main;
+            cache_turbo_backend nextjs;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 
         # A NAMED preset must pull in ONLY its own rules. `wordpress` here must
         # not react to /login, /user, /session, /index.php or another preset's

@@ -23,7 +23,9 @@ preset**, not this page. See [README.md](README.md).
 ## Why there is no framework preset
 
 A preset is three literals: `Cookie`-header substrings (matched across cookie
-names *and* values, not as cookie names), URI prefixes, query-arg keys. An
+names *and* values, not as cookie names), URI prefixes, query-arg keys. (A
+fourth tier, request-header names, exists for `nextjs` only; see
+[react.md](react.md).) An
 *application* can supply all three because it ships a fixed cookie name and a fixed
 URL layout. A *framework* supplies none of them.
 
@@ -110,7 +112,9 @@ as it does for [Drupal](drupal.md):
 - **Next.js** (App Router) sends `private, no-cache, no-store, max-age=0,
   must-revalidate` on any dynamically-rendered route — and reading `cookies()` is
   what *makes* a route dynamic. Static/ISR routes stay cacheable, which is the
-  correct split.
+  correct split. Next.js is the exception to this page: it has a preset,
+  `cache_turbo_backend nextjs`, because its App Router `Vary` needs one — see
+  [react.md](react.md).
 
 **Do not assume it for Django, Laravel, Rails, Flask or Express.** None of them
 reliably marks an authenticated response `private` out of the box. On those,
@@ -190,7 +194,7 @@ the one that decides everything.**
 | **Flask** | `session` | ✅ (but dangerously generic) | Only if session written (`flash()` writes) | No (only `Vary: Cookie`) |
 | **Express** | `connect.sid` | ✅ | **Yes: [`saveUninitialized: true`](https://expressjs.com/en/resources/middleware/session.html) is the default** | No |
 | **ASP.NET Core** | `.AspNetCore.Identity.Application` (auth) | ✅ | **No: set only on sign-in** | **Yes: `no-cache,no-store`** |
-| **Next.js** | *none* — library-defined | ❌ | library-dependent | ✅ on dynamic routes |
+| **Next.js** | *none* — library-defined ([react.md](react.md)) | ❌ | library-dependent | ✅ on dynamic routes |
 
 **Django — the conditional one.** `SessionMiddleware` sets `sessionid` only when the
 session is **non-empty AND modified**. So a brochure site with no cart, no guest
@@ -227,7 +231,9 @@ app name; Next.js has no session at all. The authentication library supplies the
 cookie: Auth.js v5 defaults to `authjs.session-token` and prefixes it as
 `__Secure-authjs.session-token` over HTTPS; NextAuth.js v4 used the corresponding
 `next-auth.session-token` names. The name can also be configured, so derive it with
-the curls instead of copying a version-specific literal.
+the curls instead of copying a version-specific literal. The `nextjs` preset
+matches the default session cookies of the common libraries; the table in
+[react.md](react.md#sessions-and-auth-libraries) lists which.
 
 ## Vhost
 

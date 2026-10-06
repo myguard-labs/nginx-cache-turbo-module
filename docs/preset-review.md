@@ -73,6 +73,7 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | `redmine` | 2 | 12 | 1 | — | — | Cookie login and cookieless `?key=` authentication are covered. |
 | `flarum` | 1 | 10 | — | — | — | Partial: login without remember-me is indistinguishable from a guest session; rechecked at 2.0.0-rc.8/1.8.19. |
 | `opencart` | — | — | 34 | — | — | Partial: base controller routes only. `OCSESSID` is identical for guests and members, so retain the application `no-store` policy; overriding it needs an application-exposed login boundary, then a fail-closed local map. |
+| `nextjs` | 7 | 1 | 1 | — | — | Plus 10 request-header rows (presence bypass; they also satisfy the matching App Router `Vary` axes). Safe for the default Auth.js/NextAuth, Clerk, Better Auth and Supabase session cookies; renamed cookies, Lucia and iron-session need local rules. `/api/` bypass is conservative. |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -85,6 +86,11 @@ sentinel, not a preset.
 The registry, runtime-test mirrors and documentation index agree on all 34
 preset rows and 37 accepted spellings. The preset unit checks cover every
 populated cookie and argument row.
+
+`nextjs` was added after this review (researched 2026-09-29 against Next.js
+16.3.7). Its cookie and argument rows are in the same mirrors; its
+request-header tier and `Vary` handling are covered by
+`ci/t/presets/nextjs.t`. See [react.md](react.md).
 
 The 2026-09-01 online refresh also confirmed that XenForo 2.3.12 and Flarum
 2.0.0-rc.8 do not require literal changes. Two material documentation

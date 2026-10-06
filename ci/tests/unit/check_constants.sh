@@ -77,7 +77,7 @@ python3 "$DIR/check_preset_mirrors.py" \
 # (ci/fuzz/ngx_shim_auto.h), which mirrors them by hand.
 #
 # ⚠ The bits are SPLIT across two headers as of MAINT-C3b and both must be
-# scanned: the 34 individual preset bits (WORDPRESS..OPENCART) are module.c-
+# scanned: the 35 individual preset bits (WORDPRESS..NEXTJS) are module.c-
 # private and live in _internal.h, while BACKEND_NONE stays in module.h because
 # the public HAS_BACKEND() macro references it. Scanning only one header makes
 # every bit in the other read as "in the fuzz shim but not the header" — a

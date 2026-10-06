@@ -1776,6 +1776,10 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
         return 1;
     }
 
+    if (ngx_http_cache_turbo_auto_header_present(r, clcf->auto_skip_headers)) {
+        return 1;
+    }
+
 #else
     for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
         if (!(clcf->backend_presets & ps->bit)) {
@@ -1883,6 +1887,81 @@ ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
 #endif /* NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO */
 
 /* >>> FUZZ-EXTRACT auto-classify END (match.c portion) <<< */
+
+/*
+ * Preset tier 4: does the request carry ANY header named in `names` (the
+ * compiled union of the active presets' headers[] rows)? Presence alone is the
+ * signal, whatever the value -- an empty `RSC:` still reached the origin, and
+ * the origin decides what it means.
+ *
+ * Deliberately IGNORES the table-element hash, unlike the lookup helpers in
+ * vary.c: a module that "deleted" a request header by zeroing its hash may
+ * still leave it on the wire to the upstream, and counting such a field as
+ * present can only cost a cache hit, never serve a wrong representation.
+ *
+ * One walk of the request header list with the (short, <= a few entries)
+ * name list as the inner loop. NULL `names` -- no active preset ships a
+ * header row, the common case -- returns before touching the list.
+ */
+ngx_int_t
+ngx_http_cache_turbo_auto_header_present(ngx_http_request_t *r,
+    ngx_array_t *names)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+    ngx_str_t        *nm;
+    ngx_uint_t        i, j;
+
+    if (names == NULL || names->nelts == 0) {
+        return 0;
+    }
+
+    nm = names->elts;
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        for (j = 0; j < names->nelts; j++) {
+            if (h[i].key.len == nm[j].len
+                && ngx_strncasecmp(h[i].key.data, nm[j].data, nm[j].len) == 0)
+            {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+
+/* Does the request carry a header field named `name` (case-insensitive,
+ * hash ignored for the same fail-safe reason as above)? Used by the Vary
+ * classifier to re-check, for the very request being captured, that a
+ * preset-satisfied Vary axis really was absent. */
+ngx_int_t
+ngx_http_cache_turbo_req_header_named(ngx_http_request_t *r, u_char *name,
+    size_t len)
+{
+    ngx_array_t  one;
+    ngx_str_t    nm;
+
+    nm.data = name;
+    nm.len = len;
+
+    one.elts = &nm;
+    one.nelts = 1;
+
+    return ngx_http_cache_turbo_auto_header_present(r, &one);
+}
 
 static ngx_int_t
 ngx_http_cache_turbo_uri_trie_add(ngx_pool_t *pool,
@@ -2175,6 +2254,7 @@ ngx_http_cache_turbo_compile_auto_presets(ngx_conf_t *cf,
     clcf->auto_arg_rules = NULL;
     clcf->auto_cookie_preds = NULL;
     clcf->auto_key_cookies = NULL;
+    clcf->auto_skip_headers = NULL;
     clcf->auto_cookie_ac.nodes = NULL;
     clcf->auto_cookie_ac.nnodes = 0;
     clcf->auto_cookie_ac.cap = 0;
@@ -2266,6 +2346,17 @@ ngx_http_cache_turbo_compile_auto_presets(ngx_conf_t *cf,
                     return NGX_CONF_ERROR;
                 }
                 clcf->backend_key_cookies++;
+            }
+        }
+
+        if (ps->headers != NULL) {
+            for (pp = ps->headers; *pp; pp++) {
+                if (ngx_http_cache_turbo_auto_str_array_add(cf,
+                        &clcf->auto_skip_headers, *pp)
+                    != NGX_OK)
+                {
+                    return NGX_CONF_ERROR;
+                }
             }
         }
     }

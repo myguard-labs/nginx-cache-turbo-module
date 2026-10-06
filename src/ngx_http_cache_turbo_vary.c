@@ -1388,6 +1388,38 @@ ngx_http_cache_turbo_vary_ignore_match(ngx_http_cache_turbo_loc_conf_t *clcf,
 }
 
 
+/* Preset tier 4 (cache_turbo_backend rows with a headers[] list, e.g. nextjs):
+ * is this Vary axis one the active presets force to bypass, AND is it absent
+ * from the request being captured? auto_skip keeps every request carrying such
+ * a header away from both the lookup and the capture, so each stored and each
+ * served representation was produced for / is handed to a request where the
+ * header is ABSENT -- one value of the axis, so the Vary is satisfied rather
+ * than ignored. The request re-check makes that local: a path that captures
+ * ahead of auto_skip (the cache_turbo_bypass_stale breaker-only store) with
+ * the header present falls through to the ordinary unknown-axis veto. */
+static ngx_int_t
+ngx_http_cache_turbo_vary_preset_satisfied(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *tok, size_t tl)
+{
+    ngx_str_t   *nm;
+    ngx_uint_t   i;
+
+    if (clcf == NULL || clcf->auto_skip_headers == NULL) {
+        return 0;
+    }
+
+    nm = clcf->auto_skip_headers->elts;
+
+    for (i = 0; i < clcf->auto_skip_headers->nelts; i++) {
+        if (nm[i].len == tl && ngx_strncasecmp(nm[i].data, tok, tl) == 0) {
+            return !ngx_http_cache_turbo_req_header_named(r, tok, tl);
+        }
+    }
+
+    return 0;
+}
+
+
 /* Classify the response Vary header into a safe-axis bitmask (what we may key
  * on) and a nocache veto. Only the whitelist (Accept-Encoding, User-Agent,
  * Accept-Language, Origin) contributes to the key. Anything else — Vary: *,
@@ -1456,6 +1488,10 @@ ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
             }
 
             if (ngx_http_cache_turbo_vary_ignore_match(clcf, tok, tl)) {
+                continue;
+            }
+
+            if (ngx_http_cache_turbo_vary_preset_satisfied(r, clcf, tok, tl)) {
                 continue;
             }
 

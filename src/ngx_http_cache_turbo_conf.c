@@ -1846,6 +1846,7 @@ static const struct {
     { "redmine",     NGX_HTTP_CACHE_TURBO_BACKEND_REDMINE,     0 },
     { "flarum",      NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM,      0 },
     { "opencart",    NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART,    0 },
+    { "nextjs",      NGX_HTTP_CACHE_TURBO_BACKEND_NEXTJS,      0 },
     { "classicpress", NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,  0 },
     { "backdrop",    NGX_HTTP_CACHE_TURBO_BACKEND_DRUPAL,      0 },
     { "none",        NGX_HTTP_CACHE_TURBO_BACKEND_NONE,        0 },
@@ -1995,7 +1996,7 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                     "typo3, invision, smf, vanilla, punbb, phorum, yabb, mybb, "
                     "vbulletin, textpattern, bludit, spip, bugzilla, mantisbt, "
                     "mantis, plone, umbraco, dotclear, wikijs, redmine, "
-                    "flarum, opencart, "
+                    "flarum, opencart, nextjs, "
                     "classicpress, backdrop, or none — "
                     "separated by spaces or '|')", &bad);
             }
@@ -2031,7 +2032,7 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             "ghost, wagtail, kirby, shopware6, typo3, invision, smf, vanilla, "
             "punbb, phorum, yabb, mybb, vbulletin, textpattern, bludit, spip, "
             "bugzilla, mantisbt, mantis, plone, umbraco, dotclear, wikijs, "
-            "redmine, flarum, opencart, "
+            "redmine, flarum, opencart, nextjs, "
             "classicpress, backdrop, or none)");
     }
 

@@ -1931,6 +1931,7 @@ typedef struct {
     ngx_http_cache_turbo_cookie_ac_t auto_cookie_ac;
     ngx_array_t             *auto_cookie_preds;   /* auto_cookie_pred_t */
     ngx_array_t             *auto_key_cookies;    /* ngx_str_t */
+    ngx_array_t             *auto_skip_headers;   /* ngx_str_t, preset tier 4 */
 
     /* Live autotune (v4-3). When on, the request path uses the zone's live
      * autotuned beta (clamped to this location's preset band) in place of the
