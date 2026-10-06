@@ -836,6 +836,14 @@ cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
 static void ct_j(int *p){ __atomic_store_n(p, 1, __ATOMIC_SEQ_CST); }
 ATOMEOF
 case_ 0 "atomic-ordering: a backslash-continued // comment covers the next line" atomic_ordering_lint
+# Explicit args: one clean file plus one missing path must fail closed (2),
+# never skip the typo and report ok (no partial scan).
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
+atomic_ordering_explicit_missing() {
+    # shellcheck disable=SC2317
+    env -C "$checkerroot" bash ci/tools/lint-atomic-ordering.sh src/control.c src/no-such-file.c
+}
+case_ 2 "atomic-ordering: an explicit missing file fails closed" atomic_ordering_explicit_missing
 #
 # THE FIXTURES ARE NOW COMPLETE, WELL-TYPED C. carve-init parses with clang
 # rather than lexing with awk, and clang's error recovery replaces the

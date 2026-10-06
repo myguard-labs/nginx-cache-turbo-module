@@ -52,7 +52,10 @@ fi
 status=0
 
 for f in "${files[@]}"; do
-    [ -f "$f" ] || continue
+    if [ ! -f "$f" ]; then
+        echo "lint-atomic-ordering: not a file: $f" >&2
+        exit 2
+    fi
 
     awk -v file="$f" '
         # Small C lexer: block comments, line comments, string and char
