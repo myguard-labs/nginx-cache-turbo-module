@@ -1020,6 +1020,31 @@ finding_case_ "stripe-seam: a plain stripe_of call is still seen by the ledger s
 # Ordinary code still passes clean.
 cp "$checkerroot/ledger.base" "$checkerroot/src/control.c"
 case_ 0 "stripe-seam: the ledger base still passes after the splice change" stripe_seam_lint
+
+# Cross-file state: the ledger scan is ONE awk pass over every src/*.c, but a
+# compiler never splices lines or keeps a function body open across translation
+# units. src/a.c sorts before src/control.c, so it is read first.
+# (1) a first file ending in a bare backslash must not glue its tail onto line 1
+# of the next file, where the ledgered definition sits (ledger.base line 1).
+printf '%s\n' 'int v; '"$bsl" > "$checkerroot/src/a.c"
+cp "$checkerroot/ledger.base" "$checkerroot/src/control.c"
+case_ 0 "stripe-seam: a trailing bare backslash in one file does not splice into line 1 of the next" stripe_seam_lint
+# (2) an unterminated ledgered body in one file must not make the next file's
+# stripe_of() calls count as calls of that function.
+printf '%s\n' 'ngx_http_cache_turbo_shm_lookup(void)' '{' > "$checkerroot/src/a.c"
+{
+    printf '%s\n' 'void other(void)' '{' '    ngx_http_cache_turbo_stripe_of(z, k);' '}'
+    tail -n +4 "$checkerroot/ledger.base"
+} > "$checkerroot/src/control.c"
+case_ 0 "stripe-seam: an unterminated body in one file does not leak into the next file" stripe_seam_lint
+# Positive control for (2): the same call inside the real body is still seen.
+printf '%s\n' 'ngx_http_cache_turbo_shm_lookup(void)' '{' '    ngx_http_cache_turbo_stripe_of(z, k);' '}' \
+    > "$checkerroot/src/a.c"
+tail -n +4 "$checkerroot/ledger.base" > "$checkerroot/src/control.c"
+finding_case_ "stripe-seam: a stripe_of call in a ledgered body is still seen across files" \
+    'shm_lookup: calls stripe_of\(\) but is ledgered as .pending.' stripe_seam_lint
+rm -f "$checkerroot/src/a.c"
+cp "$checkerroot/ledger.base" "$checkerroot/src/control.c"
 rm -f "$checkerroot/src/control.c"
 #
 # THE FIXTURES ARE NOW COMPLETE, WELL-TYPED C. carve-init parses with clang

@@ -155,7 +155,17 @@ for f in "${files[@]}"; do
             if (have) judge(pending, start)
             exit bad ? 1 : 0
         }
-    ' "$f" || status=1
+    ' "$f" && rc=0 || rc=$?
+    # awk exit 0 = clean, 1 = a finding, anything else is an awk runtime
+    # failure -- "could not run" (2), never a finding and never clean.
+    case "$rc" in
+        0) ;;
+        1) status=1 ;;
+        *)
+            echo "lint-stripe-seam: awk failed on $f (exit $rc)" >&2
+            exit 2
+            ;;
+    esac
 done
 
 if [ "$status" -ne 0 ]; then
@@ -216,11 +226,13 @@ pending:ngx_http_cache_turbo_shm_touch_lru
 # open paren is part of the pattern).
 #
 # Prints "yes"/"no". Two failure exits, neither of which is a pass:
-#   2  the function was not found -- moved or renamed, so the ledger is stale;
-#   3  more than one definition matched -- the answer would depend on which one
+#   10 the function was not found -- moved or renamed, so the ledger is stale;
+#   11 more than one definition matched -- the answer would depend on which one
 #      won, and this file already contains one genuinely duplicated symbol name
 #      (shm_count_miss_locked), so ambiguity is a real shape here, not a
 #      hypothetical.
+# (10/11 rather than awk's own 2: a crashing awk exits 2 as well, and that must
+# not be read as "not found".) Any other nonzero exit is an awk failure.
 fn_calls_stripe_of() {
     awk -v fn="$1" '
         # Phase 2 splice first (see the main scan above): a continued // comment
@@ -234,6 +246,15 @@ fn_calls_stripe_of() {
             if (index(line, fn "(") == 1) { on = 1; ndef++ }
             if (on && index(line, "ngx_http_cache_turbo_stripe_of(") > 0) calls = 1
             if (on && line ~ /^}/) on = 0
+        }
+
+        # One awk pass spans every src/*.c, but a compiler never splices or
+        # carries a function body across translation units. At the first line
+        # of each file judge what the previous file left pending (as END
+        # does), then drop all per-file state.
+        FNR == 1 {
+            if (have) judge(pending)
+            pending = ""; have = 0; on = 0
         }
 
         {
@@ -250,8 +271,8 @@ fn_calls_stripe_of() {
 
         END {
             if (have) judge(pending)
-            if (ndef == 0) { exit 2 }
-            if (ndef > 1)  { exit 3 }
+            if (ndef == 0) { exit 10 }
+            if (ndef > 1)  { exit 11 }
             print calls ? "yes" : "no"
         }
     ' src/*.c
@@ -268,7 +289,16 @@ while IFS= read -r row; do
 
     answer="$(fn_calls_stripe_of "$fn")" && rc=0 || rc=$?
 
-    if [ "$rc" -eq 2 ]; then
+    if [ "$rc" -eq 0 ] && [ "$answer" != yes ] && [ "$answer" != no ]; then
+        rc=99
+    fi
+
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 10 ] && [ "$rc" -ne 11 ]; then
+        echo "lint-stripe-seam: awk failed on the ledger scan of $fn (exit $rc)" >&2
+        exit 2
+    fi
+
+    if [ "$rc" -eq 10 ]; then
         echo "$fn: listed in the key-directed ledger but not found in src/*.c" >&2
         echo "    -- it was moved or renamed; update KEY_DIRECTED in $0." >&2
         ledger_status=1
