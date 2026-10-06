@@ -24,7 +24,7 @@
 # written with one matches nothing (see lint-stripe-seam.sh). Word edges are
 # explicit character classes over a padded line.
 #
-# Usage: ci/tools/lint-atomic-ordering.sh [src-file ...]   (defaults to src/*.[ch])
+# Usage: ci/tools/lint-atomic-ordering.sh [src-file ...]   (defaults to every .c/.h under src/, recursive)
 
 set -euo pipefail
 
@@ -33,7 +33,15 @@ cd "$(dirname "$0")/../.."
 if [ "$#" -gt 0 ]; then
     files=("$@")
 else
-    files=(src/*.c src/*.h)
+    # Recursive, deterministic (C-locale sorted) default set. Computed into a
+    # temp file so a find/sort failure is exit 2, never an empty or partial scan.
+    list="$(mktemp)" || { echo "lint-atomic-ordering: cannot create temp file" >&2; exit 2; }
+    trap 'rm -f "$list"' EXIT
+    if ! { find src -type f \( -name '*.c' -o -name '*.h' \) -print0 | LC_ALL=C sort -z; } >"$list"; then
+        echo "lint-atomic-ordering: cannot compute the src/ file set" >&2
+        exit 2
+    fi
+    mapfile -d '' -t files <"$list"
 fi
 
 if [ "${#files[@]}" -eq 0 ] || [ ! -f "${files[0]}" ]; then

@@ -774,6 +774,22 @@ ATOMEOF
 finding_case_ "atomic-ordering: an explicit weak ordering is caught" \
     'weak-ordering atomic or memory barrier: .*__ATOMIC_RELEASE' atomic_ordering_lint
 
+# atomic-ordering: the default scan is recursive. A weak ordering in a nested
+# src/<sub>/x.c must fail; a clean nested file must pass. (Went red on the old
+# top-level-only src/*.[ch] default, which never saw nested files.)
+: > "$checkerroot/src/control.c"
+mkdir -p "$checkerroot/src/sub"
+cat > "$checkerroot/src/sub/x.c" <<'ATOMEOF'
+static void nested_clean(int *p){ __atomic_store_n(p, 1, __ATOMIC_SEQ_CST); }
+ATOMEOF
+case_ 0 "atomic-ordering: a clean nested src/<sub>/x.c passes" atomic_ordering_lint
+cat > "$checkerroot/src/sub/x.c" <<'ATOMEOF'
+static void nested_weak(int *p){ __atomic_store_n(p, 1, __ATOMIC_RELEASE); }
+ATOMEOF
+finding_case_ "atomic-ordering: a weak ordering in a nested src/<sub>/x.c is caught" \
+    'src/sub/x.c:1: weak-ordering atomic or memory barrier: .*__ATOMIC_RELEASE' atomic_ordering_lint
+rm -rf "${checkerroot:?}/src/sub"
+
 # atomic-ordering: comment markers inside string/char literals are not comment
 # syntax. Each control below went red on the pre-lexer stripper, which dropped
 # the code after a literal "/*" or truncated a line at a literal "//" and so
