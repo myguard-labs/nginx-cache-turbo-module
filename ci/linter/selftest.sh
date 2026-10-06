@@ -444,6 +444,7 @@ done
 
 lint_file_wrappers=(
     ci/linter/lint-astgrep.sh
+    ci/linter/lint-atomic-ordering.sh
     ci/linter/lint-c.sh
     ci/linter/lint-carve-init.sh
     ci/linter/lint-ci-cadence.sh
@@ -680,6 +681,7 @@ checkerroot="$(mktemp -d)"
 trap 'rm -rf "$badroot" "$listroot" "$checkerroot"' EXIT
 mkdir -p "$checkerroot/src" "$checkerroot/ci/tools"
 cp ci/tools/lint-shm-lock.sh ci/tools/lint-stripe-seam.sh \
+    ci/tools/lint-atomic-ordering.sh \
     "$checkerroot/ci/tools/"
 : > "$checkerroot/src/control.c"
 for fn in \
@@ -716,6 +718,12 @@ stripe_seam_lint() {
     env -C "$checkerroot" bash ci/tools/lint-stripe-seam.sh
 }
 
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
+atomic_ordering_lint() {
+    # shellcheck disable=SC2317
+    env -C "$checkerroot" bash ci/tools/lint-atomic-ordering.sh
+}
+
 case_ 0 "shm-lock: a clean lock discipline fixture passes" shm_lock_lint
 cat >> "$checkerroot/src/control.c" <<'SHMEOF'
 shm_lock_violation(void)
@@ -737,6 +745,176 @@ stripe_seam_violation(void)
 STRIPEEOF
 finding_case_ "stripe-seam: a bare zone pool dereference is caught" \
     'bare zone shm dereference outside the stripe resolver' stripe_seam_lint
+
+# atomic-ordering: SEQ_CST and prose mentions stay clean; a real barrier or a
+# weak ordering constant is caught.
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+/* ngx_memory_barrier() is discussed here in prose only */
+atomic_ordering_clean(void)
+{
+    __atomic_load_n(&v, __ATOMIC_SEQ_CST);
+}
+ATOMEOF
+case_ 0 "atomic-ordering: SEQ_CST and prose mentions pass" atomic_ordering_lint
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+atomic_ordering_barrier(void)
+{
+    ngx_memory_barrier();
+}
+ATOMEOF
+finding_case_ "atomic-ordering: ngx_memory_barrier is caught" \
+    'weak-ordering atomic or memory barrier: ngx_memory_barrier' atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+atomic_ordering_weak(void)
+{
+    __atomic_store_n(&v, 1, __ATOMIC_RELEASE);
+}
+ATOMEOF
+finding_case_ "atomic-ordering: an explicit weak ordering is caught" \
+    'weak-ordering atomic or memory barrier: .*__ATOMIC_RELEASE' atomic_ordering_lint
+
+# atomic-ordering: the default scan is recursive. A weak ordering in a nested
+# src/<sub>/x.c must fail; a clean nested file must pass. (Went red on the old
+# top-level-only src/*.[ch] default, which never saw nested files.)
+: > "$checkerroot/src/control.c"
+mkdir -p "$checkerroot/src/sub"
+cat > "$checkerroot/src/sub/x.c" <<'ATOMEOF'
+static void nested_clean(int *p){ __atomic_store_n(p, 1, __ATOMIC_SEQ_CST); }
+ATOMEOF
+case_ 0 "atomic-ordering: a clean nested src/<sub>/x.c passes" atomic_ordering_lint
+cat > "$checkerroot/src/sub/x.c" <<'ATOMEOF'
+static void nested_weak(int *p){ __atomic_store_n(p, 1, __ATOMIC_RELEASE); }
+ATOMEOF
+finding_case_ "atomic-ordering: a weak ordering in a nested src/<sub>/x.c is caught" \
+    'src/sub/x.c:1: weak-ordering atomic or memory barrier: .*__ATOMIC_RELEASE' atomic_ordering_lint
+rm -rf "${checkerroot:?}/src/sub"
+
+# atomic-ordering: comment markers inside string/char literals are not comment
+# syntax. Each control below went red on the pre-lexer stripper, which dropped
+# the code after a literal "/*" or truncated a line at a literal "//" and so
+# reported ok over a real weak ordering (a fail-open gate hole).
+ao_msg='weak-ordering atomic or memory barrier: .*__ATOMIC_RELAXED'
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+static const char *ct_s = "/*";
+static void ct_tw(int *p){ __atomic_store_n(p, 1, __ATOMIC_RELAXED); }
+ATOMEOF
+finding_case_ "atomic-ordering: a \"/*\" string does not hide later code" \
+    "$ao_msg" atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+static const char *ct_u = "http://x"; static void ct_f(int *p){ __atomic_store_n(p, 1, __ATOMIC_RELAXED); }
+ATOMEOF
+finding_case_ "atomic-ordering: a \"//\" string does not truncate the line" \
+    "$ao_msg" atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+static const char *ct_e = "a\"/*b"; static void ct_g(int *p){ __atomic_store_n(p, 1, __ATOMIC_RELAXED); }
+ATOMEOF
+finding_case_ "atomic-ordering: an escaped quote does not end the literal early" \
+    "$ao_msg" atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+static int ct_c = '/*'; static void ct_i(int *p){ __atomic_store_n(p, 1, __ATOMIC_RELAXED); }
+ATOMEOF
+finding_case_ "atomic-ordering: a char literal holding \"/*\" does not hide later code" \
+    "$ao_msg" atomic_ordering_lint
+# Positive: banned tokens only inside a string literal or comment do not fire,
+# including a "/*" string that is later followed by clean code.
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+static const char *ct_k = "__ATOMIC_RELAXED ngx_memory_barrier /* //";
+static const char *ct_l = "http://x"; /* __ATOMIC_RELEASE */ // memory_order_acquire
+static void ct_m(int *p){ __atomic_store_n(p, 1, __ATOMIC_SEQ_CST); }
+ATOMEOF
+case_ 0 "atomic-ordering: banned tokens only in strings/comments pass" atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+cat >> "$checkerroot/src/control.c" <<'ATOMEOF'
+// a continued line comment \
+    ngx_memory_barrier();
+static void ct_j(int *p){ __atomic_store_n(p, 1, __ATOMIC_SEQ_CST); }
+ATOMEOF
+case_ 0 "atomic-ordering: a backslash-continued // comment covers the next line" atomic_ordering_lint
+# atomic-ordering: backslash-newline splicing (translation phase 2) happens
+# before lexing, so a token split by a continuation is seen whole and the
+# finding is reported at the logical line's FIRST physical line. Went red on the
+# per-physical-line lexer, which reported ok over a compiling weak ordering.
+bsl=$'\\'
+: > "$checkerroot/src/control.c"
+printf '%s\n' 'int v;' 'void t(void){ __atomic_store_n(&v, 1, __ATOMIC_REL'"$bsl" 'EASE); }' \
+    >> "$checkerroot/src/control.c"
+finding_case_ "atomic-ordering: __ATOMIC_RELEASE split by a splice is caught at its first line" \
+    'src/control.c:2: weak-ordering atomic or memory barrier: .*__ATOMIC_RELEASE' atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+printf '%s\n' 'int v;' 'void t(void){ ngx_memory_'"$bsl" 'barrier(); }' \
+    >> "$checkerroot/src/control.c"
+finding_case_ "atomic-ordering: ngx_memory_barrier split by a splice is caught at its first line" \
+    'src/control.c:2: weak-ordering atomic or memory barrier: .*ngx_memory_barrier' atomic_ordering_lint
+: > "$checkerroot/src/control.c"
+printf '%s\n' 'int v;' 'void t(void){ __atomic_store_n(&v, 1, memory_order_'"$bsl" 'rel'"$bsl" 'ease); }' \
+    >> "$checkerroot/src/control.c"
+finding_case_ "atomic-ordering: a token split over two splices is caught at its first line" \
+    'src/control.c:2: weak-ordering atomic or memory barrier: .*memory_order_release' atomic_ordering_lint
+# Boundary: backslash plus trailing blanks still splices (as GCC does).
+: > "$checkerroot/src/control.c"
+printf '%s\n' 'int v;' 'void t(void){ __atomic_store_n(&v, 1, __ATOMIC_REL\ 	' 'EASE); }' \
+    >> "$checkerroot/src/control.c"
+finding_case_ "atomic-ordering: a backslash with trailing blanks still splices and is caught" \
+    'src/control.c:2: weak-ordering atomic or memory barrier: .*__ATOMIC_RELEASE' atomic_ordering_lint
+# Boundary: a file ending in a backslash with no newline must not crash.
+printf '%s' 'int v; /* x */ '"$bsl" > "$checkerroot/src/control.c"
+case_ 0 "atomic-ordering: a clean file ending in a bare backslash does not crash" atomic_ordering_lint
+printf '%s\n%s' 'int v;' 'void t(void){ ngx_memory_barrier(); } '"$bsl" > "$checkerroot/src/control.c"
+finding_case_ "atomic-ordering: a weak token before a trailing bare backslash is still caught" \
+    'src/control.c:2: weak-ordering atomic or memory barrier: .*ngx_memory_barrier' atomic_ordering_lint
+# Negative: SEQ_CST split by a splice, and banned tokens split by a splice
+# inside a // comment or a string literal, stay clean.
+: > "$checkerroot/src/control.c"
+printf '%s\n' 'int v;' 'void t(void){ __atomic_store_n(&v, 1, __ATOMIC_SEQ_'"$bsl" 'CST); }' \
+    '// __ATOMIC_REL'"$bsl" 'EASE ngx_memory_'"$bsl" 'barrier' \
+    'static const char *s = "__ATOMIC_REL'"$bsl" 'EASE";' \
+    '/* ngx_memory_'"$bsl" 'barrier */' \
+    >> "$checkerroot/src/control.c"
+case_ 0 "atomic-ordering: SEQ_CST and comment/string tokens split by a splice stay clean" atomic_ordering_lint
+# Explicit args: one clean file plus one missing path must fail closed (2),
+# never skip the typo and report ok (no partial scan).
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
+atomic_ordering_explicit_missing() {
+    # shellcheck disable=SC2317
+    env -C "$checkerroot" bash ci/tools/lint-atomic-ordering.sh src/control.c src/no-such-file.c
+}
+case_ 2 "atomic-ordering: an explicit missing file fails closed" atomic_ordering_explicit_missing
+# An awk runtime failure is "could not run" (2) with its own message, never the
+# weak-ordering banner (exit 1). The trigger is a stub awk first on PATH: it is
+# deterministic as root and non-root (chmod 000 is readable to root) and needs
+# no test hook in the production script.
+mkdir -p "$checkerroot/fakebin"
+printf '#!/bin/sh\nexit %s\n' 2 > "$checkerroot/fakebin/awk"
+chmod +x "$checkerroot/fakebin/awk"
+# shellcheck disable=SC2329  # invoked indirectly, by name, via case_()
+atomic_ordering_awk_failed() {
+    # shellcheck disable=SC2317
+    env -C "$checkerroot" PATH="$checkerroot/fakebin:$PATH" bash ci/tools/lint-atomic-ordering.sh src/control.c
+}
+# shellcheck disable=SC2329,SC2317  # invoked indirectly, by name, via case_()
+atomic_ordering_awk_failed_msg() {
+    local out got
+    out="$(atomic_ordering_awk_failed 2>&1)"; got=$?
+    grep -qE 'lint-atomic-ordering: awk failed on src/control\.c \(exit 2\)' <<< "$out" || return 90
+    if grep -q 'CI-ARM64-NO-LIVE-LANE' <<< "$out"; then return 91; fi
+    return "$got"
+}
+case_ 2 "atomic-ordering: an awk runtime failure is exit 2, not a finding" atomic_ordering_awk_failed
+case_ 2 "atomic-ordering: an awk failure prints its message and no re-open banner" atomic_ordering_awk_failed_msg
+# Other nonzero awk exits (e.g. killed, 137) are also "could not run".
+printf '#!/bin/sh\nexit %s\n' 137 > "$checkerroot/fakebin/awk"
+case_ 2 "atomic-ordering: any other nonzero awk exit is exit 2" atomic_ordering_awk_failed
+# A stub awk exiting 1 still maps to the finding class (the contract for 1).
+printf '#!/bin/sh\nexit %s\n' 1 > "$checkerroot/fakebin/awk"
+finding_case_ "atomic-ordering: awk exit 1 is still the weak-ordering finding" \
+    'CI-ARM64-NO-LIVE-LANE' atomic_ordering_awk_failed
+rm -rf "$checkerroot/fakebin"
 #
 # THE FIXTURES ARE NOW COMPLETE, WELL-TYPED C. carve-init parses with clang
 # rather than lexing with awk, and clang's error recovery replaces the
