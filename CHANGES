@@ -4,9 +4,10 @@ Changes with the nginx-cache-turbo-module (unreleased)
        request waits on Redis or memcached (cache GET, the stampede lock,
        the cold-wait for another request's fill, or a SCAN/SSCAN purge
        walk) no longer makes the worker touch the freed request. The
-       resume path finalized the request before running nginx's posted
-       requests and then used it again, which crashed the worker or leaked
-       the connection. A client event that arrives while a request is
+       resume path ran nginx's posted requests before finalizing the
+       request, so a pending terminate could free the request and the
+       following finalize then used freed memory, which crashed the worker
+       or leaked the connection. A client event that arrives while a request is
        parked, such as a stray byte on a keep-alive connection, is now
        ignored instead of re-running the phase handler, which could start a
        second backend operation or send the response header twice.

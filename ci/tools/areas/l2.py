@@ -4605,9 +4605,10 @@ def _walk_admin(path: str, db: str, prefix: str) -> str:
 
 def _sscan_walk_abort_site(redis: RedisServer) -> AbortSite:
     """SSCAN tag walk: POST ?tag= on an admin location. redis_sscan() takes
-    r->main->count++ and walk_finish() resumes, with run_posted_requests ahead
-    of the finalize like the other sites. Unlike them the callback does not
-    finalize, so whether that order breaks here is measured, not assumed.
+    r->main->count++ and walk_finish() resumes: it finalizes with the
+    callback's result and only then runs the posted requests, the same order
+    as the other sites. Unlike them it never re-runs the phase engine, and
+    the callback itself does not finalize.
 
     Each request walks its own tag of ABORT_WALK_KEYS members, one page: SSCAN
     on one op connection, then the page's UNLINK on a second, which the walk
