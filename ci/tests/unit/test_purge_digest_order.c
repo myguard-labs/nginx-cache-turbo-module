@@ -243,6 +243,8 @@ main(void)
           "successful variant-index bytes must reach purge_tag unchanged");
     CHECK(request.count == 1,
           "parked precontent purge must preserve request-count balancing");
+    CHECK(request.write_event_handler == ngx_http_cache_turbo_parked_handler,
+          "parked precontent purge must ignore client events while parked");
 
     reset_case(&request, &pool, &connection, &clcf, &l1, NULL, &shm_zone);
     marker_present = 1;

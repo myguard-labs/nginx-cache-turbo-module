@@ -252,6 +252,12 @@ extern ngx_uint_t  ngx_test_redis_clear_calls;
 extern ngx_uint_t  ngx_test_redis_done_calls;
 extern ngx_http_cache_turbo_redis_op_t *ngx_test_redis_done_op;
 extern ngx_uint_t  ngx_test_phase_calls;
+extern ngx_uint_t  ngx_test_unpark_calls;
+/* CT-RESUME-FINALIZE-UAF: resume call order, one letter per call
+ * (U unpark, R run_phases, F finalize, P run_posted_requests). The posted
+ * requests must run LAST: they may free r. */
+extern char        ngx_test_resume_seq[16];
+extern ngx_uint_t  ngx_test_resume_seq_len;
 extern ngx_uint_t  ngx_test_posted_calls;
 extern ngx_uint_t  ngx_test_finalize_calls;
 extern ngx_http_request_t *ngx_test_finalize_request;
@@ -652,10 +658,30 @@ ngx_http_cache_turbo_blob_clear_vetted(u_char *blob, size_t blob_len)
 }
 
 static void
+ngx_test_resume_note(char call)
+{
+    if (ngx_test_resume_seq_len < sizeof(ngx_test_resume_seq) - 1) {
+        ngx_test_resume_seq[ngx_test_resume_seq_len++] = call;
+        ngx_test_resume_seq[ngx_test_resume_seq_len] = '\0';
+    }
+}
+
+/* Stands in for the static inline in ngx_http_cache_turbo_internal.h, which
+ * this shim does not include. */
+static void
+ngx_http_cache_turbo_unpark(ngx_http_request_t *r)
+{
+    (void) r;
+    ngx_test_unpark_calls++;
+    ngx_test_resume_note('U');
+}
+
+static void
 ngx_http_core_run_phases(ngx_http_request_t *r)
 {
     (void) r;
     ngx_test_phase_calls++;
+    ngx_test_resume_note('R');
 }
 
 static void
@@ -663,12 +689,14 @@ ngx_http_run_posted_requests(ngx_connection_t *c)
 {
     (void) c;
     ngx_test_posted_calls++;
+    ngx_test_resume_note('P');
 }
 
 static void
 ngx_http_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
 {
     ngx_test_finalize_calls++;
+    ngx_test_resume_note('F');
     ngx_test_finalize_request = r;
     ngx_test_finalize_rc = rc;
 }
