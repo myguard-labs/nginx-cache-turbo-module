@@ -116,11 +116,14 @@ case "$MODE" in
         #                        unaligned pointers (ngx_http_v2_write_uint32 on
         #                        NGX_HAVE_NONALIGNED); reached since asan mode builds
         #                        the v2 module for the abort fixture. Both compilers.
-        # ASan and the rest of UBSan stay on. The function, nonnull-attribute and
-        # pointer-overflow names are clang-specific; gcc's configure rejects
-        # nonnull-attribute/pointer-overflow. Only add those under clang (the local
-        # soak path); gcc keeps plain -fsanitize except alignment, which it accepts.
-        SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=alignment -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+        # ASan and the rest of UBSan stay on. gcc 14 accepts -fno-sanitize=
+        # nonnull-attribute (and pointer-overflow) but rejects `function`, so gcc
+        # gets alignment + nonnull-attribute (the --with-debug log path
+        # ngx_http_process_request_uri -> ngx_log_error_core -> ngx_sprintf_str
+        # hands memcpy a NULL pointer with len 0 for an empty log arg; core-only
+        # stack, src/core/ngx_string.c:586). function and pointer-overflow are
+        # only added under clang (the local soak path), where they are known.
+        SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=alignment,nonnull-attribute -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
         if "${CC:-cc}" --version 2>/dev/null | grep -qi clang; then
             SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow,alignment -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
         fi
