@@ -1,5 +1,16 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Security: a client that resets or closes its connection while its
+       request waits on Redis or memcached (cache GET, the stampede lock,
+       the cold-wait for another request's fill, or a SCAN/SSCAN purge
+       walk) no longer makes the worker touch the freed request. The
+       resume path finalized the request before running nginx's posted
+       requests and then used it again, which crashed the worker or leaked
+       the connection. A client event that arrives while a request is
+       parked, such as a stray byte on a keep-alive connection, is now
+       ignored instead of re-running the phase handler, which could start a
+       second backend operation or send the response header twice.
+
     *) Security: a response carrying duplicate Content-Length, duplicate
        Transfer-Encoding, or both Content-Length and Transfer-Encoding is no
        longer stored, on every supported nginx version. The exposure is
