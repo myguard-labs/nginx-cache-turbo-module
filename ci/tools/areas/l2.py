@@ -9,6 +9,21 @@ star-imports this module, so every test stays reachable as
 
 from __future__ import annotations
 
+from abort_fixture import (
+    COLD_WAIT_POLL,
+    AbortRig,
+    AbortSite,
+    ColdWaitAnchor,
+    Http1Client,
+    ProxyAnchor,
+    assert_abort_clean,
+    binary_has_debug_log,
+    run_abort_arm,
+    run_abort_test,
+    run_clean_test,
+    run_parks_test,
+)
+
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
 from test_runtime_base import *
@@ -4078,3 +4093,467 @@ def test_scan_walk_deadline_reports_incomplete(ng: Nginx,
         "deadline-abandoned purge somehow emptied the keyspace"
 
     redis.cli("-n", "7", "FLUSHDB")
+
+
+# --------------------------------------------------------------------------- #
+# Client aborts while parked on L2 (CT-RESUME-FINALIZE-UAF).
+# --------------------------------------------------------------------------- #
+
+def _redis_get_abort_site(redis: RedisServer) -> AbortSite:
+    """Redis GET park: redis_get() takes r->main->count++, get_finish() resumes.
+
+    A cold node parks twice for one hit: first on the vary marker's own L2 copy
+    (ngx_http_cache_turbo_marker_hash folds "\\x1fvarymark" into the key), then
+    on the object. The reply ending the second park is what serves the client.
+    """
+    def resp_get(key: str) -> bytes:
+        raw = key.encode()
+        return b"*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n" % (len(raw), raw)
+
+    return AbortSite(
+        name="rget",
+        upstream=redis.port,
+        directives="cache_turbo_redis 127.0.0.1:{proxy_port} prefix=ct: timeout=2s;",
+        anchor=lambda rig, uri: ProxyAnchor(rig.proxy, [
+            resp_get(l2_key(uri + "\x1fvarymark")), resp_get(l2_key(uri))]),
+        stored=lambda uri: redis.cli("EXISTS", l2_key(uri)) == "1",
+        # The lock too: priming took it, and a leftover would make priming this
+        # uri again lose the lock and wait out its TTL.
+        forget=lambda uri: redis.cli("DEL", l2_key(uri), lock_key(uri)),
+    )
+
+
+def test_l2_abort_fixture_parks(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_parks_test(
+        ng, origin, _redis_get_abort_site(redis), parks=2,
+        parked_lines=lambda uri: [f'parked on L2 vary-marker GET "{uri}"',
+                                  f'parked on L2 GET "{uri}"'])
+
+
+def test_l2_abort_redis_get_http1_rst_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "http1_rst", "before")
+
+
+def test_l2_abort_redis_get_http1_rst_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "http1_rst", "after")
+
+
+def test_l2_abort_redis_get_http1_rst_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "http1_rst", "boundary")
+
+
+def test_l2_abort_redis_get_http1_fin_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "http1_fin", "before")
+
+
+def test_l2_abort_redis_get_http1_fin_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "http1_fin", "after")
+
+
+def test_l2_abort_redis_get_http1_fin_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "http1_fin", "boundary")
+
+
+def test_l2_abort_redis_get_h2_rst_stream_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "h2_rst_stream", "before")
+
+
+def test_l2_abort_redis_get_h2_rst_stream_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "h2_rst_stream", "after")
+
+
+def test_l2_abort_redis_get_h2_rst_stream_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "h2_rst_stream", "boundary")
+
+
+def test_l2_abort_redis_get_h2_close_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "h2_close", "before")
+
+
+def test_l2_abort_redis_get_h2_close_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "h2_close", "after")
+
+
+def test_l2_abort_redis_get_h2_close_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_get_abort_site(redis), "h2_close", "boundary")
+
+
+def test_l2_abort_redis_get_clean_http1(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_clean_test(ng, origin, _redis_get_abort_site(redis), "http1")
+
+
+def test_l2_abort_redis_get_clean_http2(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_clean_test(ng, origin, _redis_get_abort_site(redis), "http2")
+
+
+def _memcached_get_abort_site(mc: MemcachedServer) -> AbortSite:
+    """Memcached GET park: same two parks as Redis, through mc_get_finish()."""
+    def text_get(uri: str) -> bytes:
+        return b"get %s\r\n" % l2_key(uri, prefix="mc:").encode()
+
+    return AbortSite(
+        name="mcget",
+        upstream=mc.port,
+        directives="cache_turbo_memcached 127.0.0.1:{proxy_port} prefix=mc: timeout=2s;",
+        anchor=lambda rig, uri: ProxyAnchor(rig.proxy, [
+            text_get(uri + "\x1fvarymark"), text_get(uri)]),
+        stored=lambda uri: mc.exists(l2_key(uri, prefix="mc:")),
+        forget=lambda uri: mc.command(
+            b"delete %s\r\n" % l2_key(uri, prefix="mc:").encode()),
+    )
+
+
+def test_l2_abort_memcached_get_parks(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_parks_test(
+        ng, origin, _memcached_get_abort_site(mc), parks=2,
+        parked_lines=lambda uri: [f'parked on L2 vary-marker GET "{uri}"',
+                                  f'parked on L2 GET "{uri}"'])
+
+
+def test_l2_abort_memcached_get_http1_rst_before(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "http1_rst", "before")
+
+
+def test_l2_abort_memcached_get_http1_rst_after(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "http1_rst", "after")
+
+
+def test_l2_abort_memcached_get_http1_rst_boundary(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "http1_rst", "boundary")
+
+
+def test_l2_abort_memcached_get_http1_fin_before(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "http1_fin", "before")
+
+
+def test_l2_abort_memcached_get_http1_fin_after(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "http1_fin", "after")
+
+
+def test_l2_abort_memcached_get_http1_fin_boundary(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "http1_fin", "boundary")
+
+
+def test_l2_abort_memcached_get_h2_rst_stream_before(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "h2_rst_stream", "before")
+
+
+def test_l2_abort_memcached_get_h2_rst_stream_after(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "h2_rst_stream", "after")
+
+
+def test_l2_abort_memcached_get_h2_rst_stream_boundary(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "h2_rst_stream", "boundary")
+
+
+def test_l2_abort_memcached_get_h2_close_before(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "h2_close", "before")
+
+
+def test_l2_abort_memcached_get_h2_close_after(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "h2_close", "after")
+
+
+def test_l2_abort_memcached_get_h2_close_boundary(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_abort_test(ng, origin, _memcached_get_abort_site(mc), "h2_close", "boundary")
+
+
+def test_l2_abort_memcached_get_clean_http1(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_clean_test(ng, origin, _memcached_get_abort_site(mc), "http1")
+
+
+def test_l2_abort_memcached_get_clean_http2(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_clean_test(ng, origin, _memcached_get_abort_site(mc), "http2")
+
+
+def _redis_lock_abort_site(redis: RedisServer) -> AbortSite:
+    """Redis lock park: a stale L1 entry wins the refresh dice, redis_lock() takes
+    r->main->count++, lock_finish() resumes. A peer holds the lock, so SET NX
+    answers nil, this node loses and serves stale, which is what writes to the
+    dead client. The park is the only one, and the only backend command.
+
+    The dice is what would make this flaky. should_refresh() compares
+    elapsed/window * beta with a random number, and elapsed counts whole seconds
+    past fresh_until, so it is 0 at first and then can never win. Beta 10000 over
+    the 7s window beats the dice outright from elapsed 1, which waiting 2s after
+    priming guarantees for every key; /lock/'s beta 5000 over 6s would lose about
+    one roll in six there. A stale_mult of 8 leaves the 6s the keys need.
+    """
+    def resp_set_nx(uri: str) -> bytes:
+        raw = lock_key(uri).encode()
+        return b"*6\r\n$3\r\nSET\r\n$%d\r\n%s\r\n" % (len(raw), raw)
+
+    def go_stale_and_lose_lock(rig: AbortRig) -> None:
+        time.sleep(2.0)
+        for uri in rig.uris:
+            redis.cli("SET", lock_key(uri), "peer-node", "PX", "60000")
+
+    return AbortSite(
+        name="rlock",
+        upstream=redis.port,
+        directives="""cache_turbo_redis 127.0.0.1:{proxy_port} prefix=ct: timeout=2s;
+            cache_turbo_stale_mult 8;
+            cache_turbo_beta 10000;
+            cache_turbo_lock off;""",
+        anchor=lambda rig, uri: ProxyAnchor(rig.proxy, [resp_set_nx(uri)]),
+        stored=lambda uri: redis.cli("EXISTS", l2_key(uri)) == "1",
+        forget=lambda uri: redis.cli("DEL", l2_key(uri), lock_key(uri)),
+        valid="1s",
+        served="STALE",
+        arrange=go_stale_and_lose_lock,
+    )
+
+
+def test_l2_abort_redis_lock_parks(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_parks_test(
+        ng, origin, _redis_lock_abort_site(redis), parks=1,
+        parked_lines=lambda uri: [f'parked on L2 lock NX "{uri}"'])
+
+
+def test_l2_abort_redis_lock_http1_rst_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "http1_rst", "before")
+
+
+def test_l2_abort_redis_lock_http1_rst_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "http1_rst", "after")
+
+
+def test_l2_abort_redis_lock_http1_rst_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "http1_rst", "boundary")
+
+
+def test_l2_abort_redis_lock_http1_fin_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "http1_fin", "before")
+
+
+def test_l2_abort_redis_lock_http1_fin_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "http1_fin", "after")
+
+
+def test_l2_abort_redis_lock_http1_fin_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "http1_fin", "boundary")
+
+
+def test_l2_abort_redis_lock_h2_rst_stream_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "h2_rst_stream", "before")
+
+
+def test_l2_abort_redis_lock_h2_rst_stream_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "h2_rst_stream", "after")
+
+
+def test_l2_abort_redis_lock_h2_rst_stream_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "h2_rst_stream", "boundary")
+
+
+def test_l2_abort_redis_lock_h2_close_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "h2_close", "before")
+
+
+def test_l2_abort_redis_lock_h2_close_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "h2_close", "after")
+
+
+def test_l2_abort_redis_lock_h2_close_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _redis_lock_abort_site(redis), "h2_close", "boundary")
+
+
+def test_l2_abort_redis_lock_clean_http1(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_clean_test(ng, origin, _redis_lock_abort_site(redis), "http1")
+
+
+def test_l2_abort_redis_lock_clean_http2(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_clean_test(ng, origin, _redis_lock_abort_site(redis), "http2")
+
+
+def _cold_wait_abort_site(origin: Origin) -> AbortSite:
+    """Cold-wait park, no L2: a slow leader holds the cold-miss claim, so the
+    next request for the key parks in cold_wait() (count++ and a 100ms timer)
+    and cold_wait_timeout() resumes it on every tick until the fill lands, then
+    serves from L1. Nothing is primed: the park needs a miss.
+
+    One leader and one aborting waiter per key, keys one at a time, so a crash
+    belongs to the key that caused it. The leader's 0.6s origin delay gives the
+    waiter about six polls, so "before" lands before its first wake and "after"
+    lands in a re-park, both well ahead of the fill.
+    """
+    return AbortSite(
+        name="cwait",
+        upstream=origin.port,
+        directives="""cache_turbo_lock on;
+            cache_turbo_lock_timeout 5s;""",
+        anchor=lambda rig, uri: ColdWaitAnchor(rig, uri, "/_ab_status"),
+        stored=lambda uri: True,
+        forget=lambda uri: None,
+        arrange=lambda rig: None,
+        prime=False,
+        origin_proxy=True,
+        proxy_delay=0.6,
+        server_extra="location = /_ab_status { cache_turbo_admin abort; }",
+        origin_hits=1,
+    )
+
+
+def test_l2_abort_cold_wait_parks(ng: Nginx, origin: Origin) -> None:
+    """The cold-wait anchor's own proof: the waiter parks on the timer, re-polls
+    several times, is served the leader's fill from L1, and an L1 hit
+    afterwards neither waits nor reaches the origin."""
+    debug = binary_has_debug_log(str(ng.binary))
+    site = _cold_wait_abort_site(origin)
+    with AbortRig(ng, site, "parks", 1, "debug" if debug else None) as rig:
+        uri = rig.uris[0]
+        base = origin.hits_for(f"{site.name}-")
+        anchor = rig.anchor(uri)
+        waiter = Http1Client(rig.node.port, uri)
+        parked_at = anchor.wait_parked()
+        status, headers, body = waiter.read_response()
+        answered = time.monotonic()
+        anchor.settle()
+        assert status == 200, f"{uri}: status {status}"
+        assert headers.get("x-cache") == site.served, (
+            f"{uri}: X-Cache={headers.get('x-cache')}, wanted {site.served}")
+        assert body == rig.bodies[uri], f"{uri}: body {body!r} is not the fill"
+        anchor.assert_each_step_once()
+        t = anchor.times()
+        assert parked_at < t.final_reply_at <= answered, (
+            f"{uri}: the waiter was answered before the fill: {t}")
+        assert t.final_reply_at - t.parked_at > 2 * COLD_WAIT_POLL, (
+            f"{uri}: the fill landed {t.final_reply_at - t.parked_at:.3f}s after "
+            f"the park, too soon for a re-park, so the after arm tests nothing")
+        if debug:
+            log = rig.node.diagnostics()
+            waits = log.count(f'cold-miss WAIT "{uri}"')
+            wakes = log.count(f'cold-miss wait wake "{uri}"')
+            assert waits >= 2 and wakes == waits, (
+                f"{uri}: {waits} parks and {wakes} wakes, wanted several, "
+                f"each woken once")
+
+        # Negative control: L1 now answers alone.
+        waits_before = anchor.lock_waits()
+        started = time.monotonic()
+        status, headers, _ = Http1Client(rig.node.port, uri).read_response()
+        elapsed = time.monotonic() - started
+        assert status == 200 and headers.get("x-cache") == site.served, (
+            f"{uri}: L1 answer {status} X-Cache={headers.get('x-cache')}")
+        assert anchor.lock_waits() == waits_before, f"{uri}: an L1 hit waited"
+        assert elapsed < COLD_WAIT_POLL, (
+            f"{uri}: an L1 hit took {elapsed:.3f}s, as long as a poll")
+        rig.assert_no_origin_traffic(origin, base)
+        rig.node.stop()
+        rig.node.assert_clean_logs()
+
+
+def test_l2_abort_cold_wait_before_first_wake(ng: Nginx, origin: Origin) -> None:
+    """A waiter that aborts before its first wake holds only the park
+    reference, so no re-poll can hide a double finalize. The before arm needs
+    only most aborts in that window; this one needs every abort there."""
+    site = _cold_wait_abort_site(origin)
+    for kind in ("http1_rst", "h2_rst_stream"):
+        result = run_abort_arm(ng, origin, site, kind, "before")
+        assert_abort_clean(result)
+        late = [round(x.minus_reply * 1000, 1)
+                for x in result.landings if not x.in_phase]
+        assert not late, (
+            f"{result.arm}: aborts {late} ms from the fill missed the first "
+            f"park")
+
+
+def test_l2_abort_cold_wait_http1_rst_before(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "http1_rst", "before")
+
+
+def test_l2_abort_cold_wait_http1_rst_after(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "http1_rst", "after")
+
+
+def test_l2_abort_cold_wait_http1_rst_boundary(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "http1_rst", "boundary")
+
+
+def test_l2_abort_cold_wait_http1_fin_before(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "http1_fin", "before")
+
+
+def test_l2_abort_cold_wait_http1_fin_after(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "http1_fin", "after")
+
+
+def test_l2_abort_cold_wait_http1_fin_boundary(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "http1_fin", "boundary")
+
+
+def test_l2_abort_cold_wait_h2_rst_stream_before(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "h2_rst_stream", "before")
+
+
+def test_l2_abort_cold_wait_h2_rst_stream_after(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "h2_rst_stream", "after")
+
+
+def test_l2_abort_cold_wait_h2_rst_stream_boundary(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "h2_rst_stream", "boundary")
+
+
+def test_l2_abort_cold_wait_h2_close_before(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "h2_close", "before")
+
+
+def test_l2_abort_cold_wait_h2_close_after(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "h2_close", "after")
+
+
+def test_l2_abort_cold_wait_h2_close_boundary(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _cold_wait_abort_site(origin), "h2_close", "boundary")
+
+
+def test_l2_abort_cold_wait_clean_http1(ng: Nginx, origin: Origin) -> None:
+    run_clean_test(ng, origin, _cold_wait_abort_site(origin), "http1")
+
+
+def test_l2_abort_cold_wait_clean_http2(ng: Nginx, origin: Origin) -> None:
+    run_clean_test(ng, origin, _cold_wait_abort_site(origin), "http2")

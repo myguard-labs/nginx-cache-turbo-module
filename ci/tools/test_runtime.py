@@ -150,6 +150,22 @@ def run_all(ng: Nginx, origin: Origin,
     test_redis_connect_backoff_fails_fast(ng, origin)          # S231-L2-BACKOFF
     test_redis_connect_backoff_disabled_never_arms(ng, origin) # S231-L2-BACKOFF
     test_cold_wait_poll_timer_no_uaf(ng, origin)                # S231-COLDWAIT-UAF
+    test_l2_abort_cold_wait_parks(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_before_first_wake(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_http1_rst_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_http1_rst_after(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_http1_rst_boundary(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_http1_fin_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_http1_fin_after(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_http1_fin_boundary(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_h2_rst_stream_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_h2_rst_stream_after(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_h2_rst_stream_boundary(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_h2_close_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_h2_close_after(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_h2_close_boundary(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_clean_http1(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_cold_wait_clean_http2(ng, origin)  # CT-RESUME-FINALIZE-UAF
     test_memcached_connect_backoff_fails_fast(ng, origin)       # S231-L2-BACKOFF
     test_memcached_replyless_peer_arms_backoff(ng)              # release audit
     test_valid_dup_status_warns(ng)
@@ -414,6 +430,36 @@ def run_all(ng: Nginx, origin: Origin,
     test_autotune_churn_disqualifies(ng, origin)
     if redis is not None:
         test_l2_write_through(ng, origin, redis)
+        test_l2_abort_fixture_parks(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_http1_rst_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_http1_rst_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_http1_rst_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_http1_fin_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_http1_fin_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_http1_fin_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_h2_rst_stream_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_h2_rst_stream_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_h2_rst_stream_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_h2_close_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_h2_close_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_h2_close_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_clean_http1(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_get_clean_http2(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_parks(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_http1_rst_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_http1_rst_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_http1_rst_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_http1_fin_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_http1_fin_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_http1_fin_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_h2_rst_stream_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_h2_rst_stream_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_h2_rst_stream_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_h2_close_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_h2_close_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_h2_close_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_clean_http1(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_redis_lock_clean_http2(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
         test_l2_negative_ttl_skips_repeat_get(ng, origin, redis)   # L13
         test_l2_negative_ttl_expires(ng, origin, redis)            # L13
         test_l2_negative_ttl_with_min_uses(ng, origin, redis)      # L13
@@ -554,6 +600,21 @@ def run_all(ng: Nginx, origin: Origin,
         test_redis_tls_expired_cert_rejected(ng, origin, redis_tls_expired)
     if mc is not None:
         test_l2_memcached_write_through(ng, origin, mc)        # v13
+        test_l2_abort_memcached_get_parks(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_http1_rst_before(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_http1_rst_after(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_http1_rst_boundary(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_http1_fin_before(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_http1_fin_after(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_http1_fin_boundary(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_h2_rst_stream_before(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_h2_rst_stream_after(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_h2_rst_stream_boundary(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_h2_close_before(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_h2_close_after(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_h2_close_boundary(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_clean_http1(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_memcached_get_clean_http2(ng, origin, mc)  # CT-RESUME-FINALIZE-UAF
         test_l2_memcached_cross_instance_fill(ng, origin, mc)  # v13
         # P4-3: the memcached ingress point is a SEPARATE call site from
         # redis.c; without this the redis test alone would stay green while

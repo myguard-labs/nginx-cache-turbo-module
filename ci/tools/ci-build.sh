@@ -98,6 +98,11 @@ CC_OPT="$TEST_OPT -DNGX_DEBUG_PALLOC=1 -g3 -O0 -fno-omit-frame-pointer -funwind-
 LD_OPT=""
 ADD_MODULE="--add-dynamic-module=$MODULE_DIR"
 WITH_DEBUG="--with-debug"
+# The runtime suite's client-abort fixture (ci/tools/abort_fixture.py) drives
+# HTTP/2 RST_STREAM and connection close against a parked request, so every
+# mode that runs the suite needs the v2 module. The two benchmark modes below
+# clear it to stay neutral baselines.
+WITH_HTTP2="--with-http_v2_module"
 case "$MODE" in
     asan)
         # Disable the UBSan sub-checks that nginx CORE trips as benign false
@@ -160,6 +165,7 @@ case "$MODE" in
         CC_OPT="$TEST_OPT -flto=auto -ffat-lto-objects"
         LD_OPT="-flto=auto"
         WITH_DEBUG=""
+        WITH_HTTP2=""
         ;;
     profile)
         # -O2 to match a real release build (bench.sh's `nginx` mode is only
@@ -175,6 +181,7 @@ case "$MODE" in
         CC_OPT="$TEST_OPT -g -O2 -fno-omit-frame-pointer -flto=auto -ffat-lto-objects"
         LD_OPT="-flto=auto"
         WITH_DEBUG=""
+        WITH_HTTP2=""
         ;;
 esac
 
@@ -209,6 +216,7 @@ cd "$ROOT/$DIR"
     --with-compat \
     --with-threads \
     $WITH_DEBUG \
+    $WITH_HTTP2 \
     --with-cc="$WITH_CC" \
     --with-http_realip_module \
     --with-http_ssl_module \
