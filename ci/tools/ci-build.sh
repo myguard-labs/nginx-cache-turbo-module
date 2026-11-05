@@ -112,13 +112,17 @@ case "$MODE" in
         #   nonnull-attribute - core passes NULL + len 0 to memcpy in the
         #                        proxy/upstream path.
         #   pointer-overflow  - core p +/- n arithmetic UBSan flags on buffers.
-        # ASan and the rest of UBSan stay on. These -fno-sanitize sub-check
-        # names are clang-specific; gcc's configure rejects nonnull-attribute/
-        # pointer-overflow. Only add them under clang (the local soak path);
-        # gcc keeps plain -fsanitize (CI was green, gcc doesn't trip these FPs).
-        SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+        #   alignment         - core HTTP/2 writes uint32 frame fields through
+        #                        unaligned pointers (ngx_http_v2_write_uint32 on
+        #                        NGX_HAVE_NONALIGNED); reached since asan mode builds
+        #                        the v2 module for the abort fixture. Both compilers.
+        # ASan and the rest of UBSan stay on. The function, nonnull-attribute and
+        # pointer-overflow names are clang-specific; gcc's configure rejects
+        # nonnull-attribute/pointer-overflow. Only add those under clang (the local
+        # soak path); gcc keeps plain -fsanitize except alignment, which it accepts.
+        SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=alignment -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
         if "${CC:-cc}" --version 2>/dev/null | grep -qi clang; then
-            SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+            SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow,alignment -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
         fi
         CC_OPT="$SAN"
         LD_OPT="$SAN"
