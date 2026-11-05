@@ -455,6 +455,7 @@ lint_file_wrappers=(
     ci/linter/lint-nginx.sh
     ci/linter/lint-perl.sh
     ci/linter/lint-python.sh
+    ci/linter/lint-resume-order.sh
     ci/linter/lint-sh.sh
     ci/linter/lint-shm-lock.sh
     ci/linter/lint-spelling.sh
@@ -916,6 +917,40 @@ printf '#!/bin/sh\nexit %s\n' 1 > "$checkerroot/fakebin/awk"
 finding_case_ "atomic-ordering: awk exit 1 is still the weak-ordering finding" \
     'CI-ARM64-NO-LIVE-LANE' atomic_ordering_awk_failed
 rm -rf "$checkerroot/fakebin"
+
+# resume-order: the resume-finalize order invariant. The scanner lives in the
+# wrapper itself, so --scan drives it over committed fixtures with no git
+# selection involved. Each bad fixture is the exact shape that came back as a
+# use-after-free (9c32123); the good ones are the admin.c shape and comment-only
+# mentions.
+ro_fx=ci/linter/fixtures/resume-order
+finding_case_ "resume-order: run_posted_requests then finalize(r) is caught" \
+    'bad-order\.c:5: r used after ngx_http_run_posted_requests' \
+    ci/linter/lint-resume-order.sh --scan "$ro_fx/bad-order.c"
+finding_case_ "resume-order: a run_posted_requests(r->connection) argument is caught" \
+    'bad-arg\.c:5: ngx_http_run_posted_requests\(r->connection\)' \
+    ci/linter/lint-resume-order.sh --scan "$ro_fx/bad-arg.c"
+finding_case_ "resume-order: a call split across lines still sees the later r use" \
+    'bad-multiline\.c:6: r used after' \
+    ci/linter/lint-resume-order.sh --scan "$ro_fx/bad-multiline.c"
+case_ 0 "resume-order: the admin.c shape (c hoisted, finalize, run_posted last) passes" \
+    ci/linter/lint-resume-order.sh --scan "$ro_fx/good-order.c"
+case_ 0 "resume-order: r mentioned only in comments and strings after the call passes" \
+    ci/linter/lint-resume-order.sh --scan "$ro_fx/comment-only.c"
+case_ 0 "resume-order: a commented-out run_posted_requests call is not a call" \
+    ci/linter/lint-resume-order.sh --scan "$ro_fx/comment-call.c"
+case_ 2 "resume-order: --scan with no files is exit 2" \
+    ci/linter/lint-resume-order.sh --scan
+ro_fake="$(mktemp -d)"
+trap 'rm -rf "$badroot" "$listroot" "$checkerroot" "$ro_fake"' EXIT
+printf '#!/bin/sh\necho boom >&2\nexit 2\n' > "$ro_fake/awk"
+chmod +x "$ro_fake/awk"
+case_ 2 "resume-order: an awk crash is exit 2, not a finding" \
+    env PATH="$ro_fake:$PATH" ci/linter/lint-resume-order.sh --scan "$ro_fx/good-order.c"
+printf '#!/bin/sh\nexit 137\n' > "$ro_fake/awk"
+case_ 2 "resume-order: any other nonzero awk exit is exit 2" \
+    env PATH="$ro_fake:$PATH" ci/linter/lint-resume-order.sh --scan "$ro_fx/good-order.c"
+rm -rf "$ro_fake"
 
 # shm-lock and stripe-seam: backslash-newline splicing (translation phase 2)
 # happens before lexing, so a continued // comment swallows the next physical
