@@ -1,4 +1,4 @@
-# sync-sha: b0342c9f5cbb11a472315e90b64b635ceb8d93113ddb0fb4911016b5d31dba95
+# sync-sha: c0eac1adaedca06baa5c7944ff10881ac9208e619d9ac33647b0e938bc028b48
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -116,7 +116,7 @@ jobs:
           perl -MTest::Nginx::Socket -e1 2>/dev/null || sudo cpanm --notest Test::Nginx
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: debug
           flavor: ${{ matrix.flavor }}
@@ -188,7 +188,7 @@ jobs:
           printf 'FUZZ_SECS=%s\n' "$FUZZ_SECONDS_INPUT" >> "$GITHUB_ENV"
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: debug
           nginx-version: ${{ env.NGINX_VERSION }}
@@ -297,7 +297,7 @@ jobs:
           sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold redis-server memcached zlib1g-dev
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: debug
           nginx-version: ${{ env.LEGACY_NGINX_VERSION }}
@@ -378,7 +378,7 @@ jobs:
           sudo apt-get install -y build-essential ccache clang curl eatmydata libpcre2-dev libssl-dev mold zlib1g-dev
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: module
           nginx-version: ${{ env.NGINX_VERSION }}
@@ -500,7 +500,7 @@ jobs:
           printf 'version\r\nquit\r\n' | timeout 2 nc 127.0.0.1 11211 | grep -q VERSION || {
             echo "::error::memcached did not come up on 127.0.0.1:11211"; exit 1; }
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: debug
           nginx-version: ${{ env.NGINX_VERSION }}
@@ -586,7 +586,7 @@ jobs:
           sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold redis-server memcached zlib1g-dev
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: asan
           nginx-version: ${{ env.NGINX_VERSION }}
@@ -770,7 +770,7 @@ jobs:
             libpcre2-dev libssl-dev redis-server redis-tools zlib1g-dev
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           # Distinct namespace from testkit.yml's own "testkit" mode: this
           # tree is built under ci-build.sh's asan flags on top of the
@@ -884,7 +884,7 @@ jobs:
             libpcre2-dev libssl-dev zlib1g-dev
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: testkit-angie
           flavor: angie
@@ -947,7 +947,7 @@ jobs:
           sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold python3 zlib1g-dev
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: debug
           nginx-version: ${{ env.NGINX_VERSION }}
@@ -1025,7 +1025,7 @@ jobs:
           tar -xzf "$archive" -C /tmp gitleaks
           /tmp/gitleaks git --no-banner .
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: module
           nginx-version: ${{ env.NGINX_VERSION }}
@@ -1147,7 +1147,7 @@ jobs:
           echo "$RUNNER_TEMP/gcovr/bin" >> "$GITHUB_PATH"
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: coverage
           nginx-version: ${{ env.NGINX_VERSION }}

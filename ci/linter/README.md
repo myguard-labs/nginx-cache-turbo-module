@@ -145,12 +145,15 @@ sudo cpanm --notest Perl::Critic          # only if libperl-critic-perl was unav
 an install step has no business demanding.
 
 ```sh
-pipx install zizmor                 # GitHub Actions security audit
+pipx install zizmor==1.32.0        # GitHub Actions security audit
 ```
 
-`zizmor` is deliberately **not** pinned, unlike ruff and semgrep: its rule set
-is the whole point, and a frozen security scanner stops finding what it was
-added for. A new rule going red is a finding to triage, not drift to suppress.
+`zizmor` is pinned like ruff and semgrep. It used to float so the rule set
+would keep growing, but a runner picking up a new release (1.32.0 enabled the
+`self-repository` audit) turned unrelated PRs red with findings they did not
+introduce. Bump the pin deliberately, in a change that triages every new
+finding (fix it, or a `# zizmor: ignore[rule]` with the reason), so the rule
+set still advances, just under review.
 
 **upstream binary (no apt/pip/cpan source)**
 
@@ -416,6 +419,13 @@ repo-settings context; that belongs in a periodic review.
 
 Inapplicable finding → `# zizmor: ignore[rule]` on the line, with the reason.
 Never a blanket disable in a `zizmor.yml`.
+
+`self-repository` (zizmor 1.30+) wants `uses: $/.github/...` instead of
+`uses: ./.github/...`. GitHub supports `$/` (July 2026), but the pinned
+actionlint 1.7.7 rejects it as an invalid action reference, and
+`workflow_policy.py` matches the `./.github/workflows/` prefix, so the local
+`uses:` lines carry a per-line ignore. Drop the ignores together with the
+actionlint pin bump once actionlint and the self-hosted runners accept `$/`.
 
 ## In CI
 

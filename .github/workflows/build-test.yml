@@ -1,4 +1,4 @@
-# sync-sha: 85e4ff5421b8172d1ddcc6dc759c960f06f2ac150f1fc67304cd82e24ddce9ac
+# sync-sha: 6221d985101e444d2d7793a95064f4003fd7cf131a52f5d94166d4bf7ed3554f
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -265,7 +265,7 @@ jobs:
       # .build/nginx-<ver> path, so a cached tree could poison a later
       # sanitizer job -- ccache gives the compile win content-keyed and safe.
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: debug
           nginx-version: ${{ env.NGINX_VERSION }}

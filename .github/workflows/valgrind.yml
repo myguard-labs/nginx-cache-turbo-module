@@ -1,4 +1,4 @@
-# sync-sha: a323a7b5ab9374789d87684755991a8d4462959182506a081ec657e40eb7e4de
+# sync-sha: 6199f62c33ed72619f710874a57696452f261a6aafa97a02070396f0008fc75d
 name: Valgrind
 
 # Valgrind memcheck lite soak (60s @ 4 conc) — ON-DEMAND ONLY.
@@ -55,7 +55,7 @@ jobs:
             valgrind zlib1g-dev
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: debug
           nginx-version: ${{ env.NGINX_VERSION }}

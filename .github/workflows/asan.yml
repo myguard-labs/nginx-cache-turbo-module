@@ -1,4 +1,4 @@
-# sync-sha: 7b5c95f1f07d6dcec0ee4041dbc6c4a16ca75bf3aca4f4b9a22686378b2c974a
+# sync-sha: cd5e6f55d78c895bc50e50cddb3317a2580a2ac521e29f32d7aad4c66d4dd216
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -55,7 +55,7 @@ jobs:
           sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold zlib1g-dev
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: asan
           nginx-version: ${{ env.NGINX_VERSION }}

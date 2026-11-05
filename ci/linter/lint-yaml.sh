@@ -33,6 +33,11 @@
 # that are genuinely inapplicable get a `# zizmor: ignore[rule]` at the line,
 # with the reason -- never a blanket rule disable in zizmor.yml.
 #
+# `self-repository` (zizmor 1.30+, `uses: $/...` over `uses: ./...`) is ignored
+# per line on every local `uses:`: actionlint 1.7.7 rejects `$/...` as an
+# invalid action reference and workflow_policy.py keys on `./.github/workflows/`.
+# Revisit when actionlint is bumped. zizmor is pinned in install-linters.sh.
+#
 # --offline: no API calls from a commit hook. The online audits need a token and
 # only add repo-settings context, which belongs in a periodic review, not here.
 #

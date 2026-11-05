@@ -1,4 +1,4 @@
-# sync-sha: 73e9c49003ff6434fc0ce4c9b8be3f3165bac3763804dd2ec6519a76abdf750d
+# sync-sha: 7a9bac2935593b9b0a41d00d91a69ff83d47b612a5de77e03ee34a4053f13987
 name: Testkit Valgrind
 
 # Weekly memcheck soak of the testkit prober scenarios -- S21.
@@ -163,7 +163,7 @@ jobs:
             libpcre2-dev libssl-dev redis-server redis-tools valgrind zlib1g-dev
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           # A distinct ccache namespace from `testkit` (plain) and
           # `testkit-asan`: this build's CFLAGS differ from both (DEBUG

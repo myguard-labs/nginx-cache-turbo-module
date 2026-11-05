@@ -1,4 +1,4 @@
-# sync-sha: ec86c96a4a878580e64aba8e4998eb87e22ea37e0b57fafead0ba81ca5265c1a
+# sync-sha: 60cbe7740304a5f855be542af8f7c4ceb1003d2ef19dd60d4fb952a1cdee93ff
 name: Testkit
 
 # The nginx-module-testkit prober leg.
@@ -161,7 +161,7 @@ jobs:
 
       - name: Restore build caches
         if: ${{ !inputs.skip-expensive-jobs }}
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           # A distinct ccache namespace. This tree's configure differs from
           # every other mode's (it binds two dynamic modules and carries
