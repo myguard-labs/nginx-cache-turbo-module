@@ -4619,6 +4619,7 @@ ngx_http_cache_turbo_redis_walk_finish(
     ngx_http_cache_turbo_redis_members_pt   cb = op->members_cb;
     void                                   *data = op->members_data;
     ngx_http_cache_turbo_redis_walk_t       walk;
+    ngx_connection_t                       *c;
     ngx_int_t                               rc;
 
     /* CT-SSCAN-TERMINATE-LEAK: the request this walk was parked on is GONE --
@@ -4662,8 +4663,12 @@ ngx_http_cache_turbo_redis_walk_finish(
     /* Now safe to drop our connection + pool (members no longer referenced). */
     ngx_http_cache_turbo_redis_op_done(op);
 
-    ngx_http_run_posted_requests(r->connection);
+    /* CT-RESUME-FINALIZE-UAF: finalize, then the posted requests, as in
+     * get_finish. c is read only here, past the detached guard above: on a
+     * detached walk r is freed memory. */
+    c = r->connection;
     ngx_http_finalize_request(r, rc);
+    ngx_http_run_posted_requests(c);
 }
 
 
@@ -4767,9 +4772,19 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
 /*
  * GET path teardown + resume. On a hit the blob (which lives in the op pool) is
  * copied into the request pool first, then recorded in ctx; the op pool is torn
- * down, and finally the parked request is resumed through the phase engine and
- * its parked reference released — exactly the park/resume dance error-abuse's
- * async redis adapter uses.
+ * down, and finally the parked request is resumed through the phase engine, its
+ * parked reference released, and only then the connection's posted requests
+ * run.
+ *
+ * CT-RESUME-FINALIZE-UAF: that last order is load-bearing. On a dead client
+ * (c->error) the resumed phases end in ngx_http_terminate_request, which posts
+ * ngx_http_terminate_handler; that handler forces count = 1 and frees the
+ * request, park reference or not. Running the posted requests BEFORE the
+ * finalize therefore frees r under it, and the finalize reads freed memory.
+ * Finalizing first only drops the park reference (count > 1 while the
+ * terminate is pending), and run_posted_requests takes the connection captured
+ * up front: ngx_http_free_request sets c->destroyed, which that loop checks
+ * first, and an HTTP/2 stream's fake connection survives its request.
  */
 static void
 ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
@@ -4777,6 +4792,7 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
 {
     ngx_http_request_t               *r = op->request;
     ngx_http_cache_turbo_ctx_t       *ctx = op->ctx;
+    ngx_connection_t                 *c = r->connection;
     u_char                           *copy;
 
     /* S231: read failures on a GET (timeout / fill error / malformed reply) are
@@ -4821,10 +4837,11 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
     /* tear down our own connection + pool (blob is now copied into r->pool) */
     ngx_http_cache_turbo_redis_op_done(op);
 
-    /* resume the parked request, then release the reference taken at park */
+    /* resume the parked request, release the reference taken at park, then run
+     * what the resume posted, which may free r: r is not touched after it */
     ngx_http_core_run_phases(r);
-    ngx_http_run_posted_requests(r->connection);
     ngx_http_finalize_request(r, NGX_DONE);
+    ngx_http_run_posted_requests(c);
 }
 
 
@@ -4930,7 +4947,8 @@ ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
  * Lock teardown + resume. Records the outcome in ctx (lock_done + lock_result),
  * tears down the op, and resumes the parked request through the phase engine —
  * the access handler re-runs and acts on ctx->lock_* (win -> origin, lose ->
- * serve stale). Same park/resume dance as get_finish, minus the blob copy.
+ * serve stale). Same park/resume dance as get_finish, minus the blob copy, and
+ * the same order: finalize before the posted requests (CT-RESUME-FINALIZE-UAF).
  */
 static void
 ngx_http_cache_turbo_redis_lock_finish(ngx_http_cache_turbo_redis_op_t *op,
@@ -4938,6 +4956,7 @@ ngx_http_cache_turbo_redis_lock_finish(ngx_http_cache_turbo_redis_op_t *op,
 {
     ngx_http_request_t          *r = op->request;
     ngx_http_cache_turbo_ctx_t  *ctx = op->ctx;
+    ngx_connection_t            *c = r->connection;
 
     /* S231: same "still unconnected" arm as get_finish() -- the lock reader
      * calls this directly instead of through op_fail(). */
@@ -4951,8 +4970,8 @@ ngx_http_cache_turbo_redis_lock_finish(ngx_http_cache_turbo_redis_op_t *op,
     ngx_http_cache_turbo_redis_op_done(op);
 
     ngx_http_core_run_phases(r);
-    ngx_http_run_posted_requests(r->connection);
     ngx_http_finalize_request(r, NGX_DONE);
+    ngx_http_run_posted_requests(c);
 }
 
 

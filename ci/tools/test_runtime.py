@@ -166,6 +166,11 @@ def run_all(ng: Nginx, origin: Origin,
     test_l2_abort_cold_wait_h2_close_boundary(ng, origin)  # CT-RESUME-FINALIZE-UAF
     test_l2_abort_cold_wait_clean_http1(ng, origin)  # CT-RESUME-FINALIZE-UAF
     test_l2_abort_cold_wait_clean_http2(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_admin_warm_http1_rst_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_admin_warm_http1_fin_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_admin_warm_h2_rst_stream_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_admin_warm_h2_close_boundary(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    test_l2_abort_admin_warm_clean_http1(ng, origin)  # CT-RESUME-FINALIZE-UAF
     test_memcached_connect_backoff_fails_fast(ng, origin)       # S231-L2-BACKOFF
     test_memcached_replyless_peer_arms_backoff(ng)              # release audit
     test_valid_dup_status_warns(ng)
@@ -460,6 +465,34 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_abort_redis_lock_h2_close_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
         test_l2_abort_redis_lock_clean_http1(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
         test_l2_abort_redis_lock_clean_http2(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_http1_rst_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_http1_rst_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_http1_rst_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_http1_fin_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_http1_fin_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_http1_fin_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_h2_rst_stream_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_h2_rst_stream_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_h2_rst_stream_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_h2_close_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_h2_close_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_h2_close_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_clean_http1(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_sscan_walk_clean_http2(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_http1_rst_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_http1_rst_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_http1_rst_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_http1_fin_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_http1_fin_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_http1_fin_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_h2_rst_stream_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_h2_rst_stream_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_h2_rst_stream_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_h2_close_before(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_h2_close_after(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_h2_close_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_clean_http1(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_scan_walk_clean_http2(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
         test_l2_negative_ttl_skips_repeat_get(ng, origin, redis)   # L13
         test_l2_negative_ttl_expires(ng, origin, redis)            # L13
         test_l2_negative_ttl_with_min_uses(ng, origin, redis)      # L13

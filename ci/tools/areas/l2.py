@@ -14,8 +14,10 @@ from abort_fixture import (
     AbortRig,
     AbortSite,
     ColdWaitAnchor,
+    FileAnchor,
     Http1Client,
     ProxyAnchor,
+    WalkAnchor,
     assert_abort_clean,
     binary_has_debug_log,
     run_abort_arm,
@@ -4557,3 +4559,345 @@ def test_l2_abort_cold_wait_clean_http1(ng: Nginx, origin: Origin) -> None:
 
 def test_l2_abort_cold_wait_clean_http2(ng: Nginx, origin: Origin) -> None:
     run_clean_test(ng, origin, _cold_wait_abort_site(origin), "http2")
+
+
+
+# Walk sites. Each has its own db and prefix: an all-purge deletes every key
+# under its prefix in its db, and a tag purge reads one set there.
+ABORT_SSCAN_DB = "9"
+ABORT_SSCAN_PREFIX = "ctabtag:"
+ABORT_SCAN_DB = "10"
+ABORT_SCAN_PREFIX = "ctabscan:"
+# Keys per walked tag or keyspace: one page, so a page purge that dropped none
+# shows, and the walk's command count stays fixed.
+ABORT_WALK_KEYS = 4
+
+
+def _resp(*args: str) -> bytes:
+    """A whole RESP command."""
+    return b"*%d\r\n" % len(args) + _resp_args(*args)
+
+
+def _resp_args(*args: str) -> bytes:
+    """Leading arguments of a RESP command, without its array header: a marker
+    for a command whose later arguments do not matter."""
+    out = b""
+    for a in args:
+        raw = a.encode()
+        out += b"$%d\r\n%s\r\n" % (len(raw), raw)
+    return out
+
+
+def _abort_walk_keys(prefix: str, uri: str) -> list[str]:
+    """Well-formed object keys, <prefix><64 hex>, distinct per uri: the shape a
+    tag purge hex-decodes to reach L1 and the object's lock key."""
+    seed = hashlib.sha256(uri.encode()).hexdigest()[:56]
+    return [f"{prefix}{seed}{i:08x}" for i in range(ABORT_WALK_KEYS)]
+
+
+def _walk_admin(path: str, db: str, prefix: str) -> str:
+    return f"""location = {path} {{
+            cache_turbo_admin abort;
+            cache_turbo_redis 127.0.0.1:{{proxy_port}} db={db} prefix={prefix} timeout=2s;
+        }}"""
+
+
+def _sscan_walk_abort_site(redis: RedisServer) -> AbortSite:
+    """SSCAN tag walk: POST ?tag= on an admin location. redis_sscan() takes
+    r->main->count++ and walk_finish() resumes, with run_posted_requests ahead
+    of the finalize like the other sites. Unlike them the callback does not
+    finalize, so whether that order breaks here is measured, not assumed.
+
+    Each request walks its own tag of ABORT_WALK_KEYS members, one page: SSCAN
+    on one op connection, then the page's UNLINK on a second, which the walk
+    waits for before it answers. The SREM of the page goes out on a third
+    connection only after the answer. Every op connection opens with SELECT.
+    """
+    def db(*args: str) -> str:
+        return redis.cli("-n", ABORT_SSCAN_DB, *args)
+
+    def tag_key(uri: str) -> str:
+        return f"{ABORT_SSCAN_PREFIX}tag:{_abort_tag(uri)}"
+
+    def fill(rig: AbortRig) -> None:
+        for uri in rig.uris:
+            keys = _abort_walk_keys(ABORT_SSCAN_PREFIX, uri)
+            for key in keys:
+                db("SET", key, "v", "EX", "300")
+            db("SADD", tag_key(uri), *keys)
+
+    def anchor(rig: AbortRig, uri: str) -> WalkAnchor:
+        return WalkAnchor(
+            rig.proxy,
+            [_resp("SELECT", ABORT_SSCAN_DB),
+             _resp_args("SSCAN", tag_key(uri), "0"), b"$6\r\nUNLINK\r\n"],
+            sends=[3, 1, 1, 1], trailing=[b"$4\r\nSREM\r\n"])
+
+    def verify(rig: AbortRig, uri: str, status: int, body: bytes) -> None:
+        assert status == 200, f"{uri}: status {status} {body!r}"
+        assert json.loads(body) == {"purged": ABORT_WALK_KEYS}, (
+            f"{uri}: purge answered {body!r}")
+        left = [k for k in [tag_key(uri), *_abort_walk_keys(ABORT_SSCAN_PREFIX, uri)]
+                if db("EXISTS", k) != "0"]
+        assert not left, f"{uri}: the tag purge left {left}"
+
+    return AbortSite(
+        name="sscan",
+        upstream=redis.port,
+        directives="",
+        anchor=anchor,
+        stored=lambda uri: db("EXISTS", tag_key(uri)) == "1",
+        forget=lambda uri: db("DEL", tag_key(uri),
+                              *_abort_walk_keys(ABORT_SSCAN_PREFIX, uri)),
+        arrange=fill,
+        prime=False,
+        method="POST",
+        target=lambda uri: f"/_ab_sscan?tag={_abort_tag(uri)}",
+        verify=verify,
+        server_extra=_walk_admin("/_ab_sscan", ABORT_SSCAN_DB, ABORT_SSCAN_PREFIX),
+    )
+
+
+def _scan_walk_abort_site(redis: RedisServer) -> AbortSite:
+    """SCAN all-purge walk: POST ?all=1 on an admin location. redis_scan_del()
+    takes r->main->count++ and walk_finish() resumes, as for SSCAN.
+
+    An all-purge empties the whole prefix, so each request's keys are written
+    when its anchor is built, not up front: a later request would otherwise walk
+    an empty keyspace. One page: SELECT, SCAN, answer; the page's UNLINK goes
+    out on a second op connection, with its own SELECT, after the answer.
+    """
+    def db(*args: str) -> str:
+        return redis.cli("-n", ABORT_SCAN_DB, *args)
+
+    def anchor(rig: AbortRig, uri: str) -> WalkAnchor:
+        for key in _abort_walk_keys(ABORT_SCAN_PREFIX, uri):
+            db("SET", key, "v", "EX", "300")
+        return WalkAnchor(
+            rig.proxy,
+            [_resp("SELECT", ABORT_SCAN_DB),
+             _resp_args("SCAN", "0", "MATCH", f"{ABORT_SCAN_PREFIX}*")],
+            sends=[2, 1, 1], trailing=[b"$6\r\nUNLINK\r\n"])
+
+    def verify(rig: AbortRig, uri: str, status: int, body: bytes) -> None:
+        assert status == 200, f"{uri}: status {status} {body!r}"
+        reply = json.loads(body)
+        assert reply.get("scan_pages") == 1 and "l2" not in reply, (
+            f"{uri}: purge answered {body!r}")
+        assert wait_for(lambda: db("DBSIZE") == "0"), (
+            f"{uri}: the all-purge left {db('DBSIZE')} keys")
+
+    return AbortSite(
+        name="scan",
+        upstream=redis.port,
+        directives="",
+        anchor=anchor,
+        stored=lambda uri: True,
+        forget=lambda uri: db("DEL", *_abort_walk_keys(ABORT_SCAN_PREFIX, uri)),
+        arrange=lambda rig: None,
+        prime=False,
+        method="POST",
+        target=lambda uri: "/_ab_scan?all=1",
+        verify=verify,
+        server_extra=_walk_admin("/_ab_scan", ABORT_SCAN_DB, ABORT_SCAN_PREFIX),
+    )
+
+
+def _abort_tag(uri: str) -> str:
+    return uri.removeprefix("/ab/")
+
+
+def _admin_warm_abort_site(ng: Nginx) -> AbortSite:
+    """Control: the admin warm ?url_file= park, which already resumes in the
+    fixed order (finalize, then run_posted_requests on a captured connection).
+    Its task sleeps WARM_FILE_TEST_DELAY on a ".delay-fstat" list (TEST_FAULTS),
+    so every key costs that long: the arms below are a subset, not the matrix.
+    The list is empty, so the warm has nothing to fetch.
+    """
+    lists = ng.root.parent / "abort-warm-lists"
+
+    def path(uri: str) -> pathlib.Path:
+        return lists / f"{_abort_tag(uri)}.delay-fstat"
+
+    def verify(rig: AbortRig, uri: str, status: int, body: bytes) -> None:
+        assert status == 200 and json.loads(body) == {"warmed": 0}, (
+            f"{uri}: warm answered {status} {body!r}")
+
+    return AbortSite(
+        name="warm",
+        upstream=ng.origin_port,
+        directives="",
+        anchor=lambda rig, uri: FileAnchor(path(uri)),
+        stored=lambda uri: True,
+        forget=lambda uri: path(uri).unlink(missing_ok=True),
+        arrange=lambda rig: lists.mkdir(parents=True, exist_ok=True),
+        prime=False,
+        method="POST",
+        target=lambda uri: f"/_ab_warm?url_file={path(uri)}",
+        verify=verify,
+        main_extra="thread_pool cache_turbo_warm threads=1 max_queue=64;",
+        server_extra="""location = /_ab_warm {
+            cache_turbo_admin abort;
+            aio threads=cache_turbo_warm;
+        }""",
+    )
+
+
+def test_l2_abort_sscan_walk_http1_rst_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "http1_rst", "before")
+
+
+def test_l2_abort_sscan_walk_http1_rst_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "http1_rst", "after")
+
+
+def test_l2_abort_sscan_walk_http1_rst_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "http1_rst", "boundary")
+
+
+def test_l2_abort_sscan_walk_http1_fin_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "http1_fin", "before")
+
+
+def test_l2_abort_sscan_walk_http1_fin_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "http1_fin", "after")
+
+
+def test_l2_abort_sscan_walk_http1_fin_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "http1_fin", "boundary")
+
+
+def test_l2_abort_sscan_walk_h2_rst_stream_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "h2_rst_stream", "before")
+
+
+def test_l2_abort_sscan_walk_h2_rst_stream_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "h2_rst_stream", "after")
+
+
+def test_l2_abort_sscan_walk_h2_rst_stream_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "h2_rst_stream", "boundary")
+
+
+def test_l2_abort_sscan_walk_h2_close_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "h2_close", "before")
+
+
+def test_l2_abort_sscan_walk_h2_close_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "h2_close", "after")
+
+
+def test_l2_abort_sscan_walk_h2_close_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _sscan_walk_abort_site(redis), "h2_close", "boundary")
+
+
+def test_l2_abort_sscan_walk_clean_http1(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_clean_test(ng, origin, _sscan_walk_abort_site(redis), "http1")
+
+
+def test_l2_abort_sscan_walk_clean_http2(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_clean_test(ng, origin, _sscan_walk_abort_site(redis), "http2")
+
+
+def test_l2_abort_scan_walk_http1_rst_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "http1_rst", "before")
+
+
+def test_l2_abort_scan_walk_http1_rst_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "http1_rst", "after")
+
+
+def test_l2_abort_scan_walk_http1_rst_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "http1_rst", "boundary")
+
+
+def test_l2_abort_scan_walk_http1_fin_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "http1_fin", "before")
+
+
+def test_l2_abort_scan_walk_http1_fin_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "http1_fin", "after")
+
+
+def test_l2_abort_scan_walk_http1_fin_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "http1_fin", "boundary")
+
+
+def test_l2_abort_scan_walk_h2_rst_stream_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "h2_rst_stream", "before")
+
+
+def test_l2_abort_scan_walk_h2_rst_stream_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "h2_rst_stream", "after")
+
+
+def test_l2_abort_scan_walk_h2_rst_stream_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "h2_rst_stream", "boundary")
+
+
+def test_l2_abort_scan_walk_h2_close_before(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "h2_close", "before")
+
+
+def test_l2_abort_scan_walk_h2_close_after(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "h2_close", "after")
+
+
+def test_l2_abort_scan_walk_h2_close_boundary(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_abort_test(ng, origin, _scan_walk_abort_site(redis), "h2_close", "boundary")
+
+
+def test_l2_abort_scan_walk_clean_http1(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_clean_test(ng, origin, _scan_walk_abort_site(redis), "http1")
+
+
+def test_l2_abort_scan_walk_clean_http2(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_clean_test(ng, origin, _scan_walk_abort_site(redis), "http2")
+
+
+def test_l2_abort_admin_warm_http1_rst_before(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _admin_warm_abort_site(ng), "http1_rst", "before")
+
+
+def test_l2_abort_admin_warm_http1_fin_before(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _admin_warm_abort_site(ng), "http1_fin", "before")
+
+
+def test_l2_abort_admin_warm_h2_rst_stream_before(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _admin_warm_abort_site(ng), "h2_rst_stream", "before")
+
+
+def test_l2_abort_admin_warm_h2_close_boundary(ng: Nginx, origin: Origin) -> None:
+    run_abort_test(ng, origin, _admin_warm_abort_site(ng), "h2_close", "boundary")
+
+
+def test_l2_abort_admin_warm_clean_http1(ng: Nginx, origin: Origin) -> None:
+    run_clean_test(ng, origin, _admin_warm_abort_site(ng), "http1")

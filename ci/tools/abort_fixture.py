@@ -107,7 +107,7 @@ class _Sighting:
     replied: threading.Event = dataclasses.field(
         default_factory=threading.Event)
     seen_at: float = 0.0      # time.monotonic() the request reached the proxy
-    reply_at: float = 0.0     # time.monotonic() the reply is released to nginx
+    reply_at: float = 0.0     # time.monotonic() the first reply is released
     count: int = 0            # times the request was sent
 
 
@@ -208,18 +208,28 @@ class DelayProxy:
                     f"the backend connection never went quiet for {margin}s")
             time.sleep(min(remaining, deadline - now))
 
-    def _note_request(self, data: bytes, now: float,
+    def _note_request(self, data: bytes, old: int, now: float,
                       pending: collections.deque[_Sighting]) -> None:
+        """Note the markers in `data`, whose first `old` bytes are the tail of
+        the previous read, carried over so a marker split across two reads is
+        still seen. A match ending inside that tail was counted last time: a
+        marker shorter than the tail (SELECT) would otherwise count twice and
+        take the reply meant for the next command. Replies come back in request
+        order, so matches queue in byte order, not marker order."""
         self._busy_until = max(self._busy_until, now)
+        hits: list[tuple[int, _Sighting]] = []
         for marker, s in self._watch.items():
-            hits = data.count(marker)
-            if not hits:
-                continue
+            at = data.find(marker)
+            while at != -1:
+                if at + len(marker) > old:
+                    hits.append((at, s))
+                at = data.find(marker, at + 1)
+        for _, s in sorted(hits, key=lambda hit: hit[0]):
             if not s.count:
                 s.seen_at = now
                 s.seen.set()
-            s.count += hits
-            pending.extend([s] * hits)
+            s.count += 1
+            pending.append(s)
 
     async def _handle(self, cr: asyncio.StreamReader,
                       cw: asyncio.StreamWriter) -> None:
@@ -240,7 +250,8 @@ class DelayProxy:
             tail = b""
             while data := await cr.read(65536):
                 self.request_bytes += len(data)
-                self._note_request(tail + data, time.monotonic(), pending)
+                self._note_request(tail + data, len(tail), time.monotonic(),
+                                   pending)
                 tail = data[-self._tail_len:] if self._tail_len else b""
                 uw.write(data)
                 await uw.drain()
@@ -252,9 +263,13 @@ class DelayProxy:
                 due = loop.time() + self.delay
                 self._busy_until = max(self._busy_until, due)
                 if pending:
+                    # A marker sent more than once (a walk's SELECT, one per
+                    # op connection) keeps its first reply: that is the one
+                    # ending the first park.
                     s = pending.popleft()
-                    s.reply_at = due
-                    s.replied.set()
+                    if not s.replied.is_set():
+                        s.reply_at = due
+                        s.replied.set()
                 loop.call_at(due, deliver, data)
             loop.call_at(loop.time() + self.delay, cw.close)
 
@@ -788,7 +803,7 @@ class AbortNode(Nginx):
 
     def __init__(self, ng: Nginx, name: str, directives: str, valid: str,
                  errlog: str | None = None, upstream_port: int | None = None,
-                 server_extra: str = "") -> None:
+                 server_extra: str = "", main_extra: str = "") -> None:
         super().__init__(ng.binary, ng.module, ng.root.parent / name,
                          ng.port + PORT_OFFSETS["abort_node"], ng.origin_port,
                          ng.runner_raw, ng.single_process)
@@ -800,6 +815,7 @@ class AbortNode(Nginx):
         self.h2_style = http2_style(str(ng.binary))
         self.upstream_port = upstream_port or ng.origin_port
         self.server_extra = server_extra
+        self.main_extra = main_extra
 
     def write_config(self, sr_off: bool = False) -> None:
         (self.root / "conf").mkdir(parents=True, exist_ok=True)
@@ -815,6 +831,7 @@ class AbortNode(Nginx):
 worker_processes 1;
 pid {self.root}/nginx.pid;
 error_log {self.root}/logs/error.log {self.errlog};
+{self.main_extra}
 events {{ worker_connections 512; }}
 http {{
     access_log off;
@@ -869,6 +886,72 @@ http {{
         assert wait_for(alive, timeout=10.0, interval=0.01), (
             "the master did not respawn a worker")
 
+    def held_client_sockets(self) -> list[str]:
+        """Client connections the serving process still holds, from /proc.
+
+        A request that nothing will ever finalize keeps its connection's fd
+        open and logs nothing, and stop() is a SIGTERM, which does not report
+        open sockets the way a graceful quit would. So the leak is looked for
+        here: a socket fd on one of this node's ports that is not listening,
+        or one the kernel no longer lists at all, which a peer's RST does to
+        the socket while its fd stays open. Backend connections are ignored:
+        they are on the proxy's port, and an RST is only ever sent by a client
+        here. Returns one description per held socket.
+        """
+        ports = {self.port, self.h2_port}
+        listed: dict[str, tuple[int, str]] = {}
+        for table in ("tcp", "tcp6", "udp", "udp6", "unix", "netlink"):
+            try:
+                rows = pathlib.Path(f"/proc/net/{table}").read_text().splitlines()[1:]
+            except OSError:
+                continue
+            for row in rows:
+                cols = row.split()
+                if table.startswith(("tcp", "udp")):
+                    port = int(cols[1].rsplit(":", 1)[1], 16)
+                    listed[cols[9]] = (port if table.startswith("tcp") else 0, cols[3])
+                elif table == "unix":
+                    listed[cols[6]] = (0, "")
+                else:
+                    listed[cols[-1]] = (0, "")
+        pids = self.worker_pids() or ({self.process.pid} if self.process else set())
+        held = []
+        for pid in pids:
+            fds = pathlib.Path(f"/proc/{pid}/fd")
+            try:
+                entries = list(fds.iterdir())
+            except OSError:
+                continue
+            for fd in entries:
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                if not target.startswith("socket:["):
+                    continue
+                inode = target[len("socket:["):-1]
+                if inode not in listed:
+                    held.append(f"pid {pid} fd {fd.name}: reset, still open")
+                    continue
+                port, state = listed[inode]
+                if port in ports and state != "0A":   # 0A = TCP_LISTEN
+                    held.append(f"pid {pid} fd {fd.name}: port {port} state {state}")
+        return held
+
+    def wait_released(self) -> list[str]:
+        """Wait for the node to let go of every client connection; return the
+        ones it still holds. A finished request closes its connection at once,
+        so the wait only matters on a loaded host; a leak never clears."""
+        held: list[str] = []
+
+        def released() -> bool:
+            nonlocal held
+            held = self.held_client_sockets()
+            return not held
+
+        wait_for(released, timeout=1.0 * sanitizer_time_scale(), interval=0.02)
+        return held
+
     def fatal_lines(self) -> list[str]:
         """Every line the abort oracle treats as a failure. A crash is an
         [alert]: `worker process N exited on signal 11`. A sanitizer report is
@@ -914,7 +997,9 @@ class AbortSite:
     proxy_delay  reply delay at the proxy, seconds before sanitizer scaling.
                  None means ABORT_REPLY_DELAY.
     server_extra config added to the node's server block, e.g. an admin
-                 location the anchor reads.
+                 location the anchor reads. {proxy_port} is replaced as in
+                 `directives`; nothing else is, so its braces stay literal.
+    main_extra   config added at the main level, e.g. a thread_pool
     origin_hits  requests per key the origin is expected to see during an arm
     method       request method; the admin purges are POSTs
     target       uri -> the request target actually sent. None sends the uri
@@ -937,6 +1022,7 @@ class AbortSite:
     origin_proxy: bool = False
     proxy_delay: float | None = None
     server_extra: str = ""
+    main_extra: str = ""
     origin_hits: int = 0
     method: str = "GET"
     target: Callable[[str], str] | None = None
@@ -1085,7 +1171,8 @@ class AbortRig:
             ng, f"abort-{site.name}-{slug}",
             site.directives.format(proxy_port=self.proxy.port), site.valid,
             errlog, self.proxy.port if site.origin_proxy else None,
-            site.server_extra)
+            site.server_extra.replace("{proxy_port}", str(self.proxy.port)),
+            site.main_extra)
 
     def _prime(self) -> None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -1146,8 +1233,9 @@ def run_abort_arm(ng: Nginx, origin: Origin, site: AbortSite, kind: str,
     Stays at the default notice log level: debug logging may read the freed
     request's strings and change how the bug shows up.
 
-    Returns the fatal log lines for assert_abort_clean() to judge, so a caller
-    can report an arm without failing it. Fatal lines outrank every other check
+    Returns the fatal log lines, and any client connection a key left held,
+    for assert_abort_clean() to judge, so a caller can report an arm without
+    failing it. Fatal lines outrank every other check
     here: they are what the arm exists to catch, and the stimulus checks that
     follow would only blame the crash's side effects. On a clean run those
     checks are what keep a pass from being vacuous.
@@ -1155,6 +1243,7 @@ def run_abort_arm(ng: Nginx, origin: Origin, site: AbortSite, kind: str,
     arm = f"{site.name} {kind} {timing}"
     keys = ABORT_BOUNDARY_KEYS if timing == "boundary" else ABORT_KEYS
     landings: list[Landing] = []
+    held: list[str] = []
     with AbortRig(ng, site, f"{kind}-{timing}", keys) as rig:
         if kind in HTTP2_KINDS:
             rig.node.require_http2()
@@ -1173,8 +1262,13 @@ def run_abort_arm(ng: Nginx, origin: Origin, site: AbortSite, kind: str,
                     f"{arm}: {cause}key {i}/{keys}: {exc}\nlog tail:\n"
                     + "\n".join(log)) from exc
             landings.append(_landing(timing, aborted_at, anchor.times()))
+            # A request nothing finalizes logs nothing and does not crash: it
+            # keeps its connection. That is how the walks fail on the old
+            # resume order, so a held socket is as fatal as an alert.
+            held.extend(f"key {i}: client connection never closed: {h}"
+                        for h in rig.node.wait_released())
         rig.node.stop()
-        result = ArmResult(arm, landings, rig.node.fatal_lines())
+        result = ArmResult(arm, landings, rig.node.fatal_lines() + held)
         print(f"abort-arm {result.describe()}", flush=True)
         if not result.fatal:
             rig.assert_no_origin_traffic(origin, base)
@@ -1224,6 +1318,8 @@ def run_clean_test(ng: Nginx, origin: Origin, site: AbortSite,
                 assert body == rig.bodies[uri], (
                     f"{uri}: body {body!r} is not the primed {rig.bodies[uri]!r}")
             anchor.assert_each_step_once()
+            held = rig.node.wait_released()
+            assert not held, f"{uri}: connection still held after the answer: {held}"
         rig.assert_no_origin_traffic(origin, base)
         rig.node.stop()
         fatal = rig.node.fatal_lines()
