@@ -831,6 +831,7 @@ ngx_http_cache_turbo_memcached_get(ngx_http_request_t *r,
     /* Parked: hold a reference so the request survives until the reply resumes
      * it (released by ngx_http_finalize_request(NGX_DONE) in get_finish). */
     r->main->count++;
+    r->write_event_handler = ngx_http_cache_turbo_parked_handler;
 
     return NGX_AGAIN;
 }
@@ -1321,6 +1322,7 @@ ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
 
     /* resume the parked request, release the reference taken at park, then run
      * what the resume posted, which may free r: r is not touched after it */
+    ngx_http_cache_turbo_unpark(r);
     ngx_http_core_run_phases(r);
     ngx_http_finalize_request(r, NGX_DONE);
     ngx_http_run_posted_requests(c);
