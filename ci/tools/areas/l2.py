@@ -24,6 +24,7 @@ from abort_fixture import (
     run_abort_test,
     run_clean_test,
     run_parks_test,
+    run_reentry_test,
 )
 
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
@@ -4901,3 +4902,135 @@ def test_l2_abort_admin_warm_h2_close_boundary(ng: Nginx, origin: Origin) -> Non
 
 def test_l2_abort_admin_warm_clean_http1(ng: Nginx, origin: Origin) -> None:
     run_clean_test(ng, origin, _admin_warm_abort_site(ng), "http1")
+
+
+# --------------------------------------------------------------------------- #
+# Client events while parked (CT-PARKED-REENTRY). See abort_fixture's
+# REENTRY_ARMS. HTTP/2 is out of scope by reading: a parked new stream has sent
+# nothing, so it has no write event of its own to fire.
+# --------------------------------------------------------------------------- #
+
+def _purge_walk_reentry_site(redis: RedisServer) -> AbortSite:
+    """PURGE on a cached location with Redis and auto Vary (on by default):
+    purge_auto_vary() starts the variant-index walk, redis_sscan() takes
+    r->main->count++, purge_request drops it again (purge.c, S231-VARY-LEAK) and
+    returns NGX_DONE from the precontent phase, so the request stays there with
+    the phase runner as its write handler. walk_finish() answers {"purged":N}.
+    Nothing needs priming: the walk runs on an empty index too."""
+    def verify(rig: AbortRig, uri: str, status: int, body: bytes) -> None:
+        assert status == 200, f"{uri}: status {status} {body!r}"
+        assert "purged" in json.loads(body), f"{uri}: purge answered {body!r}"
+
+    return AbortSite(
+        name="pwalk",
+        upstream=redis.port,
+        directives="""cache_turbo_redis 127.0.0.1:{proxy_port} prefix=ctp: timeout=2s;
+            cache_turbo_purge on;""",
+        anchor=lambda rig, uri: ProxyAnchor(rig.proxy, [b"$5\r\nSSCAN\r\n"]),
+        stored=lambda uri: True,
+        forget=lambda uri: None,
+        arrange=lambda rig: None,
+        prime=False,
+        method="PURGE",
+        verify=verify,
+    )
+
+
+def test_l2_reentry_redis_get_poke(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _redis_get_abort_site(redis), "poke")
+
+
+def test_l2_reentry_redis_get_rst(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _redis_get_abort_site(redis), "rst")
+
+
+def test_l2_reentry_redis_get_clean(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _redis_get_abort_site(redis), "clean")
+
+
+def test_l2_reentry_redis_get_control(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _redis_get_abort_site(redis), "control")
+
+
+def test_l2_reentry_memcached_get_poke(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_reentry_test(ng, origin, _memcached_get_abort_site(mc), "poke")
+
+
+def test_l2_reentry_memcached_get_rst(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_reentry_test(ng, origin, _memcached_get_abort_site(mc), "rst")
+
+
+def test_l2_reentry_memcached_get_clean(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_reentry_test(ng, origin, _memcached_get_abort_site(mc), "clean")
+
+
+def test_l2_reentry_memcached_get_control(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_reentry_test(ng, origin, _memcached_get_abort_site(mc), "control")
+
+
+def test_l2_reentry_redis_lock_poke(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _redis_lock_abort_site(redis), "poke")
+
+
+def test_l2_reentry_redis_lock_rst(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _redis_lock_abort_site(redis), "rst")
+
+
+def test_l2_reentry_redis_lock_clean(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _redis_lock_abort_site(redis), "clean")
+
+
+def test_l2_reentry_redis_lock_control(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _redis_lock_abort_site(redis), "control")
+
+
+def test_l2_reentry_cold_wait_poke(
+        ng: Nginx, origin: Origin) -> None:
+    run_reentry_test(ng, origin, _cold_wait_abort_site(origin), "poke")
+
+
+def test_l2_reentry_cold_wait_rst(
+        ng: Nginx, origin: Origin) -> None:
+    run_reentry_test(ng, origin, _cold_wait_abort_site(origin), "rst")
+
+
+def test_l2_reentry_cold_wait_clean(
+        ng: Nginx, origin: Origin) -> None:
+    run_reentry_test(ng, origin, _cold_wait_abort_site(origin), "clean")
+
+
+def test_l2_reentry_cold_wait_control(
+        ng: Nginx, origin: Origin) -> None:
+    run_reentry_test(ng, origin, _cold_wait_abort_site(origin), "control")
+
+
+def test_l2_reentry_purge_walk_poke(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _purge_walk_reentry_site(redis), "poke")
+
+
+def test_l2_reentry_purge_walk_rst(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _purge_walk_reentry_site(redis), "rst")
+
+
+def test_l2_reentry_purge_walk_clean(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _purge_walk_reentry_site(redis), "clean")
+
+
+def test_l2_reentry_purge_walk_control(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_reentry_test(ng, origin, _purge_walk_reentry_site(redis), "control")

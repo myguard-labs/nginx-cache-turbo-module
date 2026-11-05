@@ -1390,3 +1390,286 @@ def run_parks_test(ng: Nginx, origin: Origin, site: AbortSite,
                 f"{uri}: an L1 hit logged a park: {parked_counts()}, wanted {once}")
         rig.node.stop()
         rig.node.assert_clean_logs()
+
+
+# --------------------------------------------------------------------------- #
+# Client events while parked (CT-PARKED-REENTRY)
+# --------------------------------------------------------------------------- #
+
+# A parked request keeps r->write_event_handler = ngx_http_core_run_phases. With
+# epoll (edge triggered, one entry for both directions) any event on the client
+# fd reports EPOLLOUT too, and once the connection's write event is active the
+# worker calls its handler: the phases run again on a request that is parked.
+# The write event becomes active the first time a send blocks, and it stays
+# active for the life of the keep-alive connection. So each arm first sends a
+# response too big to fit in the client's window, proves the send blocked, reads
+# it all, then sends the request that parks on the same connection:
+#
+#     poke     the client sends a few bytes while the request is parked
+#     rst      the client resets the connection while it is parked
+#     clean    nothing more: the event that delivered the request is already
+#              one, as epoll reports EPOLLOUT with it
+#     control  as poke, but the warm-up response is small and the window large,
+#              so no send ever blocked and no write event is active. It must
+#              pass on any build; if it fails, the fixture is broken.
+REENTRY_ARMS = ("poke", "rst", "clean", "control")
+REENTRY_RCVBUF = 4096
+REENTRY_SMALL = 1024
+# A parked request whose answer never comes is the failure being looked for, so
+# a client that stays reads by Content-Length with a deadline, not to EOF.
+REENTRY_READ_TIMEOUT = 5.0
+
+
+def _tcp_wmem_max() -> int:
+    """Largest send buffer the kernel autotunes a socket to."""
+    try:
+        text = pathlib.Path("/proc/sys/net/ipv4/tcp_wmem").read_text(encoding="ascii")
+        return int(text.split()[2])
+    except (OSError, IndexError, ValueError):
+        return 4194304
+
+
+def reentry_site(site: AbortSite, root: pathlib.Path) -> AbortSite:
+    """`site` with the two warm-up files and their locations added. The big one
+    is larger than the biggest send buffer, so the client's small window has to
+    block nginx's send; it is sparse, so it costs no disk."""
+    files = root / "abort-reentry-files"
+    files.mkdir(parents=True, exist_ok=True)
+    big, small = files / "big", files / "small"
+    size = _tcp_wmem_max() + (1 << 20)
+    if not big.exists() or big.stat().st_size != size:
+        with big.open("wb") as fh:
+            fh.truncate(size)
+    if not small.exists():
+        small.write_bytes(b"s" * REENTRY_SMALL)
+    extra = f"""{site.server_extra}
+        location = /_ab_big {{ alias {big}; }}
+        location = /_ab_small {{ alias {small}; }}"""
+    return dataclasses.replace(site, server_extra=extra)
+
+
+class KeepaliveClient:
+    """One HTTP/1.1 connection: a keep-alive warm-up request, then the request
+    that parks, with Connection: close."""
+
+    def __init__(self, node: AbortNode, small_window: bool) -> None:
+        self.node = node
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if small_window:
+            # Before connect(): the window scale is fixed in the handshake.
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                                 REENTRY_RCVBUF)
+        self.sock.settimeout(10.0 * sanitizer_time_scale())
+        self.sock.connect(("127.0.0.1", node.port))
+        self.pending = bytearray()
+
+    def _send(self, method: str, path: str, close: bool) -> None:
+        length = "Content-Length: 0\r\n" if method not in ("GET", "PURGE") else ""
+        conn = "Connection: close\r\n" if close else ""
+        self.sock.sendall(f"{method} {path} HTTP/1.1\r\nHost: abort-fixture\r\n"
+                          f"{length}{conn}\r\n".encode())
+
+    def server_tx_queue(self) -> int | None:
+        """Bytes nginx's side of this connection has queued and not had
+        acknowledged, from /proc/net/tcp; None if the row is not there."""
+        local = f"{self.node.port:04X}"
+        remote = f"{self.sock.getsockname()[1]:04X}"
+        try:
+            rows = pathlib.Path("/proc/net/tcp").read_text(encoding="ascii").splitlines()[1:]
+        except OSError:
+            return None
+        for row in rows:
+            cols = row.split()
+            if (cols[1].rsplit(":", 1)[1] == local
+                    and cols[2].rsplit(":", 1)[1] == remote):
+                return int(cols[4].split(":")[0], 16)
+        return None
+
+    def prove_blocked(self) -> int:
+        """Wait until nginx's send to this client is stuck: a non-empty send
+        queue that does not move while the client reads nothing. Raises a
+        fixture error otherwise, because then no write event is active and the
+        arm would pass on any build."""
+        deadline = time.monotonic() + 5.0 * sanitizer_time_scale()
+        last = None
+        while time.monotonic() < deadline:
+            queued = self.server_tx_queue()
+            if queued and queued == last:
+                return queued
+            last = queued
+            time.sleep(0.05)
+        raise AssertionError(
+            "fixture error: nginx's send to the client never blocked "
+            f"(server tx_queue {last}), so no write event is active and this "
+            "arm would prove nothing")
+
+    def read_response(self, timeout: float) -> tuple[int, dict[str, str], bytes]:
+        """One response, read by Content-Length (or chunked, or to EOF)."""
+        deadline = time.monotonic() + timeout * sanitizer_time_scale()
+
+        def more() -> bool:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("no complete response before the deadline")
+            self.sock.settimeout(left)
+            chunk = self.sock.recv(262144)
+            self.pending += chunk
+            return bool(chunk)
+
+        while b"\r\n\r\n" not in self.pending:
+            if not more():
+                raise ConnectionError(
+                    f"closed before the response headers: {bytes(self.pending)!r}")
+        end = self.pending.index(b"\r\n\r\n")
+        lines = bytes(self.pending[:end]).decode("latin-1").split("\r\n")
+        del self.pending[:end + 4]
+        headers = {}
+        for line in lines[1:]:
+            name, _, value = line.partition(":")
+            headers[name.strip().lower()] = value.strip()
+        status = int(lines[0].split()[1])
+        if "content-length" in headers:
+            want = int(headers["content-length"])
+            while len(self.pending) < want:
+                if not more():
+                    raise ConnectionError(
+                        f"closed after {len(self.pending)}/{want} body bytes")
+            body = bytes(self.pending[:want])
+            del self.pending[:want]
+        elif headers.get("transfer-encoding") == "chunked":
+            while not self.pending.endswith(b"0\r\n\r\n"):
+                if not more():
+                    raise ConnectionError("closed inside a chunked body")
+            raw, out = bytes(self.pending), b""
+            self.pending.clear()
+            while True:
+                size_line, _, raw = raw.partition(b"\r\n")
+                n = int(size_line.split(b";")[0], 16)
+                if n == 0:
+                    break
+                out, raw = out + raw[:n], raw[n + 2:]
+            body = out
+        else:
+            while more():
+                pass
+            body = bytes(self.pending)
+            self.pending.clear()
+        return status, headers, body
+
+    def warm(self, big: bool) -> None:
+        """The keep-alive warm-up. With `big`, proves the send blocked first."""
+        self._send("GET", "/_ab_big" if big else "/_ab_small", close=False)
+        if big:
+            self.prove_blocked()
+        status, _, body = self.read_response(30.0)
+        want = _tcp_wmem_max() + (1 << 20) if big else REENTRY_SMALL
+        assert status == 200 and len(body) == want, (
+            f"fixture error: warm-up answered {status} with {len(body)} bytes, "
+            f"wanted 200 with {want}")
+
+    def send(self, method: str, path: str) -> None:
+        self._send(method, path, close=True)
+
+    def poke(self) -> None:
+        self.sock.sendall(b"\r\n")
+
+    def abort_rst(self) -> None:
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                             struct.pack("ii", 1, 0))
+        self.sock.close()
+
+    def close(self) -> None:
+        if self.sock.fileno() != -1:
+            _drain_nonblocking(self.sock)
+            self.sock.close()
+
+
+def _reentry_one(rig: AbortRig, uri: str, arm: str,
+                 landings: list[Landing]) -> list[str]:
+    """One parked request on a warmed connection; return what went wrong.
+
+    Fixture errors (the send never blocked, the request never parked) raise:
+    such a key tested nothing. Everything the bug can cause is returned, so
+    the remaining keys still run and the summary names every failure.
+    """
+    site, scale = rig.site, sanitizer_time_scale()
+    problems: list[str] = []
+    client = KeepaliveClient(rig.node, small_window=arm != "control")
+    try:
+        client.warm(big=arm != "control")
+        anchor = rig.anchor(uri)
+        client.send(site.method, site.request_target(uri))
+        try:
+            parked_at = anchor.wait_parked()
+        except AssertionError as exc:
+            raise AssertionError(f"fixture error: {exc}") from exc
+        aborted_at = 0.0
+        if arm != "clean":
+            _sleep_until(parked_at + 0.03 * scale)
+            aborted_at = time.monotonic()
+            if arm == "rst":
+                client.abort_rst()
+            else:
+                client.poke()
+        answer = None
+        if arm != "rst":
+            try:
+                answer = client.read_response(REENTRY_READ_TIMEOUT)
+            except (OSError, ValueError) as exc:
+                problems.append(f"no complete answer: {exc!r}")
+        anchor.settle()
+        if aborted_at:
+            landings.append(_landing("before", aborted_at, anchor.times()))
+        if answer is not None:
+            status, headers, body = answer
+            try:
+                if site.verify is not None:
+                    site.verify(rig, uri, status, body)
+                else:
+                    assert status == 200, f"status {status}"
+                    assert headers.get("x-cache") == site.served, (
+                        f"X-Cache={headers.get('x-cache')}, wanted {site.served}")
+                    assert body == rig.bodies[uri], "body is not the primed one"
+            except AssertionError as exc:
+                problems.append(f"wrong answer: {exc}")
+        if arm != "rst":
+            try:
+                anchor.assert_each_step_once()
+            except AssertionError as exc:
+                problems.append(f"extra backend op: {exc}")
+    finally:
+        client.close()
+    rig.node.wait_worker()
+    problems.extend(f"client connection never closed: {h}"
+                    for h in rig.node.wait_released())
+    return problems
+
+
+def run_reentry_test(ng: Nginx, origin: Origin, site: AbortSite,
+                     arm: str) -> None:
+    """One arm of the parked re-entry matrix as a test. Fails on an alert, a
+    count-zero line, a sanitizer report, a held client socket, a missing or
+    wrong answer, or a backend op sent more than once."""
+    if arm not in REENTRY_ARMS:
+        raise ValueError(f"unknown re-entry arm: {arm}")
+    site = reentry_site(site, ng.root.parent)
+    name = f"{site.name} reentry {arm}"
+    problems: list[str] = []
+    landings: list[Landing] = []
+    with AbortRig(ng, site, f"reentry-{arm}", ABORT_KEYS) as rig:
+        base = origin.hits_for(f"{site.name}-")
+        for i, uri in enumerate(rig.uris):
+            problems.extend(f"key {i}: {p}"
+                            for p in _reentry_one(rig, uri, arm, landings))
+        rig.node.stop()
+        fatal = rig.node.fatal_lines()
+        result = ArmResult(name, landings, fatal + problems)
+        print(f"reentry-arm {result.describe()} problems={len(problems)}",
+              flush=True)
+        assert not result.fatal, (
+            f"{result.describe()}\nfirst: {result.fatal[0]}")
+        rig.assert_no_origin_traffic(origin, base)
+        if landings:
+            _check_stimulus(result, "before")
+        if arm != "rst":
+            rig.node.assert_clean_logs()
