@@ -103,6 +103,7 @@ WITH_DEBUG="--with-debug"
 # mode that runs the suite needs the v2 module. The two benchmark modes below
 # clear it to stay neutral baselines.
 WITH_HTTP2="--with-http_v2_module"
+MODULE_SAN=""
 case "$MODE" in
     asan)
         # Disable the UBSan sub-checks that nginx CORE trips as benign false
@@ -123,12 +124,19 @@ case "$MODE" in
         # hands memcpy a NULL pointer with len 0 for an empty log arg; core-only
         # stack, src/core/ngx_string.c:586). function and pointer-overflow are
         # only added under clang (the local soak path), where they are known.
+        #
+        # alignment and nonnull-attribute are CORE-only exclusions: after
+        # configure, asan-module-reinstrument.sh re-enables them on the
+        # module's objs/addon/* objects (MODULE_SAN below), so module code stays
+        # fully checked -- test_l2_restore_href_array_alignment_ubsan relies on
+        # UBSan alignment catching a misaligned module refs[] access.
         SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=alignment,nonnull-attribute -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
         if "${CC:-cc}" --version 2>/dev/null | grep -qi clang; then
             SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow,alignment -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
         fi
         CC_OPT="$SAN"
         LD_OPT="$SAN"
+        MODULE_SAN="alignment,nonnull-attribute"
         # ASan needs the module linked into the binary (static), not dlopen'd.
         ADD_MODULE="--add-module=$MODULE_DIR"
         ;;
@@ -237,6 +245,12 @@ cd "$ROOT/$DIR"
 if [ "$MODE" = "configure" ]; then
     printf 'tree=%s\n' "$ROOT/$DIR"
     exit 0
+fi
+
+# Scope asan mode's core-only UBSan exclusions: put the checks back on the
+# module's own objects (fails the build if the Makefile cannot be rewritten).
+if [ -n "$MODULE_SAN" ]; then
+    bash "$MODULE_DIR/ci/tools/asan-module-reinstrument.sh" objs/Makefile "$MODULE_SAN"
 fi
 
 if [ "$MODE" != "asan" ]; then
