@@ -149,9 +149,9 @@ pipx install zizmor==1.32.0        # GitHub Actions security audit
 ```
 
 `zizmor` is pinned like ruff and semgrep. It used to float so the rule set
-would keep growing, but a runner picking up a new release (1.32.0 enabled the
-`self-repository` audit) turned unrelated PRs red with findings they did not
-introduce. Bump the pin deliberately, in a change that triages every new
+would keep growing, but a runner picking up a newer release (one carrying the
+`self-repository` audit, added in 1.30) turned unrelated PRs red with findings
+they did not introduce. Bump the pin deliberately, in a change that triages every new
 finding (fix it, or a `# zizmor: ignore[rule]` with the reason), so the rule
 set still advances, just under review.
 
