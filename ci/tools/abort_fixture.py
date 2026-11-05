@@ -57,6 +57,7 @@ from test_runtime_base import (
     fetch,
     sanitizer_time_scale,
     wait_for,
+    wait_port,
 )
 
 # Aborts per arm, one primed key each. The bug fires per abort, so more keys are
@@ -852,6 +853,22 @@ http {{
     }}
 }}
 """, encoding="ascii")
+
+    def start(self) -> None:
+        """Start, and return only once every listener answers.
+
+        Nginx.start() waits for the HTTP/1 port alone. nginx binds its
+        listeners one at a time, so that port can answer while the HTTP/2 one
+        is still unbound, and an arm whose first connection is HTTP/2 (a site
+        with nothing to prime) is then refused before nginx has logged a line.
+        """
+        super().start()
+        if self.h2_style:
+            try:
+                wait_port(self.h2_port)
+            except Exception:
+                self.stop()
+                raise
 
     def require_http2(self) -> None:
         """Fail, never skip: a skipped HTTP/2 arm looks like coverage. The

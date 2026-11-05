@@ -166,11 +166,12 @@ def run_all(ng: Nginx, origin: Origin,
     test_l2_abort_cold_wait_h2_close_boundary(ng, origin)  # CT-RESUME-FINALIZE-UAF
     test_l2_abort_cold_wait_clean_http1(ng, origin)  # CT-RESUME-FINALIZE-UAF
     test_l2_abort_cold_wait_clean_http2(ng, origin)  # CT-RESUME-FINALIZE-UAF
-    test_l2_abort_admin_warm_http1_rst_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
-    test_l2_abort_admin_warm_http1_fin_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
-    test_l2_abort_admin_warm_h2_rst_stream_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
-    test_l2_abort_admin_warm_h2_close_boundary(ng, origin)  # CT-RESUME-FINALIZE-UAF
-    test_l2_abort_admin_warm_clean_http1(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    if ng.fault_injection:  # the warm park is the TEST_FAULTS .delay-fstat sleep
+        test_l2_abort_admin_warm_http1_rst_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_admin_warm_http1_fin_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_admin_warm_h2_rst_stream_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_admin_warm_h2_close_boundary(ng, origin)  # CT-RESUME-FINALIZE-UAF
+        test_l2_abort_admin_warm_clean_http1(ng, origin)  # CT-RESUME-FINALIZE-UAF
     test_l2_reentry_cold_wait_poke(ng, origin)  # CT-PARKED-REENTRY
     test_l2_reentry_cold_wait_rst(ng, origin)  # CT-PARKED-REENTRY
     test_l2_reentry_cold_wait_clean(ng, origin)  # CT-PARKED-REENTRY
