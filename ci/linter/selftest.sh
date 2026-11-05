@@ -933,6 +933,9 @@ finding_case_ "resume-order: a run_posted_requests(r->connection) argument is ca
 finding_case_ "resume-order: a call split across lines still sees the later r use" \
     'bad-multiline\.c:6: r used after' \
     ci/linter/lint-resume-order.sh --scan "$ro_fx/bad-multiline.c"
+finding_case_ "resume-order: c captured from r after finalize is caught" \
+    'bad-late-capture\.c:7: c assigned from r after ngx_http_finalize_request' \
+    ci/linter/lint-resume-order.sh --scan "$ro_fx/bad-late-capture.c"
 case_ 0 "resume-order: the admin.c shape (c hoisted, finalize, run_posted last) passes" \
     ci/linter/lint-resume-order.sh --scan "$ro_fx/good-order.c"
 case_ 0 "resume-order: r mentioned only in comments and strings after the call passes" \
@@ -941,6 +944,8 @@ case_ 0 "resume-order: a commented-out run_posted_requests call is not a call" \
     ci/linter/lint-resume-order.sh --scan "$ro_fx/comment-call.c"
 case_ 2 "resume-order: --scan with no files is exit 2" \
     ci/linter/lint-resume-order.sh --scan
+case_ 2 "resume-order: --scan with a missing file is exit 2" \
+    ci/linter/lint-resume-order.sh --scan "$ro_fx/does-not-exist.c"
 ro_fake="$(mktemp -d)"
 trap 'rm -rf "$badroot" "$listroot" "$checkerroot" "$ro_fake"' EXIT
 printf '#!/bin/sh\necho boom >&2\nexit 2\n' > "$ro_fake/awk"
