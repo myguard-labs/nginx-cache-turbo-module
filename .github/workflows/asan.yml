@@ -1,4 +1,4 @@
-# sync-sha: cd5e6f55d78c895bc50e50cddb3317a2580a2ac521e29f32d7aad4c66d4dd216
+# sync-sha: f7d515991c2b3e65b6162ef437abc023ae6e98120f0fcee10765b0e35b94a33f
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -80,7 +80,9 @@ jobs:
   asan-single-process:
     name: ASan single-process
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    timeout-minutes: 30
+    # The suite plus the CT-RESUME-FINALIZE-UAF abort/re-entry arms (~18 min of
+    # them alone under ASan) no longer fits 30 min / a 1200s hang guard.
+    timeout-minutes: 60
     needs: build-asan
     # AUD-CIPORT1: own 64-wide port band, distinct from every other
     # runtime-bearing job on this shared runner. See
@@ -186,7 +188,7 @@ jobs:
         # status the suite's, not tee's, so a failing suite still fails this step.
         run: |
           chmod +x nginx-bin/nginx
-          bash ci/tools/ci-hang-guard.sh 1200 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+          bash ci/tools/ci-hang-guard.sh 2700 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
               python3 ci/tools/test_runtime.py \
@@ -214,7 +216,9 @@ jobs:
   asan-multi-worker:
     name: ASan multi-worker
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    timeout-minutes: 30
+    # The suite plus the CT-RESUME-FINALIZE-UAF abort/re-entry arms (~18 min of
+    # them alone under ASan) no longer fits 30 min / a 1200s hang guard.
+    timeout-minutes: 60
     needs: build-asan
     # AUD-CIPORT1: own 64-wide port band, distinct from every other
     # runtime-bearing job on this shared runner. See
@@ -319,7 +323,7 @@ jobs:
           CT_TEST_BREADCRUMB: ${{ github.workspace }}/ci-hang-artifacts/current-test.txt
         run: |
           chmod +x nginx-bin/nginx
-          bash ci/tools/ci-hang-guard.sh 1200 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+          bash ci/tools/ci-hang-guard.sh 2700 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
               python3 ci/tools/test_runtime.py \
