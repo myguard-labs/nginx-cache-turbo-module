@@ -656,11 +656,18 @@ class Http1Client:
             self.sock.close()
         head, _, body = data.partition(b"\r\n\r\n")
         lines = head.decode("latin-1").split("\r\n")
+        # nginx closing without a response is the failure these tests hunt:
+        # report it with the bytes received, not as a parser IndexError.
+        status = lines[0].split()
+        if len(status) < 2 or not status[0].startswith("HTTP/") \
+                or not status[1].isdigit():
+            raise AssertionError(
+                f"no HTTP/1 response before close: {data[:200]!r}")
         headers = {}
         for line in lines[1:]:
             name, _, value = line.partition(":")
             headers[name.strip().lower()] = value.strip()
-        return int(lines[0].split()[1]), headers, body
+        return int(status[1]), headers, body
 
 
 # RFC 9113 frame types and flags, only those this client uses.
