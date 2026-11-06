@@ -176,6 +176,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_l2_reentry_cold_wait_rst(ng, origin)  # CT-PARKED-REENTRY
     test_l2_reentry_cold_wait_clean(ng, origin)  # CT-PARKED-REENTRY
     test_l2_reentry_cold_wait_control(ng, origin)  # CT-PARKED-REENTRY
+    test_l2_shutdown_cold_wait_http1(ng, origin)  # CT-PARKED-SHUTDOWN
     test_memcached_connect_backoff_fails_fast(ng, origin)       # S231-L2-BACKOFF
     test_memcached_replyless_peer_arms_backoff(ng)              # release audit
     test_valid_dup_status_warns(ng)
@@ -510,6 +511,10 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_reentry_purge_walk_rst(ng, origin, redis)  # CT-PARKED-REENTRY
         test_l2_reentry_purge_walk_clean(ng, origin, redis)  # CT-PARKED-REENTRY
         test_l2_reentry_purge_walk_control(ng, origin, redis)  # CT-PARKED-REENTRY
+        test_l2_shutdown_redis_get_http1(ng, origin, redis)  # CT-PARKED-SHUTDOWN
+        test_l2_shutdown_redis_get_http2(ng, origin, redis)  # CT-PARKED-SHUTDOWN
+        test_l2_shutdown_redis_get_graceful(ng, origin, redis)  # CT-PARKED-SHUTDOWN
+        test_l2_shutdown_redis_lock_http1(ng, origin, redis)  # CT-PARKED-SHUTDOWN
         test_l2_negative_ttl_skips_repeat_get(ng, origin, redis)   # L13
         test_l2_negative_ttl_expires(ng, origin, redis)            # L13
         test_l2_negative_ttl_with_min_uses(ng, origin, redis)      # L13
@@ -669,6 +674,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_reentry_memcached_get_rst(ng, origin, mc)  # CT-PARKED-REENTRY
         test_l2_reentry_memcached_get_clean(ng, origin, mc)  # CT-PARKED-REENTRY
         test_l2_reentry_memcached_get_control(ng, origin, mc)  # CT-PARKED-REENTRY
+        test_l2_shutdown_memcached_get_http1(ng, origin, mc)  # CT-PARKED-SHUTDOWN
         test_l2_memcached_cross_instance_fill(ng, origin, mc)  # v13
         # P4-3: the memcached ingress point is a SEPARATE call site from
         # redis.c; without this the redis test alone would stay green while

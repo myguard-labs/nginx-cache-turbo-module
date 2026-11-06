@@ -25,6 +25,7 @@ from abort_fixture import (
     run_clean_test,
     run_parks_test,
     run_reentry_test,
+    run_shutdown_test,
 )
 
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
@@ -5035,3 +5036,38 @@ def test_l2_reentry_purge_walk_clean(
 def test_l2_reentry_purge_walk_control(
         ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     run_reentry_test(ng, origin, _purge_walk_reentry_site(redis), "control")
+
+
+# --------------------------------------------------------------------------- #
+# Graceful shutdown while parked (CT-PARKED-SHUTDOWN): a reload with
+# worker_shutdown_timeout frees an HTTP/1 request the backend op still holds.
+# The HTTP/2 arms are controls: the h2 shutdown path waits for the stream.
+# --------------------------------------------------------------------------- #
+
+def test_l2_shutdown_redis_get_http1(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_shutdown_test(ng, origin, _redis_get_abort_site(redis), "http1")
+
+
+def test_l2_shutdown_redis_get_http2(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_shutdown_test(ng, origin, _redis_get_abort_site(redis), "http2")
+
+
+def test_l2_shutdown_redis_get_graceful(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_shutdown_test(ng, origin, _redis_get_abort_site(redis), "graceful")
+
+
+def test_l2_shutdown_cold_wait_http1(ng: Nginx, origin: Origin) -> None:
+    run_shutdown_test(ng, origin, _cold_wait_abort_site(origin), "http1")
+
+
+def test_l2_shutdown_redis_lock_http1(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_shutdown_test(ng, origin, _redis_lock_abort_site(redis), "http1")
+
+
+def test_l2_shutdown_memcached_get_http1(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_shutdown_test(ng, origin, _memcached_get_abort_site(mc), "http1")
