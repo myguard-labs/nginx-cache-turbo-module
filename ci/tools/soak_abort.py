@@ -6,7 +6,7 @@ Subcommands (all bind/connect 127.0.0.1):
   origin <port>                       slow-able 80 KB text/css origin
   kv <port> [delay_s]                 RESP fake Redis with a per-GET delay, so a
                                       request parks on L2 long enough to be hit
-  stress <h1> <h2> <secs>   the client mix; exit 1 on any failure
+  stress <h1> <h2> <secs> [kv]  the client mix (kv: gate on its GET count); exit 1 on any failure
 
 Why a fake KV and not redis-server: a real Redis answers in microseconds, so a
 request is almost never parked when the client's abort lands. The delay is the
@@ -116,6 +116,7 @@ def _parse(buf: bytes):
 
 def run_kv(port: int, delay: float) -> None:
     store: dict[bytes, bytes] = {}
+    gets = [0]  # GETs received and held for `delay`, read back via SOAKGETS
 
     async def handle(r, w):
         buf = b""
@@ -130,6 +131,7 @@ def run_kv(port: int, delay: float) -> None:
                     c = a[0].upper()
                     if c == b"GET":
                         await asyncio.sleep(delay)
+                        gets[0] += 1
                         v = store.get(a[1])
                         w.write(
                             b"$-1\r\n" if v is None else b"$%d\r\n%s\r\n" % (len(v), v)
@@ -137,6 +139,8 @@ def run_kv(port: int, delay: float) -> None:
                     elif c == b"SET":
                         store[a[1]] = a[2]
                         w.write(b"+OK\r\n")
+                    elif c == b"SOAKGETS":
+                        w.write(b":%d\r\n" % gets[0])
                     elif c in (b"SADD", b"DEL", b"EXPIRE", b"PEXPIRE", b"SREM"):
                         w.write(b":1\r\n")
                     else:
@@ -218,43 +222,100 @@ def _h1_request(path: str, close: bool = True) -> bytes:
     ).encode()
 
 
+def _chunked_len(buf: bytes):
+    """Decode a chunked body held in `buf`. Returns (state, n): state is
+    "done" (terminal chunk and the blank line after the trailers seen, n =
+    decoded body length), "more" (valid so far, incomplete) or "bad"."""
+    i, total = 0, 0
+    while True:
+        e = buf.find(b"\r\n", i)
+        if e < 0:
+            return ("bad", 0) if len(buf) - i > 4096 else ("more", 0)
+        try:
+            size = int(buf[i:e].split(b";", 1)[0].strip(), 16)
+        except ValueError:
+            return "bad", 0
+        if size < 0:
+            return "bad", 0
+        i = e + 2
+        if size == 0:
+            # trailers, then the empty line that ends the message
+            while True:
+                e = buf.find(b"\r\n", i)
+                if e < 0:
+                    return "more", 0
+                if e == i:
+                    return "done", total
+                i = e + 2
+        if len(buf) < i + size + 2:
+            return "more", 0
+        if buf[i + size : i + size + 2] != b"\r\n":
+            return "bad", 0
+        total += size
+        i += size + 2
+
+
+def _h1_framing(head: bytes):
+    """(content_length or None, is_chunked) from a response head."""
+    n = None
+    chunked = False
+    for line in head.split(b"\r\n")[1:]:
+        k, _, v = line.partition(b":")
+        k = k.strip().lower()
+        if k == b"content-length":
+            n = int(v)
+        if k == b"transfer-encoding" and b"chunked" in v.lower():
+            chunked = True
+    return n, chunked
+
+
 def _read_h1_response(s: socket.socket, deadline: float):
-    """(status, body_len) by Content-Length, or None on EOF/timeout before the
-    whole body arrived."""
+    """(status, body_len), or None when the response is not provably complete:
+    EOF/timeout before the whole body arrived, a malformed chunk stream, or a
+    200 with neither Content-Length nor chunked framing (close-delimited, so
+    a truncated body is indistinguishable from a whole one). `deadline` is
+    the TOTAL time allowed, not a per-recv() timeout."""
+    end = time.monotonic() + deadline
+
+    def recv() -> bytes | None:
+        left = end - time.monotonic()
+        if left <= 0:
+            return None
+        s.settimeout(left)
+        return s.recv(65536) or None
+
     buf = b""
-    s.settimeout(deadline)
     try:
         while b"\r\n\r\n" not in buf:
-            d = s.recv(65536)
-            if not d:
+            d = recv()
+            if d is None:
                 return None
             buf += d
         head, _, rest = buf.partition(b"\r\n\r\n")
         status = int(head.split(b" ", 2)[1])
-        n = None
-        chunked = False
-        for line in head.split(b"\r\n")[1:]:
-            k, _, v = line.partition(b":")
-            if k.strip().lower() == b"content-length":
-                n = int(v)
-            if k.strip().lower() == b"transfer-encoding" and b"chunked" in v.lower():
-                chunked = True
-        got = len(rest)
+        n, chunked = _h1_framing(head)
         if chunked:
-            tail = rest
-            while not tail.endswith(b"0\r\n\r\n"):
-                d = s.recv(65536)
-                if not d:
+            while True:
+                state, got = _chunked_len(rest)
+                if state == "done":
+                    return status, got
+                if state == "bad":
                     return None
-                tail = (tail + d)[-16:]
-            return status, got
-        while n is not None and got < n:
-            d = s.recv(65536)
-            if not d:
+                d = recv()
+                if d is None:
+                    return None
+                rest += d
+        if n is None:
+            # No framing: the end of the body is only the connection close.
+            return None if status == 200 else (status, len(rest))
+        got = len(rest)
+        while got < n:
+            d = recv()
+            if d is None:
                 return None
             got += len(d)
         return status, got
-    except OSError:
+    except (OSError, ValueError, IndexError):
         return None
 
 
@@ -367,6 +428,12 @@ def _poke_client(st: Stats, h1: int, arm: str):
             time.sleep(random.uniform(0, 0.1))
         elif arm == "rst":
             s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        elif arm == "clean":
+            # Left alone: read the parked answer to a complete 200.
+            r = _read_h1_response(s, CLEAN_DEADLINE)
+            if r is None or r[0] != 200:
+                st.fail(f"poke_clean: parked request got no complete 200 ({r})")
+                return
         st.hit(f"poke_{arm}")
     except OSError:
         st.hit("poke_oserror")
@@ -454,7 +521,23 @@ def _l2_lookups(h1: int) -> int | None:
     return total if seen else None
 
 
-def run_stress(h1: int, h2: int, secs: float) -> int:
+def _kv_gets(kv: int) -> int | None:
+    """GETs the fake KV has received and delayed so far; None if unreachable."""
+    try:
+        with socket.create_connection(("127.0.0.1", kv), timeout=5) as c:
+            c.sendall(b"*1\r\n$8\r\nSOAKGETS\r\n")
+            line = b""
+            while not line.endswith(b"\r\n"):
+                d = c.recv(64)
+                if not d:
+                    return None
+                line += d
+        return int(line[1:-2]) if line[:1] == b":" else None
+    except (OSError, ValueError):
+        return None
+
+
+def run_stress(h1: int, h2: int, secs: float, kv: int | None = None) -> int:
     st = Stats()
     # Prime the hot keys so "primed" means a stored (L1/L2) entry, not a miss.
     for i in range(40):
@@ -466,6 +549,7 @@ def run_stress(h1: int, h2: int, secs: float) -> int:
     # L2 itself, so a counter read after the run is positive even when no
     # worker request ever parked.
     lookups_before = _l2_lookups(h1)
+    kv_before = _kv_gets(kv) if kv is not None else None
     until = time.time() + secs
     ts = [
         threading.Thread(target=_worker, args=(st, h1, h2, until))
@@ -485,6 +569,22 @@ def run_stress(h1: int, h2: int, secs: float) -> int:
         )
     else:
         st.count["l2_lookups_worker_phase"] = lookups_after - lookups_before
+    # The L2 counters above also count GETs that fail fast after an async
+    # connect, so they cannot prove the KV saw and delayed a GET. The KV's own
+    # count can.
+    if kv is not None:
+        kv_after = _kv_gets(kv)
+        if kv_before is None or kv_after is None:
+            st.fail(
+                f"engagement: fake KV GET count unreadable ({kv_before}, {kv_after})"
+            )
+        elif kv_after <= kv_before:
+            st.fail(
+                "engagement: the fake KV received no GET during the worker phase "
+                f"({kv_before} -> {kv_after}), so no worker request parked on it"
+            )
+        else:
+            st.count["kv_gets_worker_phase"] = kv_after - kv_before
     # Held sockets: the clients are all gone; nginx must have closed its side.
     end = time.time() + HELD_DEADLINE
     held = _held_to((h1, h2))
@@ -511,8 +611,13 @@ def main(argv) -> int:
         run_origin(int(argv[2]))
     elif len(argv) >= 3 and argv[1] == "kv":
         run_kv(int(argv[2]), float(argv[3]) if len(argv) > 3 else 0.1)
-    elif len(argv) == 5 and argv[1] == "stress":
-        return run_stress(int(argv[2]), int(argv[3]), float(argv[4]))
+    elif len(argv) in (5, 6) and argv[1] == "stress":
+        return run_stress(
+            int(argv[2]),
+            int(argv[3]),
+            float(argv[4]),
+            int(argv[5]) if len(argv) == 6 else None,
+        )
     else:
         print(__doc__, file=sys.stderr)
         return 2
