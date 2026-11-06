@@ -20,6 +20,24 @@
 # Build the nginx binary with the module + -fsanitize=address,undefined
 # for the ASAN path, or a plain debug build for the valgrind path.
 #
+# --- Abort mode (ABORT=1) -------------------------------------------------
+# A different workload against the same harness: client ABORTS while a request
+# is parked on L2 (CT-RESUME-FINALIZE-UAF / CT-PARKED-REENTRY). 24 client
+# threads mix HTTP/1 RST and FIN, HTTP/2 RST_STREAM and connection close, clean
+# clients, primed and fresh keys, and a blocked-send "poke" stimulus (a
+# keep-alive connection with a tiny receive window whose send blocked, then a
+# parked request that is poked / reset). Origin, fake Redis (per-GET delay, so
+# requests really park) and the client mix are ci/tools/soak_abort.py.
+#
+#   ABORT=1 MODULE=<.so> ci/tools/soak.sh <nginx-binary> [duration_seconds]
+#   ABORT_PORT_BASE=28950   uses base..base+3 (edge h1, edge h2, origin, kv)
+#   ABORT_KV_DELAY=0.1      per-GET reply delay of the fake Redis
+#
+# Fails on any [alert]/[emerg], a "count is zero" line, a sanitizer marker, a
+# worker exit/signal, a nginx non-zero exit, a clean client that gets no
+# complete answer, or a server-side socket still held after the clients left.
+# The nginx binary must be a build with http_v2; the L1/L2 flags are ignored.
+#
 # --- L2 (Redis / memcached) -----------------------------------------------
 # By default this soak is L1-ONLY: no cache_turbo_redis or cache_turbo_memcached
 # upstream exists in the generated vhost, so the L2 drivers -- their RESP and
@@ -47,9 +65,27 @@ DURATION="${2:-120}"
 CONC="${3:-8}"
 EDGE=18345
 ORIGIN=18335
+ABORT="${ABORT:-0}"
+if [ "$ABORT" = "1" ]; then
+    ABORT_BASE="${ABORT_PORT_BASE:-28950}"
+    EDGE="$ABORT_BASE"; EDGE_H2=$((ABORT_BASE + 1))
+    ORIGIN=$((ABORT_BASE + 2)); KVPORT=$((ABORT_BASE + 3))
+    SOAK_ABORT_PY="$(cd "$(dirname "$0")" && pwd)/soak_abort.py"
+fi
+HELPER_PIDS=()
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+cleanup() {
+    for _hp in "${HELPER_PIDS[@]:-}"; do
+        if [ -n "$_hp" ]; then kill "$_hp" 2>/dev/null || true; fi
+    done
+    # SOAK_LOG_COPY=<file>: keep the nginx error log past the WORK cleanup.
+    if [ -n "${SOAK_LOG_COPY:-}" ] && [ -f "$WORK/logs/error.log" ]; then
+        cp "$WORK/logs/error.log" "$SOAK_LOG_COPY" 2>/dev/null || true
+    fi
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
 mkdir -p "$WORK/conf" "$WORK/logs" "$WORK/html"
 
 # Mixed payload sizes so single- and multi-buffer store paths both run.
@@ -175,6 +211,48 @@ ${L2_LOCATIONS}    }
 }
 EOF
 
+if [ "$ABORT" = "1" ]; then
+    # Replaces the L1/L2 config above. One worker, as the reproducers ran: the
+    # parked request and the abort that hits it must land on the same process.
+    # /_ab_big is a sparse file larger than the largest send buffer, so a
+    # client with a tiny window blocks nginx's send (write event goes active).
+    _wm="$(awk '{print $3}' /proc/sys/net/ipv4/tcp_wmem 2>/dev/null || true)"
+    truncate -s $(( ${_wm:-4194304} + (1 << 20) )) "$WORK/html/ab_big"
+    cat > "$WORK/conf/nginx.conf" <<EOF
+daemon off;
+${LOAD_MODULE}
+${ZSTD_LOAD:-}
+master_process on;
+worker_processes 1;
+error_log $WORK/logs/error.log info;
+pid $WORK/logs/nginx.pid;
+events { worker_connections 4096; }
+http {
+    access_log off;
+    proxy_buffers 4 8k; proxy_buffer_size 8k; proxy_max_temp_file_size 1m;
+    keepalive_timeout 5s;
+    cache_turbo_zone name=ct 16m;
+    server {
+        listen 127.0.0.1:$EDGE;
+        listen 127.0.0.1:$EDGE_H2;
+        http2 on;
+        location = /_ab_big { alias $WORK/html/ab_big; }
+        location = /_ct { cache_turbo_admin ct; }
+        location / {
+            cache_turbo        ct;
+            cache_turbo_key    "\$uri";
+            cache_turbo_valid  60s;
+            cache_turbo_redis  127.0.0.1:$KVPORT timeout=2s;
+            proxy_pass http://127.0.0.1:$ORIGIN;
+        }
+    }
+}
+EOF
+    python3 -I "$SOAK_ABORT_PY" origin "$ORIGIN" & HELPER_PIDS+=($!)
+    python3 -I "$SOAK_ABORT_PY" kv "$KVPORT" "${ABORT_KV_DELAY:-0.1}" & HELPER_PIDS+=($!)
+    sleep 0.5
+fi
+
 ASAN_OPTIONS="${ASAN_OPTIONS:-}:detect_leaks=1:abort_on_error=1:exitcode=42:log_path=$WORK/logs/asan"
 export ASAN_OPTIONS
 export UBSAN_OPTIONS="${UBSAN_OPTIONS:-}:print_stacktrace=1:halt_on_error=1"
@@ -211,10 +289,16 @@ fi
 NGINX_PID=$!
 
 for _ in $(seq 1 100); do
-    curl -fsS -o /dev/null "http://127.0.0.1:$EDGE/tiny?k=warm" 2>/dev/null && break
+    if [ "$ABORT" = "1" ]; then
+        # No /tiny in abort mode: wait for the edge port to accept.
+        (exec 3<>"/dev/tcp/127.0.0.1/$EDGE") 2>/dev/null && break
+    else
+        curl -fsS -o /dev/null "http://127.0.0.1:$EDGE/tiny?k=warm" 2>/dev/null && break
+    fi
     sleep 0.1
 done
 
+[ "$ABORT" = "1" ] && echo "soak: abort mode, ${DURATION}s, 24 client threads"
 echo "soak: ${DURATION}s, concurrency ${CONC}$( [ "${USE_VALGRIND:-0}" = 1 ] && echo ' (valgrind)'; [ "${USE_HELGRIND:-0}" = 1 ] && echo ' (helgrind)')"
 END=$(( $(date +%s) + DURATION ))
 saw_hit="$WORK/logs/saw_hit"
@@ -251,9 +335,25 @@ worker() {
     done
 }
 
-pids=()
-for w in $(seq 1 "$CONC"); do worker "$w" & pids+=($!); done
-for pid in "${pids[@]}"; do wait "$pid" || true; done
+stress_rc=0
+if [ "$ABORT" = "1" ]; then
+    python3 -I "$SOAK_ABORT_PY" stress "$EDGE" "$EDGE_H2" "$DURATION" \
+        || stress_rc=$?
+else
+    pids=()
+    for w in $(seq 1 "$CONC"); do worker "$w" & pids+=($!); done
+    for pid in "${pids[@]}"; do wait "$pid" || true; done
+fi
+# Abort mode engagement, read before shutdown: requests must really have gone to
+# L2 (every L2 lookup is a park). l2_hits + l2_misses counts attempts, which is
+# exactly the question here (the L2 gate further down needs STORED keys instead).
+# This total includes the priming requests, so it only proves L2 is wired; the
+# client mix itself fails unless the count rose during the worker phase.
+ABORT_L2_LOOKUPS=0
+if [ "$ABORT" = "1" ]; then
+    ABORT_L2_LOOKUPS="$(curl -fsS "http://127.0.0.1:$EDGE/_ct?format=prometheus" 2>/dev/null \
+        | awk '/^cache_turbo_l2_(hits|misses)_total/ {n += $NF} END {print n + 0}' || true)"
+fi
 
 # --- L2 engagement, measured BEFORE shutdown ------------------------------
 # Engagement is measured at the BACKEND: did the server actually receive writes
@@ -407,7 +507,7 @@ fi
 #     force-exits with sockets still open)
 # These are shutdown artifacts, not runtime memory bugs — ASAN/valgrind below
 # catch real corruption — and are flaky, so they must not turn the soak red.
-if grep -nE '\[alert\]|\[emerg\]' "$WORK/logs/error.log" 2>/dev/null \
+if grep -anE '\[alert\]|\[emerg\]' "$WORK/logs/error.log" 2>/dev/null \
         | grep -vE 'shared memory zone .* was locked by|open socket #[0-9]+ left in connection|\[alert\][^:]*: aborting'; then
     echo "FAIL: alert/emerg in error.log"; problems=1
 fi
@@ -415,7 +515,24 @@ if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then
     echo "FAIL: nginx exited $rc"; tail -40 "$WORK/logs/error.log" || true
     problems=1
 fi
-if [ ! -f "$saw_hit" ]; then
+if [ "$ABORT" = "1" ]; then
+    if [ "$stress_rc" -ne 0 ]; then
+        echo "FAIL: abort client mix reported failures (rc=$stress_rc)"; problems=1
+    fi
+    if [ "${ABORT_L2_LOOKUPS:-0}" -le 0 ] 2>/dev/null; then
+        echo "FAIL: no L2 lookups recorded -- no request ever parked, the abort mix proves nothing"
+        problems=1
+    fi
+    # grep -m, not `grep | head`: under pipefail head's early close can SIGPIPE
+    # grep and turn a match into a false "no match".
+    if grep -m 5 -anE 'count is zero' "$WORK/logs/error.log" 2>/dev/null; then
+        echo "FAIL: 'count is zero' in error.log"; problems=1
+    fi
+    if grep -m 5 -anE 'exited on signal|exited with fatal code|AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|SUMMARY: .*Sanitizer|core dumped' \
+            "$WORK/logs/error.log" 2>/dev/null; then
+        echo "FAIL: worker exit/signal or sanitizer marker in error.log"; problems=1
+    fi
+elif [ ! -f "$saw_hit" ]; then
     echo "FAIL: never saw an L1 HIT/STALE — cache path did not engage, soak is not exercising the module"
     problems=1
 fi
@@ -438,4 +555,8 @@ fi
 _tiers="L1"
 [ -n "${REDIS:-}" ]     && _tiers="$_tiers+redis(${L2R_HITS} keys)"
 [ -n "${MEMCACHED:-}" ] && _tiers="$_tiers+memcached(${L2M_HITS} sets)"
+if [ "$ABORT" = "1" ]; then
+    echo "✓ abort soak clean: ${DURATION}s, ${ABORT_L2_LOOKUPS} L2 lookups (parks), no alert/count-zero/sanitizer/worker exit/held socket"
+    exit 0
+fi
 echo "✓ soak clean: ${DURATION}s @ ${CONC} concurrent — ${_tiers}, store+evict+SWR exercised, no sanitizer/leak/crash"

@@ -1,5 +1,13 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Security: a reload or graceful shutdown with worker_shutdown_timeout
+       no longer crashes the old worker when an HTTP/1 request is still
+       waiting on a Redis cache GET, the Redis stampede lock or a memcached
+       cache GET. When that timeout expires, nginx frees the waiting request
+       even though the backend operation still holds it, and the backend
+       reply that arrived afterwards resumed the freed request. The backend
+       operation is now closed together with the request it waits for.
+
     *) Security: a client that resets or closes its connection while its
        request waits on Redis or memcached (cache GET, the stampede lock,
        the cold-wait for another request's fill, or a SCAN/SSCAN purge

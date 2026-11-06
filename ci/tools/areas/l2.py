@@ -20,11 +20,14 @@ from abort_fixture import (
     WalkAnchor,
     assert_abort_clean,
     binary_has_debug_log,
+    memcached_hit_reply,
+    redis_hit_reply,
     run_abort_arm,
     run_abort_test,
     run_clean_test,
     run_parks_test,
     run_reentry_test,
+    run_shutdown_test,
 )
 
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
@@ -4299,7 +4302,8 @@ def test_l2_abort_memcached_get_clean_http2(
     run_clean_test(ng, origin, _memcached_get_abort_site(mc), "http2")
 
 
-def _redis_lock_abort_site(redis: RedisServer) -> AbortSite:
+def _redis_lock_abort_site(redis: RedisServer, valid_s: int = 1,
+                           beta: int = 10000) -> AbortSite:
     """Redis lock park: a stale L1 entry wins the refresh dice, redis_lock() takes
     r->main->count++, lock_finish() resumes. A peer holds the lock, so SET NX
     answers nil, this node loses and serves stale, which is what writes to the
@@ -4311,13 +4315,16 @@ def _redis_lock_abort_site(redis: RedisServer) -> AbortSite:
     the 7s window beats the dice outright from elapsed 1, which waiting 2s after
     priming guarantees for every key; /lock/'s beta 5000 over 6s would lose about
     one roll in six there. A stale_mult of 8 leaves the 6s the keys need.
+    A caller that needs longer passes a larger valid_s (stale_mult is capped at
+    8) with beta scaled by the same factor, so elapsed 1 still beats the dice
+    outright; the stale wait grows with valid_s.
     """
     def resp_set_nx(uri: str) -> bytes:
         raw = lock_key(uri).encode()
         return b"*6\r\n$3\r\nSET\r\n$%d\r\n%s\r\n" % (len(raw), raw)
 
     def go_stale_and_lose_lock(rig: AbortRig) -> None:
-        time.sleep(2.0)
+        time.sleep(valid_s + 1.0)
         for uri in rig.uris:
             redis.cli("SET", lock_key(uri), "peer-node", "PX", "60000")
 
@@ -4326,12 +4333,12 @@ def _redis_lock_abort_site(redis: RedisServer) -> AbortSite:
         upstream=redis.port,
         directives="""cache_turbo_redis 127.0.0.1:{proxy_port} prefix=ct: timeout=2s;
             cache_turbo_stale_mult 8;
-            cache_turbo_beta 10000;
-            cache_turbo_lock off;""",
+            cache_turbo_beta %d;
+            cache_turbo_lock off;""" % beta,
         anchor=lambda rig, uri: ProxyAnchor(rig.proxy, [resp_set_nx(uri)]),
         stored=lambda uri: redis.cli("EXISTS", l2_key(uri)) == "1",
         forget=lambda uri: redis.cli("DEL", l2_key(uri), lock_key(uri)),
-        valid="1s",
+        valid=f"{valid_s}s",
         served="STALE",
         arrange=go_stale_and_lose_lock,
     )
@@ -5035,3 +5042,60 @@ def test_l2_reentry_purge_walk_clean(
 def test_l2_reentry_purge_walk_control(
         ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     run_reentry_test(ng, origin, _purge_walk_reentry_site(redis), "control")
+
+
+# --------------------------------------------------------------------------- #
+# Graceful shutdown while parked (CT-PARKED-SHUTDOWN): a reload with
+# worker_shutdown_timeout frees an HTTP/1 request the backend op still holds.
+# The HTTP/2 arms are controls: the h2 shutdown path waits for the stream.
+# --------------------------------------------------------------------------- #
+
+def test_l2_shutdown_redis_get_http1(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_shutdown_test(ng, origin, _redis_get_abort_site(redis), "http1")
+
+
+def test_l2_shutdown_redis_get_http2(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_shutdown_test(ng, origin, _redis_get_abort_site(redis), "http2")
+
+
+def test_l2_shutdown_redis_get_graceful(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_shutdown_test(ng, origin, _redis_get_abort_site(redis), "graceful")
+
+
+def test_l2_shutdown_cold_wait_http1(ng: Nginx, origin: Origin) -> None:
+    run_shutdown_test(ng, origin, _cold_wait_abort_site(origin), "http1")
+
+
+def test_l2_shutdown_redis_lock_http1(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    # Each key waits out a full shutdown cycle, about the proxy's reply delay
+    # (doubled under ASan) plus the reload, so the third key can start some 7s
+    # after the stale wait, past the default site's 8s entry life. valid 2s
+    # doubles that life to 16s; beta doubles with it to keep the refresh forced.
+    run_shutdown_test(
+        ng, origin, _redis_lock_abort_site(redis, valid_s=2, beta=20000),
+        "http1")
+
+
+def test_l2_shutdown_memcached_get_http1(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_shutdown_test(ng, origin, _memcached_get_abort_site(mc), "http1")
+
+
+# The arms above reload inside the vary-marker park, an L2 miss. These reload
+# inside the object park, so the late reply is a hit and the resume would copy
+# the stored value into the freed request's pool.
+
+def test_l2_shutdown_redis_get_hit_http1(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_shutdown_test(ng, origin, _redis_get_abort_site(redis), "http1_hit",
+                      hit=redis_hit_reply)
+
+
+def test_l2_shutdown_memcached_get_hit_http1(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_shutdown_test(ng, origin, _memcached_get_abort_site(mc), "http1_hit",
+                      hit=memcached_hit_reply)

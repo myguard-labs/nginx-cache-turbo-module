@@ -41,6 +41,7 @@ import os
 import pathlib
 import re
 import select
+import signal
 import socket
 import struct
 import subprocess
@@ -110,6 +111,11 @@ class _Sighting:
     seen_at: float = 0.0      # time.monotonic() the request reached the proxy
     reply_at: float = 0.0     # time.monotonic() the first reply is released
     count: int = 0            # times the request was sent
+    reply_head: bytes = b""   # first bytes of that first reply
+
+
+# Bytes of a watched reply the proxy keeps, enough to tell a hit from a miss.
+REPLY_HEAD_LEN = 16
 
 
 class DelayProxy:
@@ -270,6 +276,7 @@ class DelayProxy:
                     s = pending.popleft()
                     if not s.replied.is_set():
                         s.reply_at = due
+                        s.reply_head = data[:REPLY_HEAD_LEN]
                         s.replied.set()
                 loop.call_at(due, deliver, data)
             loop.call_at(loop.time() + self.delay, cw.close)
@@ -348,6 +355,14 @@ class ProxyAnchor:
 
     def wait_final_reply(self) -> float:
         return self.proxy.wait_replied(self.commands[-1])
+
+    def wait_final_seen(self) -> float:
+        """Block until the command of the last park reached the backend."""
+        return self.proxy.wait_seen(self.commands[-1])
+
+    def final_reply_head(self) -> bytes:
+        """The first bytes of the reply ending the last park."""
+        return self.proxy.sighting(self.commands[-1]).reply_head
 
     def settle(self) -> None:
         self.proxy.wait_quiet(ABORT_SETTLE_MARGIN * sanitizer_time_scale())
@@ -1697,3 +1712,173 @@ def run_reentry_test(ng: Nginx, origin: Origin, site: AbortSite,
             _check_stimulus(result, "before")
         if arm != "rst":
             rig.node.assert_clean_logs()
+
+
+# --------------------------------------------------------------------------- #
+# Graceful shutdown while parked (CT-PARKED-SHUTDOWN)
+# --------------------------------------------------------------------------- #
+#
+# A reload sends the old worker a graceful quit. With worker_shutdown_timeout
+# set, nginx's ngx_shutdown_timer_handler then sets c->close and c->error on
+# every connection still open and calls its read handler. For an HTTP/1 request
+# that is ngx_http_request_handler, which takes c->close to
+# ngx_http_terminate_request: the posted terminate handler forces count = 1 and
+# frees the request, park reference or not. The backend op is a connection of
+# its own with a timer that is not cancelable, so the worker stays up for its
+# reply and then resumes the request it was parked for. No client abort and no
+# client event is involved, so neither the resume order nor the parked handler
+# covers it. HTTP/2 does not take that branch: the shutdown finalizes the h2
+# connection, which only marks each stream's fake connection with an error and
+# waits for the stream to finish.
+
+SHUTDOWN_TIMEOUT_MS = 100
+# Long enough that the shutdown timer always fires inside the park, even on a
+# loaded host where the reload takes a while to reach the old worker. Short
+# enough that, scaled for a sanitizer (x2), it stays under the sites' 2s L2
+# timeout: at 1.0s the ASan reply landed on the timeout and the graceful
+# control got no cache answer.
+SHUTDOWN_REPLY_DELAY = 0.75
+# http1, http2  a reload with worker_shutdown_timeout while parked
+# graceful      the same reload with no shutdown timeout, HTTP/1: the old worker
+#               waits for the request, which gets its answer. It must pass on
+#               any build; if it fails, the fixture is broken.
+# http1_hit     the http1 reload, sent once the request is parked on its last
+#               GET, the object's, so the late reply is the stored value and
+#               the resume copies a hit into the freed request. The other arms
+#               reload inside the first park, the vary-marker GET, which is a
+#               miss. Takes the site's `hit` predicate over the first bytes of
+#               that reply and fails unless every key's reply passes it.
+SHUTDOWN_ARMS = ("http1", "http2", "graceful", "http1_hit")
+
+
+def redis_hit_reply(head: bytes) -> bool:
+    """A RESP GET reply carrying a value: a bulk string that is not nil."""
+    return head.startswith(b"$") and not head.startswith(b"$-1")
+
+
+def memcached_hit_reply(head: bytes) -> bool:
+    """A memcached text-protocol get reply carrying a value."""
+    return head.startswith(b"VALUE ")
+
+
+def shutdown_site(site: AbortSite, timeout: bool) -> AbortSite:
+    """`site` with a reply delay longer than the shutdown timeout, and that
+    timeout set unless `timeout` is false."""
+    extra = f"\nworker_shutdown_timeout {SHUTDOWN_TIMEOUT_MS}ms;" if timeout else ""
+    return dataclasses.replace(site, proxy_delay=SHUTDOWN_REPLY_DELAY,
+                               main_extra=site.main_extra + extra)
+
+
+def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
+                      arm: str,
+                      hit: Callable[[bytes], bool] | None = None) -> None:
+    """Reload while one request per key is parked; the old worker's shutdown
+    timer closes the client connection before the backend answers. The client
+    stays connected and does nothing. Fails on an alert, a count-zero line, a
+    sanitizer report, a held client socket, or an old worker that never exits.
+    The answer the client gets is nginx's business there (the timeout closes the
+    connection), so only the graceful control checks it.
+
+    Multi-worker mode only: a single-process nginx has no master to reload (the
+    ASan single-process job). The Runtime and ASan multi-worker jobs run it."""
+    if arm not in SHUTDOWN_ARMS:
+        raise ValueError(f"unknown shutdown arm: {arm}")
+    if (arm == "http1_hit") != (hit is not None):
+        raise ValueError("a hit predicate goes with the http1_hit arm only")
+    if ng.single_process:
+        print(f"shutdown-arm {site.name} shutdown {arm}: SKIPPED "
+              "(single-process nginx has no master to reload)", flush=True)
+        return
+    protocol = "http2" if arm == "http2" else "http1"
+    site = shutdown_site(site, timeout=arm != "graceful")
+    name = f"{site.name} shutdown {arm}"
+    scale = sanitizer_time_scale()
+    problems: list[str] = []
+    landings: list[Landing] = []
+    with AbortRig(ng, site, f"shutdown-{arm}", ABORT_KEYS) as rig:
+        if protocol == "http2":
+            rig.node.require_http2()
+        assert rig.node.process is not None and not rig.node.single_process, (
+            "the shutdown arm needs a master process to reload")
+        base = origin.hits_for(f"{site.name}-")
+        for i, uri in enumerate(rig.uris):
+            rig.node.wait_worker()
+            old = rig.node.worker_pids()
+            anchor = rig.anchor(uri)
+            path = site.request_target(uri)
+            h1: Http1Client | None = None
+            h2: H2Client | None = None
+            if protocol == "http2":
+                h2 = H2Client(rig.node.h2_port)
+                h2.send_request(path, site.method)
+            else:
+                h1 = Http1Client(rig.node.port, path, site.method)
+            try:
+                parked_at = anchor.wait_parked()
+                if hit is not None:
+                    assert isinstance(anchor, ProxyAnchor) and len(
+                        anchor.commands) > 1, "the hit arm needs a two-park site"
+                    parked_at = anchor.wait_final_seen()
+            except AssertionError as exc:
+                raise AssertionError(f"{name}: fixture error: {exc}") from exc
+            _sleep_until(parked_at + 0.03 * scale)
+            reloaded_at = time.monotonic()
+            os.kill(rig.node.process.pid, signal.SIGHUP)
+            if not wait_for(lambda old=old: not (rig.node.worker_pids() & old),
+                            timeout=(SHUTDOWN_REPLY_DELAY + 5.0) * scale,
+                            interval=0.02):
+                problems.append(f"key {i}: old worker never exited")
+            anchor.settle()
+            if arm == "graceful" and h1 is not None:
+                try:
+                    status, headers, body = h1.read_response()
+                    assert status == 200, f"status {status}"
+                    assert headers.get("x-cache") == site.served, (
+                        f"X-Cache={headers.get('x-cache')}, wanted {site.served}")
+                    assert body == rig.bodies[uri], "body is not the primed one"
+                except (AssertionError, OSError, ValueError, IndexError) as exc:
+                    problems.append(f"key {i}: no clean answer: {exc!r}")
+            # In phase: the shutdown timer was due while the request was still
+            # parked, i.e. before the reply ending its last park. A cold-wait
+            # waiter re-parks on every poll until the leader's fill, so for it
+            # that is the fill, not its first wake.
+            t = anchor.times()
+            end = t.final_reply_at or t.first_reply_at
+            fired = reloaded_at + SHUTDOWN_TIMEOUT_MS / 1000
+            if hit is not None:
+                # In phase only if the backend answered the object GET with the
+                # value and the shutdown timer was due before that reply
+                # landed: a missing reply would let a miss or a lost key pass
+                # as this arm.
+                assert isinstance(anchor, ProxyAnchor)
+                head = anchor.final_reply_head()
+                if not t.final_reply_at:
+                    problems.append(f"key {i}: the object GET got no reply")
+                elif not hit(head):
+                    problems.append(f"key {i}: the object GET reply is not a "
+                                    f"hit: {head!r}")
+                in_phase = (bool(t.final_reply_at) and hit(head)
+                            and t.final_seen_at <= reloaded_at
+                            and fired < t.final_reply_at)
+            else:
+                in_phase = not end or fired < end
+            landings.append(Landing(in_phase,
+                                    reloaded_at - (end or reloaded_at)))
+            for client in (h1, h2):
+                if client is not None:
+                    try:
+                        client.sock.close()
+                    except OSError:
+                        pass
+            rig.node.wait_worker()
+            problems.extend(f"key {i}: client connection never closed: {h}"
+                            for h in rig.node.wait_released())
+        rig.node.stop()
+        fatal = rig.node.fatal_lines()
+        result = ArmResult(name, landings, fatal + problems)
+        print(f"shutdown-arm {result.describe()} problems={len(problems)}",
+              flush=True)
+        assert not result.fatal, (
+            f"{result.describe()}\nfirst: {result.fatal[0]}")
+        rig.assert_no_origin_traffic(origin, base)
+        _check_stimulus(result, "before")

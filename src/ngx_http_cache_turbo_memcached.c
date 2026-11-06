@@ -22,7 +22,9 @@
  *     write-through — never a request error.
  *   - SET (write-through, fire-and-forget): op->request == NULL.
  *   - GET (sync-on-L1-miss): parks the request (count++, NGX_AGAIN) and resumes
- *     the phase engine when the reply lands. op->request == r.
+ *     the phase engine when the reply lands. op->request == r. A terminate
+ *     frees the request regardless of the park; the op's r->pool cleanup
+ *     (mc_get_detach) then tears the op down first (CT-PARKED-SHUTDOWN).
  *
  * Wire forms used:
  *   set <key> 0 <exptime> <bytes>\r\n<data>\r\n   ->  STORED\r\n
@@ -63,7 +65,8 @@
 /*
  * One in-flight async memcached operation. Owns its own pool so a fire-and-
  * forget SET/DELETE can outlive the request that spawned it. A GET pins the
- * request with count++ and uses op->request to resume it.
+ * request with count++ and uses op->request to resume it, and registers
+ * req_cln so a terminated request takes the op down with it.
  */
 typedef struct {
     ngx_peer_connection_t             peer;
@@ -74,6 +77,11 @@ typedef struct {
 
     ngx_http_request_t               *request;  /* GET: parked request         */
     ngx_http_cache_turbo_ctx_t       *ctx;      /* GET: request ctx to fill    */
+    /* CT-PARKED-SHUTDOWN: GET only, the r->pool cleanup running mc_get_detach.
+     * A terminate (worker_shutdown_timeout on a reload, for one) forces the
+     * parked request's count to 1 and frees it; without this the late reply
+     * resumed freed memory in mc_get_finish. mc_op_done cancels it. */
+    ngx_pool_cleanup_t               *req_cln;
     void                            (*read_handler)(ngx_event_t *);
 
     u_char                           *rbuf;     /* GET: growable reply buffer  */
@@ -101,6 +109,7 @@ static void ngx_http_cache_turbo_mc_get_finish(
     ngx_http_cache_turbo_mc_op_t *op, ngx_int_t result,
     u_char *blob, size_t blob_len);
 static void ngx_http_cache_turbo_mc_op_fail(ngx_http_cache_turbo_mc_op_t *op);
+static void ngx_http_cache_turbo_mc_get_detach(void *data);
 static ngx_http_cache_turbo_memcached_ka_bucket_t *
     ngx_http_cache_turbo_mc_ka_bucket(ngx_http_cache_turbo_loc_conf_t *clcf,
         ngx_addr_t *addr, ngx_uint_t create);
@@ -784,6 +793,7 @@ ngx_http_cache_turbo_memcached_get(ngx_http_request_t *r,
 {
     ngx_pool_t                    *pool;
     ngx_buf_t                     *b;
+    ngx_pool_cleanup_t            *cln;
     ngx_http_cache_turbo_mc_op_t  *op;
     u_char                        *keybuf, *p;
     size_t                         keylen;
@@ -821,15 +831,32 @@ ngx_http_cache_turbo_memcached_get(ngx_http_request_t *r,
     b->last = p;
     op->send = b;
 
+    /* CT-PARKED-SHUTDOWN: before the connect, so no teardown can run without
+     * it; a failed connect destroys the op without mc_op_done, so it cancels
+     * the cleanup by hand. No cleanup slot fails the GET: parking without it
+     * is the use-after-free this closes. */
+    cln = ngx_pool_cleanup_add(r->pool, 0);
+    if (cln == NULL) {
+        ngx_destroy_pool(pool);
+        return NGX_DECLINED;
+    }
+    cln->handler = ngx_http_cache_turbo_mc_get_detach;
+    cln->data = op;
+    op->req_cln = cln;
+
     if (ngx_http_cache_turbo_mc_connect(op, &clcf->redis_addr,
             ngx_http_cache_turbo_mc_read_get) != NGX_OK)
     {
+        cln->handler = NULL;
+        op->req_cln = NULL;
         ngx_destroy_pool(pool);
         return NGX_DECLINED;
     }
 
     /* Parked: hold a reference so the request survives until the reply resumes
-     * it (released by ngx_http_finalize_request(NGX_DONE) in get_finish). */
+     * it (released by ngx_http_finalize_request(NGX_DONE) in get_finish). A
+     * terminate frees the request regardless of it; req_cln then tears the op
+     * down (mc_get_detach), so the reply never reaches get_finish. */
     r->main->count++;
     r->write_event_handler = ngx_http_cache_turbo_parked_handler;
 
@@ -1251,6 +1278,13 @@ ngx_http_cache_turbo_mc_op_done(ngx_http_cache_turbo_mc_op_t *op)
     ngx_pool_t        *pool = op->pool;
     ngx_connection_t  *c = op->peer.connection;
 
+    /* CT-PARKED-SHUTDOWN: the op dies here, so its r->pool cleanup must not
+     * outlive it (same as the Redis driver's op_done). */
+    if (op->req_cln != NULL) {
+        op->req_cln->handler = NULL;
+        op->req_cln = NULL;
+    }
+
     if (c) {
         if (ngx_http_cache_turbo_mc_ka_save(op)) {
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
@@ -1274,6 +1308,8 @@ ngx_http_cache_turbo_mc_op_done(ngx_http_cache_turbo_mc_op_t *op)
  * parked reference released, and only then the connection's posted requests
  * run — the same park/resume dance, in the same order, as the Redis driver's
  * get_finish, which explains why that order matters (CT-RESUME-FINALIZE-UAF).
+ * A request terminated while parked never gets here: mc_get_detach already
+ * tore the op down (CT-PARKED-SHUTDOWN).
  */
 static void
 ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
@@ -1326,6 +1362,29 @@ ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
     ngx_http_core_run_phases(r);
     ngx_http_finalize_request(r, NGX_DONE);
     ngx_http_run_posted_requests(c);
+}
+
+
+/*
+ * CT-PARKED-SHUTDOWN: r->pool cleanup of a parked GET. It runs from the
+ * request's own teardown, including the terminate that ignores the park's
+ * count++, before the request memory is released. Nothing but this op's own
+ * connection holds the op, and the reply is still owed (clean == 0), so
+ * mc_op_done closes that connection instead of pooling it and frees the op:
+ * no event is left that could reach mc_get_finish. No backoff verdict either:
+ * a terminated request says nothing about the peer.
+ */
+static void
+ngx_http_cache_turbo_mc_get_detach(void *data)
+{
+    ngx_http_cache_turbo_mc_op_t  *op = data;
+
+    /* The cleanup is running: nginx is done with the record. */
+    op->req_cln = NULL;
+    op->request = NULL;
+    op->ctx = NULL;
+
+    ngx_http_cache_turbo_mc_op_done(op);
 }
 
 
