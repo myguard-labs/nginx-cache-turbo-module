@@ -12,7 +12,10 @@
  *
  *   - SET (write-through, v2b-1): fire-and-forget on store. op->request == NULL.
  *   - GET (sync-on-L1-miss, v2b-2): parks the request (count++, NGX_AGAIN) and
- *     resumes the phase engine when the reply lands. op->request == r.
+ *     resumes the phase engine when the reply lands. op->request == r. The
+ *     park does not keep the request alive on its own: a terminate frees it
+ *     anyway, and the op's r->pool cleanup (walk_detach) then tears the op
+ *     down so the late reply has nothing to resume (CT-PARKED-SHUTDOWN).
  *
  * See memory/nginx+angie/cache-turbo-module-design.md ("L2 Redis driver
  * decision" + "Read model — sync on miss").
@@ -75,7 +78,8 @@
 /*
  * One in-flight async redis operation. It owns its own pool so a fire-and-
  * forget SET can outlive the request that spawned it. A GET instead pins the
- * request with count++ and uses op->request to resume it.
+ * request with count++ and uses op->request to resume it, and registers
+ * req_cln so a terminated request takes the op down with it.
  */
 typedef struct {
     ngx_peer_connection_t        peer;
@@ -220,6 +224,12 @@ typedef struct {
      * (handler = NULL) on every normal completion, because the cleanup outlives
      * the op otherwise and would run against freed memory.
      *
+     * CT-PARKED-SHUTDOWN: the GET and the lock park the same way and have the
+     * same hole -- a reload with worker_shutdown_timeout terminates a parked
+     * HTTP/1 request, and the late reply then resumed freed memory in
+     * get_finish / lock_finish. They register the same cleanup. Neither is
+     * ever suspended, so for them it always takes the immediate teardown.
+     *
      * `detached` is the flag every terminal path consults: a detached walk must
      * never call members_cb and never call ngx_http_finalize_request -- there is
      * no request left -- but must still reach op_done EXACTLY ONCE so the pool,
@@ -250,6 +260,8 @@ static void ngx_http_cache_turbo_redis_sscan_advance(
     ngx_http_cache_turbo_redis_op_t *op, ngx_str_t cursor);
 static void ngx_http_cache_turbo_redis_sscan_resume(void *opaque, ngx_int_t rc);
 static void ngx_http_cache_turbo_redis_walk_detach(void *data);
+static ngx_int_t ngx_http_cache_turbo_redis_req_attach(ngx_http_request_t *r,
+    ngx_http_cache_turbo_redis_op_t *op);
 static ngx_int_t ngx_http_cache_turbo_redis_walk_disarm_conn(
     ngx_connection_t *c);
 static void ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev);
@@ -2068,6 +2080,31 @@ ngx_http_cache_turbo_redis_get_reply_max(size_t max_size)
 }
 
 
+/*
+ * CT-PARKED-SHUTDOWN: register walk_detach as the r->pool cleanup of a GET or
+ * lock op that is about to park r. Call it before the launch, and on a failed
+ * launch cancel it by hand (the op is destroyed there without op_done). A
+ * cleanup slot that cannot be allocated fails the op: parking without it is
+ * the use-after-free this closes.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_redis_req_attach(ngx_http_request_t *r,
+    ngx_http_cache_turbo_redis_op_t *op)
+{
+    ngx_pool_cleanup_t  *cln;
+
+    cln = ngx_pool_cleanup_add(r->pool, 0);
+    if (cln == NULL) {
+        return NGX_ERROR;
+    }
+    cln->handler = ngx_http_cache_turbo_redis_walk_detach;
+    cln->data = op;
+    op->req_cln = cln;
+
+    return NGX_OK;
+}
+
+
 ngx_int_t
 ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx)
@@ -2112,15 +2149,25 @@ ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
+    /* CT-PARKED-SHUTDOWN: before the launch, for the reason redis_sscan gives. */
+    if (ngx_http_cache_turbo_redis_req_attach(r, op) != NGX_OK) {
+        ngx_destroy_pool(pool);
+        return NGX_DECLINED;
+    }
+
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_get) != NGX_OK)
     {
+        op->req_cln->handler = NULL;
+        op->req_cln = NULL;
         ngx_destroy_pool(pool);
         return NGX_DECLINED;
     }
 
     /* Parked: hold a reference so the request survives until the reply resumes
-     * it (released by ngx_http_finalize_request(NGX_DONE) in get_finish). */
+     * it (released by ngx_http_finalize_request(NGX_DONE) in get_finish). A
+     * terminate frees the request regardless of it; req_cln then tears the op
+     * down (walk_detach), so the reply never reaches get_finish. */
     r->main->count++;
     r->write_event_handler = ngx_http_cache_turbo_parked_handler;
 
@@ -2188,9 +2235,17 @@ ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
+    /* CT-PARKED-SHUTDOWN: same terminate detach as redis_get. */
+    if (ngx_http_cache_turbo_redis_req_attach(r, op) != NGX_OK) {
+        ngx_destroy_pool(pool);
+        return NGX_DECLINED;
+    }
+
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_lock) != NGX_OK)
     {
+        op->req_cln->handler = NULL;
+        op->req_cln = NULL;
         ngx_destroy_pool(pool);
         return NGX_DECLINED;
     }
@@ -4019,6 +4074,13 @@ ngx_http_cache_turbo_redis_walk_disarm_conn(ngx_connection_t *c)
  * When the walk is NOT suspended, nothing else holds the op: the connection is
  * this op's own, so disarming it and calling op_done here releases the pool,
  * the connection, its fd and this zone's varidx_inflight account immediately.
+ *
+ * CT-PARKED-SHUTDOWN: redis_get and redis_lock register this cleanup too. A
+ * GET or lock op is never suspended and has no members_cb, so it always takes
+ * the immediate teardown: the reply is still owed (clean == 0), so op_done
+ * closes the connection instead of pooling it, and get_finish / lock_finish
+ * can never run on the freed request. As for a walk, the backoff is not armed:
+ * a terminated request says nothing about the peer.
  */
 static void
 ngx_http_cache_turbo_redis_walk_detach(void *data)
@@ -4787,6 +4849,10 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
  * terminate is pending), and run_posted_requests takes the connection captured
  * up front: ngx_http_free_request sets c->destroyed, which that loop checks
  * first, and an HTTP/2 stream's fake connection survives its request.
+ *
+ * CT-PARKED-SHUTDOWN: a request terminated while still parked never reaches
+ * this function; its r->pool cleanup (walk_detach) already tore the op down.
+ * op_done below cancels that cleanup before the resume can free r.
  */
 static void
 ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
