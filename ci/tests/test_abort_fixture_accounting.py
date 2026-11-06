@@ -358,6 +358,18 @@ class ClosedWindowCase(unittest.TestCase):
             self.reentry(["wrong answer: late",
                           f"{af.REENTRY_HELD}: sock"])
 
+    def test_reentry_retry_exhaustion_is_wrapped_like_the_abort_arm(self):
+        ng = types.SimpleNamespace(root=types.SimpleNamespace(parent=None))
+        with mock.patch.object(af, "_reentry_one",
+                               side_effect=lambda *a: ([], True)), \
+                mock.patch.object(af, "reentry_site", lambda s, _: s), \
+                self.assertRaises(AssertionError) as cm:
+            af.run_reentry_test(ng, FakeOrigin(0), fake_site(), "rst")
+        msg = str(cm.exception)
+        self.assertIn("s reentry rst:", msg)
+        self.assertIn("key 0/3", msg)
+        self.assertIn("log tail:", msg)
+
 
 if __name__ == "__main__":
     unittest.main()

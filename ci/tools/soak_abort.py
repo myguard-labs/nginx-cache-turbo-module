@@ -130,8 +130,10 @@ def run_kv(port: int, delay: float) -> None:
                 for a in cmds:
                     c = a[0].upper()
                     if c == b"GET":
-                        await asyncio.sleep(delay)
+                        # Count on receipt: a GET still sleeping at the final
+                        # snapshot was received in the worker phase.
                         gets[0] += 1
+                        await asyncio.sleep(delay)
                         v = store.get(a[1])
                         w.write(
                             b"$-1\r\n" if v is None else b"$%d\r\n%s\r\n" % (len(v), v)

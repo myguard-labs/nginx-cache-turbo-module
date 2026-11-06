@@ -1951,7 +1951,11 @@ def run_reentry_test(ng: Nginx, origin: Origin, site: AbortSite,
                 if not closed:
                     break
                 attempt += 1
-                uri = rig.retry_uri(key, attempt)
+                try:
+                    uri = rig.retry_uri(key, attempt)
+                except AssertionError as exc:
+                    raise _arm_failure(name, rig, i, len(rig.uris), exc) \
+                        from exc
         rig.node.stop()
         fatal = rig.node.fatal_lines()
         result = ArmResult(name, landings, fatal + problems)
