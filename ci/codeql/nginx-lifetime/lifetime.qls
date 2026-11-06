@@ -1,0 +1,4 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+- description: nginx request-lifetime queries (BP-E1)
+- queries: queries

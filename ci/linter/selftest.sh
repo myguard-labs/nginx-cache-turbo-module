@@ -453,6 +453,7 @@ lint_file_wrappers=(
     ci/linter/lint-ci-secrets.sh
     ci/linter/lint-docs-drift.sh
     ci/linter/lint-nginx.sh
+    ci/linter/lint-park-contract.sh
     ci/linter/lint-perl.sh
     ci/linter/lint-python.sh
     ci/linter/lint-resume-order.sh
@@ -957,6 +958,51 @@ case_ 2 "resume-order: any other nonzero awk exit is exit 2" \
     env PATH="$ro_fake:$PATH" ci/linter/lint-resume-order.sh --scan "$ro_fx/good-order.c"
 rm -rf "$ro_fake"
 
+# park-contract: the r->main->count++ park registry (ci/park-sites.tsv). Each
+# fixture is a miniature tree (src/, ci/park-sites.tsv, ci/tools/areas/) driven
+# through --root, so no git selection is involved. The no-swap shape is the
+# pre-#503 access park (count++ without the write_event_handler swap).
+pk_fx=ci/linter/fixtures
+finding_case_ "park-contract: an unregistered count++ park is caught" \
+    'park\.c:5: \(a\) r->main->count\+\+ park in fx_park\(\) is not registered' \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-unregistered"
+finding_case_ "park-contract: an access park with no write_event_handler swap is caught" \
+    'fx_park: \(b\) access-phase park does not assign r->write_event_handler' \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-no-swap"
+finding_case_ "park-contract: a stale TSV row is caught" \
+    '\(a\) stale row src/park\.c:fx_park' \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-stale"
+finding_case_ "park-contract: a missing abort test name is caught" \
+    '\(d\) .*abort test test_fx_nonexistent is not a def test_' \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-missing-test"
+finding_case_ "park-contract: a detach symbol absent from the function is caught" \
+    'fx_park: \(c\) detach symbol fx_detach not found' \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-no-detach"
+case_ 0 "park-contract: a fully registered access park passes" \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-good"
+case_ 0 "park-contract: a content-phase park needs no handler swap" \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-content"
+case_ 0 "park-contract: count++ only in comments and strings is not a park" \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-comment-only"
+case_ 2 "park-contract: a malformed TSV row is exit 2" \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-bad-tsv"
+case_ 2 "park-contract: a missing root is exit 2" \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/does-not-exist"
+case_ 2 "park-contract: --root with no directory is exit 2" \
+    ci/linter/lint-park-contract.sh --root
+pk_fake="$(mktemp -d)"
+trap 'rm -rf "$badroot" "$listroot" "$checkerroot" "$ro_fake" "$pk_fake"' EXIT
+printf '#!/bin/sh\necho boom >&2\nexit 2\n' > "$pk_fake/awk"
+chmod +x "$pk_fake/awk"
+case_ 2 "park-contract: an awk crash is exit 2, not a finding" \
+    env PATH="$pk_fake:$PATH" ci/linter/lint-park-contract.sh --root "$pk_fx/park-good"
+printf '#!/bin/sh\nexit 137\n' > "$pk_fake/awk"
+case_ 2 "park-contract: any other nonzero awk exit is exit 2" \
+    env PATH="$pk_fake:$PATH" ci/linter/lint-park-contract.sh --root "$pk_fx/park-good"
+rm -rf "$pk_fake"
+case_ 0 "park-contract: the live tree satisfies its own registry" \
+    ci/linter/lint-park-contract.sh --root "$ROOT"
+
 # shm-lock and stripe-seam: backslash-newline splicing (translation phase 2)
 # happens before lexing, so a continued // comment swallows the next physical
 # line and a token split by a continuation is still one token. Both scanners
@@ -1209,7 +1255,7 @@ rm -f "$checkerroot/src/control.c"
 # on a fixture it cannot parse rather than guessing, so a fixture that drifts
 # out of compiling turns its row red rather than quietly vacuous.
 mutroot="$(mktemp -d)"
-trap 'rm -rf "$badroot" "$listroot" "$checkerroot" "$mutroot"' EXIT
+trap 'rm -rf "$badroot" "$listroot" "$checkerroot" "$ro_fake" "$pk_fake" "$mutroot"' EXIT
 mkdir -p "$mutroot/src" "$mutroot/ci/tools"
 cp ci/tools/lint-carve-init.sh ci/tools/carve_init_ast.py "$mutroot/ci/tools/"
 
