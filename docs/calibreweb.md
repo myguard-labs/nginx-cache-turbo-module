@@ -55,8 +55,11 @@ for `cache_turbo_valid`. Covers and static files go through Flask's
 refuses to store a `no-cache` response under `cache_turbo_cache_control honor`
 (implied by the preset), so covers are **not cached** as shipped. To cache them,
 give `/cover/`, `/series_cover/` and `/static/` their own location with
-`cache_turbo_cache_control ignore;` and a short `cache_turbo_valid`; the cookie
-rows still bypass logged-in users there.
+`cache_turbo_cache_control ignore;` and a short `cache_turbo_valid`. Each of
+those locations needs `cache_turbo` and the `calibreweb` preset too, set in the
+location or inherited from the server block; a sibling location does not
+provide them. With the preset active there, its cookie rows bypass logged-in
+users.
 
 ## URI rows
 
