@@ -1,4 +1,4 @@
-# sync-sha: 6221d985101e444d2d7793a95064f4003fd7cf131a52f5d94166d4bf7ed3554f
+# sync-sha: 10b8056b654350934b813153e69ee37877dfafcb6bde5e61a31926625fd86850
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -370,7 +370,9 @@ jobs:
   runtime:
     name: Runtime
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    timeout-minutes: 20
+    # The suite now includes the CT-RESUME-FINALIZE-UAF abort/re-entry arms
+    # (~19 min for the whole runtime suite on PR #503), past 20 min / 1200s.
+    timeout-minutes: 40
     # REQUIRED CHECK: always report this check, but run full suite only when
     # code changed. When docs-only, skip and report quick success.
     # Always needs build, but build will be skipped if skip-expensive-jobs=true.
@@ -464,7 +466,7 @@ jobs:
           # TIMEOUT-MARGIN, memory/labs/nginx-cache-turbo-module/TODO.md).
           # Raised to 1200s to match asan.yml's bound and restore real
           # headroom (900s -> 1200s, +451s over observed max).
-          bash ci/tools/ci-hang-guard.sh 1200 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+          bash ci/tools/ci-hang-guard.sh 2100 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
               python3 ci/tools/test_runtime.py \

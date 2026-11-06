@@ -1,4 +1,4 @@
-# sync-sha: c0eac1adaedca06baa5c7944ff10881ac9208e619d9ac33647b0e938bc028b48
+# sync-sha: 952c305327aee1d9b613e80a3d2a11ea7cfdb30fb09a8fe5600021d8bb1cf95f
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -276,7 +276,9 @@ jobs:
     # and it no longer sits on the per-PR critical path.
     name: Legacy nginx (pre-1.23) runtime
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    timeout-minutes: 20
+    # The suite now includes the CT-RESUME-FINALIZE-UAF abort/re-entry arms
+    # (~19 min for the whole runtime suite on PR #503), past 20 min / 1200s.
+    timeout-minutes: 40
     env:
       # AUD-CIPORT1: own 64-wide port band, distinct from every other
       # runtime-bearing job on this shared runner. See
