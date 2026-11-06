@@ -819,6 +819,8 @@ def test_backend_separators(ng: Nginx) -> None:
         "shopware6|typo3",
         "textpattern|bludit|spip|bugzilla|mantisbt|plone|umbraco|dotclear|wikijs",
         "mantis|classicpress|backdrop",
+        "servarr|calibre|calibreweb",
+        "sonarr|radarr|lidarr|calibre-web",
     ]):
         _config_accepts(ng, f"sep-ok-{i}", _BACKEND_LINE,
                         f"cache_turbo_backend {spec};")

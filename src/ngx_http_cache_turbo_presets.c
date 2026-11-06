@@ -1705,6 +1705,84 @@ static const char *const  ct_nextjs_headers[] = {
     "X-Middleware-Prefetch", "X-Nextjs-Data", "X-Now-Route-Matches",
     "X-Middleware-Subrequest", NULL };
 
+/*
+ * Servarr (Sonarr, Radarr, Lidarr; one engine). Research: memory
+ * research-media-apps-2026-10-06.md, upstream develop/main 2026-10.
+ *
+ * SAFETY preset, not a hit-rate preset. There is no anonymous HTML at all (only
+ * /login, /loggedout, the /content tree and /ping are public), so what is worth
+ * caching is the hashed static assets and nothing else. The danger is the
+ * origin's own cache marking: CacheableSpecification treats ANY request with a
+ * `h` query arg as cacheable (`public, max-age=31536000`), checked BEFORE the
+ * /api, /initialize.json and /feed exclusions. `GET /initialize.json?h=x` from
+ * a logged-in browser returns the API key with a year-long public lifetime, and
+ * a shared cache keyed on the URL would hand it to the next anonymous client.
+ * The cookie tier closes that for Forms auth; the URI tier keeps the private
+ * routes out of the cache even without a cookie (External auth, API clients).
+ *
+ * Cookies: `<InstanceName>Auth` (Forms login; the instance name is operator
+ * set, the `Auth` suffix is fixed, so the substring `Auth=` covers it) and
+ * `<InstanceName>OIDC` (v5 OIDC). Both are issued only after login, never to a
+ * guest. External auth with a proxy SSO cookie needs a local bypass.
+ *
+ * Args: `apikey` and SignalR `access_token` carry credentials. `h` is NOT
+ * listed: it is the only legitimate hit source on hashed static assets.
+ *
+ * `/MediaCover` and `/MediaCoverProxy` are separate rows because the slash-less
+ * boundary rule stops `/MediaCover` at `/` or `.`. UrlBase installs need
+ * cache_turbo_backend_prefix.
+ *
+ * ASP.NET Core routes paths case-insensitively, so these rows are ALSO matched
+ * ASCII-case-folded (ngx_http_cache_turbo_servarr_uri_skip() in match.c):
+ * `/API/v3/series?h=x` from an X-Api-Key client would otherwise be stored.
+ */
+static const char *const  ct_servarr_cookies[] = { "Auth=", "OIDC=", NULL };
+static const char *const  ct_servarr_uris[] = {
+    "/api", "/feed", "/signalr", "/initialize.json", "/login", "/logout",
+    "/loggedout", "/logfile", "/updatelogfile", "/backup", "/MediaCover",
+    "/MediaCoverProxy", NULL };
+static const char *const  ct_servarr_args[] = {
+    "apikey", "access_token", NULL };
+
+/*
+ * calibre content server (calibre-server). Auth is OFF by default, which makes
+ * the whole library UI and OPDS feed anonymous and shareable; with auth ON it
+ * is HTTP Digest/Basic, an Authorization request header, which the module's
+ * storage floor never caches, so this preset only matters for the open case.
+ * There is no session cookie and no API key, so the tier is URI-only: the write
+ * endpoint /cdb/, the per-user reading state (/book-set-last-read-position,
+ * /book-set-annotations, /book-get-last-read-position,
+ * /book-get-annotations), /interface-data/init (its ETag includes the
+ * username) and /ajax-setup. The slash-less rows are
+ * the full route names: the boundary rule only continues a match at `/` or `.`,
+ * so a `/book-set-` stem would match nothing.
+ */
+static const char *const  ct_calibre_cookies[] = { NULL };
+static const char *const  ct_calibre_uris[] = {
+    "/cdb/", "/book-set-last-read-position", "/book-set-annotations",
+    "/book-get-last-read-position", "/book-get-annotations",
+    "/interface-data/init", "/ajax-setup", NULL };
+static const char *const  ct_calibre_args[] = { NULL };
+
+/*
+ * Calibre-Web (janeczku). Cookies `session` (Flask) and `remember_token`
+ * (Flask-Login); both can carry an operator COOKIE_PREFIX, which the substring
+ * match still covers. The Flask session is ALSO written for guests on search and
+ * guest view settings, so `session=` fails safe: a lost hit, never a leak.
+ * Anonymous browsing is off by default and reverse-proxy header login is
+ * cookieless, so HTML caching is only safe with anonymous browsing on and no
+ * proxy-header login (docs/calibreweb.md). URIs: the private areas, Kobo/magic
+ * link token paths and per-user downloads. Guest HTML language follows
+ * Accept-Language with no Vary, so the key must include it (docs).
+ */
+static const char *const  ct_calibreweb_cookies[] = {
+    "session=", "remember_token=", NULL };
+static const char *const  ct_calibreweb_uris[] = {
+    "/login", "/logout", "/admin", "/me", "/download/", "/show/", "/send/",
+    "/ajax/", "/read/", "/kobo/", "/kobo_auth/", "/remote/login", "/verify/",
+    NULL };
+static const char *const  ct_calibreweb_args[] = { NULL };
+
 const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
       ct_wp_cookies, ct_wp_uris, ct_wp_args, NULL, NULL, NULL },
@@ -1790,6 +1868,15 @@ const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_NEXTJS,
       ct_nextjs_cookies, ct_nextjs_uris, ct_nextjs_args, NULL, NULL,
       ct_nextjs_headers },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_SERVARR,
+      ct_servarr_cookies, ct_servarr_uris, ct_servarr_args,
+      NULL, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_CALIBRE,
+      ct_calibre_cookies, ct_calibre_uris, ct_calibre_args,
+      NULL, NULL, NULL },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_CALIBREWEB,
+      ct_calibreweb_cookies, ct_calibreweb_uris, ct_calibreweb_args,
+      NULL, NULL, NULL },
     { 0, NULL, NULL, NULL, NULL, NULL, NULL }
 };
 /* >>> FUZZ-EXTRACT auto-classify END (presets.c portion) <<< */
