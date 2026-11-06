@@ -1,4 +1,4 @@
-# sync-sha: 10b8056b654350934b813153e69ee37877dfafcb6bde5e61a31926625fd86850
+# sync-sha: fd32c8372ede7eef46f9e7ce23330cb8661bcbda05378996e39b13bd5e1eb22d
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -464,8 +464,9 @@ jobs:
           # (max within ~1.2x) -- a slower/contended runner risks the
           # guard firing mid-test and reading as an R6b hang (SUITE-
           # TIMEOUT-MARGIN, memory/labs/nginx-cache-turbo-module/TODO.md).
-          # Raised to 1200s to match asan.yml's bound and restore real
-          # headroom (900s -> 1200s, +451s over observed max).
+          # Raised to 1200s then (900s -> 1200s, +451s over observed max).
+          # PR #503's abort/re-entry arms took this step to 1156s, so it is
+          # now 2100s (~1.8x) with the job at 40 minutes.
           bash ci/tools/ci-hang-guard.sh 2100 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
