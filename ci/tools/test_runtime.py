@@ -523,6 +523,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_shutdown_redis_get_http2(ng, origin, redis)  # CT-PARKED-SHUTDOWN
         test_l2_shutdown_redis_get_graceful(ng, origin, redis)  # CT-PARKED-SHUTDOWN
         test_l2_shutdown_redis_lock_http1(ng, origin, redis)  # CT-PARKED-SHUTDOWN
+        test_l2_shutdown_redis_lock_early_teardown(ng, origin, redis)  # CT-SHUTDOWN-OWN-TIMEOUT-ARM
         test_l2_shutdown_redis_get_hit_http1(ng, origin, redis)  # CT-PARKED-SHUTDOWN
         test_l2_negative_ttl_skips_repeat_get(ng, origin, redis)   # L13
         test_l2_negative_ttl_expires(ng, origin, redis)            # L13

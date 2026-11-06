@@ -4418,7 +4418,8 @@ def test_l2_abort_memcached_get_clean_http2(
 
 
 def _redis_lock_abort_site(redis: RedisServer, valid_s: int = 1,
-                           beta: int = 10000) -> AbortSite:
+                           beta: int = 10000,
+                           timeout: str = "2s") -> AbortSite:
     """Redis lock park: a stale L1 entry wins the refresh dice, redis_lock() takes
     r->main->count++, lock_finish() resumes. A peer holds the lock, so SET NX
     answers nil, this node loses and serves stale, which is what writes to the
@@ -4446,10 +4447,10 @@ def _redis_lock_abort_site(redis: RedisServer, valid_s: int = 1,
     return AbortSite(
         name="rlock",
         upstream=redis.port,
-        directives="""cache_turbo_redis 127.0.0.1:{proxy_port} prefix=ct: timeout=2s;
+        directives="""cache_turbo_redis 127.0.0.1:{proxy_port} prefix=ct: timeout=%s;
             cache_turbo_stale_mult 8;
             cache_turbo_beta %d;
-            cache_turbo_lock off;""" % beta,
+            cache_turbo_lock off;""" % (timeout, beta),
         anchor=lambda rig, uri: ProxyAnchor(rig.proxy, [resp_set_nx(uri)]),
         stored=lambda uri: redis.cli("EXISTS", l2_key(uri)) == "1",
         forget=lambda uri: redis.cli("DEL", l2_key(uri), lock_key(uri)),
@@ -5253,6 +5254,19 @@ def test_l2_shutdown_redis_lock_http1(
     run_shutdown_test(
         ng, origin, _redis_lock_abort_site(redis, valid_s=2, beta=20000),
         "http1")
+
+
+def test_l2_shutdown_redis_lock_early_teardown(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    # CT-SHUTDOWN-OWN-TIMEOUT-ARM. The lock op's L2 timeout (1s) falls after the
+    # shutdown timer and before the reply, so an op that outlived its freed
+    # request would end on its own timer. The cleanup tears it down at once: the
+    # worker exits before the timer, and no timeout line is logged. (A GET or
+    # lock op never ends by its own timeout once the request is freed.)
+    run_shutdown_test(
+        ng, origin, _redis_lock_abort_site(redis, valid_s=2, beta=20000,
+                                           timeout="1s"),
+        "early_teardown")
 
 
 def test_l2_shutdown_memcached_get_http1(

@@ -2004,7 +2004,24 @@ SHUTDOWN_REPLY_DELAY = 0.75
 #               reload inside the first park, the vary-marker GET, which is a
 #               miss. Takes the site's `hit` predicate over the first bytes of
 #               that reply and fails unless every key's reply passes it.
-SHUTDOWN_ARMS = ("http1", "http2", "graceful", "http1_hit")
+# early_teardown  the http1 reload on a site whose L2 timeout (OWN_TIMEOUT)
+#               falls after the shutdown timer and before the backend reply.
+#               The request cleanup (redis_*_detach) must tear the op down when
+#               nginx frees the request, so the old worker exits before the
+#               op's own timer could fire and no "timed out" line is logged.
+#               The other arms wait out the reply, so an op that merely
+#               survived detached (ended later by its timer or the reply)
+#               passes them. A GET or lock op cannot end by its own timeout
+#               after the request is freed; only a suspended purge walk can.
+SHUTDOWN_ARMS = ("http1", "http2", "graceful", "http1_hit",
+                 "early_teardown")
+# early_teardown: the site's L2 timeout (AbortSite directive) and the proxy's
+# reply delay, seconds before sanitizer scaling. The timeout must sit past the
+# shutdown timer (reload + SHUTDOWN_TIMEOUT_MS, with a loaded-host margin) and
+# well before the reply.
+OWN_TIMEOUT = 1.0
+OWN_TIMEOUT_REPLY_DELAY = 2.5
+TIMED_OUT = "timed out"
 
 
 def redis_hit_reply(head: bytes) -> bool:
@@ -2017,11 +2034,12 @@ def memcached_hit_reply(head: bytes) -> bool:
     return head.startswith(b"VALUE ")
 
 
-def shutdown_site(site: AbortSite, timeout: bool) -> AbortSite:
+def shutdown_site(site: AbortSite, timeout: bool,
+                  delay: float = SHUTDOWN_REPLY_DELAY) -> AbortSite:
     """`site` with a reply delay longer than the shutdown timeout, and that
     timeout set unless `timeout` is false."""
     extra = f"\nworker_shutdown_timeout {SHUTDOWN_TIMEOUT_MS}ms;" if timeout else ""
-    return dataclasses.replace(site, proxy_delay=SHUTDOWN_REPLY_DELAY,
+    return dataclasses.replace(site, proxy_delay=delay,
                                main_extra=site.main_extra + extra)
 
 
@@ -2046,12 +2064,17 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
               "(single-process nginx has no master to reload)", flush=True)
         return
     protocol = "http2" if arm == "http2" else "http1"
-    site = shutdown_site(site, timeout=arm != "graceful")
+    own = arm == "early_teardown"
+    site = shutdown_site(site, timeout=arm != "graceful",
+                         delay=OWN_TIMEOUT_REPLY_DELAY if own
+                         else SHUTDOWN_REPLY_DELAY)
     name = f"{site.name} shutdown {arm}"
     scale = sanitizer_time_scale()
     problems: list[str] = []
     landings: list[Landing] = []
-    with AbortRig(ng, site, f"shutdown-{arm}", ABORT_KEYS) as rig:
+    # The op timeout lines are logged at info.
+    with AbortRig(ng, site, f"shutdown-{arm}", ABORT_KEYS,
+                  "info" if own else None) as rig:
         if protocol == "http2":
             rig.node.require_http2()
         assert rig.node.process is not None and not rig.node.single_process, (
@@ -2080,9 +2103,13 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
             _sleep_until(parked_at + 0.03 * scale)
             reloaded_at = time.monotonic()
             os.kill(rig.node.process.pid, signal.SIGHUP)
-            if not wait_for(lambda old=old: not (rig.node.worker_pids() & old),
-                            timeout=(SHUTDOWN_REPLY_DELAY + 5.0) * scale,
-                            interval=0.02):
+            exited_at: float | None = None
+            if wait_for(lambda old=old: not (rig.node.worker_pids() & old),
+                        timeout=(max(SHUTDOWN_REPLY_DELAY,
+                                     OWN_TIMEOUT_REPLY_DELAY) + 5.0) * scale,
+                        interval=0.02):
+                exited_at = time.monotonic()
+            else:
                 problems.append(f"key {i}: old worker never exited")
             anchor.settle()
             if arm == "graceful" and h1 is not None:
@@ -2116,6 +2143,19 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
                 in_phase = (bool(t.final_reply_at) and hit(head)
                             and t.final_seen_at <= reloaded_at
                             and fired < t.final_reply_at)
+            elif own:
+                # In phase only if the shutdown timer was due before the op's
+                # own timer, and the worker was gone before that timer: the
+                # request cleanup, not the timer or the late reply, ended the
+                # op.
+                timer_at = parked_at + OWN_TIMEOUT
+                if exited_at is not None and exited_at >= timer_at:
+                    problems.append(
+                        f"key {i}: the worker outlived the op's own timeout "
+                        f"by {exited_at - timer_at:.3f}s, so the freed "
+                        "request did not tear the op down")
+                in_phase = (exited_at is not None
+                            and fired < timer_at and exited_at < timer_at)
             else:
                 in_phase = not end or fired < end
             landings.append(Landing(in_phase,
@@ -2130,6 +2170,13 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
             problems.extend(f"key {i}: client connection never closed: {h}"
                             for h in rig.node.wait_released())
         rig.node.stop()
+        if own:
+            late = [ln for ln in rig.node.diagnostics().splitlines()
+                    if TIMED_OUT in ln]
+            print(f"shutdown-arm {name}: {len(late)} op timeout lines",
+                  flush=True)
+            problems.extend(f"the op ended by its own timer: {ln[:160]}"
+                            for ln in late)
         fatal = rig.node.fatal_lines()
         result = ArmResult(name, landings, fatal + problems)
         print(f"shutdown-arm {result.describe()} problems={len(problems)}",
