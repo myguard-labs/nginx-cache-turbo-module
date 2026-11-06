@@ -1774,11 +1774,16 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
     stays connected and does nothing. Fails on an alert, a count-zero line, a
     sanitizer report, a held client socket, or an old worker that never exits.
     The answer the client gets is nginx's business there (the timeout closes the
-    connection), so only the graceful control checks it."""
+    connection), so only the graceful control checks it.
+
+    Multi-worker mode only: a single-process nginx has no master to reload (the
+    ASan single-process job). The Runtime and ASan multi-worker jobs run it."""
     if arm not in SHUTDOWN_ARMS:
         raise ValueError(f"unknown shutdown arm: {arm}")
     if (arm == "http1_hit") != (hit is not None):
         raise ValueError("a hit predicate goes with the http1_hit arm only")
+    if ng.single_process:
+        return
     protocol = "http2" if arm == "http2" else "http1"
     site = shutdown_site(site, timeout=arm != "graceful")
     name = f"{site.name} shutdown {arm}"
