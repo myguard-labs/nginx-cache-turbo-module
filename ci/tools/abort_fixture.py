@@ -1733,8 +1733,11 @@ def run_reentry_test(ng: Nginx, origin: Origin, site: AbortSite,
 
 SHUTDOWN_TIMEOUT_MS = 100
 # Long enough that the shutdown timer always fires inside the park, even on a
-# loaded host where the reload takes a while to reach the old worker.
-SHUTDOWN_REPLY_DELAY = 1.0
+# loaded host where the reload takes a while to reach the old worker. Short
+# enough that, scaled for a sanitizer (x2), it stays under the sites' 2s L2
+# timeout: at 1.0s the ASan reply landed on the timeout and the graceful
+# control got no cache answer.
+SHUTDOWN_REPLY_DELAY = 0.75
 # http1, http2  a reload with worker_shutdown_timeout while parked
 # graceful      the same reload with no shutdown timeout, HTTP/1: the old worker
 #               waits for the request, which gets its answer. It must pass on
@@ -1783,6 +1786,8 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
     if (arm == "http1_hit") != (hit is not None):
         raise ValueError("a hit predicate goes with the http1_hit arm only")
     if ng.single_process:
+        print(f"shutdown-arm {site.name} shutdown {arm}: SKIPPED "
+              "(single-process nginx has no master to reload)", flush=True)
         return
     protocol = "http2" if arm == "http2" else "http1"
     site = shutdown_site(site, timeout=arm != "graceful")
