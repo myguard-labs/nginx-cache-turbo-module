@@ -81,6 +81,13 @@ ABORT_SETTLE_MARGIN = 0.1
 ABORT_BOUNDARY_OFFSETS = (-0.003, -0.002, -0.001, 0.0, 0.001, 0.002, 0.003)
 ABORT_BOUNDARY_WINDOW = 0.005
 
+# "before" must land this long ahead of an anchor's earliest wake, so the abort
+# itself (a send after the spin-sleep) still precedes the wake.
+ABORT_WAKE_GUARD = 0.01
+# Fresh keys a "before" abort may burn on a closed window before the fixture
+# gives up loudly.
+ABORT_WINDOW_RETRIES = 3
+
 HTTP1_KINDS = ("http1_rst", "http1_fin")
 HTTP2_KINDS = ("h2_rst_stream", "h2_close")
 ABORT_TIMINGS = ("before", "after", "boundary")
@@ -116,6 +123,83 @@ class _Sighting:
 
 # Bytes of a watched reply the proxy keeps, enough to tell a hit from a miss.
 REPLY_HEAD_LEN = 16
+
+
+# Reply types a RESP value may start with. Anything else (an HTTP origin, the
+# memcached text protocol) is not framed here: one read stays one reply.
+_RESP_LINE = b"+-:,#_("
+_RESP_BULK = b"$!="
+_RESP_AGGREGATE = b"*~>%"
+_RESP_ATTRIBUTE = b"|"
+
+
+def resp_value_end(buf: bytes | bytearray, pos: int = 0) -> int | None:
+    """End offset of the complete RESP value starting at `pos`, None if more
+    bytes are needed. Raises ValueError for a byte that starts no RESP type."""
+    need = 1
+    while need:
+        if pos >= len(buf):
+            return None
+        kind = buf[pos:pos + 1]
+        if kind not in _RESP_LINE + _RESP_BULK + _RESP_AGGREGATE + _RESP_ATTRIBUTE:
+            raise ValueError(f"not RESP: {bytes(buf[pos:pos + 8])!r}")
+        eol = buf.find(b"\r\n", pos)
+        if eol == -1:
+            return None
+        header = bytes(buf[pos + 1:eol])
+        pos = eol + 2
+        if kind in _RESP_LINE:
+            need -= 1
+            continue
+        try:
+            n = int(header)
+        except ValueError as exc:
+            raise ValueError(f"bad RESP length: {header!r}") from exc
+        if kind in _RESP_BULK:
+            if n >= 0:
+                if len(buf) < pos + n + 2:
+                    return None
+                pos += n + 2
+            need -= 1
+        elif kind in _RESP_ATTRIBUTE:
+            need += 2 * max(n, 0)
+        else:
+            need -= 1
+            if n > 0:
+                need += n * (2 if kind == b"%" else 1)
+    return pos
+
+
+class ReplyCounter:
+    """Splits one connection's upstream bytes into replies.
+
+    feed() returns the first REPLY_HEAD_LEN bytes of every reply that became
+    complete with this read: none while a reply is still split across reads,
+    several when replies were coalesced. A stream that is not RESP falls back to
+    one reply per read, which is all an HTTP origin read needs.
+    """
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+        self.framed = True
+
+    def feed(self, data: bytes) -> list[bytes]:
+        if not self.framed:
+            return [data[:REPLY_HEAD_LEN]]
+        self.buf += data
+        heads: list[bytes] = []
+        try:
+            while self.buf:
+                end = resp_value_end(self.buf)
+                if end is None:
+                    break
+                heads.append(bytes(self.buf[:min(end, REPLY_HEAD_LEN)]))
+                del self.buf[:end]
+        except ValueError:
+            self.framed = False
+            self.buf.clear()
+            return heads + [data[:REPLY_HEAD_LEN]]
+        return heads
 
 
 class DelayProxy:
@@ -238,6 +322,14 @@ class DelayProxy:
             s.count += 1
             pending.append(s)
 
+    def _feed_request(self, tail: bytes, data: bytes, now: float,
+                      pending: collections.deque[_Sighting]) -> bytes:
+        """Scan one nginx-to-backend read; return the tail to carry into the
+        next one. The tail is cut from the previous tail plus this read, so a
+        marker spread over three or more reads is still found."""
+        self._note_request(tail + data, len(tail), now, pending)
+        return (tail + data)[-self._tail_len:] if self._tail_len else b""
+
     async def _handle(self, cr: asyncio.StreamReader,
                       cw: asyncio.StreamWriter) -> None:
         loop = asyncio.get_running_loop()
@@ -257,26 +349,31 @@ class DelayProxy:
             tail = b""
             while data := await cr.read(65536):
                 self.request_bytes += len(data)
-                self._note_request(tail + data, len(tail), time.monotonic(),
-                                   pending)
-                tail = data[-self._tail_len:] if self._tail_len else b""
+                tail = self._feed_request(tail, data, time.monotonic(),
+                                          pending)
                 uw.write(data)
                 await uw.drain()
 
         async def server_to_client() -> None:
+            counter = ReplyCounter()
             while data := await ur.read(65536):
                 # loop.time() is time.monotonic() on Unix, so reply_at compares
                 # directly with the time the test aborts at.
                 due = loop.time() + self.delay
                 self._busy_until = max(self._busy_until, due)
-                if pending:
+                # One sighting per complete reply, not per read: two replies
+                # coalesced in one read each take their own, and a reply split
+                # across reads takes its sighting only when it completes.
+                for head in counter.feed(data):
+                    if not pending:
+                        break
                     # A marker sent more than once (a walk's SELECT, one per
                     # op connection) keeps its first reply: that is the one
                     # ending the first park.
                     s = pending.popleft()
                     if not s.replied.is_set():
                         s.reply_at = due
-                        s.reply_head = data[:REPLY_HEAD_LEN]
+                        s.reply_head = head
                         s.replied.set()
                 loop.call_at(due, deliver, data)
             loop.call_at(loop.time() + self.delay, cw.close)
@@ -605,6 +702,11 @@ class ColdWaitAnchor:
                      + ABORT_SETTLE_MARGIN * scale)
         if isinstance(self.leader_result, tuple):
             self.rig.bodies.setdefault(self.uri, self.leader_result[2])
+
+    def earliest_wake(self) -> float:
+        """The first moment the park can end by itself: one poll after the
+        earliest the waiter could have parked."""
+        return self.park_lo + COLD_WAIT_POLL
 
     def times(self) -> ParkTimes:
         s = self.rig.proxy.sighting(self.marker)
@@ -1092,8 +1194,30 @@ class ArmResult:
                 f"abort-minus-last-reply={spread} fatal={len(self.fatal)}")
 
 
+class ParkWindowClosed(Exception):
+    """The park was observed too late to abort inside its "before" window.
+    The key is spent (a cold-wait leader filled it), so the caller retries on a
+    fresh key and records no landing for this one."""
+
+
+def _before_deadline(anchor: ParkAnchor, parked_at: float, scale: float,
+                     now: float | None = None) -> float | None:
+    """When to abort inside the first park, None if that window has closed.
+
+    The park is observed at parked_at, but an anchor whose park ends by itself
+    (earliest_wake) is only open until then, which a slow observation can pass.
+    """
+    deadline = parked_at + 0.03 * scale
+    wake = getattr(anchor, "earliest_wake", None)
+    if wake is not None:
+        deadline = min(deadline, wake() - ABORT_WAKE_GUARD)
+        if deadline <= (time.monotonic() if now is None else now):
+            return None
+    return deadline
+
+
 def _abort_deadline(anchor: ParkAnchor, timing: str, index: int, delay: float,
-                    scale: float) -> float:
+                    scale: float) -> float | None:
     """When to abort: time.monotonic(), from this request's own park events.
 
     A primed L2 hit parks twice, on the vary-marker GET and then on the object
@@ -1104,10 +1228,12 @@ def _abort_deadline(anchor: ParkAnchor, timing: str, index: int, delay: float,
               and answered, and the abort finds nothing parked. That is a control
               which stays clean even on broken resume code.
     boundary  a few ms either side of the reply that ends the last park
+
+    None means the "before" window closed before the park was observed.
     """
     parked_at = anchor.wait_parked()
     if timing == "before":
-        return parked_at + 0.03 * scale
+        return _before_deadline(anchor, parked_at, scale)
     if timing == "after":
         # An anchor whose parks are not each one delay long names the moment
         # itself (WalkAnchor, FileAnchor); it is not part of ParkAnchor
@@ -1153,8 +1279,11 @@ def _abort_one(node: AbortNode, anchor: ParkAnchor, kind: str, timing: str,
     else:
         raise ValueError(f"unknown abort kind: {kind}")
 
-    _sleep_until(_abort_deadline(anchor, timing, index, delay,
-                                 sanitizer_time_scale()))
+    deadline = _abort_deadline(anchor, timing, index, delay,
+                               sanitizer_time_scale())
+    closed = deadline is None
+    if deadline is not None:
+        _sleep_until(deadline)
     aborted_at = time.monotonic()
     if kind == "http1_rst":
         h1.abort_rst()
@@ -1171,6 +1300,10 @@ def _abort_one(node: AbortNode, anchor: ParkAnchor, kind: str, timing: str,
         # close, which is the next kind.
         h2.close()
     node.wait_worker()
+    if closed:
+        # Aborted late, so nothing is judged: the caller retries a fresh key.
+        # The late abort still ran, so a crash it caused stays in the log.
+        raise ParkWindowClosed()
     return aborted_at
 
 
@@ -1199,6 +1332,7 @@ class AbortRig:
         self.site = site
         self.uris = [f"/ab/{site.name}-{slug}-{i}" for i in range(keys)]
         self.bodies: dict[str, bytes] = {}
+        self.retired: list[str] = []   # keys burned by a closed window
         # Arm timing ("after" aborts one delay past the park) uses this; the
         # proxy's own delay may differ, see AbortSite.proxy_delay.
         self.delay = ABORT_REPLY_DELAY * sanitizer_time_scale()
@@ -1248,18 +1382,35 @@ class AbortRig:
                 raise
         finally:
             self.proxy.stop()
-            for uri in self.uris:
+            for uri in self.uris + self.retired:
                 self.site.forget(uri)
 
     def anchor(self, uri: str) -> ParkAnchor:
         return self.site.anchor(self, uri)
+
+    def retry_uri(self, uri: str, attempt: int) -> str:
+        """A fresh key for another try after a closed "before" window. Only a
+        site that parks on a miss has one: a primed key is not in the backend."""
+        if self.site.prime:
+            raise AssertionError(
+                f"{uri}: the 'before' window closed on a primed key, which "
+                "cannot be retried; the fixture cannot judge this landing")
+        if attempt > ABORT_WINDOW_RETRIES:
+            raise AssertionError(
+                f"fixture error: {uri}: the 'before' window closed "
+                f"{attempt} times in a row; the host is too slow to land an "
+                "abort ahead of the first wake")
+        fresh = f"{uri}-r{attempt}"
+        self.retired.append(fresh)
+        return fresh
 
     def assert_no_origin_traffic(self, origin: Origin, base: int) -> None:
         """A key that missed L2 goes to the origin instead of parking on a hit,
         so an origin hit means the arm did not test what it says. A site whose
         park needs origin traffic (a cold-wait leader) names how much."""
         now = origin.hits_for(f"{self.site.name}-")
-        want = base + self.site.origin_hits * len(self.uris)
+        want = base + self.site.origin_hits * (len(self.uris)
+                                               + len(self.retired))
         assert now == want, (
             f"{now - base} requests reached the origin, wanted "
             f"{want - base}: a key did not park the way this site needs")
@@ -1287,19 +1438,30 @@ def run_abort_arm(ng: Nginx, origin: Origin, site: AbortSite, kind: str,
         if kind in HTTP2_KINDS:
             rig.node.require_http2()
         base = origin.hits_for(f"{site.name}-")
-        for i, uri in enumerate(rig.uris):
-            anchor = rig.anchor(uri)
-            try:
-                aborted_at = _abort_one(rig.node, anchor, kind, timing, i,
-                                        rig.delay, site.request_target(uri),
-                                        site.method)
-            except (AssertionError, OSError) as exc:
-                fatal = rig.node.fatal_lines()
-                cause = f"{len(fatal)} fatal lines, first: {fatal[0]}\n" if fatal else ""
-                log = rig.node.diagnostics().splitlines()[-8:]
-                raise AssertionError(
-                    f"{arm}: {cause}key {i}/{keys}: {exc}\nlog tail:\n"
-                    + "\n".join(log)) from exc
+        for i, key in enumerate(rig.uris):
+            uri, attempt = key, 0
+            while True:
+                anchor = rig.anchor(uri)
+                try:
+                    aborted_at = _abort_one(
+                        rig.node, anchor, kind, timing, i, rig.delay,
+                        site.request_target(uri), site.method)
+                except ParkWindowClosed:
+                    # Nothing was judged; the late abort's crash, if any, is
+                    # still in the log read below.
+                    held.extend(f"key {i}: client connection never closed: {h}"
+                                for h in rig.node.wait_released())
+                    attempt += 1
+                    uri = rig.retry_uri(key, attempt)
+                    continue
+                except (AssertionError, OSError) as exc:
+                    fatal = rig.node.fatal_lines()
+                    cause = f"{len(fatal)} fatal lines, first: {fatal[0]}\n" if fatal else ""
+                    log = rig.node.diagnostics().splitlines()[-8:]
+                    raise AssertionError(
+                        f"{arm}: {cause}key {i}/{keys}: {exc}\nlog tail:\n"
+                        + "\n".join(log)) from exc
+                break
             landings.append(_landing(timing, aborted_at, anchor.times()))
             # A request nothing finalizes logs nothing and does not crash: it
             # keeps its connection. That is how the walks fail on the old
@@ -1624,8 +1786,10 @@ class KeepaliveClient:
 
 
 def _reentry_one(rig: AbortRig, uri: str, arm: str,
-                 landings: list[Landing]) -> list[str]:
-    """One parked request on a warmed connection; return what went wrong.
+                 landings: list[Landing]) -> tuple[list[str], bool]:
+    """One parked request on a warmed connection; return what went wrong and
+    whether the "before" window had closed (no landing recorded: retry a fresh
+    key).
 
     Fixture errors (the send never blocked, the request never parked) raise:
     such a key tested nothing. Everything the bug can cause is returned, so
@@ -1633,6 +1797,7 @@ def _reentry_one(rig: AbortRig, uri: str, arm: str,
     """
     site, scale = rig.site, sanitizer_time_scale()
     problems: list[str] = []
+    closed = False
     client = KeepaliveClient(rig.node, small_window=arm != "control")
     try:
         client.warm(big=arm != "control")
@@ -1644,7 +1809,10 @@ def _reentry_one(rig: AbortRig, uri: str, arm: str,
             raise AssertionError(f"fixture error: {exc}") from exc
         aborted_at = 0.0
         if arm != "clean":
-            _sleep_until(parked_at + 0.03 * scale)
+            deadline = _before_deadline(anchor, parked_at, scale)
+            closed = deadline is None
+            if deadline is not None:
+                _sleep_until(deadline)
             aborted_at = time.monotonic()
             if arm == "rst":
                 client.abort_rst()
@@ -1657,7 +1825,7 @@ def _reentry_one(rig: AbortRig, uri: str, arm: str,
             except (OSError, ValueError) as exc:
                 problems.append(f"no complete answer: {exc!r}")
         anchor.settle()
-        if aborted_at:
+        if aborted_at and not closed:
             landings.append(_landing("before", aborted_at, anchor.times()))
         if answer is not None:
             status, headers, body = answer
@@ -1681,7 +1849,7 @@ def _reentry_one(rig: AbortRig, uri: str, arm: str,
     rig.node.wait_worker()
     problems.extend(f"client connection never closed: {h}"
                     for h in rig.node.wait_released())
-    return problems
+    return problems, closed
 
 
 def run_reentry_test(ng: Nginx, origin: Origin, site: AbortSite,
@@ -1697,9 +1865,15 @@ def run_reentry_test(ng: Nginx, origin: Origin, site: AbortSite,
     landings: list[Landing] = []
     with AbortRig(ng, site, f"reentry-{arm}", ABORT_KEYS) as rig:
         base = origin.hits_for(f"{site.name}-")
-        for i, uri in enumerate(rig.uris):
-            problems.extend(f"key {i}: {p}"
-                            for p in _reentry_one(rig, uri, arm, landings))
+        for i, key in enumerate(rig.uris):
+            uri, attempt = key, 0
+            while True:
+                found, closed = _reentry_one(rig, uri, arm, landings)
+                problems.extend(f"key {i}: {p}" for p in found)
+                if not closed:
+                    break
+                attempt += 1
+                uri = rig.retry_uri(key, attempt)
         rig.node.stop()
         fatal = rig.node.fatal_lines()
         result = ArmResult(name, landings, fatal + problems)

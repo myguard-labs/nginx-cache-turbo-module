@@ -45,12 +45,13 @@ count="$tmp.count"
 trap 'rm -f "$tmp" "$count"' EXIT
 
 # A target block starts at "objs/addon/....o:" and ends at the first blank
-# line. Inside it, the single "$(CC) -c $(CFLAGS)" recipe line gets the flag.
+# line. Inside it, the single "$(CC) -c [-fPIC] $(CFLAGS)" recipe line gets the
+# flag (-fPIC is present for --add-dynamic-module objects, absent for static).
 # The END block writes "<targets> <rewritten>" to $count for the guard below.
 awk -v flag="$flag" -v count="$count" '
     /^objs\/addon\/[^:]*\.o:/ { in_addon = 1; targets++; done_this = 0 }
     /^$/ { in_addon = 0 }
-    in_addon && !done_this && /^\t\$\(CC\) -c \$\(CFLAGS\)/ {
+    in_addon && !done_this && /^\t\$\(CC\) -c (-fPIC )?\$\(CFLAGS\)/ {
         if (index($0, " " flag " ") == 0) {
             sub(/\$\(CFLAGS\)/, "$(CFLAGS) " flag)
         }

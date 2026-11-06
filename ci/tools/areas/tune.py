@@ -838,11 +838,18 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     #     AVSWR_FRESH_TTL_S boundary, and 1.15s crosses a 1s TTL at every
     #     scale. Scaling it (the pre-fix code used 1.3 * scale) bought nothing
     #     and cost 1.3s of window under ASan.
-    #   * the two wait_for() timeouts are 1.0s, not 2.0s. wait_for() scales
-    #     its timeout internally, so 1.0s is already 2.0s under ASan for
-    #     operations (a background SWR refresh reaching the origin, and the
-    #     refreshed body becoming a HIT) that complete in well under a second
-    #     even instrumented.
+    #   * the two wait_for() timeouts are DERIVED from what is left of the
+    #     window, not a fixed 1.0s (a fixed 1s lost the refresh-reached-origin
+    #     poll on a CPU-starved runner: the refresh was only slow, not absent,
+    #     and ~7s of window were still unused). wait_for() scales its timeout
+    #     internally, so the per-poll value is divided by the scale; the
+    #     budget below multiplies it back, so the sum of both worst-case polls
+    #     plus SLACK_S for the final fetch still lands inside the window.
+    #     POLL_MIN_S keeps the old floor, so a window that is too small fails
+    #     the loud assert below rather than silently shrinking the polls.
+    #     The same-generation oracle is untouched: the polls still require
+    #     origin.hits_for(path) > after_priming and a fresh `en` HIT whose
+    #     body differs from body0.
     #
     # Budget also counts elapsed_s (the warm-up wait_for plus the two priming
     # fetches, measured from t_entry above) since that time is spent inside
@@ -850,9 +857,14 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     # that ever stops holding, instead of discovering it later as a flaky
     # EXPIRED.
     sleep_s = 1.15
-    poll_timeout_s = 1.0
-    poll_budget_s = poll_timeout_s * sanitizer_time_scale() * 2
+    slack_s = 1.0
+    poll_min_s = 1.0
     elapsed_s = time.monotonic() - t_entry
+    scale = sanitizer_time_scale()
+    poll_timeout_s = max(
+        poll_min_s,
+        (AVSWR_STALE_WINDOW_S - elapsed_s - sleep_s - slack_s) / (2 * scale))
+    poll_budget_s = poll_timeout_s * scale * 2
     total_budget_s = elapsed_s + sleep_s + poll_budget_s
     assert total_budget_s < AVSWR_STALE_WINDOW_S, \
         (f"test timing budget ({total_budget_s:.2f}s: setup={elapsed_s:.2f}s + "

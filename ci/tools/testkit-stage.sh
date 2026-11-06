@@ -322,14 +322,25 @@ CONFIGURE_ARGS=(
 # is a compile-time property: it survives a caller that runs the binary
 # without carrying UBSAN_OPTIONS through. Without it every UBSan report is
 # advisory and the scenario still exits 0 -- a green leg over a real defect.
+MODULE_SAN=""
 if [ "$SANITIZE" -eq 1 ]; then
     SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
-    # clang trips three known false positives on nginx core that gcc does not;
-    # ci-build.sh:108-110 makes exactly this distinction and the reasons are
-    # documented there. Mirrored rather than re-litigated.
-    if "${CC:-cc}" --version 2>/dev/null | grep -qi clang; then
-        SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
-    fi
+    # clang trips known false positives on nginx core that gcc does not;
+    # ci-build.sh's asan mode makes exactly this distinction. function and
+    # pointer-overflow are excluded build-wide (generic ngx_*_filter_pt
+    # prototypes, core p +/- n arithmetic). nonnull-attribute is a CORE-only
+    # exclusion (core passes NULL + len 0 to memcpy): it is excluded build-wide
+    # here and re-enabled on the module objects after configure through
+    # asan-module-reinstrument.sh (MODULE_SAN), exactly as ci-build.sh does.
+    # Capture the version first: `cc --version | grep -q` under pipefail can
+    # SIGPIPE the producer when grep exits early.
+    CC_VERSION="$("${CC:-cc}" --version 2>/dev/null || true)"
+    case "$CC_VERSION" in
+        *[Cc][Ll][Aa][Nn][Gg]*)
+            SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+            MODULE_SAN="nonnull-attribute"
+            ;;
+    esac
     CONFIGURE_ARGS+=(
         "--with-cc-opt=-DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1 $SAN_FLAGS"
         "--with-ld-opt=$SAN_FLAGS"
@@ -524,6 +535,13 @@ echo "==> configuring ($FLAVOR $VERSION, ref probe + cache_turbo)"
     cd "$BUILDDIR"
     ./configure --with-cc="$WITH_CC" "${CONFIGURE_ARGS[@]}"
 ) || die "configure failed"
+
+# Scope the clang core-only nonnull-attribute exclusion: put the check back on
+# the module objects (fails closed if the Makefile cannot be rewritten).
+if [ -n "$MODULE_SAN" ]; then
+    bash "$ROOT/ci/tools/asan-module-reinstrument.sh" "$BUILDDIR/objs/Makefile" "$MODULE_SAN" \
+        || die "module re-instrumentation failed"
+fi
 
 # Full build, not just `make modules`. The prober needs BOTH:
 #   * objs/*.so                -- the two dynamic modules, and

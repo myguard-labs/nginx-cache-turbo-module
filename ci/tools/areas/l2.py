@@ -713,7 +713,42 @@ def test_l2_restore_href_array_alignment_ubsan(ng: Nginx, origin: Origin,
     below are the fallback oracle for a non-UBSan build, and assert_clean_logs
     at suite teardown is what actually proves the worker survived.
     """
-    uri = "/l2e/href-align"
+    # Path coverage: restore_response() hands blob_validate() a 24-entry
+    # STACK array (stack_refs[24], module.c restore_response()); only a blob
+    # with MORE than 24 headers falls back to ngx_palloc(r->pool, ...), which
+    # is the allocation this regression is actually about. The original
+    # 4-header case alone only ever ran the stack path, so the pool path was
+    # never exercised (CT-ALIGN-TEST-POOL-PATH). Run both, plus the exact
+    # 24 (last stack size) / 25 (first pool size) boundary pair, each with the
+    # same restore + byte-correctness oracle.
+    _href_align_roundtrip(ng, origin, redis, "/l2e/href-align", [
+        ("X-Align-A", "alpha"),
+        ("X-Align-B", "bravo-bravo"),
+        ("X-Align-C", "charlie-charlie-charlie"),
+    ])                                                  # 4 hdrs: stack path
+    _href_align_roundtrip(ng, origin, redis, "/l2e/href-align-24",
+                          _align_hdrs(23, 1))           # 24 hdrs: stack, full
+    _href_align_roundtrip(ng, origin, redis, "/l2e/href-align-25",
+                          _align_hdrs(24, 2))           # 25 hdrs: pool, first
+    _href_align_roundtrip(ng, origin, redis, "/l2e/href-align-48",
+                          _align_hdrs(47, 3))           # 48 hdrs: pool path
+
+
+def _align_hdrs(n: int, pad: int) -> list[tuple[str, str]]:
+    """n distinct custom headers; `pad` varies the value lengths so the
+    pool offset the refs array lands on differs between cases (a misaligned
+    ngx_pnalloc() result is only visible when d.last happens to be odd)."""
+    return [(f"X-Align-{i:02d}", f"v{i:02d}-" + "x" * ((i * 3 + pad) % 11))
+            for i in range(n)]
+
+
+def _href_align_roundtrip(ng: Nginx, origin: Origin, redis: RedisServer,
+                          uri: str,
+                          extra: "list[tuple[str, str]]") -> None:
+    """Seed a CTB5 blob carrying Content-Type plus `extra`, restore it via the
+    L2-fill serve then the promoted L1 HIT, and require every header and the
+    body byte-exact on both reads (worker survival is proven by
+    assert_clean_logs at suite teardown)."""
     key = l2_key(uri)
     redis.cli("DEL", key, lock_key(uri))
 
@@ -722,49 +757,33 @@ def test_l2_restore_href_array_alignment_ubsan(ng: Nginx, origin: Origin,
     # the bug. Values are distinct so a misaligned/garbage read is visible as
     # wrong bytes even if the worker does not outright crash.
     seeded = b"href-align-body\n"
-    blob = make_ctb5_blob(seeded, headers={
-        "Content-Type": "text/plain",
-        "X-Align-A":    "alpha",
-        "X-Align-B":    "bravo-bravo",
-        "X-Align-C":    "charlie-charlie-charlie",
-    })
+    headers = {"Content-Type": "text/plain"}
+    headers.update(extra)
+    blob = make_ctb5_blob(seeded, headers=headers)
     redis.set_raw(key, blob, 60_000)
     assert redis.cli("EXISTS", key) == "1", "failed to seed the alignment blob"
 
     origin_before = origin.hits
 
     # 1st read: L2-fill restore (the call site that allocates refs[] via
-    # blob_validate(..., r->pool, &refs)).
-    s1, body1, h1 = fetch(ng.port, uri)
-    assert s1 == 200, f"L2-fill serve: status {s1}"
-    assert h1.get("x-cache") == "HIT", \
-        f"L2-fill serve: expected HIT from the seeded L2 blob, got " \
-        f"x-cache={h1.get('x-cache')!r} (status {s1})"
-    assert body1 == seeded.decode(), \
-        f"L2-fill serve: body corrupted -- {body1!r} != {seeded!r}"
-    assert h1.get("x-align-a") == "alpha", \
-        f"L2-fill serve: X-Align-A corrupted: {h1.get('x-align-a')!r}"
-    assert h1.get("x-align-b") == "bravo-bravo", \
-        f"L2-fill serve: X-Align-B corrupted: {h1.get('x-align-b')!r}"
-    assert h1.get("x-align-c") == "charlie-charlie-charlie", \
-        f"L2-fill serve: X-Align-C corrupted: {h1.get('x-align-c')!r}"
-    assert origin.hits == origin_before, \
-        "origin was consulted; response is not the seeded L2 blob"
-
-    # 2nd read: L1 HIT promoted from the fill above -- same restore_response()
-    # call site, second walk of the same refs-array allocation path.
-    s2, body2, h2 = fetch(ng.port, uri)
-    assert s2 == 200 and h2.get("x-cache") == "HIT", \
-        f"L1 HIT serve: status {s2}, x-cache={h2.get('x-cache')!r}"
-    assert body2 == seeded.decode(), \
-        f"L1 HIT serve: body corrupted -- {body2!r} != {seeded!r}"
-    assert h2.get("x-align-a") == "alpha", \
-        f"L1 HIT serve: X-Align-A corrupted: {h2.get('x-align-a')!r}"
-    assert h2.get("x-align-b") == "bravo-bravo", \
-        f"L1 HIT serve: X-Align-B corrupted: {h2.get('x-align-b')!r}"
-    assert h2.get("x-align-c") == "charlie-charlie-charlie", \
-        f"L1 HIT serve: X-Align-C corrupted: {h2.get('x-align-c')!r}"
-    assert origin.hits == origin_before, "L1 HIT unexpectedly used the origin"
+    # blob_validate(..., r->pool, &refs)); 2nd read: L1 HIT promoted from the
+    # fill above -- same restore_response() call site, second walk of the same
+    # refs-array allocation path.
+    for stage in ("L2-fill serve", "L1 HIT serve"):
+        st, body, h = fetch(ng.port, uri)
+        assert st == 200, f"{uri} {stage}: status {st}"
+        assert h.get("x-cache") == "HIT", \
+            f"{uri} {stage}: expected HIT from the seeded blob, got " \
+            f"x-cache={h.get('x-cache')!r} (status {st})"
+        assert body == seeded.decode(), \
+            f"{uri} {stage}: body corrupted -- {body!r} != {seeded!r}"
+        for name, val in extra:
+            assert h.get(name.lower()) == val, \
+                f"{uri} {stage}: {name} corrupted: {h.get(name.lower())!r} " \
+                f"!= {val!r}"
+        assert origin.hits == origin_before, \
+            f"{uri} {stage}: origin was consulted; response is not the " \
+            "seeded blob"
 
 
 def test_sie_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,
