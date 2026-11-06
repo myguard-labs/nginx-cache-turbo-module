@@ -111,6 +111,11 @@ class _Sighting:
     seen_at: float = 0.0      # time.monotonic() the request reached the proxy
     reply_at: float = 0.0     # time.monotonic() the first reply is released
     count: int = 0            # times the request was sent
+    reply_head: bytes = b""   # first bytes of that first reply
+
+
+# Bytes of a watched reply the proxy keeps, enough to tell a hit from a miss.
+REPLY_HEAD_LEN = 16
 
 
 class DelayProxy:
@@ -271,6 +276,7 @@ class DelayProxy:
                     s = pending.popleft()
                     if not s.replied.is_set():
                         s.reply_at = due
+                        s.reply_head = data[:REPLY_HEAD_LEN]
                         s.replied.set()
                 loop.call_at(due, deliver, data)
             loop.call_at(loop.time() + self.delay, cw.close)
@@ -349,6 +355,14 @@ class ProxyAnchor:
 
     def wait_final_reply(self) -> float:
         return self.proxy.wait_replied(self.commands[-1])
+
+    def wait_final_seen(self) -> float:
+        """Block until the command of the last park reached the backend."""
+        return self.proxy.wait_seen(self.commands[-1])
+
+    def final_reply_head(self) -> bytes:
+        """The first bytes of the reply ending the last park."""
+        return self.proxy.sighting(self.commands[-1]).reply_head
 
     def settle(self) -> None:
         self.proxy.wait_quiet(ABORT_SETTLE_MARGIN * sanitizer_time_scale())
@@ -1725,7 +1739,23 @@ SHUTDOWN_REPLY_DELAY = 1.0
 # graceful      the same reload with no shutdown timeout, HTTP/1: the old worker
 #               waits for the request, which gets its answer. It must pass on
 #               any build; if it fails, the fixture is broken.
-SHUTDOWN_ARMS = ("http1", "http2", "graceful")
+# http1_hit     the http1 reload, sent once the request is parked on its last
+#               GET, the object's, so the late reply is the stored value and
+#               the resume copies a hit into the freed request. The other arms
+#               reload inside the first park, the vary-marker GET, which is a
+#               miss. Takes the site's `hit` predicate over the first bytes of
+#               that reply and fails unless every key's reply passes it.
+SHUTDOWN_ARMS = ("http1", "http2", "graceful", "http1_hit")
+
+
+def redis_hit_reply(head: bytes) -> bool:
+    """A RESP GET reply carrying a value: a bulk string that is not nil."""
+    return head.startswith(b"$") and not head.startswith(b"$-1")
+
+
+def memcached_hit_reply(head: bytes) -> bool:
+    """A memcached text-protocol get reply carrying a value."""
+    return head.startswith(b"VALUE ")
 
 
 def shutdown_site(site: AbortSite, timeout: bool) -> AbortSite:
@@ -1737,7 +1767,8 @@ def shutdown_site(site: AbortSite, timeout: bool) -> AbortSite:
 
 
 def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
-                      arm: str) -> None:
+                      arm: str,
+                      hit: Callable[[bytes], bool] | None = None) -> None:
     """Reload while one request per key is parked; the old worker's shutdown
     timer closes the client connection before the backend answers. The client
     stays connected and does nothing. Fails on an alert, a count-zero line, a
@@ -1746,6 +1777,8 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
     connection), so only the graceful control checks it."""
     if arm not in SHUTDOWN_ARMS:
         raise ValueError(f"unknown shutdown arm: {arm}")
+    if (arm == "http1_hit") != (hit is not None):
+        raise ValueError("a hit predicate goes with the http1_hit arm only")
     protocol = "http2" if arm == "http2" else "http1"
     site = shutdown_site(site, timeout=arm != "graceful")
     name = f"{site.name} shutdown {arm}"
@@ -1772,6 +1805,10 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
                 h1 = Http1Client(rig.node.port, path, site.method)
             try:
                 parked_at = anchor.wait_parked()
+                if hit is not None:
+                    assert isinstance(anchor, ProxyAnchor) and len(
+                        anchor.commands) > 1, "the hit arm needs a two-park site"
+                    parked_at = anchor.wait_final_seen()
             except AssertionError as exc:
                 raise AssertionError(f"{name}: fixture error: {exc}") from exc
             _sleep_until(parked_at + 0.03 * scale)
@@ -1798,7 +1835,24 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
             t = anchor.times()
             end = t.final_reply_at or t.first_reply_at
             fired = reloaded_at + SHUTDOWN_TIMEOUT_MS / 1000
-            landings.append(Landing(not end or fired < end,
+            if hit is not None:
+                # In phase only if the backend answered the object GET with the
+                # value and the shutdown timer was due before that reply
+                # landed: a missing reply would let a miss or a lost key pass
+                # as this arm.
+                assert isinstance(anchor, ProxyAnchor)
+                head = anchor.final_reply_head()
+                if not t.final_reply_at:
+                    problems.append(f"key {i}: the object GET got no reply")
+                elif not hit(head):
+                    problems.append(f"key {i}: the object GET reply is not a "
+                                    f"hit: {head!r}")
+                in_phase = (bool(t.final_reply_at) and hit(head)
+                            and t.final_seen_at <= reloaded_at
+                            and fired < t.final_reply_at)
+            else:
+                in_phase = not end or fired < end
+            landings.append(Landing(in_phase,
                                     reloaded_at - (end or reloaded_at)))
             for client in (h1, h2):
                 if client is not None:

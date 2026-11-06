@@ -20,6 +20,8 @@ from abort_fixture import (
     WalkAnchor,
     assert_abort_clean,
     binary_has_debug_log,
+    memcached_hit_reply,
+    redis_hit_reply,
     run_abort_arm,
     run_abort_test,
     run_clean_test,
@@ -5071,3 +5073,19 @@ def test_l2_shutdown_redis_lock_http1(
 def test_l2_shutdown_memcached_get_http1(
         ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
     run_shutdown_test(ng, origin, _memcached_get_abort_site(mc), "http1")
+
+
+# The arms above reload inside the vary-marker park, an L2 miss. These reload
+# inside the object park, so the late reply is a hit and the resume would copy
+# the stored value into the freed request's pool.
+
+def test_l2_shutdown_redis_get_hit_http1(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    run_shutdown_test(ng, origin, _redis_get_abort_site(redis), "http1_hit",
+                      hit=redis_hit_reply)
+
+
+def test_l2_shutdown_memcached_get_hit_http1(
+        ng: Nginx, origin: Origin, mc: MemcachedServer) -> None:
+    run_shutdown_test(ng, origin, _memcached_get_abort_site(mc), "http1_hit",
+                      hit=memcached_hit_reply)
