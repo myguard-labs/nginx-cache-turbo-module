@@ -521,11 +521,13 @@ if [ "$ABORT" = "1" ]; then
         echo "FAIL: no L2 lookups recorded -- no request ever parked, the abort mix proves nothing"
         problems=1
     fi
-    if grep -anE 'count is zero' "$WORK/logs/error.log" 2>/dev/null | head -5 | grep .; then
+    # grep -m, not `grep | head`: under pipefail head's early close can SIGPIPE
+    # grep and turn a match into a false "no match".
+    if grep -m 5 -anE 'count is zero' "$WORK/logs/error.log" 2>/dev/null; then
         echo "FAIL: 'count is zero' in error.log"; problems=1
     fi
-    if grep -anE 'exited on signal|exited with fatal code|AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|SUMMARY: .*Sanitizer|core dumped' \
-            "$WORK/logs/error.log" 2>/dev/null | head -5 | grep .; then
+    if grep -m 5 -anE 'exited on signal|exited with fatal code|AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|SUMMARY: .*Sanitizer|core dumped' \
+            "$WORK/logs/error.log" 2>/dev/null; then
         echo "FAIL: worker exit/signal or sanitizer marker in error.log"; problems=1
     fi
 elif [ ! -f "$saw_hit" ]; then

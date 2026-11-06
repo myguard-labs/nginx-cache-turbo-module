@@ -402,6 +402,10 @@ def _worker(st: Stats, h1: int, h2: int, until: float):
                 _poke_client(st, h1, k[5:])
         except OSError:
             st.hit("oserror")  # a refused/reset connection is not a verdict
+        except Exception as exc:  # a parse error means nginx sent garbage
+            # Record it and keep the thread alive: a thread that died quietly
+            # would leave st.failures empty and thin the load.
+            st.fail(f"{k}: client raised {exc!r}")
 
 
 def _established_to(ports) -> list[str]:
