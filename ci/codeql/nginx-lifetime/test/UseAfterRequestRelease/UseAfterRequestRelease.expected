@@ -1,0 +1,8 @@
+| test.c:11:31:11:31 | r | 'r' (request) is used after $@, which may free the request. | test.c:10:5:10:32 | call to ngx_http_run_posted_requests | ngx_http_run_posted_requests |
+| test.c:22:31:22:31 | r | 'r' (request) is used after $@, which may free the request. | test.c:21:5:21:32 | call to ngx_http_run_posted_requests | ngx_http_run_posted_requests |
+| test.c:32:16:32:18 | req | 'req' (request) is used after $@, which may free the request. | test.c:31:5:31:29 | call to ngx_http_finalize_request | ngx_http_finalize_request |
+| test.c:42:9:42:9 | r | 'r' (request) is used after $@, which may free the request. | test.c:41:5:41:29 | call to ngx_http_finalize_request | ngx_http_finalize_request |
+| test.c:52:23:52:26 | pool | 'pool' (pool) is used after $@, which may free the request. | test.c:51:5:51:25 | call to ngx_http_free_request | ngx_http_free_request |
+| test.c:61:16:61:16 | c | 'c' (connection) is used after $@, which may free the request. | test.c:60:5:60:30 | call to ngx_http_terminate_request | ngx_http_terminate_request |
+| test.c:70:30:70:30 | r | 'r' (request) is used after $@, which may free the request. | test.c:68:9:68:33 | call to ngx_http_finalize_request | ngx_http_finalize_request |
+| test.c:77:31:77:31 | r | 'r' (request) is used after $@, which may free the request. | test.c:76:5:76:29 | call to ngx_http_finalize_request | ngx_http_finalize_request |

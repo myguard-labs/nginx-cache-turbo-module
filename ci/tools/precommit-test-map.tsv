@@ -1,0 +1,96 @@
+# Reviewed map: changed path glob -> the ONLY tests the pre-commit hook runs.
+# Format and semantics: see the header of ci/tools/precommit-tests.sh.
+# Columns (TAB-separated): glob[|glob...]  needs  command
+# ci/tools/lint-precommit-map.py fails when a src/*.c, areas/*.py or unit
+# check/test/extract file has no row here: a new file must be mapped, not
+# silently left unchecked. No row may call run_all(), test_runtime.py or
+# ci/tests/unit/run.sh (a whole suite); that is asserted by the selector tests.
+#
+# --- src/<unit>.c -> its unit targets + matching runtime area ---------------
+src/ngx_http_cache_turbo_access.c	none	ut access_marker_resolve access_marker_resolve
+src/ngx_http_cache_turbo_access.c	build	@area policy
+src/ngx_http_cache_turbo_admin.c	none	ut admin_purge_key admin_purge_key && ut admin_purge_all admin_purge_all && ut error_helpers error_helpers
+src/ngx_http_cache_turbo_admin.c	build	@area admin
+src/ngx_http_cache_turbo_autotune.c	none	ut math -
+src/ngx_http_cache_turbo_autotune.c	build	@area tune
+src/ngx_http_cache_turbo_blob.c	none	ut digest digest -lssl -lcrypto && ut key_fold key_fold -lssl -lcrypto
+src/ngx_http_cache_turbo_conf.c	none	bash ci/tests/unit/check_constants.sh && bash ci/tests/unit/check_directive_synopsis.sh "$ROOT" && bash ci/tests/unit/check_default_comments.sh "$ROOT"
+src/ngx_http_cache_turbo_filters.c	none	ut marker_rollback marker_rollback -pthread
+src/ngx_http_cache_turbo_filters.c	build	@area breaker
+src/ngx_http_cache_turbo_match.c	build	@area policy
+src/ngx_http_cache_turbo_memcached.c	none	ut error_helpers error_helpers
+src/ngx_http_cache_turbo_module.c	none	ut breaker_retry breaker_retry && ut cc_delta cc_delta && ut key_fold key_fold -lssl -lcrypto && ut tok_sort tok_sort
+src/ngx_http_cache_turbo_module.c	build	@area core
+src/ngx_http_cache_turbo_presets.c	none	bash ci/tests/unit/check_constants.sh && python3 ci/tests/unit/check_preset_mirrors.py
+src/ngx_http_cache_turbo_probe.c	build	@area http
+src/ngx_http_cache_turbo_purge.c	none	ut purge_digest_order purge_digest_order && ut error_helpers error_helpers
+src/ngx_http_cache_turbo_purge.c	build	@area admin
+src/ngx_http_cache_turbo_redis.c	none	ut error_helpers error_helpers
+src/ngx_http_cache_turbo_redis.c	clang	@fuzz-replay
+src/ngx_http_cache_turbo_shm.c	none	ut marker_rollback marker_rollback -pthread
+src/ngx_http_cache_turbo_shm.c	build	@make-check
+src/ngx_http_cache_turbo_swr.c	none	ut math -
+src/ngx_http_cache_turbo_swr.c	build	@area tune
+src/ngx_http_cache_turbo_vary.c	none	ut marker_store_key marker_store_key && ut variant_gen variant_hash -lssl -lcrypto && ut tok_sort tok_sort
+src/ngx_http_cache_turbo_vary.c	build	@area policy
+# Shared headers: no single owner; the unit make check is the cheapest broad net.
+src/*.h	build	@make-check
+
+# --- runtime areas: an edited area file runs just that area -----------------
+ci/tools/areas/admin.py	build	@area admin
+ci/tools/areas/breaker.py	build	@area breaker
+ci/tools/areas/core.py	build	@area core
+ci/tools/areas/http.py	build	@area http
+ci/tools/areas/l2.py	build	@area l2
+ci/tools/areas/policy.py	build	@area policy
+ci/tools/areas/tune.py	build	@area tune
+
+# --- ci/tests/unit: an edited check/test/extract file runs just that check ---
+ci/tests/unit/check_constants.sh	none	bash ci/tests/unit/check_constants.sh "$ROOT"
+ci/tests/unit/check_default_comments.sh	none	bash ci/tests/unit/check_default_comments.sh "$ROOT"
+ci/tests/unit/check_directive_synopsis.sh	none	bash ci/tests/unit/check_directive_synopsis.sh "$ROOT"
+ci/tests/unit/check_testkit_contract.sh	none	bash ci/tests/unit/check_testkit_contract.sh "$ROOT"
+ci/tests/unit/check_stage_inventory_control.sh	none	bash ci/tests/unit/check_stage_inventory_control.sh "$ROOT"
+ci/tests/unit/check_producer_status_controls.sh	none	bash ci/tests/unit/check_producer_status_controls.sh "$ROOT"
+ci/tests/unit/check_breaker_retry_control.sh	none	bash ci/tests/unit/check_breaker_retry_control.sh
+ci/tests/unit/check_digest_result_contract.sh	none	bash ci/tests/unit/check_digest_result_contract.sh
+ci/tests/unit/check_error_helpers_control.sh	none	bash ci/tests/unit/check_error_helpers_control.sh
+ci/tests/unit/check_marker_rollback_control.sh	none	bash ci/tests/unit/check_marker_rollback_control.sh
+ci/tests/unit/check_norm_args_tail_control.sh	none	bash ci/tests/unit/check_norm_args_tail_control.sh
+ci/tests/unit/check_norm_args_tail.sh	none	bash ci/tests/unit/check_norm_args_tail.sh
+ci/tests/unit/check_purge_partial_warn_control.sh	none	bash ci/tests/unit/check_purge_partial_warn_control.sh
+ci/tests/unit/check_ttl_width.sh	none	bash ci/tests/unit/check_ttl_width.sh
+ci/tests/unit/check_variant_gen_normalize_control.sh	none	bash ci/tests/unit/check_variant_gen_normalize_control.sh
+ci/tests/unit/check_versions_env.sh	none	bash ci/tests/unit/check_versions_env.sh
+ci/tests/unit/check_purge_snapshot_control.sh	build	bash ci/tests/unit/check_purge_snapshot_control.sh
+ci/tests/unit/check_purge_zero_skew_control.sh	build	bash ci/tests/unit/check_purge_zero_skew_control.sh
+ci/tests/unit/check_hash_diagnostic_controls.sh	build	bash ci/tests/unit/check_hash_diagnostic_controls.sh
+ci/tests/unit/check_varidx_accounting.sh	build	bash ci/tests/unit/check_varidx_accounting.sh
+ci/tests/unit/check_preset_mirrors.py	none	python3 ci/tests/unit/check_preset_mirrors.py
+ci/tests/unit/test_math.c|ci/tests/unit/ngx_shim_math.h	none	ut math -
+ci/tests/unit/test_digest.c|ci/tests/unit/extract_digest.sh|ci/tests/unit/ngx_shim_digest*.h	none	ut digest digest -lssl -lcrypto
+ci/tests/unit/test_digest_fail.c	none	bash ci/tests/unit/check_digest_result_contract.sh && ut digest_fail - -lssl -lcrypto
+ci/tests/unit/test_key_fold.c|ci/tests/unit/extract_key_fold.sh|ci/tests/unit/ngx_shim_key_fold.h	none	ut key_fold key_fold -lssl -lcrypto
+ci/tests/unit/test_tok_sort.c|ci/tests/unit/extract_tok_sort.sh	none	ut tok_sort tok_sort
+ci/tests/unit/test_cc_delta.c|ci/tests/unit/extract_cc_delta.sh	none	ut cc_delta cc_delta
+ci/tests/unit/test_variant_gen.c|ci/tests/unit/extract_variant_hash.sh|ci/tests/unit/ngx_shim_variant.h	none	ut variant_gen variant_hash -lssl -lcrypto
+ci/tests/unit/test_marker_store_key.c|ci/tests/unit/extract_marker_store_key.sh|ci/tests/unit/ngx_shim_marker_store_key.h	none	ut marker_store_key marker_store_key
+ci/tests/unit/test_marker_rollback.c|ci/tests/unit/extract_marker_rollback.sh|ci/tests/unit/ngx_shim_marker_rollback.h	none	ut marker_rollback marker_rollback -pthread
+ci/tests/unit/test_admin_purge_key.c|ci/tests/unit/extract_admin_purge_key.sh|ci/tests/unit/ngx_shim_admin_purge_key.h	none	ut admin_purge_key admin_purge_key
+ci/tests/unit/test_admin_purge_all.c|ci/tests/unit/extract_admin_purge_all.sh|ci/tests/unit/ngx_shim_admin_purge_all.h	none	ut admin_purge_all admin_purge_all
+ci/tests/unit/test_purge_digest_order.c|ci/tests/unit/extract_purge_digest_order.sh|ci/tests/unit/ngx_shim_purge_digest_order.h	none	ut purge_digest_order purge_digest_order
+ci/tests/unit/test_error_helpers.c|ci/tests/unit/extract_error_helpers.sh|ci/tests/unit/ngx_shim_error_helpers.h	none	ut error_helpers error_helpers
+ci/tests/unit/test_breaker_retry.c|ci/tests/unit/extract_breaker_retry.sh	none	ut breaker_retry breaker_retry
+ci/tests/unit/test_access_marker_resolve.c|ci/tests/unit/extract_access_marker_resolve.sh|ci/tests/unit/ngx_shim_access_marker_resolve.h	none	ut access_marker_resolve access_marker_resolve
+ci/tests/unit/test_stripe_resolver.c|ci/tests/unit/extract_stripe_resolver.sh	none	ut stripe_resolver stripe_resolver
+ci/tests/unit/test_frame_scan.c	none	make -C ci/tests/unit --no-print-directory check-frame-scan
+ci/tests/unit/test_mc_parse.c	none	make -C ci/tests/unit --no-print-directory check-mc-parse
+ci/tests/unit/test_ae_class_guard.c	none	make -C ci/tests/unit --no-print-directory check-ae-class-guard
+ci/tests/unit/test_shm_state.c|ci/tests/unit/layout_check.c|ci/tests/unit/layout_expect.h|ci/tests/unit/extract_shm.sh|ci/tests/unit/ngx_shim_shm.h|ci/tests/unit/Makefile	build	@make-check
+
+# --- fuzz and linter trees -------------------------------------------------
+ci/fuzz/*	clang	@fuzz-replay
+ci/linter/*	none	bash ci/linter/selftest.sh
+ci/tests/unit/test_vary_gen.c	none	ut vary_gen -
+ci/tests/unit/test_vary_encoding_collapse.c	none	ut vary_encoding_collapse -
+ci/tests/unit/test_vary_marker_fastpath.c	none	ut vary_marker_fastpath -

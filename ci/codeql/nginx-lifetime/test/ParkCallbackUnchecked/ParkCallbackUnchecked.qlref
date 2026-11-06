@@ -1,0 +1,2 @@
+query: queries/ParkCallbackUnchecked.ql
+postprocess: utils/test/InlineExpectationsTestQuery.ql

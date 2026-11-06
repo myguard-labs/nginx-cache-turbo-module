@@ -1,0 +1,4 @@
+# codeql test run extracts each test directory into a sibling *.testproj
+# database; codeql pack install fills .codeql/ with downloaded packs.
+*.testproj/
+.codeql/

@@ -1,0 +1,8 @@
+# Copyright (C) 2026 Thijs Eilander
+# SPDX-License-Identifier: BSD-2-Clause
+name: myguard/nginx-lifetime-tests
+version: 0.1.0
+extractor: cpp
+tests: .
+dependencies:
+  myguard/nginx-lifetime: ${workspace}
