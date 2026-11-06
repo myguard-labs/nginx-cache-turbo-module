@@ -347,6 +347,8 @@ fi
 # Abort mode engagement, read before shutdown: requests must really have gone to
 # L2 (every L2 lookup is a park). l2_hits + l2_misses counts attempts, which is
 # exactly the question here (the L2 gate further down needs STORED keys instead).
+# This total includes the priming requests, so it only proves L2 is wired; the
+# client mix itself fails unless the count rose during the worker phase.
 ABORT_L2_LOOKUPS=0
 if [ "$ABORT" = "1" ]; then
     ABORT_L2_LOOKUPS="$(curl -fsS "http://127.0.0.1:$EDGE/_ct?format=prometheus" 2>/dev/null \

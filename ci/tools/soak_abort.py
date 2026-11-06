@@ -21,8 +21,8 @@ request on it -- the one that parks -- is then poked, reset or left alone.
 
 Failure conditions the client itself reports: a clean client that gets no
 complete 200 within its deadline (a request nobody answers), and a server-side
-socket still ESTABLISHED to the edge ports after the clients are gone and the
-keep-alive timeout has passed (a held connection).
+socket still ESTABLISHED or CLOSE_WAIT on the edge ports after the clients are
+gone and the keep-alive timeout has passed (a held connection).
 """
 
 import asyncio
@@ -35,6 +35,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.request
 
 WORKERS = 24
 CLEAN_DEADLINE = 15.0
@@ -408,8 +409,15 @@ def _worker(st: Stats, h1: int, h2: int, until: float):
             st.fail(f"{k}: client raised {exc!r}")
 
 
-def _established_to(ports) -> list[str]:
-    """Server-side ESTABLISHED sockets whose local port is one of `ports`."""
+# /proc/net/tcp st column. Every client here ends with close() (a FIN) or an
+# RST. A socket nginx still holds after the client's FIN is CLOSE_WAIT, not
+# ESTABLISHED, so both count as held.
+_HELD_STATES = {"01": "ESTABLISHED", "08": "CLOSE_WAIT"}
+
+
+def _held_to(ports) -> list[str]:
+    """Server-side ESTABLISHED or CLOSE_WAIT sockets whose local port is one of
+    `ports`: connections nginx has not closed."""
     want = {f"{p:04X}" for p in ports}
     rows = []
     for f in ("/proc/net/tcp",):
@@ -419,9 +427,31 @@ def _established_to(ports) -> list[str]:
             continue
         for ln in lines:
             cols = ln.split()
-            if cols[3] == "01" and cols[1].split(":")[1] in want:
-                rows.append(ln.strip())
+            if cols[3] in _HELD_STATES and cols[1].split(":")[1] in want:
+                rows.append(f"{_HELD_STATES[cols[3]]} {ln.strip()}")
     return rows
+
+
+def _l2_lookups(h1: int) -> int | None:
+    """l2_hits + l2_misses from the edge's Prometheus page; None if unreadable.
+    Every L2 lookup parks the request, so a rise across the worker phase means a
+    worker request parked."""
+    url = f"http://127.0.0.1:{h1}/_ct?format=prometheus"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310
+            text = resp.read().decode("ascii", "replace")
+    except (OSError, ValueError):
+        return None
+    total = 0
+    seen = False
+    for line in text.splitlines():
+        if line.startswith(("cache_turbo_l2_hits_total", "cache_turbo_l2_misses_total")):
+            try:
+                total += int(float(line.split()[-1]))
+            except (IndexError, ValueError):
+                return None
+            seen = True
+    return total if seen else None
 
 
 def run_stress(h1: int, h2: int, secs: float) -> int:
@@ -432,6 +462,10 @@ def run_stress(h1: int, h2: int, secs: float) -> int:
             _clean_h1(st, h1, f"/p{i}")
         except OSError as e:
             st.fail(f"prime /p{i}: {e}")
+    # Engagement is measured over the worker phase only: priming goes through
+    # L2 itself, so a counter read after the run is positive even when no
+    # worker request ever parked.
+    lookups_before = _l2_lookups(h1)
     until = time.time() + secs
     ts = [
         threading.Thread(target=_worker, args=(st, h1, h2, until))
@@ -441,15 +475,25 @@ def run_stress(h1: int, h2: int, secs: float) -> int:
         t.start()
     for t in ts:
         t.join()
+    lookups_after = _l2_lookups(h1)
+    if lookups_before is None or lookups_after is None:
+        st.fail(f"engagement: L2 counters unreadable ({lookups_before}, {lookups_after})")
+    elif lookups_after <= lookups_before:
+        st.fail(
+            f"engagement: no L2 lookup during the worker phase "
+            f"({lookups_before} -> {lookups_after}), so no worker request parked"
+        )
+    else:
+        st.count["l2_lookups_worker_phase"] = lookups_after - lookups_before
     # Held sockets: the clients are all gone; nginx must have closed its side.
     end = time.time() + HELD_DEADLINE
-    held = _established_to((h1, h2))
+    held = _held_to((h1, h2))
     while held and time.time() < end:
         time.sleep(0.5)
-        held = _established_to((h1, h2))
+        held = _held_to((h1, h2))
     if held:
         st.fail(
-            f"{len(held)} server-side socket(s) still ESTABLISHED "
+            f"{len(held)} server-side socket(s) still ESTABLISHED or CLOSE_WAIT "
             f"{HELD_DEADLINE}s after the last client closed: {held[:3]}"
         )
     if not (st.count.get("clean_h1_ok") and st.count.get("clean_h2_ok")):
