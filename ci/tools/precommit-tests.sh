@@ -139,8 +139,8 @@ NGINX_VERSION="${NGINX_VERSION#nginx-}"
 export ROOT PCT_TMP NGX_SRC NGX_OBJS NGINX_SRC NGINX_OBJS NGINX_VERSION
 
 # Compile + run one pure unit test from ci/tests/unit (flags as in run.sh).
-# Invoked from map commands via `bash -c` (export -f), hence the SC2317 waiver.
-# shellcheck disable=SC2317
+# Invoked from map commands via `bash -c` (export -f), hence the SC2317 and SC2329 waivers.
+# shellcheck disable=SC2317,SC2329
 ut() {
     local name="$1" ext="$2"
     shift 2
