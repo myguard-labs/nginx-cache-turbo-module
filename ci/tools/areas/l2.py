@@ -728,10 +728,18 @@ def test_l2_restore_href_array_alignment_ubsan(ng: Nginx, origin: Origin,
     ])                                                  # 4 hdrs: stack path
     _href_align_roundtrip(ng, origin, redis, "/l2e/href-align-24",
                           _align_hdrs(23, 1))           # 24 hdrs: stack, full
-    _href_align_roundtrip(ng, origin, redis, "/l2e/href-align-25",
-                          _align_hdrs(24, 2))           # 25 hdrs: pool, first
-    _href_align_roundtrip(ng, origin, redis, "/l2e/href-align-48",
-                          _align_hdrs(47, 3))           # 48 hdrs: pool path
+    # Pool path (25/48 headers): the refs array lands at the request pool's
+    # d.last, i.e. right after the byte-aligned ngx_pnalloc() of the blob copy
+    # whose size is the blob length. A fixed blob size therefore pins ONE
+    # offset residue (observed: always 0 mod 8), and a regressed ngx_pnalloc()
+    # for refs[] would pass by luck. Growing the body 0..7 bytes shifts the
+    # blob length through every residue mod 8, so an odd (misaligned) refs
+    # offset is hit deterministically (CT-ALIGN-POOL-OFFSET-DETERMINISM).
+    for pad in range(8):
+        _href_align_roundtrip(ng, origin, redis, f"/l2e/href-align-25-p{pad}",
+                              _align_hdrs(24, 2), body_pad=pad)
+        _href_align_roundtrip(ng, origin, redis, f"/l2e/href-align-48-p{pad}",
+                              _align_hdrs(47, 3), body_pad=pad)
 
 
 def _align_hdrs(n: int, pad: int) -> list[tuple[str, str]]:
@@ -744,7 +752,8 @@ def _align_hdrs(n: int, pad: int) -> list[tuple[str, str]]:
 
 def _href_align_roundtrip(ng: Nginx, origin: Origin, redis: RedisServer,
                           uri: str,
-                          extra: "list[tuple[str, str]]") -> None:
+                          extra: "list[tuple[str, str]]",
+                          body_pad: int = 0) -> None:
     """Seed a CTB5 blob carrying Content-Type plus `extra`, restore it via the
     L2-fill serve then the promoted L1 HIT, and require every header and the
     body byte-exact on both reads (worker survival is proven by
@@ -756,7 +765,7 @@ def _href_align_roundtrip(ng: Nginx, origin: Origin, redis: RedisServer,
     # single-entry array can land on an accidentally-aligned offset and hide
     # the bug. Values are distinct so a misaligned/garbage read is visible as
     # wrong bytes even if the worker does not outright crash.
-    seeded = b"href-align-body\n"
+    seeded = b"href-align-body\n" + b"p" * body_pad
     headers = {"Content-Type": "text/plain"}
     headers.update(extra)
     blob = make_ctb5_blob(seeded, headers=headers)
@@ -764,12 +773,18 @@ def _href_align_roundtrip(ng: Nginx, origin: Origin, redis: RedisServer,
     assert redis.cli("EXISTS", key) == "1", "failed to seed the alignment blob"
 
     origin_before = origin.hits
+    l2_hits_before = _admin_stat(ng, "l2_hits")
 
     # 1st read: L2-fill restore (the call site that allocates refs[] via
     # blob_validate(..., r->pool, &refs)); 2nd read: L1 HIT promoted from the
     # fill above -- same restore_response() call site, second walk of the same
     # refs-array allocation path.
     for stage in ("L2-fill serve", "L1 HIT serve"):
+        if stage == "L1 HIT serve":
+            # The 1st read must have been the L2 fill (exactly one L2 hit),
+            # else the "L2-fill" stage never reached the restore path.
+            assert _admin_stat(ng, "l2_hits") == l2_hits_before + 1, \
+                f"{uri}: 1st read was not exactly one L2 hit"
         st, body, h = fetch(ng.port, uri)
         assert st == 200, f"{uri} {stage}: status {st}"
         assert h.get("x-cache") == "HIT", \
@@ -784,6 +799,10 @@ def _href_align_roundtrip(ng: Nginx, origin: Origin, redis: RedisServer,
         assert origin.hits == origin_before, \
             f"{uri} {stage}: origin was consulted; response is not the " \
             "seeded blob"
+    # 2nd read must be an L1 serve: l2_hits unchanged since the fill. If both
+    # reads were L2 hits the promoted-L1 restore walk would go untested.
+    assert _admin_stat(ng, "l2_hits") == l2_hits_before + 1, \
+        f"{uri}: 2nd read was an L2 hit, not an L1 serve"
 
 
 def test_sie_forged_blob_cannot_inject_headers(ng: Nginx, origin: Origin,

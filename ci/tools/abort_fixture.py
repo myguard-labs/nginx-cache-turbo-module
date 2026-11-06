@@ -202,6 +202,39 @@ class ReplyCounter:
         return heads
 
 
+class CommandSplitter:
+    """Splits one connection's nginx-to-backend bytes into RESP commands.
+
+    feed() returns (commands, rest): the complete commands, and the bytes to
+    scan the old way. A stream that is not RESP (memcached text, HTTP) stops
+    being framed and comes back whole in `rest`; once framed is False every
+    later read is `rest` too.
+    """
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+        self.framed = True
+
+    def feed(self, data: bytes) -> tuple[list[bytes], bytes]:
+        if not self.framed:
+            return [], data
+        self.buf += data
+        cmds: list[bytes] = []
+        try:
+            while self.buf:
+                end = resp_value_end(self.buf)
+                if end is None:
+                    break
+                cmds.append(bytes(self.buf[:end]))
+                del self.buf[:end]
+        except ValueError:
+            self.framed = False
+            rest = bytes(self.buf)
+            self.buf.clear()
+            return cmds, rest
+        return cmds, b""
+
+
 class DelayProxy:
     """TCP proxy delaying the server-to-client direction by `delay` seconds.
 
@@ -300,7 +333,7 @@ class DelayProxy:
             time.sleep(min(remaining, deadline - now))
 
     def _note_request(self, data: bytes, old: int, now: float,
-                      pending: collections.deque[_Sighting]) -> None:
+                      pending: collections.deque[_Sighting | None]) -> None:
         """Note the markers in `data`, whose first `old` bytes are the tail of
         the previous read, carried over so a marker split across two reads is
         still seen. A match ending inside that tail was counted last time: a
@@ -322,8 +355,30 @@ class DelayProxy:
             s.count += 1
             pending.append(s)
 
+    def _note_command(self, cmd: bytes, now: float,
+                      pending: collections.deque[_Sighting | None]) -> None:
+        """Queue exactly one entry for one framed command: its sighting when it
+        carries a marker, else a placeholder (None), so an unwatched command
+        pipelined ahead of a watched one takes its own reply, not the
+        watched one's."""
+        self._busy_until = max(self._busy_until, now)
+        first: tuple[int, _Sighting] | None = None
+        for marker, s in self._watch.items():
+            at = cmd.find(marker)
+            if at != -1 and (first is None or at < first[0]):
+                first = (at, s)
+        if first is None:
+            pending.append(None)
+            return
+        s = first[1]
+        if not s.count:
+            s.seen_at = now
+            s.seen.set()
+        s.count += 1
+        pending.append(s)
+
     def _feed_request(self, tail: bytes, data: bytes, now: float,
-                      pending: collections.deque[_Sighting]) -> bytes:
+                      pending: collections.deque[_Sighting | None]) -> bytes:
         """Scan one nginx-to-backend read; return the tail to carry into the
         next one. The tail is cut from the previous tail plus this read, so a
         marker spread over three or more reads is still found."""
@@ -339,7 +394,9 @@ class DelayProxy:
         except OSError:
             cw.close()
             return
-        pending: collections.deque[_Sighting] = collections.deque()
+        pending: collections.deque[_Sighting | None] = collections.deque()
+
+        splitter = CommandSplitter()
 
         def deliver(data: bytes) -> None:
             if not cw.is_closing():
@@ -349,8 +406,12 @@ class DelayProxy:
             tail = b""
             while data := await cr.read(65536):
                 self.request_bytes += len(data)
-                tail = self._feed_request(tail, data, time.monotonic(),
-                                          pending)
+                now = time.monotonic()
+                cmds, rest = splitter.feed(data)
+                for cmd in cmds:
+                    self._note_command(cmd, now, pending)
+                if rest:
+                    tail = self._feed_request(tail, rest, now, pending)
                 uw.write(data)
                 await uw.drain()
 
@@ -371,7 +432,7 @@ class DelayProxy:
                     # op connection) keeps its first reply: that is the one
                     # ending the first park.
                     s = pending.popleft()
-                    if not s.replied.is_set():
+                    if s is not None and not s.replied.is_set():
                         s.reply_at = due
                         s.reply_head = head
                         s.replied.set()
@@ -1206,11 +1267,13 @@ def _before_deadline(anchor: ParkAnchor, parked_at: float, scale: float,
 
     The park is observed at parked_at, but an anchor whose park ends by itself
     (earliest_wake) is only open until then, which a slow observation can pass.
+    The guard scales with `scale`: a sanitizer build sends later after the
+    spin-sleep, so it needs a wider margin ahead of the wake.
     """
     deadline = parked_at + 0.03 * scale
     wake = getattr(anchor, "earliest_wake", None)
     if wake is not None:
-        deadline = min(deadline, wake() - ABORT_WAKE_GUARD)
+        deadline = min(deadline, wake() - ABORT_WAKE_GUARD * scale)
         if deadline <= (time.monotonic() if now is None else now):
             return None
     return deadline
@@ -1416,6 +1479,16 @@ class AbortRig:
             f"{want - base}: a key did not park the way this site needs")
 
 
+def _arm_failure(arm: str, rig: AbortRig, i: int, keys: int,
+                 exc: BaseException) -> AssertionError:
+    """The arm's failure for key `i`: fatal lines first, then the log tail."""
+    fatal = rig.node.fatal_lines()
+    cause = f"{len(fatal)} fatal lines, first: {fatal[0]}\n" if fatal else ""
+    log = rig.node.diagnostics().splitlines()[-8:]
+    return AssertionError(
+        f"{arm}: {cause}key {i}/{keys}: {exc}\nlog tail:\n" + "\n".join(log))
+
+
 def run_abort_arm(ng: Nginx, origin: Origin, site: AbortSite, kind: str,
                   timing: str) -> ArmResult:
     """Prime, restart cold, abort one parked request per key, stop, read logs.
@@ -1452,15 +1525,13 @@ def run_abort_arm(ng: Nginx, origin: Origin, site: AbortSite, kind: str,
                     held.extend(f"key {i}: client connection never closed: {h}"
                                 for h in rig.node.wait_released())
                     attempt += 1
-                    uri = rig.retry_uri(key, attempt)
+                    try:
+                        uri = rig.retry_uri(key, attempt)
+                    except AssertionError as exc:
+                        raise _arm_failure(arm, rig, i, keys, exc) from exc
                     continue
                 except (AssertionError, OSError) as exc:
-                    fatal = rig.node.fatal_lines()
-                    cause = f"{len(fatal)} fatal lines, first: {fatal[0]}\n" if fatal else ""
-                    log = rig.node.diagnostics().splitlines()[-8:]
-                    raise AssertionError(
-                        f"{arm}: {cause}key {i}/{keys}: {exc}\nlog tail:\n"
-                        + "\n".join(log)) from exc
+                    raise _arm_failure(arm, rig, i, keys, exc) from exc
                 break
             landings.append(_landing(timing, aborted_at, anchor.times()))
             # A request nothing finalizes logs nothing and does not crash: it
@@ -1785,6 +1856,9 @@ class KeepaliveClient:
             self.sock.close()
 
 
+REENTRY_HELD = "client connection never closed"
+
+
 def _reentry_one(rig: AbortRig, uri: str, arm: str,
                  landings: list[Landing]) -> tuple[list[str], bool]:
     """One parked request on a warmed connection; return what went wrong and
@@ -1847,8 +1921,7 @@ def _reentry_one(rig: AbortRig, uri: str, arm: str,
     finally:
         client.close()
     rig.node.wait_worker()
-    problems.extend(f"client connection never closed: {h}"
-                    for h in rig.node.wait_released())
+    problems.extend(f"{REENTRY_HELD}: {h}" for h in rig.node.wait_released())
     return problems, closed
 
 
@@ -1869,11 +1942,20 @@ def run_reentry_test(ng: Nginx, origin: Origin, site: AbortSite,
             uri, attempt = key, 0
             while True:
                 found, closed = _reentry_one(rig, uri, arm, landings)
+                if closed:
+                    # The abort came too late to be judged: the answer and
+                    # body checks of this attempt are not evidence, only a
+                    # held client socket is (a crash is in the fatal lines).
+                    found = [p for p in found if p.startswith(REENTRY_HELD)]
                 problems.extend(f"key {i}: {p}" for p in found)
                 if not closed:
                     break
                 attempt += 1
-                uri = rig.retry_uri(key, attempt)
+                try:
+                    uri = rig.retry_uri(key, attempt)
+                except AssertionError as exc:
+                    raise _arm_failure(name, rig, i, len(rig.uris), exc) \
+                        from exc
         rig.node.stop()
         fatal = rig.node.fatal_lines()
         result = ArmResult(name, landings, fatal + problems)

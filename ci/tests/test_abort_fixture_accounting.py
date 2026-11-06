@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import types
+import typing
 import unittest
 from unittest import mock
 
@@ -128,6 +129,24 @@ class ProxyCase(unittest.TestCase):
         proxy.wait_seen(marker, timeout=2.0)
         self.assertEqual(proxy.sighting(marker).count, 1)
 
+    def test_unwatched_command_ahead_does_not_take_the_sighting(self) -> None:
+        ping = b"*1\r\n$4\r\nPING\r\n"
+        get = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"
+        marker = b"GET\r\n$1\r\nk"
+        proxy, _ = self.rig(len(ping + get), [(0.0, b"+PONG\r\n$3\r\nabc\r\n")],
+                            [marker])
+        self.send(proxy, [(0.0, ping + get)])
+        proxy.wait_replied(marker, timeout=2.0)
+        self.assertEqual(proxy.sighting(marker).reply_head, b"$3\r\nabc\r\n")
+
+    def test_command_split_across_reads_is_one_sighting(self) -> None:
+        get = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"
+        marker = b"GET\r\n$1\r\nk"
+        proxy, _ = self.rig(len(get), [(0.0, b"+OK\r\n")], [marker])
+        self.send(proxy, [(0.0, get[:9]), (0.05, get[9:])])
+        proxy.wait_replied(marker, timeout=2.0)
+        self.assertEqual(proxy.sighting(marker).count, 1)
+
 
 class FakeAnchor:
     def __init__(self, parked_at: float, wake: float | None) -> None:
@@ -164,6 +183,16 @@ class DeadlineCase(unittest.TestCase):
         now = self.NOW
         self.assertIsNone(self.deadline(FakeAnchor(now, now - 0.01)))
 
+    def test_wake_guard_scales_with_the_sanitizer_factor(self) -> None:
+        now = self.NOW
+        wake = now + 0.05          # unscaled guard (10ms) leaves 40ms open
+        with mock.patch.object(af.time, "monotonic", return_value=now):
+            self.assertIsNotNone(
+                af._before_deadline(FakeAnchor(now, wake), now, 1.0))
+            # at x10 the guard is 100ms: the wake is inside it, window closed
+            self.assertIsNone(
+                af._before_deadline(FakeAnchor(now, wake), now, 10.0))
+
     def test_anchor_without_a_wake_is_unchanged(self) -> None:
         now = self.NOW
         got = self.deadline(FakeAnchor(now, None))
@@ -189,6 +218,157 @@ class RetryCase(unittest.TestCase):
     def test_primed_key_cannot_be_retried(self) -> None:
         with self.assertRaisesRegex(AssertionError, "primed"):
             af.AbortRig.retry_uri(self.rig(True), "/ab/k", 1)
+
+
+class FakeNode:
+    def __init__(self, fatal: list[str] | None = None) -> None:
+        self._fatal = fatal or []
+
+    def require_http2(self) -> None:
+        pass
+
+    def wait_released(self) -> list[str]:
+        return []
+
+    def fatal_lines(self) -> list[str]:
+        return list(self._fatal)
+
+    def diagnostics(self) -> str:
+        return "\n".join(f"log{n}" for n in range(12))
+
+    def stop(self) -> None:
+        pass
+
+    def assert_clean_logs(self) -> None:
+        pass
+
+
+class FakeAbortRig(af.AbortRig):
+    """The real retry_uri and origin accounting around a fake node."""
+    instances: typing.ClassVar[list["FakeAbortRig"]] = []
+
+    def __init__(self, ng, site, slug, keys) -> None:
+        self.site = site
+        self.uris = [f"/{site.name}/k{n}" for n in range(keys)]
+        self.retired: list[str] = []
+        self.delay = 0.1
+        self.node = FakeNode()
+        self.anchored: list[str] = []
+        FakeAbortRig.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        pass
+
+    def anchor(self, uri: str):
+        self.anchored.append(uri)
+        return types.SimpleNamespace(times=lambda: af.ParkTimes(
+            0.5, 2.0, 0.0, 0.0, True))
+
+
+def fake_site() -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        name="s", prime=False, origin_hits=1, method="GET",
+        request_target=lambda u: u)
+
+
+class FakeOrigin:
+    """hits_for() is 0 at the arm's baseline read, `hits` after it."""
+
+    def __init__(self, hits: int) -> None:
+        self.hits, self.reads = hits, 0
+
+    def hits_for(self, prefix: str) -> int:
+        self.reads += 1
+        return 0 if self.reads == 1 else self.hits
+
+
+class ClosedWindowCase(unittest.TestCase):
+    def setUp(self) -> None:
+        FakeAbortRig.instances.clear()
+        p = mock.patch.object(af, "AbortRig", FakeAbortRig)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_abort_arm_retries_closed_keys_without_a_landing(self) -> None:
+        def one(node, anchor, kind, timing, index, delay, path, method):
+            if path.endswith("-r1"):
+                return 1.0
+            raise af.ParkWindowClosed()
+
+        with mock.patch.object(af, "_abort_one", side_effect=one):
+            # 3 first tries + 3 retries reach the origin once each
+            res = af.run_abort_arm(None, FakeOrigin(6), fake_site(),
+                                   "http1_rst", "before")
+        rig = FakeAbortRig.instances[0]
+        self.assertEqual(rig.retired, [f"{u}-r1" for u in rig.uris])
+        self.assertEqual(len(res.landings), len(rig.uris))
+        self.assertEqual(rig.anchored[1::2], rig.retired)
+        self.assertEqual(res.fatal, [])
+
+    def test_abort_arm_origin_accounting_counts_retired_keys(self) -> None:
+        def one(node, anchor, kind, timing, index, delay, path, method):
+            if path.endswith("-r1"):
+                return 1.0
+            raise af.ParkWindowClosed()
+
+        with mock.patch.object(af, "_abort_one", side_effect=one), \
+                self.assertRaisesRegex(AssertionError, "reached the origin"):
+            af.run_abort_arm(None, FakeOrigin(3), fake_site(),
+                             "http1_rst", "before")
+
+    def test_abort_arm_retry_exhaustion_is_wrapped_like_the_sibling(self):
+        with mock.patch.object(af, "_abort_one",
+                               side_effect=af.ParkWindowClosed()), \
+                self.assertRaises(AssertionError) as cm:
+            af.run_abort_arm(None, FakeOrigin(0), fake_site(),
+                             "http1_rst", "before")
+        msg = str(cm.exception)
+        self.assertIn("s http1_rst before:", msg)
+        self.assertIn("key 0/3", msg)
+        self.assertIn("fixture error", msg)
+        self.assertIn("log tail:", msg)
+
+    def reentry(self, closed_problems: list[str]) -> None:
+        calls: list[str] = []
+
+        def one(rig, uri, arm, landings):
+            calls.append(uri)
+            if not uri.endswith("-r1"):
+                return list(closed_problems), True
+            landings.append(af.Landing(True, -0.01))
+            return [], False
+
+        site = fake_site()
+        ng = types.SimpleNamespace(root=types.SimpleNamespace(parent=None))
+        with mock.patch.object(af, "_reentry_one", side_effect=one), \
+                mock.patch.object(af, "reentry_site", lambda s, _: s):
+            af.run_reentry_test(ng, FakeOrigin(6), site, "rst")
+        self.assertEqual(len(calls), 6)
+
+    def test_reentry_closed_attempt_answer_problems_are_dropped(self) -> None:
+        self.reentry(["wrong answer: late", "extra backend op: late",
+                      "no complete answer: late"])
+
+    def test_reentry_closed_attempt_keeps_the_held_socket(self) -> None:
+        with self.assertRaisesRegex(AssertionError,
+                                    "client connection never closed"):
+            self.reentry(["wrong answer: late",
+                          f"{af.REENTRY_HELD}: sock"])
+
+    def test_reentry_retry_exhaustion_is_wrapped_like_the_abort_arm(self):
+        ng = types.SimpleNamespace(root=types.SimpleNamespace(parent=None))
+        with mock.patch.object(af, "_reentry_one",
+                               side_effect=lambda *a: ([], True)), \
+                mock.patch.object(af, "reentry_site", lambda s, _: s), \
+                self.assertRaises(AssertionError) as cm:
+            af.run_reentry_test(ng, FakeOrigin(0), fake_site(), "rst")
+        msg = str(cm.exception)
+        self.assertIn("s reentry rst:", msg)
+        self.assertIn("key 0/3", msg)
+        self.assertIn("log tail:", msg)
 
 
 if __name__ == "__main__":

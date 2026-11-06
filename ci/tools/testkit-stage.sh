@@ -334,7 +334,10 @@ if [ "$SANITIZE" -eq 1 ]; then
     # asan-module-reinstrument.sh (MODULE_SAN), exactly as ci-build.sh does.
     # Capture the version first: `cc --version | grep -q` under pipefail can
     # SIGPIPE the producer when grep exits early.
-    CC_VERSION="$("${CC:-cc}" --version 2>/dev/null || true)"
+    # CC may carry flags (e.g. "clang -m64"): split it into words so the
+    # probe runs the compiler, not a single executable named "clang -m64".
+    read -ra cc_words <<<"${CC:-cc}"
+    CC_VERSION="$("${cc_words[@]}" --version 2>/dev/null || true)"
     case "$CC_VERSION" in
         *[Cc][Ll][Aa][Nn][Gg]*)
             SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"

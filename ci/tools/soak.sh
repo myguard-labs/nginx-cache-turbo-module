@@ -67,6 +67,9 @@ EDGE=18345
 ORIGIN=18335
 ABORT="${ABORT:-0}"
 if [ "$ABORT" = "1" ]; then
+    # The header promises the L2 flags are ignored: an inherited REDIS or
+    # MEMCACHED must not arm the real-backend engagement gates below.
+    unset REDIS MEMCACHED
     ABORT_BASE="${ABORT_PORT_BASE:-28950}"
     EDGE="$ABORT_BASE"; EDGE_H2=$((ABORT_BASE + 1))
     ORIGIN=$((ABORT_BASE + 2)); KVPORT=$((ABORT_BASE + 3))
@@ -289,6 +292,14 @@ fi
 NGINX_PID=$!
 
 for _ in $(seq 1 100); do
+    # Fail fast when nginx died at startup (bad config/module/binary) instead
+    # of letting the clients print dozens of "Connection refused" lines.
+    if ! kill -0 "$NGINX_PID" 2>/dev/null; then
+        wait "$NGINX_PID" 2>/dev/null && _rc=0 || _rc=$?
+        echo "FAIL: nginx exited at startup (rc=$_rc) before accepting connections" >&2
+        tail -20 "$WORK/logs/error.log" >&2 2>/dev/null || true
+        exit 1
+    fi
     if [ "$ABORT" = "1" ]; then
         # No /tiny in abort mode: wait for the edge port to accept.
         (exec 3<>"/dev/tcp/127.0.0.1/$EDGE") 2>/dev/null && break
@@ -337,7 +348,7 @@ worker() {
 
 stress_rc=0
 if [ "$ABORT" = "1" ]; then
-    python3 -I "$SOAK_ABORT_PY" stress "$EDGE" "$EDGE_H2" "$DURATION" \
+    python3 -I "$SOAK_ABORT_PY" stress "$EDGE" "$EDGE_H2" "$DURATION" "$KVPORT" \
         || stress_rc=$?
 else
     pids=()

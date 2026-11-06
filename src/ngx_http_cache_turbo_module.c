@@ -2979,7 +2979,7 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     u_char                           *body;
     size_t                            body_len;
     ngx_int_t                         rc;
-    ngx_buf_t                        *b;
+    ngx_buf_t                        *b = NULL;
     ngx_chain_t                       out;
     ngx_http_cache_turbo_ctx_t       *ctx;
     ngx_pool_cleanup_t               *cln;
