@@ -1,4 +1,4 @@
-# sync-sha: efe4cd43891940e2966fe77b67d80259ed39f9107d031fa3595557de264d0a88
+# sync-sha: e450e3f8a3638304bee08910b4d32b513ae408845a5fd08180171bf4722ca02a
 name: CodeQL
 
 env:
@@ -61,7 +61,7 @@ jobs:
       # database. This still caches the upstream tarball and ensures mold/
       # eatmydata (link/IO-only, safe for tracing).
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: module
           nginx-version: ${{ env.NGINX_VERSION }}

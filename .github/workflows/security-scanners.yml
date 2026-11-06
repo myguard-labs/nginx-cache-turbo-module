@@ -1,4 +1,4 @@
-# sync-sha: 23feaea2c086f248aaeeb2b6a6d2c22d0b057f88c38887456770de4b15b62a97
+# sync-sha: 725deebef6632ff8e64e95b1492b016c56ffb8cc0de0d38e655221574e32c44b
 name: Security scanners
 
 # Static/security scanners gate (flawfinder, clang-tidy cert-*/security.*,
@@ -64,7 +64,7 @@ jobs:
           tar -xzf "$archive" -C /tmp gitleaks
           /tmp/gitleaks git --no-banner .
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: module
           nginx-version: ${{ env.NGINX_VERSION }}

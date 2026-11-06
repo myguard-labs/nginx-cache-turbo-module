@@ -231,6 +231,12 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
          * in the shared completion. */
         r->main->count--;
 
+        /* CT-PARKED-REENTRY: still parked on the walk; a client event
+         * must not re-run this phase handler. walk_finish only ever
+         * finalizes (never run_phases), and finalize installs its own
+         * handlers, so no restore is needed. */
+        r->write_event_handler = ngx_http_cache_turbo_parked_handler;
+
         return NGX_DONE;
     }
 

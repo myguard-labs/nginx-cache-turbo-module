@@ -168,6 +168,15 @@ Test::Nginx files, runtime suites under `tools/`) — look at the existing
 tests in this repo and put yours next to them. A PR that adds code without
 a test will not be merged, and yes, we check.
 
+### Parked requests need an abort test
+
+Every `r->main->count++` park (`rg -n 'r->main->count\+\+' src/`) needs a test
+that aborts the request while it is parked (client close, timeout, worker exit)
+and proves the resume path neither leaks the count nor touches a freed request.
+A new park without such an abort test fails review. The resume order itself
+(finalize first, `ngx_http_run_posted_requests(c)` last, `c` hoisted before the
+finalize) is enforced mechanically by `ci/linter/lint-resume-order.sh`.
+
 ### Running the runtime test suite
 
 The end-to-end test suite (`ci/tools/test_runtime.py`) requires the module to be

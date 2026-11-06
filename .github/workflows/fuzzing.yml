@@ -1,4 +1,4 @@
-# sync-sha: c834f76579388cf4aeb095f972639372df76d657cf6bcc9d8755bdc583bf6024
+# sync-sha: db26d5e2b04db349f9d1361d863098eee4cf8540873f511d48d731b469baabec
 name: Fuzzing
 
 # Fast fuzz regression gate on every PR/push — 60s/target on all five parser
@@ -63,7 +63,7 @@ jobs:
           sudo apt-get install -y clang
 
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: debug
           nginx-version: ${{ env.NGINX_VERSION }}

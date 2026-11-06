@@ -98,6 +98,12 @@ CC_OPT="$TEST_OPT -DNGX_DEBUG_PALLOC=1 -g3 -O0 -fno-omit-frame-pointer -funwind-
 LD_OPT=""
 ADD_MODULE="--add-dynamic-module=$MODULE_DIR"
 WITH_DEBUG="--with-debug"
+# The runtime suite's client-abort fixture (ci/tools/abort_fixture.py) drives
+# HTTP/2 RST_STREAM and connection close against a parked request, so every
+# mode that runs the suite needs the v2 module. The two benchmark modes below
+# clear it to stay neutral baselines.
+WITH_HTTP2="--with-http_v2_module"
+MODULE_SAN=""
 case "$MODE" in
     asan)
         # Disable the UBSan sub-checks that nginx CORE trips as benign false
@@ -107,16 +113,30 @@ case "$MODE" in
         #   nonnull-attribute - core passes NULL + len 0 to memcpy in the
         #                        proxy/upstream path.
         #   pointer-overflow  - core p +/- n arithmetic UBSan flags on buffers.
-        # ASan and the rest of UBSan stay on. These -fno-sanitize sub-check
-        # names are clang-specific; gcc's configure rejects nonnull-attribute/
-        # pointer-overflow. Only add them under clang (the local soak path);
-        # gcc keeps plain -fsanitize (CI was green, gcc doesn't trip these FPs).
-        SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+        #   alignment         - core HTTP/2 writes uint32 frame fields through
+        #                        unaligned pointers (ngx_http_v2_write_uint32 on
+        #                        NGX_HAVE_NONALIGNED); reached since asan mode builds
+        #                        the v2 module for the abort fixture. Both compilers.
+        # ASan and the rest of UBSan stay on. gcc 14 accepts -fno-sanitize=
+        # nonnull-attribute (and pointer-overflow) but rejects `function`, so gcc
+        # gets alignment + nonnull-attribute (the --with-debug log path
+        # ngx_http_process_request_uri -> ngx_log_error_core -> ngx_sprintf_str
+        # hands memcpy a NULL pointer with len 0 for an empty log arg; core-only
+        # stack, src/core/ngx_string.c:586). function and pointer-overflow are
+        # only added under clang (the local soak path), where they are known.
+        #
+        # alignment and nonnull-attribute are CORE-only exclusions: after
+        # configure, asan-module-reinstrument.sh re-enables them on the
+        # module's objs/addon/* objects (MODULE_SAN below), so module code stays
+        # fully checked -- test_l2_restore_href_array_alignment_ubsan relies on
+        # UBSan alignment catching a misaligned module refs[] access.
+        SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=alignment,nonnull-attribute -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
         if "${CC:-cc}" --version 2>/dev/null | grep -qi clang; then
-            SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+            SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow,alignment -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
         fi
         CC_OPT="$SAN"
         LD_OPT="$SAN"
+        MODULE_SAN="alignment,nonnull-attribute"
         # ASan needs the module linked into the binary (static), not dlopen'd.
         ADD_MODULE="--add-module=$MODULE_DIR"
         ;;
@@ -160,6 +180,7 @@ case "$MODE" in
         CC_OPT="$TEST_OPT -flto=auto -ffat-lto-objects"
         LD_OPT="-flto=auto"
         WITH_DEBUG=""
+        WITH_HTTP2=""
         ;;
     profile)
         # -O2 to match a real release build (bench.sh's `nginx` mode is only
@@ -175,6 +196,7 @@ case "$MODE" in
         CC_OPT="$TEST_OPT -g -O2 -fno-omit-frame-pointer -flto=auto -ffat-lto-objects"
         LD_OPT="-flto=auto"
         WITH_DEBUG=""
+        WITH_HTTP2=""
         ;;
 esac
 
@@ -209,6 +231,7 @@ cd "$ROOT/$DIR"
     --with-compat \
     --with-threads \
     $WITH_DEBUG \
+    $WITH_HTTP2 \
     --with-cc="$WITH_CC" \
     --with-http_realip_module \
     --with-http_ssl_module \
@@ -222,6 +245,12 @@ cd "$ROOT/$DIR"
 if [ "$MODE" = "configure" ]; then
     printf 'tree=%s\n' "$ROOT/$DIR"
     exit 0
+fi
+
+# Scope asan mode's core-only UBSan exclusions: put the checks back on the
+# module's own objects (fails the build if the Makefile cannot be rewritten).
+if [ -n "$MODULE_SAN" ]; then
+    bash "$MODULE_DIR/ci/tools/asan-module-reinstrument.sh" objs/Makefile "$MODULE_SAN"
 fi
 
 if [ "$MODE" != "asan" ]; then

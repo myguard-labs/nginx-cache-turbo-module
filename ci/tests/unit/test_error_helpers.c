@@ -2,6 +2,7 @@
 #include "ngx_shim_error_helpers.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #include "generated_error_helpers.inc"
 
@@ -28,6 +29,9 @@ ngx_uint_t  ngx_test_redis_clear_calls;
 ngx_uint_t  ngx_test_redis_done_calls;
 ngx_http_cache_turbo_redis_op_t *ngx_test_redis_done_op;
 ngx_uint_t  ngx_test_phase_calls;
+ngx_uint_t  ngx_test_unpark_calls;
+char        ngx_test_resume_seq[16];
+ngx_uint_t  ngx_test_resume_seq_len;
 ngx_uint_t  ngx_test_posted_calls;
 ngx_uint_t  ngx_test_finalize_calls;
 ngx_http_request_t *ngx_test_finalize_request;
@@ -149,6 +153,9 @@ reset_observations(void)
     ngx_test_destroy_pool_calls = 0;
     ngx_test_last_destroyed_pool = NULL;
     ngx_test_phase_calls = 0;
+    ngx_test_unpark_calls = 0;
+    ngx_test_resume_seq[0] = '\0';
+    ngx_test_resume_seq_len = 0;
     ngx_test_posted_calls = 0;
     ngx_test_finalize_calls = 0;
     ngx_test_finalize_request = NULL;
@@ -306,6 +313,9 @@ check_mc_get_completion(ngx_http_cache_turbo_mc_op_t *op,
               && ngx_test_finalize_request == r
               && ngx_test_finalize_rc == NGX_DONE,
           "memcached failed GET must resume and release its parked request once");
+    CHECK(ngx_test_unpark_calls == 1
+              && strcmp(ngx_test_resume_seq, "URFP") == 0,
+          "memcached failed GET must unpark, resume, finalize, then run posted");
 }
 
 static void
@@ -433,6 +443,9 @@ check_redis_resume(ngx_http_cache_turbo_redis_op_t *op,
               && ngx_test_finalize_request == r
               && ngx_test_finalize_rc == NGX_DONE,
           "Redis terminal request must resume and release its park once");
+    CHECK(ngx_test_unpark_calls == 1
+              && strcmp(ngx_test_resume_seq, "URFP") == 0,
+          "Redis terminal request must unpark, resume, finalize, then run posted");
 }
 
 static void
@@ -499,6 +512,8 @@ test_redis_sscan_zero_byte(void)
               && ngx_test_posted_calls == 1 && ngx_test_finalize_calls == 1
               && ngx_test_finalize_rc == ngx_test_members_result,
           "Redis SSCAN failure must tear down and finalize exactly once");
+    CHECK(strcmp(ngx_test_resume_seq, "FP") == 0,
+          "Redis SSCAN failure must finalize before running posted requests");
 
     init_redis(&op, &clcf, &ctx, &request, &pool);
     op.members_cb = members_callback;

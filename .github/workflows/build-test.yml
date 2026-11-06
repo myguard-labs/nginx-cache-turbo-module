@@ -1,4 +1,4 @@
-# sync-sha: 85e4ff5421b8172d1ddcc6dc759c960f06f2ac150f1fc67304cd82e24ddce9ac
+# sync-sha: fd32c8372ede7eef46f9e7ce23330cb8661bcbda05378996e39b13bd5e1eb22d
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -265,7 +265,7 @@ jobs:
       # .build/nginx-<ver> path, so a cached tree could poison a later
       # sanitizer job -- ccache gives the compile win content-keyed and safe.
       - name: Restore build caches
-        uses: ./.github/actions/build-cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
           mode: debug
           nginx-version: ${{ env.NGINX_VERSION }}
@@ -370,7 +370,9 @@ jobs:
   runtime:
     name: Runtime
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    timeout-minutes: 20
+    # The suite now includes the CT-RESUME-FINALIZE-UAF abort/re-entry arms
+    # (~19 min for the whole runtime suite on PR #503), past 20 min / 1200s.
+    timeout-minutes: 40
     # REQUIRED CHECK: always report this check, but run full suite only when
     # code changed. When docs-only, skip and report quick success.
     # Always needs build, but build will be skipped if skip-expensive-jobs=true.
@@ -462,9 +464,10 @@ jobs:
           # (max within ~1.2x) -- a slower/contended runner risks the
           # guard firing mid-test and reading as an R6b hang (SUITE-
           # TIMEOUT-MARGIN, memory/labs/nginx-cache-turbo-module/TODO.md).
-          # Raised to 1200s to match asan.yml's bound and restore real
-          # headroom (900s -> 1200s, +451s over observed max).
-          bash ci/tools/ci-hang-guard.sh 1200 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+          # Raised to 1200s then (900s -> 1200s, +451s over observed max).
+          # PR #503's abort/re-entry arms took this step to 1156s, so it is
+          # now 2100s (~1.8x) with the job at 40 minutes.
+          bash ci/tools/ci-hang-guard.sh 2100 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
               python3 ci/tools/test_runtime.py \

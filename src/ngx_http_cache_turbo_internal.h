@@ -1423,6 +1423,25 @@ ngx_int_t ngx_http_cache_turbo_filter_chain_init(void);
 ngx_int_t ngx_http_cache_turbo_access_handler(ngx_http_request_t *r);
 ngx_int_t ngx_http_cache_turbo_precontent_handler(ngx_http_request_t *r);
 
+/* CT-PARKED-REENTRY: r->write_event_handler while a phase handler has parked
+ * the request (r->main->count++, NGX_AGAIN/NGX_DONE). The phase engine leaves
+ * ngx_http_core_run_phases installed there, so any client write event during
+ * the park (a keepalive connection whose earlier send blocked keeps EPOLLOUT
+ * armed; a client byte or RST then fires it) would re-run the parking handler
+ * and start a second op on the same request. Same idiom as limit_req's delay:
+ * swap the handler at the park, restore ngx_http_core_run_phases right before
+ * the resume calls it. The restore is conditional (unpark) so a terminate that
+ * installed ngx_http_terminate_handler while parked is not clobbered. */
+void ngx_http_cache_turbo_parked_handler(ngx_http_request_t *r);
+
+static ngx_inline void
+ngx_http_cache_turbo_unpark(ngx_http_request_t *r)
+{
+    if (r->write_event_handler == ngx_http_cache_turbo_parked_handler) {
+        r->write_event_handler = ngx_http_core_run_phases;
+    }
+}
+
 /* PERF-7 blob-reference cleanup record. Lives here rather than in access.c
  * because ngx_http_cache_turbo_serve() (module.c) allocates one as pool cleanup
  * data and writes both fields, while access.c owns the handler that reads and

@@ -831,6 +831,7 @@ ngx_http_cache_turbo_memcached_get(ngx_http_request_t *r,
     /* Parked: hold a reference so the request survives until the reply resumes
      * it (released by ngx_http_finalize_request(NGX_DONE) in get_finish). */
     r->main->count++;
+    r->write_event_handler = ngx_http_cache_turbo_parked_handler;
 
     return NGX_AGAIN;
 }
@@ -1269,8 +1270,10 @@ ngx_http_cache_turbo_mc_op_done(ngx_http_cache_turbo_mc_op_t *op)
 /*
  * GET path teardown + resume. On a hit the blob (which lives in the op pool) is
  * copied into the request pool first, then recorded in ctx; the op pool is torn
- * down, and finally the parked request is resumed through the phase engine and
- * its parked reference released — the same park/resume dance as the Redis driver.
+ * down, and finally the parked request is resumed through the phase engine, its
+ * parked reference released, and only then the connection's posted requests
+ * run — the same park/resume dance, in the same order, as the Redis driver's
+ * get_finish, which explains why that order matters (CT-RESUME-FINALIZE-UAF).
  */
 static void
 ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
@@ -1278,6 +1281,7 @@ ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
 {
     ngx_http_request_t          *r = op->request;
     ngx_http_cache_turbo_ctx_t  *ctx = op->ctx;
+    ngx_connection_t            *c = r->connection;
     u_char                      *copy;
 
     /* Read handlers call this directly; write failures arrive through
@@ -1316,10 +1320,12 @@ ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
     /* tear down our own connection + pool (blob is now copied into r->pool) */
     ngx_http_cache_turbo_mc_op_done(op);
 
-    /* resume the parked request, then release the reference taken at park */
+    /* resume the parked request, release the reference taken at park, then run
+     * what the resume posted, which may free r: r is not touched after it */
+    ngx_http_cache_turbo_unpark(r);
     ngx_http_core_run_phases(r);
-    ngx_http_run_posted_requests(r->connection);
     ngx_http_finalize_request(r, NGX_DONE);
+    ngx_http_run_posted_requests(c);
 }
 
 

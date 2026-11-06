@@ -38,6 +38,7 @@ typedef struct {
 } ngx_pool_t;
 
 typedef struct ngx_http_request_s ngx_http_request_t;
+typedef void (*ngx_http_event_handler_pt)(ngx_http_request_t *r);
 typedef struct ngx_http_cache_turbo_loc_conf_s
     ngx_http_cache_turbo_loc_conf_t;
 typedef struct ngx_http_cache_turbo_zone_s ngx_http_cache_turbo_zone_t;
@@ -59,7 +60,16 @@ struct ngx_http_request_s {
     ngx_str_t            sent_body;
     ngx_uint_t           finalize_calls;
     ngx_int_t            finalized_rc;
+    ngx_http_event_handler_pt  write_event_handler;
 };
+
+/* CT-PARKED-REENTRY: the parked purge walk installs this so a client event
+ * cannot re-run the phase handler. Recorded by address only. */
+static void
+ngx_http_cache_turbo_parked_handler(ngx_http_request_t *r)
+{
+    (void) r;
+}
 
 typedef struct {
     ngx_str_t  cache_key;

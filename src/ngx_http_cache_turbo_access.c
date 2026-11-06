@@ -3619,7 +3619,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
  * (or the cross-node NX) parks on a short timer and re-checks L1/L2 until the
  * winner fills the entry (a later re-entry then serves it) or lock_timeout
  * elapses, at which point it falls through to the origin itself. Mirrors the
- * redis park/resume dance: count++ here, finalize(NGX_DONE) in the timer handler. */
+ * redis park/resume dance: count++ here, finalize(NGX_DONE) in the timer handler,
+ * ahead of the posted requests (CT-RESUME-FINALIZE-UAF). */
 static ngx_int_t
 ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
@@ -3773,6 +3774,7 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
 
     ngx_add_timer(&ctx->cold_wait_ev, delay);
     r->main->count++;
+    r->write_event_handler = ngx_http_cache_turbo_parked_handler;
     /* We are now genuinely parked: any subsequent re-entry is a re-poll, so the
      * V-HANG-2 give-up at the top of this function may trust an
      * l2_present_unserveable observed from here on. Never cleared. */
@@ -3787,7 +3789,8 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
 
 /* Timer fired: re-drive the parked waiter through the phase engine (re-enters the
  * access handler, which re-checks L1/L2). Same teardown as the redis get_finish
- * resume — run_phases, run_posted_requests, then release the parked reference. */
+ * resume — run_phases, release the parked reference, then run_posted_requests on
+ * the connection captured up front, since a pending terminate frees r there. */
 static void
 ngx_http_cache_turbo_cold_wait_timeout(ngx_event_t *ev)
 {
@@ -3797,9 +3800,21 @@ ngx_http_cache_turbo_cold_wait_timeout(ngx_event_t *ev)
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
                    "cache_turbo: cold-miss wait wake \"%V\"", &r->uri);
 
+    ngx_http_cache_turbo_unpark(r);
     ngx_http_core_run_phases(r);
-    ngx_http_run_posted_requests(c);
     ngx_http_finalize_request(r, NGX_DONE);
+    ngx_http_run_posted_requests(c);
+}
+
+
+/* CT-PARKED-REENTRY: write_event_handler of a parked request (see internal.h).
+ * The park's own completion resumes it; a client event in between is ignored,
+ * exactly like ngx_http_request_empty_handler but with a debug trace. */
+void
+ngx_http_cache_turbo_parked_handler(ngx_http_request_t *r)
+{
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cache_turbo: client event while parked, ignored");
 }
 
 

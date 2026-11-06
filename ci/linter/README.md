@@ -24,6 +24,7 @@ finding shellcheck could have named in two seconds. Every script is standalone;
 | `lint-shm-lock.sh` | `src/*.[ch]` | **this module's own** (no skeleton counterpart): the shm-mutex hold invariant, issue R7 — the zone mutex is never held across anything that yields to the event loop, parks the request or registers a timer |
 | `lint-stripe-seam.sh` | `src/*.[ch]` | **this module's own** (no skeleton counterpart): the stripe seam, P4-2-s3b — no site reaches a zone's slab pool except through `ngx_http_cache_turbo_zone_sh()` / `_zone_pool()` / `_zone_mutex()` or the key-directed `stripe_of()`. A stray bare `z->shpool` is invisible at today's N == 1 and becomes a cross-pool free once N > 1 |
 | `lint-atomic-ordering.sh` | `src/**/*.[ch]` (recursive) | **this module's own** (no skeleton counterpart): tripwire for `CI-ARM64-NO-LIVE-LANE` — `src/` must not gain `ngx_memory_barrier` or a raw `__atomic_*` call with an explicit weak ordering, which would void the accepted no-arm64-lane risk |
+| `lint-resume-order.sh` | `src/*.[ch]` | **this module's own** (no skeleton counterpart): the resume-finalize order invariant — `ngx_http_run_posted_requests()` is the last use of the request in its function (no later `r`) and never takes `r->connection`; hoist `c = r->connection`, then `ngx_http_finalize_request(r, ...)`, then `ngx_http_run_posted_requests(c)`. The reverse order is a use-after-free (9c32123). Scanner is in the wrapper; `--scan files...` skips the `src/` selection for the selftest fixtures under `fixtures/resume-order/` |
 | `lint-carve-init.sh` | `src/*.[ch]` | **this module's own** (no skeleton counterpart): the shctx carve-init invariant, CARVE-INIT — every `ngx_http_cache_turbo_shctx_t` member is explicitly initialised in `shm_init_zone()`'s carve block. `ngx_slab_alloc()` does not zero, but the fresh-carve path lands on kernel-zeroed pages, so an omitted member reads 0 anyway and is invisible to every runtime test |
 | `lint-suite-docs.sh` | `ci/t/`, `ci/tools/`, `docs/`, `src/`, `README.md` | **this module's own**: orphan `.t` files no suite runs, the documented preset count against the presets that exist, and TLS-fixture teardown |
 | `lint-spelling.sh` | all tracked files | codespell over prose, comments and log strings; vendored trees excluded via `lib.sh` |
@@ -144,12 +145,15 @@ sudo cpanm --notest Perl::Critic          # only if libperl-critic-perl was unav
 an install step has no business demanding.
 
 ```sh
-pipx install zizmor                 # GitHub Actions security audit
+pipx install zizmor==1.32.0        # GitHub Actions security audit
 ```
 
-`zizmor` is deliberately **not** pinned, unlike ruff and semgrep: its rule set
-is the whole point, and a frozen security scanner stops finding what it was
-added for. A new rule going red is a finding to triage, not drift to suppress.
+`zizmor` is pinned like ruff and semgrep. It used to float so the rule set
+would keep growing, but a runner picking up a newer release (one carrying the
+`self-repository` audit, added in 1.30) turned unrelated PRs red with findings
+they did not introduce. Bump the pin deliberately, in a change that triages every new
+finding (fix it, or a `# zizmor: ignore[rule]` with the reason), so the rule
+set still advances, just under review.
 
 **upstream binary (no apt/pip/cpan source)**
 
@@ -415,6 +419,13 @@ repo-settings context; that belongs in a periodic review.
 
 Inapplicable finding → `# zizmor: ignore[rule]` on the line, with the reason.
 Never a blanket disable in a `zizmor.yml`.
+
+`self-repository` (zizmor 1.30+) wants `uses: $/.github/...` instead of
+`uses: ./.github/...`. GitHub supports `$/` (July 2026), but the pinned
+actionlint 1.7.7 rejects it as an invalid action reference, and
+`workflow_policy.py` matches the `./.github/workflows/` prefix, so the local
+`uses:` lines carry a per-line ignore. Drop the ignores together with the
+actionlint pin bump once actionlint and the self-hosted runners accept `$/`.
 
 ## In CI
 

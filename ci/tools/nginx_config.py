@@ -68,6 +68,10 @@ PORT_OFFSETS: dict[str, int] = {
     # somebody eventually binds.
     "redis_dead": 29,
     "redis_dirty_reply": 30,  # test_redis_dirty_reply_not_pooled()
+    # abort_fixture.py: one-worker node (HTTP/1, HTTP/2) and its delay proxy.
+    "abort_node": 31,
+    "abort_node_h2": 32,
+    "abort_proxy": 33,
 }
 
 
