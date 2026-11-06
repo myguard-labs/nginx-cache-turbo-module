@@ -131,9 +131,14 @@ case "$MODE" in
         # fully checked -- test_l2_restore_href_array_alignment_ubsan relies on
         # UBSan alignment catching a misaligned module refs[] access.
         SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=alignment,nonnull-attribute -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
-        if "${CC:-cc}" --version 2>/dev/null | grep -qi clang; then
+        # Capture first: `cc --version | grep -q` under pipefail can SIGPIPE the
+        # producer when grep exits early and fail a clang match spuriously.
+        CC_VERSION="$("${CC:-cc}" --version 2>/dev/null || true)"
+        case "$CC_VERSION" in
+            *[Cc][Ll][Aa][Nn][Gg]*)
             SAN="$TEST_OPT -fsanitize=address,undefined -fno-sanitize=function,nonnull-attribute,pointer-overflow,alignment -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
-        fi
+            ;;
+        esac
         CC_OPT="$SAN"
         LD_OPT="$SAN"
         MODULE_SAN="alignment,nonnull-attribute"
