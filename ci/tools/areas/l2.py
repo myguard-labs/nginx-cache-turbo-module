@@ -21,6 +21,7 @@ from abort_fixture import (
     assert_abort_clean,
     binary_has_debug_log,
     memcached_hit_reply,
+    own_timeout_ms,
     redis_hit_reply,
     run_abort_arm,
     run_abort_test,
@@ -28,6 +29,8 @@ from abort_fixture import (
     run_parks_test,
     run_reentry_test,
     run_shutdown_test,
+    run_walk_timeout_test,
+    walk_timeout_ms,
 )
 
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
@@ -4779,14 +4782,15 @@ def _abort_walk_keys(prefix: str, uri: str) -> list[str]:
     return [f"{prefix}{seed}{i:08x}" for i in range(ABORT_WALK_KEYS)]
 
 
-def _walk_admin(path: str, db: str, prefix: str) -> str:
+def _walk_admin(path: str, db: str, prefix: str, timeout: str = "2s") -> str:
     return f"""location = {path} {{
             cache_turbo_admin abort;
-            cache_turbo_redis 127.0.0.1:{{proxy_port}} db={db} prefix={prefix} timeout=2s;
+            cache_turbo_redis 127.0.0.1:{{proxy_port}} db={db} prefix={prefix} timeout={timeout};
         }}"""
 
 
-def _sscan_walk_abort_site(redis: RedisServer) -> AbortSite:
+def _sscan_walk_abort_site(redis: RedisServer,
+                           timeout: str = "2s") -> AbortSite:
     """SSCAN tag walk: POST ?tag= on an admin location. redis_sscan() takes
     r->main->count++ and walk_finish() resumes: it finalizes with the
     callback's result and only then runs the posted requests, the same order
@@ -4839,7 +4843,8 @@ def _sscan_walk_abort_site(redis: RedisServer) -> AbortSite:
         method="POST",
         target=lambda uri: f"/_ab_sscan?tag={_abort_tag(uri)}",
         verify=verify,
-        server_extra=_walk_admin("/_ab_sscan", ABORT_SSCAN_DB, ABORT_SSCAN_PREFIX),
+        server_extra=_walk_admin("/_ab_sscan", ABORT_SSCAN_DB, ABORT_SSCAN_PREFIX,
+                                 timeout),
     )
 
 
@@ -5265,8 +5270,20 @@ def test_l2_shutdown_redis_lock_early_teardown(
     # lock op never ends by its own timeout once the request is freed.)
     run_shutdown_test(
         ng, origin, _redis_lock_abort_site(redis, valid_s=2, beta=20000,
-                                           timeout="1s"),
+                                           timeout=own_timeout_ms()),
         "early_teardown")
+
+
+def test_l2_shutdown_redis_purge_walk_own_timeout(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    # CT-SHUTDOWN-OWN-TIMEOUT-ARM. The one op that outlives its freed request:
+    # an SSCAN tag walk suspended on its page's UNLINK. A reload with a short
+    # worker_shutdown_timeout frees the request while the UNLINK is held; the
+    # walk must be torn down when the UNLINK ends on its
+    # own timeout (own_timeout arm) or on its reply (reply arm), and nginx must
+    # then serve a purge and a GET and quit gracefully with no open socket.
+    run_walk_timeout_test(
+        ng, _sscan_walk_abort_site(redis, timeout=walk_timeout_ms()))
 
 
 def test_l2_shutdown_memcached_get_http1(
