@@ -154,6 +154,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_cold_wait_poll_timer_no_uaf(ng, origin)                # S231-COLDWAIT-UAF
     test_l2_abort_cold_wait_parks(ng, origin)  # CT-RESUME-FINALIZE-UAF
     test_l2_abort_cold_wait_before_first_wake(ng, origin)  # CT-RESUME-FINALIZE-UAF
+    if ng.fault_injection:  # the park tripwire is a TEST_FAULTS build feature
+        test_l2_stale_park_resume_cold_wait(ng, origin)  # BP-B2
     test_l2_abort_cold_wait_http1_rst_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
     test_l2_abort_cold_wait_http1_rst_after(ng, origin)  # CT-RESUME-FINALIZE-UAF
     test_l2_abort_cold_wait_http1_rst_boundary(ng, origin)  # CT-RESUME-FINALIZE-UAF
@@ -501,6 +503,8 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_abort_scan_walk_h2_close_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
         test_l2_abort_scan_walk_clean_http1(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
         test_l2_abort_scan_walk_clean_http2(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        if ng.fault_injection:  # TEST_FAULTS park tripwire
+            test_l2_stale_park_resume_redis_get(ng, origin, redis)  # BP-B2
         test_l2_reentry_redis_get_poke(ng, origin, redis)  # CT-PARKED-REENTRY
         test_l2_reentry_redis_get_rst(ng, origin, redis)  # CT-PARKED-REENTRY
         test_l2_reentry_redis_get_clean(ng, origin, redis)  # CT-PARKED-REENTRY

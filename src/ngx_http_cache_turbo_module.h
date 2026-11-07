@@ -3882,6 +3882,15 @@ ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
     && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
 #include "ngx_http_cache_turbo_testalloc.h"
+#else
+/* BP-B2: the park-generation tripwire (see testalloc.h) compiles away. */
+#define NGX_HTTP_CACHE_TURBO_PARK_GEN_FIELD
+#define CT_PARK_ENTER(r, op)
+#define CT_PARK_CHECK(r, op, site, drop)
+#define CT_PARK_TEST_STALE(r, op)
+#define CT_PARK_ENTER_SLOT(r, key)
+#define CT_PARK_CHECK_SLOT(r, key, site)
+#define CT_PARK_TEST_STALE_COLD_WAIT(r, ev)
 #endif
 
 

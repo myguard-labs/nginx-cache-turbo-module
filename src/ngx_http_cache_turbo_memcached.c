@@ -74,7 +74,7 @@ typedef struct {
     ngx_buf_t                        *send;     /* buffer being written        */
     ngx_msec_t                        timeout;
     ngx_http_cache_turbo_loc_conf_t  *clcf;     /* for keepalive pool config   */
-
+    NGX_HTTP_CACHE_TURBO_PARK_GEN_FIELD
     ngx_http_request_t               *request;  /* GET: parked request         */
     ngx_http_cache_turbo_ctx_t       *ctx;      /* GET: request ctx to fill    */
     /* CT-PARKED-SHUTDOWN: GET only, the r->pool cleanup running mc_get_detach.
@@ -852,7 +852,7 @@ ngx_http_cache_turbo_memcached_get(ngx_http_request_t *r,
         ngx_destroy_pool(pool);
         return NGX_DECLINED;
     }
-
+    CT_PARK_ENTER(r, op)
     /* Parked: hold a reference so the request survives until the reply resumes
      * it (released by ngx_http_finalize_request(NGX_DONE) in get_finish). A
      * terminate frees the request regardless of it; req_cln then tears the op
@@ -1319,7 +1319,7 @@ ngx_http_cache_turbo_mc_get_finish(ngx_http_cache_turbo_mc_op_t *op,
     ngx_http_cache_turbo_ctx_t  *ctx = op->ctx;
     ngx_connection_t            *c = r->connection;
     u_char                      *copy;
-
+    CT_PARK_CHECK(r, op, "memcached_get", mc)
     /* Read handlers call this directly; write failures arrive through
      * mc_op_fail(), whose consume makes this second call a no-op. */
     if (result == NGX_ERROR) {
@@ -1427,5 +1427,26 @@ ngx_cache_turbo_backend_t  ngx_http_cache_turbo_memcached_backend = {
     NULL,   /* lock      — no atomic NX  */
     NULL,   /* unlock                    */
 };
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+
+/* BP-B2: the memcached GET drop of the park-generation tripwire (contract in
+ * testalloc.h; record, enter and check live at the end of redis.c). When the
+ * request is gone its pool, and the req_cln record in it, is no longer ours
+ * to write. */
+void
+ngx_http_cache_turbo_test_park_drop_mc(void *data, ngx_int_t rc)
+{
+    ngx_http_cache_turbo_mc_op_t  *op = data;
+
+    if (rc == NGX_ABORT) {
+        op->req_cln = NULL;
+    }
+
+    ngx_http_cache_turbo_mc_op_done(op);
+}
+
+#endif
 
 #pragma GCC visibility pop

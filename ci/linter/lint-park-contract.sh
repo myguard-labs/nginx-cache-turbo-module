@@ -19,6 +19,11 @@
 #       events, or a stray read re-enters the phase engine);
 #   (c) the `detach` symbol appears in the function, or in the function named
 #       by `detach_via`; `none:<reason>` needs a non-empty reason and is exempt;
+#   (e) test-build tripwire (BP-B2): the park function carries CT_PARK_ENTER or
+#       CT_PARK_ENTER_SLOT, and its file carries a CT_PARK_CHECK or
+#       CT_PARK_CHECK_SLOT naming the site (function minus the module prefix,
+#       as a string literal inside the macro's argument list; comments are
+#       removed there but string literals kept) in the completion path;
 #   (d) every abort_tests name (comma list) exists as `def test_` in
 #       ci/tools/areas/*.py.
 # Whole-tree by nature: the staged list only decides relevance.
@@ -70,6 +75,40 @@ function strip(s,    i, n, ch, nx, q, out) {
     }
     return out
 }
+# Comments blanked (same width), string/char literals kept: the CT_PARK_CHECK
+# site label is matched inside the macro argument list of this text.
+function nocomment(s,    i, n, ch, nx, q, out) {
+    n = length(s); q = ""; out = ""
+    for (i = 1; i <= n; i++) {
+        ch = substr(s, i, 1); nx = substr(s, i + 1, 1)
+        if (inblk2) {
+            if (ch == "*" && nx == "/") { inblk2 = 0; i++; out = out "  " }
+            else out = out " "
+        } else if (q != "") {
+            if (ch == "\\") { i++; out = out ch nx }
+            else { if (ch == q) q = ""; out = out ch }
+        } else if (ch == "/" && nx == "*") { inblk2 = 1; i++; out = out "  " }
+        else if (ch == "/" && nx == "/") { break }
+        else { if (ch == "\"" || ch == "\047") q = ch; out = out ch }
+    }
+    return out
+}
+# The argument list of the macro call starting at column p of s (comments
+# already removed), up to its matching close paren, quotes respected.
+function macroargs(s, p,    i, n, ch, q, d, out) {
+    n = length(s); q = ""; d = 0; out = ""
+    for (i = p; i <= n; i++) {
+        ch = substr(s, i, 1)
+        if (q != "") {
+            if (ch == "\\") { out = out ch substr(s, i + 1, 1); i++; continue }
+            if (ch == q) q = ""
+        } else if (ch == "\"" || ch == "\047") q = ch
+        else if (ch == "(") d++
+        else if (ch == ")") { d--; if (d == 0) return out }
+        if (d > 0) out = out ch
+    }
+    return out
+}
 function squash(s) { gsub(/[ \t]+/, "", s); return s }
 FNR == NR {
     sub(/\r$/, "")
@@ -84,10 +123,11 @@ FNR == NR {
     rowname[k] = c[1] ":" c[2]
     next
 }
-FNR == 1 { infn = 0; fn = ""; inblk = 0 }
+FNR == 1 { infn = 0; fn = ""; inblk = 0; inblk2 = 0 }
 {
     line = $0; sub(/\r$/, "", line)
     code = strip(line)
+    nocm = nocomment(line)
     c1 = substr(line, 1, 1)
     if (!infn && c1 !~ /[ \t#{}\/*]/ && c1 != "" && match(code, /[A-Za-z_][A-Za-z0-9_]*[ \t]*\(/)) {
         nm = substr(code, RSTART, RLENGTH); sub(/[ \t]*\($/, "", nm); fn = nm
@@ -96,6 +136,8 @@ FNR == 1 { infn = 0; fn = ""; inblk = 0 }
     if (infn) {
         key = FILENAME SUBSEP fn
         body[key] = body[key] " " code
+        if (match(code, /CT_PARK_CHECK(_SLOT)?[ \t]*\(/))
+            chkarg[FILENAME] = chkarg[FILENAME] " " macroargs(nocm, RSTART)
         if (code ~ /r[ \t]*->[ \t]*main[ \t]*->[ \t]*count[ \t]*\+\+/) {
             if (!(key in row)) {
                 print FILENAME ":" FNR ": (a) r->main->count++ park in " fn "() is not registered in " tsv
@@ -118,6 +160,15 @@ END {
                 print rowname[k] ": (b) " phase[k] "-phase park does not assign r->write_event_handler = " handler[k]
                 found = 1
             }
+        }
+        if (body[k] !~ /(^|[^A-Za-z0-9_])CT_PARK_ENTER(_SLOT)?[ \t]*\(/) {
+            print rowname[k] ": (e) park has no CT_PARK_ENTER / CT_PARK_ENTER_SLOT"
+            found = 1
+        }
+        site = substr(k, index(k, SUBSEP) + 1); sub(/^ngx_http_cache_turbo_/, "", site)
+        if (index(chkarg[substr(k, 1, index(k, SUBSEP) - 1)], "\"" site "\"") == 0) {
+            print rowname[k] ": (e) no CT_PARK_CHECK / CT_PARK_CHECK_SLOT for site \"" site "\" in the completion path"
+            found = 1
         }
         if (detach[k] ~ /^none:/) {
             if (length(detach[k]) <= 5) { print tsv ": (c) " rowname[k] ": detach=none: needs a reason"; found = 1 }

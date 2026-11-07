@@ -29,7 +29,8 @@ this code started by not knowing nginx internals either.
       [ci/park-sites.tsv](ci/park-sites.tsv) (checked by
       `ci/linter/lint-park-contract.sh`), the handler swap (only for
       access/precontent parks), detach (unless the TSV detach column is `none`),
-      the abort arms, and finalize before posted.
+      the `CT_PARK_*` macros (`CT_PARK_ENTER` at the park, `CT_PARK_CHECK` in
+      the completion path), the abort arms, and finalize before posted.
 
 ## Before your first commit
 

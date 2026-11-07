@@ -41,9 +41,16 @@ Request-lifetime detectors for this module (plan row BP-E1). They complement
   build the database with `-DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1`.
   `ci/tools/ci-build.sh` sets it in every mode. If the macro expands to
   nothing, nothing counts as a guard and the query reports the read anyway.
-- Until BP-B2 adds `CT_PARK_CHECK`, query (b) reports the five completion
-  sites on `main`. Wire query (a) as a gate now, and query (b) once BP-B2
-  lands (BP-W1).
+- BP-B2 added `CT_PARK_CHECK` (and `CT_PARK_CHECK_SLOT`) at the completion
+  sites. Query (b) still reports four of the five on a TEST_FAULTS build,
+  because each copies `op->request` in a declaration initialiser before the
+  check runs: `redis_get_finish`, `redis_lock_finish`, `redis_walk_finish`
+  (`r = op->request`) and `mc_get_finish`. The first, second and fourth also
+  read `r->connection` there. Moving those declarations below the check would
+  change the release objects, which must stay byte-identical. Only the SSCAN
+  page delivery in `redis_read_sscan`, whose check is the first use of
+  `op->request`, is no longer reported. Wire query (a) as a gate now. Query
+  (b) waits for BP-W1, which must clear or accept those four reports first.
 
 ## Running
 

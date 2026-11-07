@@ -12,6 +12,12 @@ Changes with the nginx-cache-turbo-module (unreleased)
        Spotweb is documented without a preset: it sets a fresh session cookie
        on every request.
 
+    *) Change: test builds now stop a resumed backend reply that no longer
+       belongs to the request it was started for. Each Redis, memcached,
+       cold-wait and warm-file park records a generation, and the completion
+       checks it and logs "stale park resume" instead of touching the freed
+       request. Release builds are byte-identical.
+
     *) Security: a reload or graceful shutdown with worker_shutdown_timeout
        no longer crashes the old worker when an HTTP/1 request is still
        waiting on a Redis cache GET, the Redis stampede lock or a memcached
