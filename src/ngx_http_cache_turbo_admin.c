@@ -1250,7 +1250,7 @@ ngx_http_cache_turbo_warm_file_start(ngx_http_request_t *r, ngx_str_t *path,
         r->aio = 0;
         return ngx_http_cache_turbo_warm_file_schedule_error(r);
     }
-
+    CT_PARK_ENTER_SLOT(r, ctx)
     /* Watchdog only: nginx thread-pool tasks cannot be cancelled safely once
      * posted.  The timer reports a slow task but deliberately leaves blocked,
      * aio and the request reference intact until the sole completion event
@@ -1385,7 +1385,7 @@ ngx_http_cache_turbo_warm_file_thread_event(ngx_event_t *ev)
         c->write->handler(c->write);
         return;
     }
-
+    CT_PARK_CHECK_SLOT(r, ctx, "warm_file_start")
     if (ctx->file_error) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, ctx->file_errno,
             "cache_turbo: warm url_file \"%s\" failed at %s",

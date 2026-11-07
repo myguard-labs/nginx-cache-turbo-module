@@ -3771,7 +3771,7 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
         cln->handler = ngx_http_cache_turbo_cold_wait_cleanup;
         cln->data = ctx;
     }
-
+    CT_PARK_ENTER_SLOT(r, &ctx->cold_wait_ev)
     ngx_add_timer(&ctx->cold_wait_ev, delay);
     r->main->count++;
     r->write_event_handler = ngx_http_cache_turbo_parked_handler;
@@ -3779,7 +3779,7 @@ ngx_http_cache_turbo_cold_wait(ngx_http_request_t *r,
      * V-HANG-2 give-up at the top of this function may trust an
      * l2_present_unserveable observed from here on. Never cleared. */
     ctx->wait_polled = 1;
-
+    CT_PARK_TEST_STALE_COLD_WAIT(r, &ctx->cold_wait_ev)
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "cache_turbo: cold-miss WAIT \"%V\" poll=%M ms",
                    &r->uri, delay);
@@ -3796,7 +3796,7 @@ ngx_http_cache_turbo_cold_wait_timeout(ngx_event_t *ev)
 {
     ngx_http_request_t  *r = ev->data;
     ngx_connection_t    *c = r->connection;
-
+    CT_PARK_CHECK_SLOT(r, ev, "cold_wait")
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
                    "cache_turbo: cold-miss wait wake \"%V\"", &r->uri);
 
@@ -3995,5 +3995,191 @@ ngx_http_cache_turbo_cold_cleanup(void *data)
     ngx_http_cache_turbo_shm_unstub(ctx->cold_zone, ctx->key_hash, hash,
                                     ctx->cold_owner);
 }
+
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+
+/*
+ * BP-B2: generation slots for parks whose op has no TEST_FAULTS field
+ * (contract in testalloc.h). Defined here, after every other definition, so
+ * a release build sees no line shift. The allocations call the real
+ * functions (parenthesised) so the BP-B1 funnel numbering does not change.
+ */
+typedef struct {
+    ngx_http_request_t  *r;
+    void                *key;
+    ngx_uint_t           gen;
+} ngx_http_cache_turbo_test_park_slot_t;
+
+
+/* Tag handler of a slot's r->pool cleanup: identifies the slot. */
+void
+ngx_http_cache_turbo_test_park_slot_cleanup(void *data)
+{
+    ngx_http_cache_turbo_test_park_slot_t  *slot = data;
+
+    slot->r = NULL;
+}
+
+
+static ngx_http_cache_turbo_test_park_slot_t *
+ngx_http_cache_turbo_test_park_slot_find(ngx_http_request_t *r, void *key)
+{
+    ngx_pool_cleanup_t                     *cln;
+    ngx_http_cache_turbo_test_park_slot_t  *slot;
+
+    for (cln = r->pool->cleanup; cln != NULL; cln = cln->next) {
+        if (cln->handler != ngx_http_cache_turbo_test_park_slot_cleanup) {
+            continue;
+        }
+
+        slot = cln->data;
+        if (slot->r == r && slot->key == key) {
+            return slot;
+        }
+    }
+
+    return NULL;
+}
+
+
+static ngx_http_cache_turbo_test_park_slot_t *
+ngx_http_cache_turbo_test_park_slot_add(ngx_http_request_t *r, void *key)
+{
+    ngx_pool_cleanup_t                     *cln;
+    ngx_http_cache_turbo_test_park_slot_t  *slot;
+
+    cln = (ngx_pool_cleanup_add)(r->pool,
+              sizeof(ngx_http_cache_turbo_test_park_slot_t));
+    if (cln == NULL) {
+        return NULL;
+    }
+
+    slot = cln->data;
+    slot->r = r;
+    slot->key = key;
+    slot->gen = 0;
+    cln->handler = ngx_http_cache_turbo_test_park_slot_cleanup;
+
+    return slot;
+}
+
+
+/* Stamp a fresh park of the op at `key`. A slot that cannot be allocated
+ * leaves the park unstamped; its check then compares generation 0. */
+void
+ngx_http_cache_turbo_test_park_enter_slot(ngx_http_request_t *r, void *key)
+{
+    ngx_http_cache_turbo_test_park_slot_t  *slot;
+
+    slot = ngx_http_cache_turbo_test_park_slot_find(r, key);
+    if (slot == NULL) {
+        slot = ngx_http_cache_turbo_test_park_slot_add(r, key);
+        if (slot == NULL) {
+            return;
+        }
+    }
+
+    ngx_http_cache_turbo_test_park_enter(r, &slot->gen);
+}
+
+
+/* Same verdicts as ngx_http_cache_turbo_test_park_check(). The slot is only
+ * looked up while the request is still there. */
+ngx_int_t
+ngx_http_cache_turbo_test_park_check_slot(ngx_http_request_t *r, void *key,
+    const char *site)
+{
+    ngx_uint_t                              gen;
+    ngx_http_cache_turbo_test_park_slot_t  *slot;
+
+    gen = 0;
+
+    if (r != NULL && r->pool != NULL && r->main != NULL
+        && r->main->count != 0)
+    {
+        slot = ngx_http_cache_turbo_test_park_slot_find(r, key);
+        if (slot != NULL) {
+            gen = slot->gen;
+        }
+    }
+
+    return ngx_http_cache_turbo_test_park_check(r, gen, site);
+}
+
+
+/* The cold-wait stale-resume injection: with X-CT-Test-Stale-Park on the
+ * request, its first park also fires a decoy poll timer (own event, data r)
+ * stamped one generation behind the live park. The check must log the alert
+ * and drop it; the live timer then resumes the request as usual. A marker
+ * slot keyed by `once` limits it to one decoy per request, so the alert
+ * count does not depend on how many polls the wait takes. */
+void
+ngx_http_cache_turbo_test_park_stale_cold_wait(ngx_http_request_t *r,
+    ngx_event_t *ev)
+{
+    ngx_uint_t                              i;
+    ngx_event_t                            *decoy;
+    ngx_list_part_t                        *part;
+    ngx_table_elt_t                        *h;
+    ngx_http_cache_turbo_test_park_slot_t  *live, *slot;
+
+    static u_char     once;
+    static ngx_str_t  name = ngx_string("X-CT-Test-Stale-Park");
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                return;
+            }
+
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].key.len == name.len
+            && ngx_strncasecmp(h[i].key.data, name.data, name.len) == 0)
+        {
+            break;
+        }
+    }
+
+    if (ngx_http_cache_turbo_test_park_slot_find(r, &once) != NULL) {
+        return;
+    }
+
+    live = ngx_http_cache_turbo_test_park_slot_find(r, ev);
+    if (live == NULL || live->gen == 0) {
+        return;
+    }
+
+    if (ngx_http_cache_turbo_test_park_slot_add(r, &once) == NULL) {
+        return;
+    }
+
+    decoy = (ngx_pcalloc)(r->pool, sizeof(ngx_event_t));
+    if (decoy == NULL) {
+        return;
+    }
+
+    decoy->data = r;
+    decoy->log = ev->log;
+
+    slot = ngx_http_cache_turbo_test_park_slot_add(r, decoy);
+    if (slot == NULL) {
+        return;
+    }
+
+    slot->gen = live->gen - 1;
+
+    ngx_http_cache_turbo_cold_wait_timeout(decoy);
+}
+
+#endif
 
 #pragma GCC visibility pop

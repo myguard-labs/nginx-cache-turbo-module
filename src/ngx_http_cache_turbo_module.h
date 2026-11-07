@@ -3888,6 +3888,9 @@ ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
 #define CT_PARK_ENTER(r, op)
 #define CT_PARK_CHECK(r, op, site, drop)
 #define CT_PARK_TEST_STALE(r, op)
+#define CT_PARK_ENTER_SLOT(r, key)
+#define CT_PARK_CHECK_SLOT(r, key, site)
+#define CT_PARK_TEST_STALE_COLD_WAIT(r, ev)
 #endif
 
 

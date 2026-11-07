@@ -290,6 +290,43 @@ void ngx_http_cache_turbo_test_park_drop_mc(void *op, ngx_int_t rc);
 void ngx_http_cache_turbo_test_park_stale_redis_get(ngx_http_request_t *r,
     void *op);
 
+/*
+ * Slot form, for parks whose op has no line left for the field: the cold-wait
+ * poll timer (its op is the request ctx, declared in module.h before this
+ * header is included) and the warm url_file thread task (its ctx struct has
+ * no blank line). The generation lives in a TEST_FAULTS-only r->pool slot
+ * keyed by (r, key) instead, key being the op's address. A missing slot
+ * checks as generation 0. A failed check logs the same alert and returns
+ * without touching the request: these sites own no op to tear down.
+ */
+#define CT_PARK_ENTER_SLOT(r, key)                                            \
+    ngx_http_cache_turbo_test_park_enter_slot((r), (key));
+
+#define CT_PARK_CHECK_SLOT(r, key, site)                                      \
+    do {                                                                      \
+        if (ngx_http_cache_turbo_test_park_check_slot((r), (key), (site))     \
+            != NGX_OK)                                                        \
+        {                                                                     \
+            return;                                                           \
+        }                                                                     \
+    } while (0);
+
+#define CT_PARK_TEST_STALE_COLD_WAIT(r, ev)                                   \
+    ngx_http_cache_turbo_test_park_stale_cold_wait((r), (ev));
+
+/* Defined at the end of access.c. */
+void ngx_http_cache_turbo_test_park_slot_cleanup(void *data);
+void ngx_http_cache_turbo_test_park_enter_slot(ngx_http_request_t *r,
+    void *key);
+ngx_int_t ngx_http_cache_turbo_test_park_check_slot(ngx_http_request_t *r,
+    void *key, const char *site);
+
+/* Header X-CT-Test-Stale-Park on a request parking in cold_wait: on its first
+ * park, fire a decoy poll timer stamped one generation behind, which the
+ * check must drop. */
+void ngx_http_cache_turbo_test_park_stale_cold_wait(ngx_http_request_t *r,
+    ngx_event_t *ev);
+
 
 #endif /* NGX_HTTP_CACHE_TURBO_TEST_FAULTS */
 

@@ -4613,6 +4613,66 @@ def test_l2_abort_cold_wait_parks(ng: Nginx, origin: Origin) -> None:
         rig.node.assert_clean_logs()
 
 
+def test_l2_stale_park_resume_cold_wait(ng: Nginx, origin: Origin) -> None:
+    """BP-B2: a cold-wait poll timer stamped one generation behind the live
+    park is dropped by the park-generation check (TEST_FAULTS tripwire).
+
+    X-CT-Test-Stale-Park makes the waiter's first park in cold_wait() fire a
+    decoy poll timer, stamped one generation behind, through
+    cold_wait_timeout(). Only the first park injects, so however many polls
+    the wait takes there is exactly one "stale park resume cold_wait" alert.
+    The live timer still resumes the waiter, which is served the leader's
+    fill. A second key's waiter, without the header, waits, is served and
+    logs nothing new."""
+    site = _cold_wait_abort_site(origin)
+    with AbortRig(ng, site, "stale", 2) as rig:
+        uri, clean_uri = rig.uris
+        assert not rig.node.fatal_lines(), (
+            f"alerts before the injection: {rig.node.fatal_lines()}")
+        anchor = rig.anchor(uri)
+        sock = socket.create_connection(("127.0.0.1", rig.node.port), timeout=5)
+        sock.sendall(f"GET {uri} HTTP/1.1\r\nHost: abort-fixture\r\n"
+                     "X-CT-Test-Stale-Park: 1\r\n"
+                     "Connection: close\r\n\r\n".encode())
+        anchor.wait_parked()
+        sock.settimeout(10 * sanitizer_time_scale())
+        data = b""
+        try:
+            while chunk := sock.recv(65536):
+                data += chunk
+        finally:
+            sock.close()
+        anchor.settle()
+        head, _, body = data.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        headers = {k.lower(): v.strip() for k, _, v in
+                   (ln.partition(":") for ln in lines[1:])}
+        assert lines[0].split()[1:2] == ["200"], f"{uri}: {lines[0]!r}"
+        assert headers.get("x-cache") == site.served, (
+            f"{uri}: X-Cache={headers.get('x-cache')}, wanted {site.served}")
+        assert body == rig.bodies[uri], f"{uri}: body {body!r} is not the fill"
+        anchor.assert_each_step_once()
+
+        fatal = rig.node.fatal_lines()
+        needle = "stale park resume cold_wait"
+        assert len(fatal) == 1 and needle in fatal[0], (
+            f"wanted exactly one {needle!r} alert (first park only), "
+            f"got {fatal}")
+
+        clean = rig.anchor(clean_uri)
+        waiter = Http1Client(rig.node.port, clean_uri)
+        clean.wait_parked()
+        status, headers, body = waiter.read_response()
+        clean.settle()
+        assert status == 200 and headers.get("x-cache") == site.served, (
+            f"{clean_uri}: {status} X-Cache={headers.get('x-cache')}")
+        assert body == rig.bodies[clean_uri], f"{clean_uri}: wrong body"
+        clean.assert_each_step_once()
+        assert rig.node.fatal_lines() == fatal, (
+            "new alerts on the clean request: "
+            f"{rig.node.fatal_lines()[len(fatal):]}")
+
+
 def test_l2_abort_cold_wait_before_first_wake(ng: Nginx, origin: Origin) -> None:
     """A waiter that aborts before its first wake holds only the park
     reference, so no re-poll can hide a double finalize. The before arm needs
