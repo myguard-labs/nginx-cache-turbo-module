@@ -2382,7 +2382,8 @@ def _walk_timeout_arm(ng: Nginx, site: AbortSite, arm: str) -> None:
                 f"the walk closed {closed_at - sent_at:.3f}s after its UNLINK, "
                 f"wanted on the reply at {replied_at - sent_at:.3f}s, before "
                 f"the {timeout:.3f}s timer")
-        unlink_closed = rig.proxy.wait_closed(unlink, 0.0)
+        # Both closes can land in one proxy loop pass in either order.
+        unlink_closed = rig.proxy.wait_closed(unlink, ABORT_SETTLE_MARGIN * scale)
         if own and (unlink_closed is None or unlink_closed >= replied_at):
             problems.append("the UNLINK connection outlived the UNLINK's own "
                             "timeout")

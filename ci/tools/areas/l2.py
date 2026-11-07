@@ -5269,7 +5269,7 @@ def test_l2_shutdown_redis_lock_early_teardown(
     # worker exits before the timer, and no timeout line is logged. (A GET or
     # lock op never ends by its own timeout once the request is freed.)
     run_shutdown_test(
-        ng, origin, _redis_lock_abort_site(redis, valid_s=2, beta=20000,
+        ng, origin, _redis_lock_abort_site(redis, valid_s=4, beta=40000,
                                            timeout=own_timeout_ms()),
         "early_teardown")
 
