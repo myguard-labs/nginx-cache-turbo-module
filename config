@@ -48,6 +48,7 @@ fi
 
 CACHE_TURBO_DEPS="                                                      \
                   $ngx_addon_dir/src/ngx_http_cache_turbo_module.h      \
+                  $ngx_addon_dir/src/ngx_http_cache_turbo_testalloc.h   \
                   "
 
 # This module captures the upstream response body, so it depends on the

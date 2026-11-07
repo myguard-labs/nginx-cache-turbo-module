@@ -285,7 +285,8 @@ ngx_http_cache_turbo_probe_zone_render(u_char *buf, u_char *last,
  * a rule naming an unimplemented site is refused rather than reported armed.
  *
  * WHY ONLY FAULT_SLAB.
- *   It is the only site this module has a single honest chokepoint for.
+ *   It is the only site this module has a single honest chokepoint for in
+ *   every build that can host the probe.
  *   ngx_http_cache_turbo_shm_alloc_evict() is the SOLE allocation funnel for
  *   cached payload and metadata -- every node allocation, and via blob_alloc()
  *   every body allocation, passes through it, and it is one of only two
@@ -293,12 +294,22 @@ ngx_http_cache_turbo_probe_zone_render(u_char *buf, u_char *last,
  *   once at zone init, before any request exists). One gate there covers the
  *   entire class.
  *
- *   The other enum values have no such point. FAULT_PALLOC would need every
- *   ngx_palloc site in the request path, FAULT_TEMPFILE and FAULT_ACCEPT name
- *   machinery this module does not own at all, and the two codec sites belong
- *   to compression filters. Registering them would mean claiming an arm the
- *   module cannot honour -- a query answered "applied" that injects nothing,
- *   which is strictly worse than a refusal because it reads as coverage.
+ *   FAULT_TEMPFILE and FAULT_ACCEPT name machinery this module does not own
+ *   at all, and the two codec sites belong to compression filters.
+ *   Registering them would mean claiming an arm the module cannot honour -- a
+ *   query answered "applied" that injects nothing, which is strictly worse
+ *   than a refusal because it reads as coverage.
+ *
+ *   Pool allocations now HAVE a single point, but only in a TEST_FAULTS
+ *   build: the allocation funnel (ngx_http_cache_turbo_testalloc.h) sends
+ *   every module ngx_palloc-family call through one gate, and its
+ *   fault_alloc=N countdown fails exactly the Nth call once (armed through
+ *   the module-local `cache_turbo_test_fault_alloc` location, end of
+ *   module.c). This hook still declines FAULT_PALLOC: routing it, or a new
+ *   NGX_TEST_PROBE_FAULT_ALLOC value, to that countdown needs the enum and
+ *   its query parsing in nginx-module-testkit, and that hookup is deferred
+ *   to the testkit's own grind. A harness build without TEST_FAULTS has no
+ *   funnel, so the hook must keep declining there either way.
  *
  * THE STORE IS NOT UNDER THE ZONE MUTEX, ON PURPOSE.
  *   Same reasoning as zone_render above: this runs on a probe request, and

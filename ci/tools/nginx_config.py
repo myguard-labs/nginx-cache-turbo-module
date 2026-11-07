@@ -72,6 +72,8 @@ PORT_OFFSETS: dict[str, int] = {
     "abort_node": 31,
     "abort_node_h2": 32,
     "abort_proxy": 33,
+    # BP-C1: test_fault_alloc_countdown() runs its own one-worker nginx here.
+    "fault_alloc": 9,
 }
 
 

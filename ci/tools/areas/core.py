@@ -2181,6 +2181,232 @@ def test_invalid_backend_name(ng: Nginx) -> None:
 
 
 
+def test_dead_pool_alloc_trap(ng: Nginx) -> None:
+    """BP-B1: the TEST_FAULTS allocation funnel traps an allocation on a dead
+    (NULL) pool and names the module call site.
+
+    `cache_turbo_test_dead_pool_alloc;` makes its directive handler call
+    ngx_palloc() on a NULL pool at parse time. The funnel must log
+    `[alert] cache_turbo: alloc on dead pool at <file>:<line>` with this
+    module's module.c as <file>, then abort. Without the funnel (or with its
+    NULL check gone) the same call faults inside nginx core: nginx -t still
+    fails, but with no alert and no module file:line, so the message asserts
+    are the oracle, not the exit status alone."""
+    trap = ng.root.parent / "dead-pool-trap"
+    (trap / "conf").mkdir(parents=True, exist_ok=True)
+    (trap / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = nginx_config(trap, ng.port, ng.module, ng.origin_port, 1)
+    anchor = "http {"
+    assert anchor in cfg, "nginx_config() output has no http block"
+    cfg = cfg.replace(anchor,
+                      anchor + "\n    cache_turbo_test_dead_pool_alloc;", 1)
+    (trap / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+    cmd = ng.runner + [str(ng.binary), "-p", str(trap),
+                       "-c", str(trap / "conf" / "nginx.conf"), "-t"]
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=20,
+                       env=config_check_env())
+    out = r.stdout
+    log = trap / "logs" / "error.log"
+    if log.exists():
+        out += log.read_text(encoding="utf-8", errors="replace")
+    # The trap ends in ngx_abort() (abort(3)), so the status must be SIGABRT:
+    # -6 for a direct spawn, 134 when a --runner shell wrapper reports it as
+    # 128+6. Any other status fails, including the SIGSEGV a gate that logged
+    # and returned NGX_OK would still hit inside the NULL-pool allocation.
+    assert r.returncode in (-6, 134), \
+        f"dead-pool allocation did not abort (status {r.returncode}):\n{out}"
+    m = re.search(r"\[alert\].*cache_turbo: alloc on dead pool at "
+                  r"(\S*ngx_http_cache_turbo_module\.c):(\d+)", out)
+    assert m is not None, \
+        f"funnel did not trap the dead-pool allocation with its site:\n{out}"
+    assert int(m.group(2)) > 0, f"trap reported line 0:\n{out}"
+    assert "allocated on a dead pool without trapping" not in out, \
+        f"dead-pool allocation returned to its caller:\n{out}"
+
+
+
+def _fault_alloc_config(root: pathlib.Path, port: int,
+                        module: pathlib.Path | None, origin_port: int) -> str:
+    load = f"load_module {module};\n" if module else ""
+    return f"""{load}worker_processes 1;
+pid {root}/nginx.pid;
+error_log {root}/logs/error.log notice;
+
+events {{ worker_connections 64; }}
+
+http {{
+    access_log off;
+    cache_turbo_zone name=fa 1m;
+
+    server {{
+        listen 127.0.0.1:{port};
+
+        location = /__fault_alloc {{
+            cache_turbo_test_fault_alloc;
+        }}
+
+        location /fa/ {{
+            cache_turbo          fa;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    300s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+    }}
+}}
+"""
+
+
+class _FaultAlloc:
+    """Client for one fault_alloc test nginx: the /__fault_alloc report and
+    arm location plus one cached URI under /fa/."""
+
+    FAR = 1000000
+    URI = "/fa/countdown"
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.body = ""
+
+    def ctl(self, query: str = "") -> dict[str, str]:
+        status, body, _ = fetch_raw(self.port, "/__fault_alloc" + query)
+        assert status == 200, f"/__fault_alloc{query}: {status} {body!r}"
+        fields = dict(tok.split("=", 1) for tok in body.split())
+        assert set(fields) == {"left", "calls", "fired", "fired_at",
+                               "site"}, f"bad report {body!r}"
+        return fields
+
+    def get(self):
+        try:
+            return fetch_raw(self.port, self.URI)
+        except (http.client.RemoteDisconnected, ConnectionResetError) as e:
+            return (None, "", {"error": repr(e)})
+
+    def hit(self, where: str) -> None:
+        st, b, h = self.get()
+        assert st == 200 and h.get("x-cache") == "HIT" and b == self.body, \
+            f"{where}: wanted a clean HIT, got {st} {h}"
+
+    def measure(self) -> int:
+        """Module allocations of one HIT, under an arm it cannot reach."""
+        self.ctl(f"?n={self.FAR}")
+        self.hit("HIT under a far arm")
+        r = self.ctl("?n=0")
+        calls = int(r["calls"])
+        assert calls > 0, f"a cache HIT made no funnel call: {r}"
+        assert r["fired"] == "0" and int(r["left"]) == self.FAR - calls, \
+            f"far arm fired or miscounted: {r}"
+        return calls
+
+    def fire_once(self, n: int) -> None:
+        """Arm n: exactly call n fails, once, and the next request is
+        served without another failure."""
+        self.ctl(f"?n={n}")
+        failed = self.get()
+        r = self.ctl()  # disarmed by now if it fired: a plain read is safe
+        assert (r["fired"], r["fired_at"], r["left"], r["calls"]) \
+            == ("1", str(n), "0", str(n)), \
+            f"n={n}: wanted one failure at call {n}: {r} " \
+            f"(request: {failed[0]} {failed[2]})"
+        assert re.fullmatch(r"\S*src/ngx_http_cache_turbo_\w+\.[ch]:"
+                            r"[1-9]\d*", r["site"]), \
+            f"n={n}: failure site is not a module call site: {r}"
+        st, b, h = self.get()
+        assert st == 200 and b == self.body, \
+            f"n={n}: request after the injected failure: {st} {h}"
+        r = self.ctl("?n=0")
+        assert (r["fired"], r["calls"]) == ("1", str(n)), \
+            f"n={n}: countdown did not disarm after firing: {r}"
+
+
+def _fault_alloc_nginx(ng: Nginx) -> Nginx:
+    root = ng.root.parent / "fault-alloc"
+    fa = Nginx(ng.binary, ng.module, root,
+               ng.port + PORT_OFFSETS["fault_alloc"], ng.origin_port,
+               ng.runner_raw, ng.single_process)
+
+    def write_config(sr_off: bool = False) -> None:
+        del sr_off  # one fixed config; the main harness's knob does not apply
+        (root / "conf").mkdir(parents=True, exist_ok=True)
+        (root / "logs").mkdir(parents=True, exist_ok=True)
+        (root / "conf" / "nginx.conf").write_text(
+            _fault_alloc_config(root, fa.port, fa.module, fa.origin_port),
+            encoding="ascii")
+
+    fa.write_config = write_config  # type: ignore[method-assign]
+    return fa
+
+
+def test_fault_alloc_countdown(ng: Nginx) -> None:
+    """BP-C1: the fault_alloc=N countdown fails exactly the Nth module
+    allocation after arming, once, then disarms.
+
+    Runs its own one-worker nginx, so the arming request and the request
+    under test share the process that holds the (process-local) countdown.
+    The /__fault_alloc report is the oracle: it counts funnel calls since
+    the arm went live, how many failures were injected and at which call.
+    A report request is itself a module request whose filters allocate
+    after the snapshot, so while armed it is always read as ?n=0, which
+    disarms before those allocations run.
+
+    1. Measure C, the module allocations of one cache HIT, with an arm far
+       beyond it: nothing fires.
+    2. N = C + 1: still nothing fires inside the request (upper boundary).
+    3. N = C: the last allocation of the HIT fails, once (fired=1 at C);
+       the next request is served and the countdown counts nothing more.
+    4. N = 1: the first allocation fails, once; the next request is served.
+    Malformed arms (n=abc, n=, n=-1) are rejected with 400 and arm nothing."""
+    fa = _fault_alloc_nginx(ng)
+    fa.write_config()
+    fa.config_test()
+    fa.start()
+    try:
+        c = _FaultAlloc(fa.port)
+        idle = c.ctl("?n=0")
+        assert (idle["fired"], idle["left"]) == ("0", "0"), \
+            f"countdown armed before any arm: {idle}"
+
+        s0, c.body, h0 = c.get()
+        assert s0 == 200 and "x-cache" not in h0, f"prime MISS: {s0} {h0}"
+        c.hit("prime HIT")
+
+        for bad in ("?n=abc", "?n=", "?n=-1"):
+            st, _, _ = fetch_raw(fa.port, "/__fault_alloc" + bad)
+            assert st == 400, f"malformed arm {bad} answered {st}"
+        assert c.ctl()["left"] == "0", "a malformed arm armed the countdown"
+
+        # 1. The first HITs after a fill do one-off work (measured: 25
+        #    calls, then 19), so C is the count once two HITs in a row agree.
+        counts = [c.measure(), c.measure()]
+        while counts[-1] != counts[-2]:
+            assert len(counts) < 6, f"HIT allocation count unstable: {counts}"
+            counts.append(c.measure())
+        calls = counts[-1]
+
+        # 2. N = C + 1: the request's last allocation is call C, no fire.
+        c.ctl(f"?n={calls + 1}")
+        c.hit("HIT under n=C+1")
+        r = c.ctl("?n=0")
+        assert (r["fired"], r["calls"], r["left"]) == ("0", str(calls), "1"), \
+            f"n=C+1 boundary: {r}"
+
+        # 3. N = C, then 4. N = 1.
+        c.fire_once(calls)
+        c.fire_once(1)
+
+        log = (fa.root / "logs" / "error.log").read_text(encoding="utf-8",
+                                                        errors="replace")
+        notices = re.findall(r"cache_turbo: injected allocation failure at "
+                             r"call (\d+), ", log)
+        assert notices == [str(calls), "1"], \
+            f"injected-failure notices {notices}, wanted {[str(calls), '1']}"
+
+        fa.stop()
+        fa.assert_clean_logs()
+    finally:
+        fa.stop()
+
+
 
 def test_invalid_cache_turbo_mode(ng: Nginx) -> None:
     """cache_turbo takes a zone name and nothing else. Any 2nd token is rejected

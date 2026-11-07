@@ -670,7 +670,7 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_l2_promote_hold_ms),
       NULL },
-
+    NGX_HTTP_CACHE_TURBO_TEST_ALLOC_COMMANDS
     /* S231-SIE-MIDBODY: deterministically simulate an upstream that dies
      * AFTER headers were sent but BEFORE last_buf, so the pre-flush SIE
      * body rescue can be exercised without racing real connection teardown.
@@ -5837,5 +5837,266 @@ ngx_http_cache_turbo_init(ngx_conf_t *cf)
 
     return NGX_OK;
 }
+
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+
+/*
+ * BP-B1: the TEST_FAULTS allocation funnel's gate and its trap directive (see
+ * ngx_http_cache_turbo_testalloc.h). Defined after every other function in
+ * this file so a release build, which compiles none of it, keeps every line
+ * number above unchanged.
+ *
+ * A NULL pool is a use of request or connection state that is already gone.
+ * Letting the allocation run would fault inside nginx core with no module
+ * frame in the message; trapping here names the module call site instead.
+ * ngx_debug_point() reads the core conf through ngx_cycle->conf_ctx, which is
+ * still NULL while the first configuration is parsed (nginx -t, startup), so
+ * it is only consulted once a cycle exists. The abort follows either way:
+ * nothing after this point could use the result.
+ *
+ * Past the NULL check the fault_alloc countdown (BP-C1, below) decides: it
+ * returns NGX_DECLINED for the one selected call, which makes the wrapper
+ * return NULL.
+ */
+static ngx_int_t ngx_http_cache_turbo_test_alloc_countdown(const char *file,
+    ngx_uint_t line);
+
+
+ngx_int_t
+ngx_http_cache_turbo_test_alloc_gate(ngx_pool_t *pool, const char *file,
+    ngx_uint_t line)
+{
+    if (pool != NULL) {
+        return ngx_http_cache_turbo_test_alloc_countdown(file, line);
+    }
+
+    ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                  "cache_turbo: alloc on dead pool at %s:%ui", file, line);
+
+    if (ngx_cycle->conf_ctx != NULL) {
+        ngx_debug_point();
+    }
+
+    ngx_abort();
+
+    return NGX_ERROR;
+}
+
+
+/*
+ * `cache_turbo_test_dead_pool_alloc;` -- the deliberate dead-pool allocation
+ * that proves the trap fires and names this file and line. Never returns when
+ * the gate works: a NULL result or a return means the funnel is not wired.
+ */
+char *
+ngx_http_cache_turbo_test_dead_pool_alloc(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_pool_t  *dead;
+
+    dead = NULL;
+
+    (void) ngx_palloc(dead, 1);
+
+    return "allocated on a dead pool without trapping";
+}
+
+
+/*
+ * BP-C1: the fault_alloc=N countdown. Fails exactly the Nth funnel call after
+ * arming, once, then disarms, so a test can walk an injected allocation
+ * failure across every module allocation a request makes and check that each
+ * one fails closed.
+ *
+ * ARMING. A location with `cache_turbo_test_fault_alloc;` serves a one-line
+ * report of the countdown state. `?n=N` (N > 0) arms it; `?n=0` disarms it
+ * and clears the report. The arm does not start counting while the arming
+ * request is still running: it is applied by a cleanup on that request's
+ * pool, so the first counted call belongs to whatever runs after the arming
+ * request is freed (in a quiet worker, the next request). The handler's own
+ * allocations call the real functions with the macro suppressed, and the
+ * report is rendered before anything else, so the snapshot is exact. The
+ * response still passes the module's filters, whose allocations do count:
+ * read a live countdown with `?n=0`, which disarms before they run.
+ *
+ * WHY PROCESS-LOCAL STATE IS THE SAFE SHAPE. The countdown lives in static
+ * variables, never in shared memory. Each worker is its own address space, so
+ * an arm affects only the worker that served the arming request, and the
+ * test pins that by running one worker. The master never serves a request,
+ * so its copy is never armed, and every worker forked by a reload or a
+ * respawn starts disarmed. A failed reload does not touch running workers.
+ * Within a worker all of this runs on the one event-loop thread (the module
+ * does not allocate from nginx thread-pool tasks), so no update can race.
+ *
+ * ONCE ONLY. The countdown reaches zero on the failing call and zero is the
+ * disarmed state, so the next call is allocated normally without any second
+ * check. The report's `fired` count is the test's oracle for that.
+ */
+static ngx_uint_t   ngx_http_cache_turbo_test_fa_left;
+static ngx_uint_t   ngx_http_cache_turbo_test_fa_calls;
+static ngx_uint_t   ngx_http_cache_turbo_test_fa_fired;
+static ngx_uint_t   ngx_http_cache_turbo_test_fa_fired_at;
+static const char  *ngx_http_cache_turbo_test_fa_file;
+static ngx_uint_t   ngx_http_cache_turbo_test_fa_line;
+
+
+static ngx_int_t
+ngx_http_cache_turbo_test_alloc_countdown(const char *file, ngx_uint_t line)
+{
+    if (ngx_http_cache_turbo_test_fa_left == 0) {
+        return NGX_OK;
+    }
+
+    ngx_http_cache_turbo_test_fa_calls++;
+
+    if (--ngx_http_cache_turbo_test_fa_left != 0) {
+        return NGX_OK;
+    }
+
+    ngx_http_cache_turbo_test_fa_fired++;
+    ngx_http_cache_turbo_test_fa_fired_at = ngx_http_cache_turbo_test_fa_calls;
+    ngx_http_cache_turbo_test_fa_file = file;
+    ngx_http_cache_turbo_test_fa_line = line;
+
+    ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0,
+                  "cache_turbo: injected allocation failure at call %ui, "
+                  "%s:%ui", ngx_http_cache_turbo_test_fa_calls, file, line);
+
+    return NGX_DECLINED;
+}
+
+
+static void
+ngx_http_cache_turbo_test_fault_alloc_reset(ngx_uint_t n)
+{
+    ngx_http_cache_turbo_test_fa_left = n;
+    ngx_http_cache_turbo_test_fa_calls = 0;
+    ngx_http_cache_turbo_test_fa_fired = 0;
+    ngx_http_cache_turbo_test_fa_fired_at = 0;
+    ngx_http_cache_turbo_test_fa_file = NULL;
+    ngx_http_cache_turbo_test_fa_line = 0;
+}
+
+
+/* Pool cleanup of the arming request: the countdown goes live here. */
+static void
+ngx_http_cache_turbo_test_fault_alloc_arm(void *data)
+{
+    ngx_http_cache_turbo_test_fault_alloc_reset(*(ngx_uint_t *) data);
+}
+
+
+/*
+ * Content handler: report, then arm or disarm. The report reflects the state
+ * BEFORE this request's argument is applied:
+ *
+ *     left=<n> calls=<n> fired=<n> fired_at=<n> site=<file>:<line>|-
+ *
+ * The parenthesised calls below are the real nginx functions; the funnel's
+ * function-like macros do not expand there.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_test_fault_alloc_handler(ngx_http_request_t *r)
+{
+    size_t               len;
+    ngx_int_t            rc, n;
+    ngx_buf_t           *b;
+    ngx_str_t            arg;
+    ngx_chain_t          out;
+    ngx_pool_cleanup_t  *cln;
+
+    if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    rc = ngx_http_discard_request_body(r);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    n = -1;
+
+    if (ngx_http_arg(r, (u_char *) "n", 1, &arg) == NGX_OK) {
+        n = ngx_atoi(arg.data, arg.len);
+        if (n == NGX_ERROR) {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+    }
+
+    len = sizeof("left= calls= fired= fired_at= site=:\n") - 1
+          + 5 * NGX_INT_T_LEN
+          + (ngx_http_cache_turbo_test_fa_file != NULL
+             ? ngx_strlen(ngx_http_cache_turbo_test_fa_file) : 1);
+
+    b = (ngx_create_temp_buf)(r->pool, len);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    b->last = ngx_sprintf(b->last, "left=%ui calls=%ui fired=%ui fired_at=%ui",
+                          ngx_http_cache_turbo_test_fa_left,
+                          ngx_http_cache_turbo_test_fa_calls,
+                          ngx_http_cache_turbo_test_fa_fired,
+                          ngx_http_cache_turbo_test_fa_fired_at);
+
+    if (ngx_http_cache_turbo_test_fa_file != NULL) {
+        b->last = ngx_sprintf(b->last, " site=%s:%ui\n",
+                              ngx_http_cache_turbo_test_fa_file,
+                              ngx_http_cache_turbo_test_fa_line);
+
+    } else {
+        b->last = ngx_sprintf(b->last, " site=-\n");
+    }
+
+    if (n == 0) {
+        ngx_http_cache_turbo_test_fault_alloc_reset(0);
+
+    } else if (n > 0) {
+        cln = (ngx_pool_cleanup_add)(r->pool, sizeof(ngx_uint_t));
+        if (cln == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        *(ngx_uint_t *) cln->data = (ngx_uint_t) n;
+        cln->handler = ngx_http_cache_turbo_test_fault_alloc_arm;
+    }
+
+    b->last_buf = (r == r->main) ? 1 : 0;
+    b->last_in_chain = 1;
+
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = b->last - b->pos;
+    ngx_str_set(&r->headers_out.content_type, "text/plain");
+    r->headers_out.content_type_len = r->headers_out.content_type.len;
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    out.buf = b;
+    out.next = NULL;
+
+    return ngx_http_output_filter(r, &out);
+}
+
+
+/* `cache_turbo_test_fault_alloc;` -- location level: serve the countdown
+ * report and arm path above. */
+char *
+ngx_http_cache_turbo_test_fault_alloc(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_core_loc_conf_t  *core_lcf;
+
+    core_lcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    core_lcf->handler = ngx_http_cache_turbo_test_fault_alloc_handler;
+
+    return NGX_CONF_OK;
+}
+
+#endif
 
 #pragma GCC visibility pop
