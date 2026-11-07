@@ -168,15 +168,16 @@ area_tests() {
 area_l2_tests() {
     awk '
         /^def test_/ { name = $0; sub(/^def /, "", name); sub(/\(.*/, "", name); sig = ""; open = 1 }
-        open { sig = sig $0 }
-        open && /\)[ ]*(->.*)?:[ ]*$/ {
+        open { line = $0; sub(/[ \t]*#.*$/, "", line); sig = sig line }
+        open && line ~ /\)[ ]*(->.*)?:[ ]*$/ {
             open = 0
             if (sig ~ /[(, ](mc|redis|redis_auth|redis_tls|redis_tls_untrusted|redis_tls_expired)[:,) =]/) print name
         }' "$ROOT/ci/tools/areas/$1.py"
 }
 
-REDIS_BIN="${PRECOMMIT_REDIS_SERVER:-$(command -v redis-server 2>/dev/null || true)}"
-MC_BIN="${PRECOMMIT_MEMCACHED_SERVER:-$(command -v memcached 2>/dev/null || true)}"
+# An override may be a bare name on PATH or a path; resolve it like the default.
+REDIS_BIN="$(command -v "${PRECOMMIT_REDIS_SERVER:-redis-server}" 2>/dev/null || true)"
+MC_BIN="$(command -v "${PRECOMMIT_MEMCACHED_SERVER:-memcached}" 2>/dev/null || true)"
 
 # Echo a reason and return 1 when an @area group cannot give a truthful result.
 # Stale build: a build older than the sources it tests fails on the NEW

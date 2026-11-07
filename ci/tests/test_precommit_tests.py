@@ -258,5 +258,66 @@ class MapCompleteness(unittest.TestCase):
         self.assertEqual(self.lint("/nonexistent/map.tsv").returncode, 2)
 
 
+class AreaL2(unittest.TestCase):
+    """L2 signature detection and server-override resolution (fake root)."""
+
+    AREA = (
+        "def test_first(\n"
+        "    redis,  # note\n"
+        "):  # note\n"
+        "    pass\n"
+        "def test_second():\n"
+        "    pass\n"
+    )
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.root = pathlib.Path(self._td.name)
+        areas = self.root / "ci" / "tools" / "areas"
+        areas.mkdir(parents=True)
+        (areas / "fx.py").write_text(self.AREA)
+        (self.root / "ci" / "tools" / "run_named.py").write_text(
+            "import sys\nprint('RUN', *sys.argv[1:])\n")
+        (self.root / "map.tsv").write_text("src/x.c\tbuild\t@area fx\n")
+        objs = self.root / ".build" / "nginx-9.9.9" / "objs"
+        objs.mkdir(parents=True)
+        ngx = objs / "nginx"
+        ngx.write_text("#!/bin/sh\n")
+        ngx.chmod(0o755)
+        self.bindir = self.root / "bin"
+        self.bindir.mkdir()
+        for n in ("fake-redis", "fake-mc"):
+            f = self.bindir / n
+            f.write_text("#!/bin/sh\n")
+            f.chmod(0o755)
+        self.path = f"{self.bindir}:{os.environ['PATH']}"
+
+    def run_sel(self, env):
+        e = {"PATH": self.path, "PRECOMMIT_TESTS": "require"}
+        e.update(env)
+        return sh("--map", str(self.root / "map.tsv"), "--files", "src/x.c",
+                  root=self.root, env=e)
+
+    def test_trailing_comment_after_signature_still_lists_test(self):
+        r = self.run_sel({"PRECOMMIT_REDIS_SERVER": "fake-redis",
+                          "PRECOMMIT_MEMCACHED_SERVER": "fake-mc"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--redis-server", r.stdout)
+
+    def test_bare_name_override_on_path_is_accepted(self):
+        r = self.run_sel({"PRECOMMIT_REDIS_SERVER": "fake-redis",
+                          "PRECOMMIT_MEMCACHED_SERVER": "fake-mc"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"--redis-server {self.bindir}/fake-redis", r.stdout)
+        self.assertIn(f"--memcached-server {self.bindir}/fake-mc", r.stdout)
+
+    def test_nonexistent_override_is_loud_failure(self):
+        r = self.run_sel({"PRECOMMIT_REDIS_SERVER": "no-such-redis-bin",
+                          "PRECOMMIT_MEMCACHED_SERVER": "fake-mc"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("redis-server is not available", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

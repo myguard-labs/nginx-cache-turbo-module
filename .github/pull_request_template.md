@@ -6,6 +6,6 @@
 
 - [ ] Tests ship in this PR for the new behaviour or fix.
 - [ ] README updated if behaviour changed.
-- [ ] New or changed park: TSV row in `ci/park-sites.tsv`, handler swap, detach,
-      `CT_PARK_*` macros, abort arms, finalize-before-posted order (or: no park
-      touched).
+- [ ] New or changed park: TSV row in `ci/park-sites.tsv`, handler swap (only
+      for access/precontent parks), detach (unless the TSV detach column is
+      `none`), abort arms, finalize-before-posted order (or: no park touched).
