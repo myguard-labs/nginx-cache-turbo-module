@@ -40,6 +40,7 @@ src/*.h	build	@make-check
 ci/tools/areas/admin.py	build	@area admin
 ci/tools/areas/breaker.py	build	@area breaker
 ci/tools/areas/core.py	build	@area core
+ci/tools/areas/faults.py	build	@area faults
 ci/tools/areas/http.py	build	@area http
 ci/tools/areas/l2.py	build	@area l2
 ci/tools/areas/policy.py	build	@area policy
