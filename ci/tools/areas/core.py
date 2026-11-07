@@ -9,6 +9,8 @@ star-imports this module, so every test stays reachable as
 
 from __future__ import annotations
 
+import resource
+
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
 from test_runtime_base import *
@@ -2203,9 +2205,14 @@ def test_dead_pool_alloc_trap(ng: Nginx) -> None:
     (trap / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
     cmd = ng.runner + [str(ng.binary), "-p", str(trap),
                        "-c", str(trap / "conf" / "nginx.conf"), "-t"]
+    # This child is EXPECTED to abort: no core file (CT-TRAP-TEST-CORE-DUMP).
+    # RLIMIT_CORE=0 is set in the child only, the parent keeps its limits.
+    def _no_core() -> None:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, timeout=20,
-                       env=config_check_env())
+                       env=config_check_env(), preexec_fn=_no_core)
     out = r.stdout
     log = trap / "logs" / "error.log"
     if log.exists():
