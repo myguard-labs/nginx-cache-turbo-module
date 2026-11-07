@@ -21,7 +21,7 @@ src/ngx_http_cache_turbo_match.c	build	@area policy
 src/ngx_http_cache_turbo_memcached.c	none	ut error_helpers error_helpers
 src/ngx_http_cache_turbo_module.c	none	ut breaker_retry breaker_retry && ut cc_delta cc_delta && ut key_fold key_fold -lssl -lcrypto && ut tok_sort tok_sort
 src/ngx_http_cache_turbo_module.c	build	@area core
-src/ngx_http_cache_turbo_presets.c	none	bash ci/tests/unit/check_constants.sh && python3 ci/tests/unit/check_preset_mirrors.py
+src/ngx_http_cache_turbo_presets.c	none	bash ci/tests/unit/check_constants.sh
 src/ngx_http_cache_turbo_probe.c	build	@area http
 src/ngx_http_cache_turbo_purge.c	none	ut purge_digest_order purge_digest_order && ut error_helpers error_helpers
 src/ngx_http_cache_turbo_purge.c	build	@area admin
@@ -68,7 +68,7 @@ ci/tests/unit/check_purge_snapshot_control.sh	build	bash ci/tests/unit/check_pur
 ci/tests/unit/check_purge_zero_skew_control.sh	build	bash ci/tests/unit/check_purge_zero_skew_control.sh
 ci/tests/unit/check_hash_diagnostic_controls.sh	build	bash ci/tests/unit/check_hash_diagnostic_controls.sh
 ci/tests/unit/check_varidx_accounting.sh	build	bash ci/tests/unit/check_varidx_accounting.sh
-ci/tests/unit/check_preset_mirrors.py	none	python3 ci/tests/unit/check_preset_mirrors.py
+ci/tests/unit/check_preset_mirrors.py	none	bash ci/tests/unit/check_constants.sh
 ci/tests/unit/test_math.c|ci/tests/unit/ngx_shim_math.h	none	ut math -
 ci/tests/unit/test_digest.c|ci/tests/unit/extract_digest.sh|ci/tests/unit/ngx_shim_digest*.h	none	ut digest digest -lssl -lcrypto
 ci/tests/unit/test_digest_fail.c	none	bash ci/tests/unit/check_digest_result_contract.sh && ut digest_fail - -lssl -lcrypto

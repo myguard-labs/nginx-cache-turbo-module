@@ -286,13 +286,18 @@ static const char *const  ct_woo_args[] = { "wc-ajax", NULL };
  *
  * The real guard for a logged-in Joomla user therefore remains Joomla's own
  * Cache-Control (core's page cache plugin itself gates on
- * !$app->getIdentity()->guest), plus the /administrator/ URI rule. An operator
- * running a site with frontend logins MUST add their own cache_turbo_bypass on
+ * !$app->getIdentity()->guest), plus the /administrator/ and /api/ URI rules.
+ * An operator running a site with frontend logins MUST add their own cache_turbo_bypass on
  * their install's session-cookie name — docs/joomla.md shows how to find it.
  * Do not read the presence of a cookie rule here as "joomla is now handled".
+ *
+ * /api/ is the Web Services application (htaccess.txt routes it to
+ * api/index.php; Joomla 6.2.0). Its token plugin authenticates from the
+ * X-Joomla-Token header (plugins/api-authentication/token Token.php:138), not a
+ * cookie, so no cookie rule can see it: the URI rule is the only guard.
  */
 static const char *const  ct_joomla_cookies[] = { "joomla_remember_me_", NULL };
-static const char *const  ct_joomla_uris[] = { "/administrator/", NULL };
+static const char *const  ct_joomla_uris[] = { "/administrator/", "/api/", NULL };
 static const char *const  ct_joomla_args[] = { NULL };
 
 /*
@@ -401,7 +406,10 @@ static const char *const  ct_xf_key_cookies[] = {
  *
  * Note Discourse ships its own anonymous page cache and already sends
  * Cache-Control: no-store on authenticated responses, so this preset is mostly
- * defence-in-depth. The api_key/api_username args mark API calls.
+ * defence-in-depth. The api_key/api_username/user_api_key args mark API calls.
+ * user_api_key (PARAMETER_USER_API_KEY, default_current_user_provider.rb:34)
+ * is read from the query on the RSS/bookmark feed paths (:54-77, :128-129);
+ * arg rows match exact names, so api_key does not cover it.
  *
  * The rule is "_t=", not "_t": a two-character substring would match inside
  * unrelated names and values (_gat, utm_term=...). Keeping the "=" pins it to a
@@ -423,7 +431,7 @@ static const char *const  ct_discourse_uris[] = {
     "/my/", "/message-bus/", "/drafts", "/presence/", "/notifications",
     "/user_actions", NULL };
 static const char *const  ct_discourse_args[] = {
-    "api_key", "api_username", NULL };
+    "api_key", "api_username", "user_api_key", NULL };
 
 /*
  * phpBB 3.x. NO COOKIE RULE — and that is deliberate, not an omission.
@@ -808,9 +816,14 @@ static const char *const  ct_magento_key_cookies[] = { "X-Magento-Vary", NULL };
  *
  * /p/ is unpublished post previews (must never be cached) and /r/ is the
  * link-redirect tracker.
+ *
+ * ghost-admin-toolbar (frontend/web/middleware/admin-toolbar.js:5) is the only
+ * staff signal on site pages: the admin session cookie is path-scoped to /ghost,
+ * and Ghost itself marks toolbar responses private (frontend-caching.js:54).
  */
 static const char *const  ct_ghost_cookies[] = {
-    "ghost-members-ssr", "ghost-admin-api-session", NULL };
+    "ghost-members-ssr", "ghost-admin-api-session", "ghost-admin-toolbar",
+    NULL };
 static const char *const  ct_ghost_uris[] = {
     "/ghost/", "/members/", "/p/", "/r/", NULL };
 static const char *const  ct_ghost_args[] = {
@@ -902,12 +915,12 @@ static const char *const  ct_kirby_args[] = { NULL };
  * CacheHeadersService::buildCacheHash() folds a SET of fields into it —
  * {rule_ids, version_id, currency_id, tax_state, logged_in_state} — where
  * logged_in_state is literally 'logged-in' | 'not-logged-in' (CacheHeadersService
- * .php:104). The logged-in bit is INSIDE the value, alongside currency and price
+ * .php:100). The logged-in bit is INSIDE the value, alongside currency and price
  * rules. Shopware's own reverse proxy treats it exactly as a key and never as a
  * bypass (shopware/varnish-shopware default.vcl: hash_data("+context=" +
  * cookie.get("sw-cache-hash"))), which is the behaviour we are matching.
  *
- * WHY A BYPASS WOULD BE WRONG, precisely: isCacheHashRequired() (:125) returns
+ * WHY A BYPASS WOULD BE WRONG, precisely: isCacheHashRequired() (:116) returns
  * true for a logged-in customer OR a guest with a filled cart OR a guest on a
  * non-default currency. So bypass-on-presence would send cart-holding GUESTS and
  * non-default-currency GUESTS to the origin — anonymous visitors whose private
@@ -917,7 +930,7 @@ static const char *const  ct_kirby_args[] = { NULL };
  *
  * LAZY, and actively so — this is the (b) half of the screening question, and
  * Shopware enforces it harder than any other preset here. When the hash is NOT
- * required, applyCacheHash() (:62) does not merely omit the cookie, it DELETES a
+ * required, applyCacheHash() (:48/:58-59) does not merely omit the cookie, it DELETES a
  * stale one (removeCookie + clearCookie). A default anonymous visitor is
  * guaranteed cookieless, so the anonymous bucket is the common case.
  *
@@ -940,6 +953,11 @@ static const char *const  ct_kirby_args[] = { NULL };
  * defence-in-depth (Shopware sends no-store on them anyway). /admin is the API +
  * Administration SPA. /store-api is the headless JSON API: it is context-sensitive
  * per sw-context-token and must never be shared.
+ *
+ * The one EQ predicate: sw-cache-hash == "not-cacheable" (Event/
+ * HttpCacheCookieEvent.php:20-25, HttpCacheKeyGenerator.php:158; set for pending
+ * flash messages by Storefront CacheCookieEventSubscriber.php:54). Shopware
+ * declares that visitor uncacheable; the key cookie alone would share one bucket.
  */
 static const char *const  ct_shopware6_cookies[] = { NULL };
 static const char *const  ct_shopware6_uris[] = {
@@ -947,6 +965,13 @@ static const char *const  ct_shopware6_uris[] = {
 static const char *const  ct_shopware6_args[] = { NULL };
 /* Value-keyed, never bypassed. Exact name — see ngx_http_cache_turbo_cookie_value. */
 static const char *const  ct_shopware6_key_cookies[] = { "sw-cache-hash", NULL };
+/* sw-cache-hash == "not-cacheable" is Shopware's own "bypass the cache for
+ * further requests" marker (HttpCacheCookieEvent::NOT_CACHEABLE). Keyed alone it
+ * would pool every such visitor in one shared bucket, so it also bypasses. */
+static const ngx_http_cache_turbo_cookie_pred_t  ct_shopware6_preds[] = {
+    { "sw-cache-hash", NGX_HTTP_CACHE_TURBO_CVOP_EQ, "not-cacheable" },
+    { NULL, 0, NULL }
+};
 
 /*
  * TYPO3 (v11..v13). Lazy sessions, confirmed at the strongest possible place: the
@@ -1812,8 +1837,8 @@ const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY,
       ct_kirby_cookies, ct_kirby_uris, ct_kirby_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6,
-      ct_shopware6_cookies, ct_shopware6_uris, ct_shopware6_args, NULL,
-      ct_shopware6_key_cookies, NULL },
+      ct_shopware6_cookies, ct_shopware6_uris, ct_shopware6_args,
+      ct_shopware6_preds, ct_shopware6_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3,
       ct_typo3_cookies, ct_typo3_uris, ct_typo3_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_INVISION,

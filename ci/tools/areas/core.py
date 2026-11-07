@@ -174,9 +174,11 @@ def test_surrogate_key_emit_on_miss_and_hit(ng: Nginx) -> None:
         f"expected exactly one Surrogate-Key line on a HIT, got {sk_lines!r}"
 
 
-def test_surrogate_key_off_by_default(ng: Nginx) -> None:
+def test_surrogate_key_off_by_default(ng: Nginx,
+                                      redis: RedisServer | None = None) -> None:
     """A cache_turbo_tag location WITHOUT cache_turbo_surrogate_key emits no
-    Surrogate-Key header -- the directive gates the emit."""
+    Surrogate-Key header -- the directive gates the emit.  /skoff/ lives in
+    redis_loc, so the redis fixture is taken only so run_named.py starts Redis."""
     s1, _b1, h1 = fetch(ng.port, "/skoff/page")
     assert s1 == 200, f"miss status {s1}"
     assert "x-cache" not in h1, f"first req should MISS, got {h1.get('x-cache')}"
@@ -630,6 +632,9 @@ def test_restore_allocation_failure_fails_closed(ng: Nginx,
     """Allocation failure while rebuilding a cached response must never emit a
     partial cached 200/3xx or fall through from a destructively reset SIE header
     list. The hidden directive exists only in ci/tools/ci-build.sh builds."""
+    if not ng.fault_injection:  # run_all gates this on the TEST_FAULTS build
+        print("restore allocation failure: SKIPPED (not a fault-injection build)")
+        return
     aborted_paths: list[str] = []
 
     def assert_failed_closed(path: str, forbidden_status: int,
@@ -704,6 +709,9 @@ def test_file_backed_delegate_never_stores(ng: Nginx,
     cache_turbo_test_force_file_buf directive drives that branch
     deterministically (the real in_file trigger is directio/fs dependent). The
     directive exists only in ci/tools/ci-build.sh builds."""
+    if not ng.fault_injection:  # run_all gates this on the TEST_FAULTS build
+        print("file-backed delegate: SKIPPED (not a fault-injection build)")
+        return
     n0 = origin.hits
     s1, b1, h1 = fetch(ng.port, "/forcefile/asset")
     assert s1 == 200 and b1, f"forcefile prime failed: {s1}"
@@ -1176,7 +1184,8 @@ _COOKIE_NEEDLE_TABLE = {
     "drupal":      ("/ct-drupal/", ["SESS"]),
     "mediawiki":   ("/ct-mediawiki/", ["Token=", "_session=", "UserID="]),
     "ghost":       ("/ct-ghost/", ["ghost-members-ssr",
-                                    "ghost-admin-api-session"]),
+                                    "ghost-admin-api-session",
+                                    "ghost-admin-toolbar"]),
     "wagtail":     ("/ct-wagtail/", ["sessionid"]),
     "kirby":       ("/ct-kirby/", ["kirby_session"]),
     "typo3":       ("/ct-typo3/", ["fe_typo_user", "be_typo_user"]),
@@ -1802,7 +1811,8 @@ _ARG_NEEDLE_TABLE = {
     "wordpress":   ("/auto/", ["preview", "rest_route"]),
     "woocommerce": ("/auto/", ["wc-ajax"]),
     "xenforo":     ("/xf/", ["_xfToken"]),
-    "discourse":   ("/dc/", ["api_key", "api_username"]),
+    "discourse":   ("/dc/", ["api_key", "api_username",
+                                    "user_api_key"]),
     "phpbb":       ("/phpbb/", ["sid"]),
     "mediawiki":   ("/ct-mediawiki-args/", ["veaction", "returnto",
                                                  "action=edit", "action=submit",

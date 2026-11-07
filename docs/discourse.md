@@ -52,7 +52,7 @@ cache_turbo_backend discourse;      # implies cache_turbo_cache_control honor
 | Check | Values |
 |---|---|
 | URI prefixes | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` |
-| Query args | `api_key`, `api_username` |
+| Query args | `api_key`, `api_username`, `user_api_key` |
 | Cookie header substrings | `_t=` |
 
 > **Subdirectory installs.** The URI prefixes above are root-relative literals
@@ -246,8 +246,8 @@ The copy stays fresh for `60s`; if the origin starts failing after that, the exp
   misses cheap. If you want to see cache-turbo's true miss cost, set
   `DISCOURSE_DISABLE_ANON_CACHE=1` and watch your origin latency, not because you
   should run it that way.
-- **The API is a bypass surface.** `?api_key=` / `?api_username=` requests are
-  authenticated by query arg, not cookie; the preset bypasses on both. The
+- **The API is a bypass surface.** `?api_key=` / `?api_username=` / `?user_api_key=` requests are
+  authenticated by query arg, not cookie; the preset bypasses on all three. The
   match is done by the preset's own scanner: it splits on `;` as well as `&`,
   checks every occurrence of a name rather than the first, and percent-decodes
   before comparing. A hand-written `$arg_api_key` rule does none of that — use

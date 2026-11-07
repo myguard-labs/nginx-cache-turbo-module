@@ -57,7 +57,7 @@
 # prefix-row rule does not add a case here.
 #
 # THIS PRESET HAS AN ARG TIER -- ct_discourse_args[] = { "api_key",
-# "api_username", NULL }. The /dcarg/ location below overrides the suite
+# "api_username", "user_api_key", NULL }. The /dcarg/ location below overrides the suite
 # default key to `$is_args$args` so a query-arg case is not silently masked
 # by a path-only key (TEST 11: repeat traffic for the SAME ?api_key= value
 # must stay bypassed rather than looking like an ordinary cached entry).
@@ -297,6 +297,23 @@ Cookie: list_t=whatever
  qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200, 200, 200, 200, 200]
+
+
+
+=== TEST 10b: ?user_api_key= (feed/bookmark auth, exact arg name) bypasses
+# user_api_key is read from the query on the RSS/bookmark feed paths
+# (default_current_user_provider.rb:34,128-129). Arg rows match exact names, so
+# api_key does not cover it. A plain feed URL without it must still HIT.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /dcarg/feed-a?user_api_key=abc123", "GET /dcarg/feed-a?user_api_key=abc123",
+ "GET /dcarg/feed-b.rss",                 "GET /dcarg/feed-b.rss"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200, 200]
 
 
 

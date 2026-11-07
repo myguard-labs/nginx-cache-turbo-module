@@ -39,13 +39,12 @@
 # sw-states as a non-bypass, positively (via $cache_turbo_status), because an
 # empty bypass-cookie list would pass a bare `x-cache == HIT` assert for free.
 #
-# NO ARG RULES, NO PREDICATES -- ONLY THE URI LEG AND THE KEY-COOKIE LEG APPLY
+# NO ARG RULES, ONE PREDICATE -- URI, KEY-COOKIE AND ONE EQ-PREDICATE LEG
 # ----------------------------------------------------------------------------
-# ct_shopware6_cookies[] and ct_shopware6_args[] are both {NULL} -- the
-# shopware6 row in ngx_http_cache_turbo_presets[] carries NULL for cookie_preds
-# too, so this file has no cookie-bypass leg, no arg-rule leg and no predicate
-# leg. Only the URI-bypass leg (TEST 1, 1b) and the key-cookie leg (TEST 2-9)
-# apply.
+# ct_shopware6_cookies[] and ct_shopware6_args[] are both {NULL}. The row carries
+# one cookie predicate: sw-cache-hash EQ "not-cacheable" (TEST 3b), Shopware's
+# own "do not cache this visitor" marker. The URI-bypass leg (TEST 1, 1b), the
+# key-cookie leg (TEST 2-9) and that predicate apply.
 #
 # /account, /checkout, /admin, /api and /store-api are all slash-less needles
 # except /store-api which itself has no trailing slash either -- every row in
@@ -196,6 +195,28 @@ Cookie: sw-cache-hash=b1946ac92492d2347c6235b4d2611184
 --- response_body_like eval
 [qr/ck=sw-cache-hash=b1946ac9/, qr/ck=sw-cache-hash=b1946ac9/,
  qr/ck=sw-cache-hash=591785b7/, qr/ck=sw-cache-hash=591785b7/]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
+=== TEST 3b: sw-cache-hash=not-cacheable BYPASSES -- Shopware's own opt-out marker
+# HttpCacheCookieEvent::NOT_CACHEABLE (:20-25): "bypass the cache for further
+# requests"; set for pending flash messages. Keyed alone every such visitor would
+# share ONE bucket. Any other hash value still keys and HITs (negative control).
+--- http_config eval: $::HttpConfigExtra
+--- config eval: $::Config
+--- request eval
+["GET /sw/product-nc", "GET /sw/product-nc",
+ "GET /sw/product-ok", "GET /sw/product-ok"]
+--- more_headers eval
+["Cookie: sw-cache-hash=not-cacheable",
+ "Cookie: sw-cache-hash=not-cacheable",
+ "Cookie: sw-cache-hash=not-cacheable-x",
+ "Cookie: sw-cache-hash=not-cacheable-x"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200, 200, 200]
 

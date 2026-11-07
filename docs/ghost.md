@@ -42,7 +42,7 @@ cache_turbo_backend ghost;      # implies cache_turbo_cache_control honor
 |---|---|
 | URI prefixes | `/ghost/`, `/members/`, `/p/`, `/r/` |
 | Query args | `uuid`, `key`, `token`, `gift` |
-| Cookie header substrings | `ghost-members-ssr`, `ghost-admin-api-session` |
+| Cookie header substrings | `ghost-members-ssr`, `ghost-admin-api-session`, `ghost-admin-toolbar` |
 
 The question that decides any preset is: *does a logged-in user change the HTML
 that a logged-out user would have seen?* For Ghost the answer is **yes, even on a
