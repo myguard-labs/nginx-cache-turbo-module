@@ -137,6 +137,25 @@ MODULE=""
 if [ -n "$NGX_DIR" ]; then
     MODULE="$(find "$NGX_DIR/objs" -maxdepth 1 -name 'ngx_http_cache_turbo*module.so' 2>/dev/null | head -1)"
 fi
+# A static (--add-module, e.g. asan) build already contains the module; passing
+# --module to it fails "module already loaded". Detect it from the configure
+# line: `nginx -V` lists --add-module=<path> only for statically built modules.
+#   Only an --add-module= path that is this module's source tree counts (a
+#   third-party static module does not satisfy it).
+STATIC_MODULE=0
+if [ -n "$NGX_DIR" ] && [ -x "$NGX_OBJS/nginx" ]; then
+    NGX_CONF_ARGS="$("$NGX_OBJS/nginx" -V 2>&1)"
+    while IFS= read -r tok; do
+        mdir="${tok#--add-module=}"
+        if compgen -G "$mdir/src/ngx_http_cache_turbo*.c" >/dev/null; then
+            STATIC_MODULE=1
+        fi
+    done < <(tr ' ' '\n' <<<"$NGX_CONF_ARGS" | grep '^--add-module=' || true)
+fi
+MODULE_ARG=()
+if [ -n "$MODULE" ] && [ "$STATIC_MODULE" = 0 ]; then
+    MODULE_ARG=(--module "$MODULE")
+fi
 
 # The unit scripts/Makefile read these names (see ci/tests/unit/run.sh).
 NGINX_SRC="$NGX_SRC"
@@ -243,7 +262,7 @@ run_one() {
             # is None and the test crashes on it. Same flags CI passes.
             [ "${#l2[@]}" -eq 0 ] || srv=(--redis-server "$REDIS_BIN" --memcached-server "$MC_BIN")
             python3 ci/tools/run_named.py --nginx-binary "$NGX_OBJS/nginx" \
-                ${MODULE:+--module "$MODULE"} --port "$PORT" ${srv[@]+"${srv[@]}"} "${all[@]}" ;;
+                ${MODULE_ARG[@]+"${MODULE_ARG[@]}"} --port "$PORT" ${srv[@]+"${srv[@]}"} "${all[@]}" ;;
         "@fuzz-replay") fuzz_replay ;;
         "@make-check")
             make -C ci/tests/unit --no-print-directory check \
