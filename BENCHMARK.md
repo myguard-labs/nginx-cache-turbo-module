@@ -446,3 +446,5 @@ allocator, OS, and concurrent request count.
 - [`tools/soak.sh`](ci/tools/soak.sh) — correctness/stability soak under ASAN/valgrind.
 - [Monitoring (Prometheus + Grafana)](README.md#monitoring-prometheus--grafana)
   — the same counters bench.sh reads for its HIT % column.
+
+<!-- CI-L1 docs-only control: no content change -->
