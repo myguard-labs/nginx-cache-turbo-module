@@ -36,6 +36,12 @@ handled natively and needs no cookie `map`.
 | URI prefixes | `/account`, `/checkout`, `/admin`, `/api`, `/store-api` |
 | Query args | — |
 | Key cookies (value folded into cache key) | `sw-cache-hash` |
+| Cookie value predicates (bypass) | `sw-cache-hash` equals `not-cacheable` |
+
+The one exception to "never bypassed" is the literal value `not-cacheable`: Shopware
+sets it (for example for pending flash messages) to mean "bypass the cache for
+further requests", so that visitor skips the cache instead of sharing one bucket.
+Every other value stays keyed.
 
 > **Subdirectory installs.** The URI prefixes above are root-relative literals
 > matched from byte 0 of `r->uri`, so an install mounted under a subdirectory

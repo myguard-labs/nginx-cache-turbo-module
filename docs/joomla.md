@@ -23,7 +23,7 @@ cache_turbo_bypass   $cookie_<your_joomla_session_cookie>;   # ← REQUIRED, see
 cache_turbo_no_store $cookie_<your_joomla_session_cookie>;   # ← REQUIRED, bypass alone still STORES
 ```
 
-The preset alone skips `/administrator/` and nothing else. Those two lines are
+The preset alone skips `/administrator/` and `/api/` and nothing else. Those two lines are
 not optional garnish — without them, a logged-in Joomla user's page can be
 stored and served to the public. **You need both:** `cache_turbo_bypass` only
 skips the cache *lookup*, so the logged-in response is still written under the
@@ -33,7 +33,7 @@ shared key; `cache_turbo_no_store` is the half that prevents storing.
 
 | Check | Values |
 |---|---|
-| URI prefixes | `/administrator/` |
+| URI prefixes | `/administrator/`, `/api/` |
 | Query args | — |
 | Cookie header substrings | `joomla_remember_me_` |
 

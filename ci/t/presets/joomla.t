@@ -25,7 +25,7 @@
 # their install's session-cookie name -- docs/joomla.md shows how to find it.
 # Do not read the presence of a cookie rule here as "joomla is now handled".
 #
-# NO ARGS, NO PREDICATES, NO KEY COOKIES
+# NO ARGS, NO PREDICATES, NO KEY COOKIES (the second URI row, /api/, is TEST 2c/2d)
 # ---------------------------------------
 # ct_joomla_args[] is empty and the preset's table row carries NULL for both
 # cookie_preds and key_cookies (see ngx_http_cache_turbo_presets[] in
@@ -35,7 +35,7 @@
 #
 # THE URI NEEDLE IS ALREADY SLASH-TERMINATED -- NO BOUNDARY-BYTE LEG TO TEST
 # ----------------------------------------------------------------------------
-# ct_joomla_uris[] holds one row, "/administrator/", which already ends in '/'.
+# ct_joomla_uris[] holds two rows, "/administrator/" and "/api/", which already end in '/'.
 # ngx_http_cache_turbo_uri_prefix() takes the "carries its own segment
 # terminator" branch for such a needle and returns on the ngx_strncmp prefix
 # alone -- the boundary-byte check ('/'/'.', used for slash-less needles like
@@ -78,6 +78,8 @@ our $Config = ct_config(
     { path => '/jm/',            backend => 'joomla'    },
     { path => '/gen/',           backend => 'wordpress' },
     { path => '/administratorX', backend => 'joomla'    },
+    { path => '/api/',           backend => 'joomla'    },
+    { path => '/apis',           backend => 'joomla'    },
 );
 
 run_tests();
@@ -146,6 +148,33 @@ __DATA__
 --- config eval: $::Config
 --- request eval
 ["GET /administratorX", "GET /administratorX"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 2c: /api/ (Web Services, X-Joomla-Token) bypasses on the URI rule
+# Joomla 6.2.0 routes /api/ to api/index.php; the token plugin authenticates from
+# the X-Joomla-Token header (Token.php:138), never a cookie, so the URI rule is
+# the only guard.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /api/index.php/v1/users", "GET /api/index.php/v1/users"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 2d: a sibling /apis is NOT covered -- slash-terminated needle, HIT
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /apis", "GET /apis"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval

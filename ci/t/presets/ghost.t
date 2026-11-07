@@ -184,6 +184,28 @@ __DATA__
 
 
 
+=== TEST 3b: ghost-admin-toolbar (staff frontend toolbar) bypasses; a lookalike does not
+# admin-toolbar.js:5 COOKIE_NAME. The admin session cookie is path-scoped to
+# /ghost, so this is the only staff signal on site pages. "ghost-admin-tool=1" is
+# a truncated lookalike that must not match the needle and so must HIT.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /blog/post-tb", "GET /blog/post-tb",
+ "GET /blog/post-tn", "GET /blog/post-tn"]
+--- more_headers eval
+["Cookie: ghost-admin-toolbar=true",
+ "Cookie: ghost-admin-toolbar=true",
+ "Cookie: ghost-admin-tool=1",
+ "Cookie: ghost-admin-tool=1"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
 === TEST 4: a suffix-bearing cookie under ANY prefix still bypasses
 # The bypass predicate matches the cookie NAME by suffix, so a proxy- or
 # CDN-prefixed variant of the members cookie is still a member signal. If this

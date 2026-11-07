@@ -1,6 +1,6 @@
 # Preset review and deployment checklist
 
-_Implementation reviewed: 2026-09-01 at `3db1ca9`._
+_Implementation reviewed: 2026-09-01 at `3db1ca9`; 13 original presets re-checked upstream 2026-11-07._
 
 This page records what was checked across every shipped
 `cache_turbo_backend` preset. The per-application guides remain the source for
@@ -41,17 +41,17 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | --- | ---: | ---: | ---: | --- | ---: | --- |
 | `wordpress` | 3 | 5 | 2 | — | — | Safe for stock cookie names; password previews, comments and REST are covered. |
 | `woocommerce` | 3 | 3 | 1 | — | — | Implies `wordpress`; add translated or renamed cart/account slugs. |
-| `joomla` | 1 | 1 | — | — | — | Partial: ordinary frontend login uses an install-specific session cookie. |
+| `joomla` | 1 | 2 | — | — | — | Partial: ordinary frontend login uses an install-specific session cookie. |
 | `xenforo` | 4 | 11 | 1 | — | 3 | Safe but `xf_session` can reduce guest hit rate; custom cookie prefixes need local rules. |
-| `discourse` | 1 | 12 | 2 | — | — | Safe for the stock `_t` token cookie; a renamed token cookie needs a local rule. |
+| `discourse` | 1 | 12 | 3 | — | — | Safe for the stock `_t` token cookie; a renamed token cookie needs a local rule. |
 | `phpbb` | — | 7 | 1 | yes | — | Member `_u != 1` is detected without bypassing every guest session. |
 | `drupal` | 1 | 7 | — | — | — | `SESS`/`SSESS` names are covered; the broad substring can reduce hit rate on co-hosted apps. |
 | `mediawiki` | 3 | — | 15 | — | — | Query-driven private actions are covered without bypassing all `/index.php` articles. |
 | `magento` | — | 12 | — | — | 1 | `X-Magento-Vary` is value-keyed; do not convert it to presence bypass. |
-| `ghost` | 2 | 4 | 4 | — | — | Cookieless member and paid-content token arguments are covered. |
+| `ghost` | 3 | 4 | 4 | — | — | Cookieless member and paid-content token arguments are covered. |
 | `wagtail` | 1 | 3 | — | — | — | Safe while guests remain session-free; anonymous sessions fail safe by reducing hit rate. |
 | `kirby` | 1 | 1 | — | — | — | Safe while guests remain session-free; `csrf()` can make guest pages bypass. |
-| `shopware6` | — | 5 | — | — | 1 | `sw-cache-hash` is value-keyed; preserve that contract across Shopware upgrades. |
+| `shopware6` | — | 5 | — | yes | 1 | `sw-cache-hash` is value-keyed, except the `not-cacheable` marker, which bypasses; preserve that contract across Shopware upgrades. |
 | `typo3` | 2 | 1 | — | — | — | Unsafe after an unmirrored `FE/cookieName` rename; add local bypass and no-store rules. |
 | `invision` | — | 5 | 5 | yes | 3 | Vendor-attested closed-source rules; verify cookies on the deployed release. |
 | `smf` | 1 | — | 12 | — | — | Safe but presence-only session matching can bypass guests. |
@@ -89,6 +89,29 @@ sentinel, not a preset.
 The registry, runtime-test mirrors and documentation index agree on all 34
 preset rows and 37 accepted spellings. The preset unit checks cover every
 populated cookie and argument row.
+
+The 2026-11-07 upstream re-check of the 13 original application presets
+(wordpress, woocommerce, joomla, xenforo, discourse, phpbb, drupal, mediawiki,
+magento, ghost, wagtail, kirby, shopware6) read the cited upstream source of
+each release below and changed four presets; the other nine needed no literal
+change. XenForo is closed source (its docs were unreachable), so its rows stay
+vendor-attested and were not re-verified.
+
+| Preset | Release checked | Result |
+| --- | --- | --- |
+| `wordpress` | 7.1.4 | No change. |
+| `woocommerce` | 11.2.2 | No change. |
+| `joomla` | 6.2.0 | Added URI `/api/`: the Web Services application authenticates from the `X-Joomla-Token` header, never a cookie. |
+| `xenforo` | closed source | No change; vendor-attested, unverified. |
+| `discourse` | v2026.10.0 | Added arg `user_api_key`: read from the query on feed and bookmark paths; arg rows match exact names, so `api_key` does not cover it. |
+| `phpbb` | 3.3.19 | No change. |
+| `drupal` | 11.4.12 | No change. |
+| `mediawiki` | 1.46.2 | No change. |
+| `magento` | 2.4.9 | No change. |
+| `ghost` | v6.75.0 | Added cookie `ghost-admin-toolbar`: the staff toolbar cookie is the only staff signal on site pages, because the admin session cookie is path-scoped to `/ghost`. |
+| `wagtail` | v8.1 (Django 6.1.3) | No change. |
+| `kirby` | 5.6.3 | No change. |
+| `shopware6` | v6.7.16.0 | Added predicate `sw-cache-hash` equals `not-cacheable` (Shopware's own "bypass the cache" marker); the key cookie stays. |
 
 `nextjs` was added after this review (researched 2026-09-29 against Next.js
 16.3.7). Its cookie and argument rows are in the same mirrors; its
