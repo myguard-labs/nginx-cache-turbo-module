@@ -300,11 +300,11 @@ case_ 0 "Semgrep engine/rule/consumer mutations are all red" \
 # run remotely when this control was written. A gate that runs everywhere except
 # the merge path is the one place it is load-bearing.
 missing=""
-only="$(sed -n 's/^ *LINT_ONLY: *//p' .github/workflows/lint.yml)"
+only="$(sed -n 's/^ *LINT_ONLY: *//p' .github/workflows/static.yml)"
 for s in ci/linter/lint-*.sh; do
     n="${s#ci/linter/lint-}"; n="${n%.sh}"
-    # "c" is deliberately excluded in CI (see lint.yml's header): the src/
-    # scanners run in security-scanners.yml instead.
+    # "c" is deliberately excluded in CI (see static.yml's header): the src/
+    # scanners run in static.yml instead.
     [ "$n" = "c" ] && continue
     # In-process membership. `printf | grep -qx` can invert its verdict when
     # grep -q exits early and printf's write hits EPIPE -- same defect that
@@ -316,9 +316,9 @@ for s in ci/linter/lint-*.sh; do
     [ -n "$found" ] || missing="$missing $n"
 done
 if [ -z "$missing" ]; then
-    echo "ok   every checker is named in lint.yml LINT_ONLY"
+    echo "ok   every checker is named in static.yml LINT_ONLY"
 else
-    echo "FAIL checkers absent from lint.yml LINT_ONLY:$missing" >&2
+    echo "FAIL checkers absent from static.yml LINT_ONLY:$missing" >&2
     echo "       | they run locally and in the hook, but never on a PR" >&2
     rc=1
 fi
@@ -684,8 +684,8 @@ case_ 2 "lint-astgrep.sh: a failing rule-id producer is exit 2" \
 # workflow linters, while an ordinary YAML path must not call either one.
 case_ 0 "lint-yaml.sh: a workflow path reaches the workflow linters" \
     env PATH="$listroot/bin:$PATH" REAL_GIT="$(command -v git)" \
-    YAML_EXPECT_WORKFLOW=.github/workflows/lint.yml \
-    ci/linter/lint-yaml.sh .github/workflows/lint.yml
+    YAML_EXPECT_WORKFLOW=.github/workflows/static.yml \
+    ci/linter/lint-yaml.sh .github/workflows/static.yml
 case_ 0 "lint-yaml.sh: a non-workflow YAML path leaves WF empty" \
     env PATH="$listroot/bin:$PATH" REAL_GIT="$(command -v git)" \
     YAML_REJECT_WORKFLOW_TOOLS=1 \
@@ -698,7 +698,7 @@ case_ 1 "lint-yaml.sh: subset grep failure cannot become empty-clean" \
     env PATH="$listroot/bin:$PATH" REAL_GIT="$(command -v git)" \
     REAL_GREP="$(command -v grep)" GREP_FAIL_YAML_SUBSET=1 \
     YAML_REJECT_WORKFLOW_TOOLS=1 \
-    ci/linter/lint-yaml.sh .github/workflows/lint.yml
+    ci/linter/lint-yaml.sh .github/workflows/static.yml
 
 # NUL transport controls. One actual tracked path carries both a space and a
 # newline byte; explicit, all-tracked, and staged selection must each return it
