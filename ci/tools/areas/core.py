@@ -2210,8 +2210,12 @@ def test_dead_pool_alloc_trap(ng: Nginx) -> None:
     log = trap / "logs" / "error.log"
     if log.exists():
         out += log.read_text(encoding="utf-8", errors="replace")
-    assert r.returncode != 0, \
-        f"dead-pool allocation did not stop nginx -t:\n{out}"
+    # The trap ends in ngx_abort() (abort(3)), so the status must be SIGABRT:
+    # -6 for a direct spawn, 134 when a --runner shell wrapper reports it as
+    # 128+6. Any other status fails, including the SIGSEGV a gate that logged
+    # and returned NGX_OK would still hit inside the NULL-pool allocation.
+    assert r.returncode in (-6, 134), \
+        f"dead-pool allocation did not abort (status {r.returncode}):\n{out}"
     m = re.search(r"\[alert\].*cache_turbo: alloc on dead pool at "
                   r"(\S*ngx_http_cache_turbo_module\.c):(\d+)", out)
     assert m is not None, \
@@ -2220,12 +2224,6 @@ def test_dead_pool_alloc_trap(ng: Nginx) -> None:
     assert "allocated on a dead pool without trapping" not in out, \
         f"dead-pool allocation returned to its caller:\n{out}"
 
-
-
-# BP-C1: own nginx for the fault_alloc countdown, ng.port + this. Not in
-# PORT_OFFSETS (nginx_config.py) because only this test uses it; 9 is free
-# there (5/6 cross-instance nodes, 11+ origin and backends).
-_FAULT_ALLOC_PORT_OFFSET = 9
 
 
 def _fault_alloc_config(root: pathlib.Path, port: int,
@@ -2324,7 +2322,7 @@ class _FaultAlloc:
 def _fault_alloc_nginx(ng: Nginx) -> Nginx:
     root = ng.root.parent / "fault-alloc"
     fa = Nginx(ng.binary, ng.module, root,
-               ng.port + _FAULT_ALLOC_PORT_OFFSET, ng.origin_port,
+               ng.port + PORT_OFFSETS["fault_alloc"], ng.origin_port,
                ng.runner_raw, ng.single_process)
 
     def write_config(sr_off: bool = False) -> None:
