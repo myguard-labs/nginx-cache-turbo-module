@@ -10,7 +10,9 @@ serve the next normal request on a fresh connection.
 The scenario table is the extension point: a row is a ``_Scenario`` with a
 name, a ``uri`` factory (called once per step, so a MISS row can hand out a
 fresh key every time), a ``ready`` hook that puts the cache into the state the
-measured request needs, and the stable ``expect_x_cache`` of the follow-up.
+measured request needs, and the ``measured_hit`` flag (does a clean request
+for the row report X-Cache: HIT). Hit rows also take the expected body from
+``probe`` or ``_Sweep.expect``.
 
 Sampling: by default (PR mode) each row fails a seeded, deterministic sample of
 N (always N=1 and N=count) so the whole sweep stays within ~60 s on the ASan
