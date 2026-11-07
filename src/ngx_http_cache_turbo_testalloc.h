@@ -227,7 +227,7 @@ ngx_http_cache_turbo_ta_pool_cleanup_add(ngx_pool_t *p, size_t size,
  *   A parked request (r->main->count++ while an L2 op is in flight) must only
  *   be resumed by the op that parked it, while it is still alive. Each park
  *   stamps the op with a generation taken from a per-request record; each
- *   completion callback checks, before it touches the request, that
+ *   completion callback checks, before it acts on the request, that
  *
  *     - the request still exists (r, r->pool non-NULL, r->main->count > 0),
  *     - it is not finalized yet (r->done == 0),
@@ -249,6 +249,18 @@ ngx_http_cache_turbo_ta_pool_cleanup_add(ngx_pool_t *p, size_t size,
  *   is a complete statement and its call sites carry no semicolon: a stray
  *   `;` left behind in a release build is a null statement that still gets
  *   a DWARF line-table row, which breaks the byte identity.
+ *
+ *   Accepted deviation: get_finish, lock_finish and mc_get_finish read
+ *   `c = r->connection` in a declaration initialiser, and walk_finish copies
+ *   `r = op->request`, before the check runs. Moving those lines would break
+ *   the release byte identity. A NULL op->request cannot reach those three
+ *   sites on a live op: only the request cleanups (redis walk_detach,
+ *   mc_get_detach) clear it, and they free a GET/lock/mc op in the same call.
+ *   A resume after that is a use-after-free of the op, which ASan reports at
+ *   the op->request read before r is dereferenced. The NULL guard in the check
+ *   therefore serves the walk sites, whose op can outlive its request. The
+ *   check does not protect against a dangling r: it reads r->pool and
+ *   r->main itself.
  *
  *   Drop kinds: redis (GET/lock op), walk (SCAN/SSCAN walk: disarm the
  *   connection first), mc (memcached GET). Each clears the op's request

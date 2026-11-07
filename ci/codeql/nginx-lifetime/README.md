@@ -42,8 +42,15 @@ Request-lifetime detectors for this module (plan row BP-E1). They complement
   `ci/tools/ci-build.sh` sets it in every mode. If the macro expands to
   nothing, nothing counts as a guard and the query reports the read anyway.
 - BP-B2 added `CT_PARK_CHECK` (and `CT_PARK_CHECK_SLOT`) at the completion
-  sites, so query (b) no longer reports them on a TEST_FAULTS build. Wire
-  query (a) as a gate now, and query (b) in BP-W1.
+  sites. Query (b) still reports four of the five on a TEST_FAULTS build,
+  because each copies `op->request` in a declaration initialiser before the
+  check runs: `redis_get_finish`, `redis_lock_finish`, `redis_walk_finish`
+  (`r = op->request`) and `mc_get_finish`. The first, second and fourth also
+  read `r->connection` there. Moving those declarations below the check would
+  change the release objects, which must stay byte-identical. Only the SSCAN
+  page delivery in `redis_read_sscan`, whose check is the first use of
+  `op->request`, is no longer reported. Wire query (a) as a gate now. Query
+  (b) waits for BP-W1, which must clear or accept those four reports first.
 
 ## Running
 

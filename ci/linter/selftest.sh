@@ -1076,6 +1076,9 @@ finding_case_ "park-contract: a park with no CT_PARK_ENTER is caught" \
 finding_case_ "park-contract: a park with no CT_PARK_CHECK for its site is caught" \
     'fx_park: \(e\) no CT_PARK_CHECK / CT_PARK_CHECK_SLOT for site "fx_park"' \
     ci/linter/lint-park-contract.sh --root "$pk_fx/park-no-check"
+finding_case_ "park-contract: a site label outside the CT_PARK_CHECK argument list is not a check" \
+    'fx_park: \(e\) no CT_PARK_CHECK / CT_PARK_CHECK_SLOT for site "fx_park"' \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-check-label-outside"
 case_ 0 "park-contract: a fully registered access park passes" \
     ci/linter/lint-park-contract.sh --root "$pk_fx/park-good"
 case_ 0 "park-contract: a content-phase park needs no handler swap" \
