@@ -242,7 +242,7 @@ run_one() {
             # is None and the test crashes on it. Same flags CI passes.
             [ "${#l2[@]}" -eq 0 ] || srv=(--redis-server "$REDIS_BIN" --memcached-server "$MC_BIN")
             python3 ci/tools/run_named.py --nginx-binary "$NGX_OBJS/nginx" \
-                ${MODULE:+--module "$MODULE"} --port "$PORT" "${srv[@]}" "${all[@]}" ;;
+                ${MODULE:+--module "$MODULE"} --port "$PORT" ${srv[@]+"${srv[@]}"} "${all[@]}" ;;
         "@fuzz-replay") fuzz_replay ;;
         "@make-check")
             make -C ci/tests/unit --no-print-directory check \
