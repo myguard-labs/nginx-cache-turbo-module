@@ -57,6 +57,8 @@ our $Config = ct_config(
     { path => '/member.php', backend => 'mybb'      },
     { path => '/usercp.php', backend => 'mybb'      },
     { path => '/admin/',     backend => 'mybb'      },
+    { path => '/task.php',   backend => 'mybb'      },
+    { path => '/tasks.php',  backend => 'mybb'      },
     { path => '/mybb/',      backend => 'mybb'      },
     { path => '/gen/',       backend => 'wordpress' },
 );
@@ -368,6 +370,36 @@ Cookie: mybbuser; sid=deadbeef
 Cookie: mybbuser=12_abcdef
 --- request eval
 ["GET /gen/showthread", "GET /gen/showthread"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 18: /task.php bypasses -- the scheduled-task runner
+# task.php:47-61 runs MyBB's scheduled tasks and returns a gif; docs/mybb.md
+# already calls it a never-cache surface. A cached copy would stop the tasks
+# running for every later request.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /task.php", "GET /task.php"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 19: NEAR MISS -- /tasks.php shares the prefix text but caches
+# "/task.php" has a '.' inside it, so the boundary check runs after the whole
+# needle; "/tasks.php" diverges at the 's' and must cache. Its own REAL location
+# keeps the HIT from passing on an implicit 404.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /tasks.php", "GET /tasks.php"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval

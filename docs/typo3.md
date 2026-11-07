@@ -1,8 +1,8 @@
 # TYPO3 + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-11-07 (TYPO3 v14.3.10)_
 
-Caching a TYPO3 (v11–v13) frontend. A lazy-session bypass preset — same shape
+Caching a TYPO3 (v11–v14) frontend. A lazy-session bypass preset — same shape
 as [kirby](kirby.md) — but with a real, **fails-unsafe** caveat that the kirby
 and wagtail presets do not have. Read the [one condition](#the-one-condition--and-why-it-is-not-safe)
 section before you ship this.
@@ -30,16 +30,26 @@ not enough on its own** — see below, this is not optional reading.
 
 | Check | Values |
 |---|---|
-| Cookie header substrings | `fe_typo_user`, `be_typo_user` |
+| Cookie header substrings | `fe_typo_user`, `be_typo_user`, `ADMCMD_prev=` |
 | URI prefixes | `/typo3` |
-| Query args | — |
+| Query args | `ADMCMD_prev` |
 
 `fe_typo_user` is the frontend login cookie. `be_typo_user` is the backend
 login cookie — matched too, and not redundant (see
 [below](#be_typo_user-is-a-separate-risk-not-a-duplicate)).
 
 **`/typo3`** is the backend entry point. Unlike Magento, TYPO3 does not
-randomise it — it is a stable, shippable prefix across supported versions.
+randomise it — it is a stable default across supported versions. It is
+configurable, though: `BE/entryPoint` (`DefaultConfiguration.php:1656`) can move
+it, and an install that does so adds `cache_turbo_bypass_uri` for the new path.
+
+**`ADMCMD_prev`** is the workspace-preview key (`WorkspacePreview.php:61`). A
+preview link carries it in the query string; TYPO3 then sets it as a cookie
+(`:140-142`) for a visitor with **no login at all**, and reads it from the query
+or the cookie (`:263-265`), rendering unpublished workspace content. TYPO3
+marks that response `private, no-store`, so this is defense in depth, with the
+same rationale as `be_typo_user`. The cookie is matched as a substring
+(`ADMCMD_prev=`), the argument by exact name.
 
 ## The one condition — and why it is NOT safe
 
@@ -103,6 +113,13 @@ This is the same class of hazard as XenForo's `xf_session_admin` — a separate
 cookie, separate session table, independent lifetime from the primary session,
 and it must be matched independently rather than assumed covered by the
 frontend rule.
+
+The backend cookie name is **also configurable**
+(`$GLOBALS['TYPO3_CONF_VARS']['BE']['cookieName']`,
+`BackendUserAuthentication.php:1872-1875`, default in
+`DefaultConfiguration.php:1679`). An install that sets `BE/cookieName` adds its
+own `cache_turbo_bypass $cookie_<your_name>;` and
+`cache_turbo_no_store $cookie_<your_name>;`, exactly as for `FE/cookieName`.
 
 ## Vhost
 

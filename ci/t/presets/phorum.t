@@ -50,8 +50,9 @@
 # posting.php: the file still ships as a stub whose body is a die() that
 # overwrites the 5.0 script on upgrade so spammers cannot POST to it.
 #
-# ct_phorum_args[] is { NULL } and the preset row carries NULL in
-# cookie_preds, so this file has no arg leg and no predicate leg. No row is
+# ct_phorum_args[] is { "phorum_session_v5" } (TESTS 13-14: URI-carried session
+# id while use_cookies < 2) and the preset row carries NULL in cookie_preds, so
+# this file has no predicate leg. No row is
 # a prefix of another row (admin.php/login.php/register.php/pm.php/
 # posting.php/post.php/moderation.php/control.php/ajax.php/report.php/
 # follow.php/file.php -- checked pairwise), so the #222 prefix-row rule does
@@ -354,6 +355,34 @@ Cookie: PHPSESSID=abc
 Cookie: phorum_session_v5=42:deadbeef
 --- request eval
 ["GET /gen/topic-iso", "GET /gen/topic-iso"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 13: ?phorum_session_v5=... bypasses -- URI authentication
+# While use_cookies is below 2 Phorum accepts the session id from the request
+# (include/api/user.php:2416-2442), rendering a member's page with no cookie.
+# The arg row is an exact NAME match on the query string.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /phorum/read-a?phorum_session_v5=1:abc", "GET /phorum/read-a?phorum_session_v5=1:abc"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 14: NEAR MISS -- ?phorum_session_v5x=1 caches
+# The arg match is on the exact name: a longer name is a different parameter.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /phorum/read-b?phorum_session_v5x=1", "GET /phorum/read-b?phorum_session_v5x=1"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval

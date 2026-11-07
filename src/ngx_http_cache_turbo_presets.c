@@ -974,7 +974,7 @@ static const ngx_http_cache_turbo_cookie_pred_t  ct_shopware6_preds[] = {
 };
 
 /*
- * TYPO3 (v11..v13). Lazy sessions, confirmed at the strongest possible place: the
+ * TYPO3 (v11..v14, re-checked against v14.3.10). Lazy sessions, confirmed at the strongest possible place: the
  * frontend authentication object opts OUT of cookies by default.
  * FrontendUserAuthentication::$dontSetCookie = true (:155) OVERRIDES the base
  * class default of false (AbstractUserAuthentication:199), and it is flipped back
@@ -994,20 +994,36 @@ static const ngx_http_cache_turbo_cookie_pred_t  ct_shopware6_preds[] = {
  * your name with cache_turbo_bypass_cookie. We match the default exactly; we
  * cannot match a name we cannot know.
  *
- * be_typo_user is matched too, and is a genuine stable literal. It is not
+ * be_typo_user is matched too, and is a default literal: the backend cookie name
+ * is configurable as well (BackendUserAuthentication.php:1872-1875, read from
+ * $GLOBALS['TYPO3_CONF_VARS']['BE']['cookieName'], default in
+ * DefaultConfiguration.php:1679), so an operator who sets BE/cookieName adds
+ * their own name with cache_turbo_bypass_cookie, same as for FE/cookieName. It is not
  * redundant with the FE cookie: an editor previewing the frontend, or any backend
  * user hitting a FE page, carries only the BE cookie, and TYPO3 renders
  * hidden/scheduled records and preview versions for them. Caching that response
  * would publish unpublished content to strangers. Same class as xenforo's
  * xf_session_admin — a second cookie, a second table, an independent lifetime.
  *
- * /typo3 is the backend entry point (stable; TYPO3 does not randomise it the way
- * magento randomises /admin).
+ * /typo3 is the backend entry point's DEFAULT (TYPO3 does not randomise it the
+ * way magento randomises /admin), but BE/entryPoint is configurable
+ * (DefaultConfiguration.php:1656): an operator who moves it adds their own
+ * cache_turbo_bypass_uri.
+ *
+ * ADMCMD_prev is the workspace-preview key (sysext/workspaces
+ * WorkspacePreview.php:61 PREVIEW_KEY). A preview link carries it as a query
+ * argument; the middleware then sets it as a cookie (:140-142) for a visitor
+ * with NO fe/be login, and reads it from the query OR the cookie (:263-265), so
+ * the unpublished workspace content is rendered for a visitor holding neither
+ * login cookie. The origin marks that response private,no-store
+ * (frontend RequestHandler.php:1268-1278), so this is defense-in-depth with the
+ * same rationale as be_typo_user. The cookie is a substring needle ("ADMCMD_prev="),
+ * the argument an exact name.
  */
 static const char *const  ct_typo3_cookies[] = {
-    "fe_typo_user", "be_typo_user", NULL };
+    "fe_typo_user", "be_typo_user", "ADMCMD_prev=", NULL };
 static const char *const  ct_typo3_uris[] = { "/typo3", NULL };
-static const char *const  ct_typo3_args[] = { NULL };
+static const char *const  ct_typo3_args[] = { "ADMCMD_prev", NULL };
 
 /*
  * Invision Community (IPS4). Closed-source, vendor-attested rather than
@@ -1119,23 +1135,19 @@ static const char *const  ct_smf_args[] = {
  * tells the operator to add their own cache_turbo_bypass in that case.
  */
 /*
- * NO /api ROW, DELIBERATELY, and this is an unresolved gap rather than a
- * decision. Vanilla's API v2 is Bearer-authenticated, so it is exactly the
- * header-auth surface the cookie tier cannot see — the same class as magento
- * /rest, drupal /jsonapi and xenforo /api/, all of which ARE listed.
- *
- * It is not listed here because it cannot be verified: github.com/vanilla/vanilla
- * now 404s (repo, raw and API alike; the org survives), so there is no upstream
- * tree left to check the prefix against, and every surviving reference is a
- * Garden-era fork last pushed in 2013. Adding a row from recollection is exactly
- * what produced the dead /admin.php and /message_send.php rows in punbb, so it
- * is not being done. An operator running Vanilla's API adds their own:
- *     cache_turbo_bypass_uri /api;
- * See docs/vanilla.md.
+ * "/api/" -- Vanilla's API v2 is Bearer-authenticated, exactly the header-auth
+ * surface the cookie tier cannot see (the same class as magento /rest, drupal
+ * /jsonapi and xenforo /api/). Evidence: the official vanilla org's
+ * knowledge-porter VanillaClient.php:49 sends `Authorization: Bearer` and :60
+ * issues GET /api/v2/knowledge-bases. The former github.com/vanilla/vanilla
+ * tree is gone, so the prefix is taken from this current official client, not
+ * from the Garden-era forks. docs/vanilla.md carries the front-controller
+ * internal-redirect note: where the front controller rewrites to /index.php the
+ * URI the rule sees is /index.php, and the operator adds their own bypass.
  */
 static const char *const  ct_vanilla_cookies[] = { "Vanilla=", NULL };
 static const char *const  ct_vanilla_uris[] = {
-    "/dashboard", "/entry/", "/messages/", "/post/", NULL };
+    "/dashboard", "/entry/", "/messages/", "/post/", "/api/", NULL };
 static const char *const  ct_vanilla_args[] = { NULL };
 
 /*
@@ -1252,7 +1264,17 @@ static const char *const  ct_phorum_uris[] = {
     "/admin.php", "/login.php", "/register.php", "/pm.php", "/posting.php",
     "/post.php", "/moderation.php", "/control.php", "/ajax.php", "/report.php",
     "/follow.php", "/file.php", NULL };
-static const char *const  ct_phorum_args[] = { NULL };
+/*
+ * phorum_session_v5 as an ARGUMENT: while use_cookies is below 2 ("Require
+ * cookies"), common URI authentication accepts the session id from the request
+ * (user.php:2416-2442; the default use_cookies is 1, admin/install.php:344), so a
+ * ?phorum_session_v5=... request renders a member's page with no cookie. docs/phorum.md
+ * tells operators to set use_cookies = 2. The exact-name row catches the
+ * query-string and &-forms, NOT Phorum's comma form (?1,2,phorum_session_v5=x):
+ * an engine limit. Exposure is bounded because the documented key includes
+ * $request_uri, so the session id is part of the key.
+ */
+static const char *const  ct_phorum_args[] = { "phorum_session_v5", NULL };
 static const char *const  ct_phorum_key_cookies[] = { "list_style", NULL };
 
 /*
@@ -1342,7 +1364,7 @@ static const char *const  ct_mybb_cookies[] = { NULL };
 static const char *const  ct_mybb_uris[] = {
     "/member.php", "/usercp.php", "/private.php", "/modcp.php",
     "/newthread.php", "/newreply.php", "/editpost.php", "/polls.php",
-    "/admin/", "/xmlhttp.php", NULL };
+    "/admin/", "/xmlhttp.php", "/task.php", NULL };
 static const char *const  ct_mybb_args[] = {
     "action=login", "action=do_login", "action=logout", "action=do_logout",
     "action=register", "action=do_register", "action=activate",
@@ -1352,10 +1374,17 @@ static const char *const  ct_mybb_key_cookies[] = {
 
 /*
  * vBulletin (3.x/4.x "bb_" cookie-prefix era). `bb_userid` / `bb_password`
- * (or `bbimloggedin=yes` on some builds, confirmed as the real signal ops use
- * in production LiteSpeed vBulletin caching configs) are set ONLY on login
- * and removed on logout — never issued to guests. Presence/non-empty-value
- * alone is sufficient; no value-split trick needed.
+ * are set on login ONLY WHEN "Remember Me" is ticked (functions_login.php:136-143
+ * set_authentication_cookies, written only if $cookieuser; the CP login writes
+ * them too) and removed on logout — never issued to guests. A stock vB4 member who
+ * logs in WITHOUT Remember Me carries only the guest-issued `bb_sessionhash` and
+ * is invisible to this preset; no registry row can fix that. `imloggedin` is not
+ * a core cookie either: it comes from a third-party plugin (ibvbboost,
+ * login_verify_success), so an imloggedin-style login flag, or a local
+ * cache_turbo_bypass rule, is a deployment prerequisite for non-Remember-Me
+ * logins (docs/vbulletin.md). The vB4 evidence is from third-party copies of
+ * vB 4.1.11; vB5/6 is vendor-attested and unverified at 2026-11-07. Where the
+ * cookies are present, presence/non-empty-value is sufficient.
  *
  * `bb_sessionhash` is issued to guests too (session tracking for everyone) —
  * deliberately excluded, the xf_session shape again. The `bb_` prefix is
@@ -1380,14 +1409,16 @@ static const char *const  ct_vbulletin_uris[] = {
     "/login.php", "/register.php", "/usercp.php", "/private.php",
     "/profile.php", "/cron.php", "/admincp/", NULL };
 static const char *const  ct_vbulletin_args[] = { NULL };
-/* Only bb_language. bb_lastvisit and bb_lastactivity are per-visit timestamps
+/* bb_languageid and bb_userstyleid (includes/init.php: COOKIE_PREFIX.'languageid'
+ * and 'userstyleid'; there is no 'language' cookie, so the earlier "bb_language"
+ * folded nothing). bb_lastvisit and bb_lastactivity are per-visit timestamps
  * that change on essentially every request, so keying on them gave each visitor
  * a private bucket the next request already invalidated -- a hit rate near zero
  * on a board that otherwise caches well. They were also a free remote memory
  * attack: the values come straight from the client, so anyone could mint
  * unlimited distinct keys and push the zone into eviction. */
 static const char *const  ct_vbulletin_key_cookies[] = {
-    "bb_language", NULL };
+    "bb_languageid", "bb_userstyleid", NULL };
 
 /*
  * Textpattern. Both login cookies are written after every successful login;

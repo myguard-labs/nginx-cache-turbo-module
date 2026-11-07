@@ -1188,7 +1188,8 @@ _COOKIE_NEEDLE_TABLE = {
                                     "ghost-admin-toolbar"]),
     "wagtail":     ("/ct-wagtail/", ["sessionid"]),
     "kirby":       ("/ct-kirby/", ["kirby_session"]),
-    "typo3":       ("/ct-typo3/", ["fe_typo_user", "be_typo_user"]),
+    "typo3":       ("/ct-typo3/", ["fe_typo_user", "be_typo_user",
+                              "ADMCMD_prev="]),
     "smf":         ("/smf/", ["SMFCookie"]),
     "vanilla":     ("/ct-vanilla/", ["Vanilla="]),
     "punbb":       ("/ct-punbb/", ["forum_cookie", "punbb_cookie"]),
@@ -1803,8 +1804,8 @@ def _arg_scans(hdrs: dict, where: str) -> int:
 # preset -> (location, [(query-string suffix, needle-name-first-byte)]) for
 # the negative control below. Mirrors src/ngx_http_cache_turbo_module.c's
 # ngx_http_cache_turbo_presets[] table exactly -- ENUMERATED by reading every
-# non-empty ct_*_args[] array in the source directly (15 of the 34 declared
-# args arrays are non-empty; the other 19 are `{ NULL }` and carry no query-
+# non-empty ct_*_args[] array in the source directly (20 of the 38 declared
+# args arrays are non-empty; the other 18 are `{ NULL }` and carry no query-
 # arg tier at all, classified by cookie/URI/cookie_pred instead -- not a gap
 # here since there is nothing to prefilter). A preset added here with a
 # non-empty args[] row and no entry below is a silent coverage gap.
@@ -1841,6 +1842,8 @@ _ARG_NEEDLE_TABLE = {
                                   "action=register", "action=do_register",
                                   "action=activate", "action=lostpw",
                                   "action=do_lostpw", "action=resetpassword"]),
+    "typo3":       ("/ct-typo3/", ["ADMCMD_prev"]),
+    "phorum":      ("/ct-phorum/", ["phorum_session_v5"]),
     "spip":        ("/ct-spip/", ["action", "var_mode"]),
     "mantisbt":    ("/ct-mantis/", ["key"]),
     "bugzilla":    ("/ct-bugzilla/", ["Bugzilla_api_key", "api_key",

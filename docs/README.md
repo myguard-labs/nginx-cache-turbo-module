@@ -31,15 +31,15 @@ One page per `cache_turbo_backend` preset:
 | `ghost` | [ghost.md](ghost.md) | ✅ yes (`ghost-members-ssr`) — **plus `?uuid=`/`?key=`/`?gift=`, which auth a member or unlock paid content with no cookie** |
 | `wagtail` | [wagtail.md](wagtail.md) | ⚠️ yes (`sessionid`) — **but only while nothing writes the session for guests**; fails safe |
 | `kirby` | [kirby.md](kirby.md) | ⚠️ yes (`kirby_session`) — **but a `csrf()` form page cookies guests**; fails safe |
-| `typo3` | [typo3.md](typo3.md) | ⚠️ yes (`fe_typo_user`, `be_typo_user`) — **but the cookie name is admin-overridable via `FE/cookieName`**; fails **UNSAFE** |
+| `typo3` | [typo3.md](typo3.md) | ⚠️ yes (`fe_typo_user`, `be_typo_user`, plus the `ADMCMD_prev` workspace-preview cookie and argument) — **but the cookie names are admin-overridable via `FE/cookieName` and `BE/cookieName`**; fails **UNSAFE** |
 | `invision` | [invision.md](invision.md) | ✅ yes (`ips4_loggedIn`, vendor-documented for this exact purpose) — closed-source, vendor-attested not code-verified |
 | `smf` | [smf.md](smf.md) | ✅ yes (`SMFCookie`, presence-only) — guest-issued too; the ideal value predicate needs JSON/array decoding this engine doesn't do, so it costs hit rate instead |
-| `vanilla` | [vanilla.md](vanilla.md) | ⚠️ legacy self-hosted only (`Vanilla=`, presence-only) — current Vanilla SaaS uses a per-site `vf_*` login-cookie name that the stock preset cannot match; configure the exact deployed name |
+| `vanilla` | [vanilla.md](vanilla.md) | ⚠️ legacy self-hosted only (`Vanilla=`, presence-only) — current Vanilla SaaS uses a per-site `vf_*` login-cookie name that the stock preset cannot match; configure the exact deployed name. The Bearer-authenticated `/api/` is bypassed |
 | `punbb` | [punbb.md](punbb.md) | ✅ yes (`forum_cookie`/`punbb_cookie`, presence-only) — `forum_cookie` covers stock 1.4.x (incl. the installer's randomised suffix), `punbb_cookie` the legacy 1.2-era name; same engine limitation as `smf`, guest-issued too |
-| `phorum` | [phorum.md](phorum.md) | ✅ yes (fixed session-cookie constants) — never guest-issued, the clean case |
+| `phorum` | [phorum.md](phorum.md) | ✅ yes (fixed session-cookie constants) — never guest-issued, the clean case; set `use_cookies` to "Require cookies" so `?phorum_session_v5=` URI sessions are not accepted |
 | `yabb` | [yabb.md](yabb.md) | ✅ yes (`Y2Sess-`/`Y2User-`/`Y2Pass-` prefix) — per-install random suffix, but never guest-issued |
 | `mybb` | [mybb.md](mybb.md) | ✅ yes (`{prefix}user` suffix) — never guest-issued |
-| `vbulletin` | [vbulletin.md](vbulletin.md) | ⚠️ yes (suffixes `userid`/`password`; optional `imloggedin=yes`) — closed-source; verify on current vBulletin 6 |
+| `vbulletin` | [vbulletin.md](vbulletin.md) | ⚠️ yes (suffixes `userid`/`password`; optional `imloggedin=yes`) — closed-source; verify on current vBulletin 6. **`bb_userid`/`bb_password` exist only after a Remember Me login**: a stock vB4 member without it carries only the guest `bb_sessionhash`, so an `imloggedin`-style login flag or a local rule is a deployment prerequisite |
 | `textpattern` | [textpattern.md](textpattern.md) | ✅ yes (`txp_login_public`/`txp_login`) — default `/textpattern` admin folder; add a rule if renamed |
 | `bludit` | [bludit.md](bludit.md) | ✅ yes (`BLUDIT-KEY` plus remember-me cookies) — public bootstrap is session-free |
 | `spip` | [spip.md](spip.md) | ✅ yes (prefix-independent `_session`/`_admin` suffixes) — language/Ajax state bypasses conservatively |

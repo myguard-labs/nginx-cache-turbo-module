@@ -1,6 +1,6 @@
 # vBulletin + cache-turbo
 
-_Last researched: 2026-07-26_
+_Last researched: 2026-11-07_
 
 Caching a vBulletin board — current
 [vBulletin 6](https://www.vbulletin.com/en/vbulletin-6.html), vBulletin 5
@@ -31,12 +31,28 @@ cache_turbo_backend vbulletin;
 
 ## Why presence/non-empty is safe here
 
-`bbuserid` and `bbpassword` are the load-bearing signal. The vBulletin
-community documents them as set **on login and removed on logout**; guest
-session-cookie behaviour varies by product line and configuration.
-Presence/non-empty-value alone is sufficient; no value-split trick needed.
+`bbuserid` and `bbpassword` are the load-bearing signal, and they carry a
+**deployment prerequisite**. They are written on login and removed on logout,
+but in vBulletin 4 `set_authentication_cookies()` writes them
+(`includes/functions_login.php:136-143`) **only when "Remember Me" is ticked**;
+the control-panel login writes them too. A stock member who logs in **without
+Remember Me** carries only the guest-issued `bbsessionhash`, which the preset
+cannot use (see below), so that member is invisible to the registry and their
+pages can be cached and served to strangers. No registry row can fix this. Make
+one of these true on every install:
+
+- the board sets an `imloggedin`-style login flag (a plugin or a template
+  cookie; the preset matches `imloggedin` == `yes` under any prefix), or
+- a local `cache_turbo_bypass` plus `cache_turbo_no_store` rule keys on
+  whatever your board sets for every logged-in member, or
+- Remember Me is forced on.
+
+The vB4 evidence is from third-party copies of vBulletin 4.1.11 and the
+`ibvbboost` plugin, not vBulletin's own site (closed source); vBulletin 5/6 is
+vendor-attested and unverified at 2026-11-07. Where the cookies are present,
+presence/non-empty-value alone is sufficient; no value-split trick needed.
 (`bbimloggedin=yes` also appears in some LiteSpeed/nginx guest-cache configs as
-an extra login flag. A
+an extra login flag; the `ibvbboost` plugin sets it at login. A
 [vBulletin staff response](https://forum.vbulletin.com/forum/vbulletin-5-connect/support-issues-questions/4027789-question-about-remember-me-cookies-and-having-to-log-in-over-and-over)
 identifies it as specific to vbulletin.com's own Varnish setup, not a stock
 product cookie — treat it as a
@@ -45,9 +61,9 @@ harmless extra match, not the primary signal.)
 | Cookie | Treatment | Why |
 |---|---|---|
 | `bbuserid` / `bbpassword` (suffix `userid`/`password`) | **bypass** (non-empty) | set only on login, removed on logout |
-| `bbimloggedin` == `yes` | **bypass** | site-specific extra flag used by vbulletin.com's cache; not a stock cookie |
+| `bbimloggedin` == `yes` | **bypass** | not a stock cookie: set at login by the third-party `ibvbboost` plugin and used by vbulletin.com's own cache; the usual way to cover non-Remember-Me logins |
 | `bbsessionhash` | **ignore** | session tracking for every visitor including guests |
-| `bb_language` (exact name) | **cache key** | presentation, not identity |
+| `bb_languageid`, `bb_userstyleid` (exact names) | **cache key** | presentation, not identity; the earlier `bb_language` name does not exist in vBulletin and folded nothing |
 | `bblastvisit` / `bblastactivity` | **ignore** | presentation, but per-visit timestamps: keying on them would give every visitor a private entry their own next request invalidates, and let anyone mint unlimited keys to force eviction |
 
 ### The cookie prefix, and the underscore
@@ -93,7 +109,7 @@ http {
             cache_turbo_key           $host$request_uri;
 
             # Keep cookie values out of the base key above: the `vbulletin`
-            # preset folds the exact `bb_language` cookie into it with
+            # preset folds the exact `bb_languageid` and `bb_userstyleid` cookies into it with
             # length-prefixed framing. Do NOT hand-write a replacement that
             # splices $cookie_* values together — unframed
             # concatenation lets a visitor choose a cookie value that reproduces
@@ -175,7 +191,7 @@ The copy stays fresh for `60s`; if the origin starts failing after that, the exp
   not vBulletin's own code.
 - **A full manual cookie rename (not just the `bb` prefix)** evades the
   suffix match. Rare, but possible.
-- **The presentation-key cookie is exactly `bb_language`.** Unlike the auth
+- **The presentation-key cookies are exactly `bb_languageid` and `bb_userstyleid`.** Unlike the auth
   predicates, this key-cookie name does not follow the configured prefix. If
   your board emits a differently named language/style cookie, add that exact
   name with `cache_turbo_key_cookie` or disable the selector; otherwise two

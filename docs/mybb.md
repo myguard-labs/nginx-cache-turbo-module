@@ -1,6 +1,6 @@
 # MyBB + cache-turbo
 
-_Last researched: 2026-07-18_
+_Last researched: 2026-11-07 (MyBB 1.8.41)_
 
 Caching a MyBB board (verified against MyBB 1.8.40). Clean case: the login
 cookie is only ever written on login success, no value predicate needed.
@@ -235,7 +235,8 @@ MyBB-specific notes that interact with the nginx cache layer:
   through `task.php` (web-cron or a real cron hitting the URL / CLI). Long jobs —
   pruning, backups, mailouts — can exceed the default 30 s; give the PHP-FPM pool
   (or CLI) that serves `task.php` a longer `max_execution_time`. `task.php` is a
-  never-cache surface; keep it out of the cache like `/admin/`.
+  never-cache surface; the preset lists `/task.php` as a bypass URI (it runs the
+  scheduled tasks and returns a gif), like `/admin/`.
 
 ## See also
 

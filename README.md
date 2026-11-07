@@ -961,15 +961,15 @@ storage; the trade is a lost cache hit, never a cacheable private request.
 | `ghost` †     | `/ghost/`, `/members/`, `/p/`, `/r/` | `uuid`, `key`, `token`, `gift` | `ghost-members-ssr`, `ghost-admin-api-session`, `ghost-admin-toolbar` |
 | `wagtail` † § | `/admin/`, `/django-admin/`, `/documents/` | — | `sessionid` |
 | `kirby` † §   | `/panel` | — | `kirby_session` |
-| `typo3` † ※   | `/typo3` | — | `fe_typo_user`, `be_typo_user` |
+| `typo3` † ※   | `/typo3` | `ADMCMD_prev` | `fe_typo_user`, `be_typo_user`, `ADMCMD_prev=` |
 | `invision` †  | `/admin`, `/login`, `/register`, `/lostpassword`, `/messenger` | `do=compose`, `do=post`, `do=reply`, `do=report`, `module=messaging` | `_loggedIn` (suffix); *(key)* `ips4_hasJS`, `ips4_theme`, `ips4_language` |
 | `smf` †       | — | `action=admin`, `action=login`, `action=login2`, `action=logintfa`, `action=logout`, `action=profile`, `action=pm`, `action=post`, `action=post2`, `action=moderate`, `action=reporttm`, `action=xmlhttp` | `SMFCookie` (presence-only) |
-| `vanilla` †   | `/dashboard`, `/entry/`, `/messages/`, `/post/` ⁂ | — | `Vanilla=` (legacy self-hosted only); SaaS `vf_*` names need an exact local rule |
+| `vanilla` †   | `/dashboard`, `/entry/`, `/messages/`, `/post/`, `/api/` ⁂ | — | `Vanilla=` (legacy self-hosted only); SaaS `vf_*` names need an exact local rule |
 | `punbb` †     | `/admin.php`, `/admin/`, `/login.php`, `/post.php`, `/message_send.php`, `/message_delete.php`, `/misc.php` | — | `forum_cookie`, `punbb_cookie` (presence-only) |
-| `phorum` †    | `admin.php`, `login.php`, `register.php`, `pm.php`, `posting.php`, `post.php`, `moderation.php`, `control.php`, `ajax.php`, `report.php`, `follow.php` | — | `phorum_session_v5`, `phorum_session_st`, `phorum_admin_session_v5`; *(key)* `list_style` |
+| `phorum` †    | `admin.php`, `login.php`, `register.php`, `pm.php`, `posting.php`, `post.php`, `moderation.php`, `control.php`, `ajax.php`, `report.php`, `follow.php` | `phorum_session_v5` | `phorum_session_v5`, `phorum_session_st`, `phorum_admin_session`; *(key)* `list_style` |
 | `yabb` †      | — | `action=post`, `action=post2`, `action=login`, `action=login2`, `action=register`, `action=register2`, `action=admin`, `action=pm`, `action=imsend`, `action=imsend2` | `Y2User-`, `Y2Pass-`, `Y2Sess-` (prefix) |
-| `mybb` †      | `/member.php`, `/usercp.php`, `/private.php`, `/modcp.php`, `/newthread.php`, `/newreply.php`, `/editpost.php`, `/polls.php`, `/admin/`, `/xmlhttp.php` | `action=login`, `action=do_login`, `action=logout`, `action=do_logout`, `action=register`, `action=do_register`, `action=activate`, `action=lostpw`, `action=do_lostpw`, `action=resetpassword` | `user` (suffix, presence); *(key)* `mybbtheme`, `mybblang` |
-| `vbulletin` † | `/login.php`, `/register.php`, `/usercp.php`, `/private.php`, `/profile.php`, `/cron.php`, `/admincp/` | — | `userid`, `password` (suffix, non-empty), `imloggedin` == `yes`; *(key)* `bb_language` |
+| `mybb` †      | `/member.php`, `/usercp.php`, `/private.php`, `/modcp.php`, `/newthread.php`, `/newreply.php`, `/editpost.php`, `/polls.php`, `/admin/`, `/xmlhttp.php`, `/task.php` | `action=login`, `action=do_login`, `action=logout`, `action=do_logout`, `action=register`, `action=do_register`, `action=activate`, `action=lostpw`, `action=do_lostpw`, `action=resetpassword` | `user` (suffix, presence); *(key)* `mybbtheme`, `mybblang` |
+| `vbulletin` † | `/login.php`, `/register.php`, `/usercp.php`, `/private.php`, `/profile.php`, `/cron.php`, `/admincp/` | — | `userid`, `password` (suffix, non-empty), `imloggedin` == `yes`; *(key)* `bb_languageid`, `bb_userstyleid` |
 | `textpattern` † | `/textpattern` | — | `txp_login_public`, `txp_login` |
 | `bludit` † | `/admin`, `/install.php` | — | `BLUDIT-KEY` (also `__Secure-`), `BLUDITREMEMBERUSERNAME`, `BLUDITREMEMBERTOKEN` |
 | `spip` † | `/ecrire` | `action`, `var_mode` | `_session`, `_admin`, `_lang`, `_lang_ecrire`, `_accepte_ajax` (suffix, non-empty) |
@@ -999,12 +999,12 @@ you do not run punches holes in your own cache — which is why none of them is
 ever enabled implicitly, and why the old `generic` union is gone. Name them:
 `cache_turbo_backend xenforo;`.
 
-⁂ **Vanilla ships no `/api` row**, and that is a known gap rather than a
-decision: Vanilla's API v2 is Bearer-authenticated, so it is the same
-header-auth class as `magento /rest` and `drupal /jsonapi`. It is absent
-because `github.com/vanilla/vanilla` now 404s and the prefix cannot be
-verified against any surviving upstream tree. Add `cache_turbo_bypass_uri
-/api;` if you serve it.
+⁂ **Vanilla's `/api/` row** covers API v2, which is Bearer-authenticated and so
+the same header-auth class as `magento /rest` and `drupal /jsonapi`. The prefix
+comes from the official client in the `vanilla` organisation, as the former
+main repository is gone. Behind a front controller that internally redirects
+to `/index.php` the URI the rule sees is `/index.php`: see
+[vanilla.md](docs/vanilla.md).
 
 ‡ `edit`, `submit`, `delete`, `protect`, `unprotect`, `purge`, `rollback`,
 `revert`, `watch`, `unwatch`, `markpatrolled`, `mcrundo`, `mcrrestore` — the
@@ -1147,7 +1147,9 @@ opposite of the wagtail/kirby failure direction. If you override
 only the lookup and still stores the logged-in response. The
 preset also matches `be_typo_user` (the backend session) independently — it
 catches an editor previewing the frontend, who carries no `fe_typo_user` at
-all. See [typo3.md](docs/typo3.md).
+all; `be_typo_user` and the `/typo3` entry point are configurable too
+(`BE/cookieName`, `BE/entryPoint`). `ADMCMD_prev`, the workspace-preview key,
+is matched as a cookie and a query argument. See [typo3.md](docs/typo3.md).
 
 ◇ **A request-HEADER tier, and the only preset that changes what `Vary`
 accepts (`nextjs`; `redmine` uses the same tier for `X-Redmine-API-Key` only,
