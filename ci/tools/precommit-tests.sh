@@ -235,7 +235,7 @@ run_one() {
                 all+=("${names[@]}")
                 area_l2_tests "$a" >"$PCT_TMP/l2names" || return 1
                 mapfile -t names <"$PCT_TMP/l2names"
-                l2+=("${names[@]}")
+                [ "${#names[@]}" -eq 0 ] || l2+=("${names[@]}")
             done
             # L2-needing tests take redis*/mc fixtures that run_named.py only
             # builds when told where the servers are; without them the fixture
