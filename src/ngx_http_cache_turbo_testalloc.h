@@ -32,9 +32,9 @@
  *   source AFTER this point, including nginx macros that expand to one of
  *   these names at the use site (ngx_calloc_buf, ngx_alloc_buf), expands to
  *   the wrapper with the caller's __FILE__/__LINE__. Each argument is
- *   evaluated exactly once. nginx's own static inline helpers that allocate
- *   (ngx_array_init, ngx_list_init) were compiled before the macros exist and
- *   stay outside the funnel.
+ *   evaluated exactly once. ngx_array_init and ngx_list_init are funneled the
+ *   same way (their wrappers call the real inline helpers, defined earlier);
+ *   an injected failure returns NGX_ERROR like a real one.
  *
  * INJECTED FAILURES (BP-C1)
  *   ngx_http_cache_turbo_test_alloc_gate() is the single decision point.
@@ -201,6 +201,30 @@ ngx_http_cache_turbo_ta_pool_cleanup_add(ngx_pool_t *p, size_t size,
 }
 
 
+static ngx_inline ngx_int_t
+ngx_http_cache_turbo_ta_list_init(ngx_list_t *list, ngx_pool_t *pool,
+    ngx_uint_t n, size_t size, const char *file, ngx_uint_t line)
+{
+    if (ngx_http_cache_turbo_test_alloc_gate(pool, file, line) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return ngx_list_init(list, pool, n, size);
+}
+
+
+static ngx_inline ngx_int_t
+ngx_http_cache_turbo_ta_array_init(ngx_array_t *array, ngx_pool_t *pool,
+    ngx_uint_t n, size_t size, const char *file, ngx_uint_t line)
+{
+    if (ngx_http_cache_turbo_test_alloc_gate(pool, file, line) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return ngx_array_init(array, pool, n, size);
+}
+
+
 #define ngx_palloc(pool, size)                                                \
     ngx_http_cache_turbo_ta_palloc(pool, size, __FILE__, __LINE__)
 #define ngx_pnalloc(pool, size)                                               \
@@ -213,6 +237,11 @@ ngx_http_cache_turbo_ta_pool_cleanup_add(ngx_pool_t *p, size_t size,
     ngx_http_cache_turbo_ta_array_push_n(a, n, __FILE__, __LINE__)
 #define ngx_list_push(l)                                                      \
     ngx_http_cache_turbo_ta_list_push(l, __FILE__, __LINE__)
+#define ngx_list_init(list, pool, n, size)                                    \
+    ngx_http_cache_turbo_ta_list_init(list, pool, n, size, __FILE__, __LINE__)
+#define ngx_array_init(array, pool, n, size)                                  \
+    ngx_http_cache_turbo_ta_array_init(array, pool, n, size, __FILE__,        \
+                                       __LINE__)
 #define ngx_create_temp_buf(pool, size)                                       \
     ngx_http_cache_turbo_ta_create_temp_buf(pool, size, __FILE__, __LINE__)
 #define ngx_alloc_chain_link(pool)                                            \

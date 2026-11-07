@@ -71,6 +71,11 @@ class _Scenario:
     strict_body: bool = True
     # Needs the Redis fixture and the /fa2/ L2 location.
     needs_l2: bool = False
+    # Request headers of every request of the row (the key-cookie row).
+    headers: dict[str, str] | None = None
+    # X-Cache the unarmed measured request must report, when the row only
+    # reaches its target path in one state (stale-if-error).
+    expect_xcache: str | None = None
 
 
 class _Sweep(_FaultAlloc):
@@ -88,9 +93,10 @@ class _Sweep(_FaultAlloc):
         # reported, not failed (CT-ALLOC-FAIL-LOCK-HELD, PURGE decision).
         self.purge_lock_left: list[str] = []
 
-    def get_uri(self, uri: str, method: str = "GET"):
+    def get_uri(self, uri: str, method: str = "GET",
+                headers: dict[str, str] | None = None):
         try:
-            return fetch_raw(self.port, uri, method=method)
+            return fetch_raw(self.port, uri, method=method, headers=headers)
         except (http.client.RemoteDisconnected, ConnectionResetError,
                 http.client.BadStatusLine) as e:
             return (None, "", {"error": repr(e)})
@@ -101,11 +107,14 @@ class _Sweep(_FaultAlloc):
         scn.ready(self, uri)
         self.ctl(f"?n={self.FAR}")
         try:
-            st, _, h = self.get_uri(uri, scn.method)
+            st, _, h = self.get_uri(uri, scn.method, scn.headers)
         finally:
             r = self.ctl("?n=0")  # never leave the far arm set
         assert st == 200, f"{scn.name}: unarmed count run: {st} {h}"
         assert r["fired"] == "0", f"{scn.name}: far arm fired: {r}"
+        assert scn.expect_xcache is None \
+            or h.get("x-cache") == scn.expect_xcache, \
+            f"{scn.name}: wanted X-Cache {scn.expect_xcache}, got {h}"
         calls = int(r["calls"])
         assert calls > 0, f"{scn.name}: request made no funnel call: {r}"
         return calls
@@ -171,6 +180,18 @@ def _ready_l2_only(sw: _Sweep, uri: str) -> None:
     sw.expect[uri] = body
 
 
+def _ready_sie(sw: _Sweep, uri: str) -> None:
+    """Stale-if-error row: store uri's key through the live origin (its path
+    carries the "sieserve" marker: stale-if-error=30, fresh 1s, stale window
+    1s), then let it expire. The measured request goes to a location with the
+    same key and a dead upstream, so the revalidation fails and the module
+    rewrites the 502 into the stored snapshot (sie_rewrite)."""
+    key = uri.split("k=", 1)[1]
+    st, _, h = sw.get_uri(f"/fa-sieprime/{key}?k={key}")
+    assert st == 200, f"stale-if-error prime of {key}: {st} {h}"
+    time.sleep(1.4)  # past fresh (1s) and the stale window (mult 1)
+
+
 def _ready_purge(sw: _Sweep, uri: str) -> None:
     """A cached entry (L1 and L2) for the PURGE under test to remove."""
     assert sw.redis is not None
@@ -191,6 +212,12 @@ def _fresh_uri(prefix: str) -> Callable[[int], str]:
     return make
 
 
+def _fresh_sie_uri(i: int) -> str:
+    del i
+    _SWEEP_URI_SEQ[0] += 1
+    return f"/fa-sie/x?k=sieserve-{_SWEEP_URI_SEQ[0]}"
+
+
 _SCENARIOS = (
     _Scenario("MISS", _fresh_uri("/fa/sweep-miss-"), _ready_nothing,
               measured_hit=False),
@@ -203,6 +230,13 @@ _SCENARIOS = (
               _ready_nothing, measured_hit=False, needs_l2=True),
     _Scenario("PURGE", _fresh_uri("/fa2/sweep-purge-"), _ready_purge,
               measured_hit=False, method="PURGE", needs_l2=True),
+    # CT-ALLOC-FUNNEL-INLINE-INIT: the key-cookie slot array (module.c).
+    _Scenario("key cookie", _fresh_uri("/fa-kc/sweep-kc-"), _ready_nothing,
+              measured_hit=False, headers={"Cookie": "seg=aaaa1111bbbb2222"}),
+    # CT-ALLOC-FUNNEL-INLINE-INIT: stale-if-error rewrite (sie_rewrite).
+    _Scenario("stale-if-error", _fresh_sie_uri, _ready_sie,
+              measured_hit=False, strict_body=False,
+              expect_xcache="STALE-IF-ERROR"),
     # GET of the admin stats endpoint (cache_turbo_admin fa).
     _Scenario("admin status", lambda i: "/fa-admin", _ready_nothing,
               measured_hit=False),
@@ -246,11 +280,11 @@ def _step(sw: _Sweep, fa: Nginx, scn: _Scenario, n: int, count: int) -> bool:
     scn.ready(sw, uri)
     expect_body = None
     if scn.measured_hit:
-        expect_body = (sw.get_uri(uri)[1] if scn.probe
+        expect_body = (sw.get_uri(uri, "GET", scn.headers)[1] if scn.probe
                        else sw.expect[uri])
     sw.ctl(f"?n={n}")
     try:
-        st, body, h = sw.get_uri(uri, scn.method)
+        st, body, h = sw.get_uri(uri, scn.method, scn.headers)
     except TimeoutError:
         sw.ctl("?n=0")
         raise AssertionError(f"{where}: request hung") from None
@@ -267,7 +301,7 @@ def _step(sw: _Sweep, fa: Nginx, scn: _Scenario, n: int, count: int) -> bool:
     # Next normal request, fresh connection (fetch_raw opens one).
     t0 = time.monotonic()
     try:
-        st2, body2, h2 = sw.get_uri(uri)
+        st2, body2, h2 = sw.get_uri(uri, "GET", scn.headers)
     except TimeoutError:
         raise AssertionError(f"{where}: follow-up request hung") from None
     if time.monotonic() - t0 > 0.9:
@@ -299,6 +333,45 @@ def _fault_alloc_l2_nginx(ng: Nginx, redis_port: int | None) -> Nginx:
         admin = """        location = /fa-admin {
             cache_turbo_admin fa;
         }
+
+"""
+        # CT-ALLOC-FUNNEL-INLINE-INIT rows. /fa-kc/ folds a cookie into the
+        # key. /fa-sieprime/ stores a stale-if-error entry from the origin
+        # under key $arg_k; /fa-sie/ shares that key but its upstream is a
+        # closed port, so once the entry expires the revalidation fails and
+        # the stored snapshot replaces the 502. keep_stale is off, else the
+        # 24h default would serve the expired entry before the rewrite runs.
+        admin += f"""        location /fa-kc/ {{
+            cache_turbo          fa;
+            cache_turbo_key      $uri;
+            cache_turbo_key_cookie seg;
+            cache_turbo_valid    300s;
+            proxy_pass http://127.0.0.1:{fa.origin_port}/;
+        }}
+
+        location /fa-sieprime/ {{
+            cache_turbo          fa;
+            cache_turbo_key      $arg_k;
+            cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
+            cache_turbo_keep_stale off;
+            proxy_pass http://127.0.0.1:{fa.origin_port}/;
+        }}
+
+        location /fa-sie/ {{
+            cache_turbo          fa;
+            cache_turbo_key      $arg_k;
+            # Even an unfailed stale-if-error serve leaves the miss lock held
+            # until lock_timeout (default 5s; measured 4.5s on the second
+            # request), which would stall every follow-up. A short timeout
+            # keeps the per-N follow-up budget meaningful. Reported as a
+            # finding (CT-SIE-LOCK-HELD), not asserted here.
+            cache_turbo_lock_timeout 300ms;
+            cache_turbo_valid    1s;
+            cache_turbo_stale_mult 1;
+            cache_turbo_keep_stale off;
+            proxy_pass http://127.0.0.1:1/;
+        }}
 
 """
         l2 = admin
