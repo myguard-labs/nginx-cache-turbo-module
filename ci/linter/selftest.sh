@@ -260,6 +260,18 @@ policy_msg_ home-cache home '[~]/\.cache'
 policy_msg_ home-local-bin home 'HOME/\.local'
 policy_msg_ home-action home 'HOME\}/\.cache'
 
+# CT-LINT-CI-RUNNERS-ACTIONS-SCOPE: the wrapper's relevance filter must include
+# composite actions, or an action-only change skips the `home` check entirely.
+# The explicit file selects only relevance; the policy reads the fixture tree.
+# Red: action-only change over the ~/.cache fixture. Green pair: same selection
+# over the clean fixture, so the red is the finding and not "any action file".
+case_ 1 "lint-ci-runners.sh: an action-only change runs the home check (red)" \
+    env WORKFLOW_POLICY_ROOT=ci/linter/fixtures/policy/home-action \
+    ci/linter/lint-ci-runners.sh .github/actions/build-cache/action.yml
+case_ 0 "lint-ci-runners.sh: an action-only change over a clean tree stays green" \
+    env WORKFLOW_POLICY_ROOT=ci/linter/fixtures/policy/clean \
+    ci/linter/lint-ci-runners.sh .github/actions/build-cache/action.yml
+
 # WIRING CONTROLS. These assert that a checker is reachable at all, which is a
 # weaker claim than "it goes red on a defect" -- the red-direction probes need
 # real tools and live in each checker's header instead, so this file keeps its

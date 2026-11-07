@@ -23,6 +23,8 @@
 #              @area A [A...]    run_named.py over every test in areas/A.py
 #              @fuzz-replay      build ci/fuzz targets, replay regressions only
 #              @make-check       make -C ci/tests/unit check (nginx tree)
+#   An @area group is also SKIPPED (FAIL under require) when the build is older
+#   than the module sources it exercises (stale build; rebuild first).
 #   An unmatched src/ path falls back to @make-check; any other unmatched
 #   path (docs, workflows, ...) selects nothing.
 #
@@ -31,6 +33,11 @@
 #                                      instead of printing a loud SKIP
 #   PRECOMMIT_BUILD_DIR  (default $ROOT/.build)
 #   PRECOMMIT_TEST_PORT  (default 19400; outside CI's 18870-18999 band)
+#   PRECOMMIT_REDIS_SERVER / PRECOMMIT_MEMCACHED_SERVER
+#                        L2 server binaries handed to run_named.py when a
+#                        selected @area test takes a redis*/mc fixture
+#                        (default: redis-server / memcached on PATH; missing =
+#                        loud SKIP, FAIL under require)
 #   PRECOMMIT_ROOT       (default: repo containing this script; for tests)
 #
 # Exit: 0 all selected tests passed (or none selected / loud SKIP),
@@ -156,6 +163,44 @@ area_tests() {
     sed -n 's/^def \(test_[A-Za-z0-9_]*\)(.*/\1/p' "$ROOT/ci/tools/areas/$1.py"
 }
 
+# Tests of an area file whose signature takes an L2 fixture (redis*, mc). The
+# signature may span lines, so collect from `def test_` up to the closing `)`.
+area_l2_tests() {
+    awk '
+        /^def test_/ { name = $0; sub(/^def /, "", name); sub(/\(.*/, "", name); sig = ""; open = 1 }
+        open { line = $0; sub(/[ \t]*#.*$/, "", line); sig = sig line }
+        open && line ~ /\)[ ]*(->.*)?:[ ]*$/ {
+            open = 0
+            if (sig ~ /[(, ](mc|redis|redis_auth|redis_tls|redis_tls_untrusted|redis_tls_expired)[:,) =]/) print name
+        }' "$ROOT/ci/tools/areas/$1.py"
+}
+
+# An override may be a bare name on PATH or a path; resolve it like the default.
+REDIS_BIN="$(command -v "${PRECOMMIT_REDIS_SERVER:-redis-server}" 2>/dev/null || true)"
+MC_BIN="$(command -v "${PRECOMMIT_MEMCACHED_SERVER:-memcached}" 2>/dev/null || true)"
+
+# Echo a reason and return 1 when an @area group cannot give a truthful result.
+# Stale build: a build older than the sources it tests fails on the NEW
+# behaviour (a pre-preset build 404s `servarr`), which reads as a test failure
+# when it is a missing rebuild.
+area_ok() {
+    local a ref stale l2=0
+    ref="${MODULE:-$NGX_OBJS/nginx}"
+    for a in ${1#@area }; do
+        [ -n "$(area_l2_tests "$a" | head -1)" ] && l2=1
+    done
+    stale="$(find "$ROOT/src" -maxdepth 1 \( -name '*.c' -o -name '*.h' \) -newer "$ref" 2>/dev/null | head -1)"
+    if [ -n "$stale" ]; then
+        echo "stale build: ${stale#"$ROOT"/} is newer than ${ref#"$ROOT"/}; rebuild with ci/tools/ci-build.sh"
+        return 1
+    fi
+    if [ "$l2" = 1 ]; then
+        [ -x "$REDIS_BIN" ] || { echo "an L2 test is selected but redis-server is not available (set PRECOMMIT_REDIS_SERVER)"; return 1; }
+        [ -x "$MC_BIN" ] || { echo "an L2 test is selected but memcached is not available (set PRECOMMIT_MEMCACHED_SERVER)"; return 1; }
+    fi
+    return 0
+}
+
 fuzz_replay() {
     local fz="$ROOT/ci/fuzz" t rc=0 files
     bash "$fz/build.sh" "$PCT_TMP" >/dev/null || return 1
@@ -180,7 +225,7 @@ need_ok() {
 }
 
 run_one() {
-    local cmd="$1" a names=() all=()
+    local cmd="$1" a names=() all=() l2=() srv=()
     cd "$ROOT" || return 1
     case "$cmd" in
         "@area "*)
@@ -189,9 +234,16 @@ run_one() {
                 mapfile -t names <"$PCT_TMP/names"
                 [ "${#names[@]}" -gt 0 ] || { echo "area $a has no tests" >&2; return 1; }
                 all+=("${names[@]}")
+                area_l2_tests "$a" >"$PCT_TMP/l2names" || return 1
+                mapfile -t names <"$PCT_TMP/l2names"
+                [ "${#names[@]}" -eq 0 ] || l2+=("${names[@]}")
             done
+            # L2-needing tests take redis*/mc fixtures that run_named.py only
+            # builds when told where the servers are; without them the fixture
+            # is None and the test crashes on it. Same flags CI passes.
+            [ "${#l2[@]}" -eq 0 ] || srv=(--redis-server "$REDIS_BIN" --memcached-server "$MC_BIN")
             python3 ci/tools/run_named.py --nginx-binary "$NGX_OBJS/nginx" \
-                ${MODULE:+--module "$MODULE"} --port "$PORT" "${all[@]}" ;;
+                ${MODULE:+--module "$MODULE"} --port "$PORT" ${srv[@]+"${srv[@]}"} "${all[@]}" ;;
         "@fuzz-replay") fuzz_replay ;;
         "@make-check")
             make -C ci/tests/unit --no-print-directory check \
@@ -234,6 +286,19 @@ for row in "${SEL[@]}"; do
         fi
         continue
     fi
+    case "$cmd" in
+        "@area "*)
+            if ! why="$(area_ok "$cmd")"; then
+                if [ "$MODE" = require ]; then
+                    echo "precommit-tests: FAIL (PRECOMMIT_TESTS=require): $why; needed by: $cmd" >&2
+                    rc=1
+                else
+                    echo "precommit-tests: *** SKIP *** (NOT RUN): $why; needed by: $cmd" >&2
+                    skipped=$((skipped + 1))
+                fi
+                continue
+            fi ;;
+    esac
     echo "precommit-tests: RUN $cmd"
     if ! run_one "$cmd"; then
         echo "precommit-tests: FAIL: $cmd" >&2

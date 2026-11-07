@@ -2203,6 +2203,12 @@ def test_dead_pool_alloc_trap(ng: Nginx) -> None:
     (trap / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
     cmd = ng.runner + [str(ng.binary), "-p", str(trap),
                        "-c", str(trap / "conf" / "nginx.conf"), "-t"]
+    # This child is EXPECTED to abort: no core file (CT-TRAP-TEST-CORE-DUMP).
+    # The shell lowers the core limit in the child only, then execs the runner,
+    # so the abort status reaches this process unchanged. (preexec_fn is unsafe
+    # beside the running Origin thread: it can deadlock before exec, outside
+    # the timeout.)
+    cmd = ["/bin/sh", "-c", 'ulimit -c 0 && exec "$0" "$@"'] + cmd
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, timeout=20,
                        env=config_check_env())

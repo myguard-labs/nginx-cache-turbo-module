@@ -28,8 +28,10 @@
 # shellcheck source=ci/linter/lib.sh
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
 
-lint_files_into FILES '^\.github/workflows/.*\.ya?ml$' "$@"
-[ "${#FILES[@]}" -gt 0 ] || { echo "lint-ci-runners: no workflow files to check"; exit 0; }
+# Composite actions count too: the `home` check reads them, so an action-only
+# change must not be skipped as irrelevant.
+lint_files_into FILES '^\.github/(workflows|actions)/.*\.ya?ml$' "$@"
+[ "${#FILES[@]}" -gt 0 ] || { echo "lint-ci-runners: no workflow or action files to check"; exit 0; }
 
 need python3 "apt-get install python3"
 # The check is whole-tree by nature -- a runner policy is a property of the SET
