@@ -242,6 +242,17 @@ policy_ 0 secrets-typed-ok secrets
 policy_ 1 schedule-only-runner-labels runners
 policy_ 0 schedule-only-runner-labels-ok runners
 
+# Runner-home paths (CI-F1). The pool slot's home can be read-only or shared, so
+# a cache or tool path under ~/.cache or ~/.local fails there. Three reds cover
+# a workflow ~/.cache, a workflow $HOME/.local/bin and a composite action
+# ${HOME}/.cache; the -ok fixture holds the same strings only in comments plus a
+# $RUNNER_TEMP path and must stay clean, so the reds are not "any mention".
+policy_ 0 clean home
+policy_ 0 home-comment-ok home
+policy_msg_ home-cache home '[~]/\.cache'
+policy_msg_ home-local-bin home 'HOME/\.local'
+policy_msg_ home-action home 'HOME\}/\.cache'
+
 # WIRING CONTROLS. These assert that a checker is reachable at all, which is a
 # weaker claim than "it goes red on a defect" -- the red-direction probes need
 # real tools and live in each checker's header instead, so this file keeps its

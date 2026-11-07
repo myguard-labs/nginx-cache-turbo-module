@@ -8,6 +8,7 @@
     ci/linter/workflow_policy.py docs        README <-> workflows drift
     ci/linter/workflow_policy.py cadence     one PR entry point per member
     ci/linter/workflow_policy.py secrets     typed per-member secrets, no inherit
+    ci/linter/workflow_policy.py home        no runner-home cache/tool paths
 
 Each subcommand is wrapped by a ci/linter/lint-*.sh so run-all.sh picks it up by
 glob and a human can select it with LINT_ONLY. Exit: 0 clean, 1 findings,
@@ -722,12 +723,60 @@ def check_secrets() -> int:
     )
 
 
+# --------------------------------------------------------------------------
+# home
+
+# A pool slot can have its home directory read-only or shared with another job,
+# so a workflow or composite action that reads or writes ~/.cache, ~/.local or
+# the $HOME equivalents fails (or cross-contaminates) on that slot. Caches and
+# user-installed tools go under $RUNNER_TEMP instead (see the build-cache action).
+HOME_PATH_RE = re.compile(
+    r"(?:~|\$HOME|\$\{HOME\}|/home/runner)/\.(?:cache|local)(?![\w-])"
+)
+COMMENT_RE = re.compile(r"(?:^|\s)#.*$")
+
+
+def home_files() -> list[pathlib.Path]:
+    actions = ROOT / ".github" / "actions"
+    found = list(workflows())
+    if actions.is_dir():
+        found += sorted(
+            [*actions.rglob("action.yml"), *actions.rglob("action.yaml")],
+            key=lambda p: str(p),
+        )
+    return found
+
+
+def check_home() -> int:
+    errors: list[str] = []
+    files = home_files()
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise PolicyError(f"{path.name}: unreadable: {exc}") from exc
+        for n, line in enumerate(text.splitlines(), 1):
+            code = COMMENT_RE.sub("", line)
+            m = HOME_PATH_RE.search(code)
+            if m:
+                errors.append(
+                    f"{path.relative_to(ROOT)}:{n}: `{m.group(0)}` -- use a path "
+                    "under $RUNNER_TEMP, not the runner home directory"
+                )
+    return report(
+        "lint-ci-home",
+        errors,
+        f"{len(files)} workflow/action file(s), no runner-home cache or tool path",
+    )
+
+
 COMMANDS = {
     "runners": check_runners,
     "ports": check_ports,
     "docs": check_docs,
     "cadence": check_cadence,
     "secrets": check_secrets,
+    "home": check_home,
 }
 
 

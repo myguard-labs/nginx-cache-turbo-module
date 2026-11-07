@@ -1,4 +1,4 @@
-# sync-sha: 4551b7078e9e0309c608b136eeb14c52e68c6ea7e72c6c60849d0f9ed4aa354d
+# sync-sha: d1d7e15e6b7aba6b72e63b7db1d8e0158fc5b85256a513b8002c49cf36214c34
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -997,6 +997,22 @@ jobs:
       - name: Load version pins
         run: bash .github/scripts/load-versions.sh
 
+      - name: Private cache and tool directories
+        run: |
+          set -euo pipefail
+          # Keep every cache and user-tool path under this job's own temp dir:
+          # a shared runner's home directory can be read-only or shared.
+          base="$RUNNER_TEMP/ci-cache"
+          mkdir -p "$base/ccache" "$base/xdg" "$base/pyuser" "$base/pip" "$base/pipx" "$base/pipx-bin"
+          {
+            echo "CCACHE_DIR=$base/ccache"
+            echo "XDG_CACHE_HOME=$base/xdg"
+            echo "PYTHONUSERBASE=$base/pyuser"
+            echo "PIP_CACHE_DIR=$base/pip"
+            echo "PIPX_HOME=$base/pipx"
+            echo "PIPX_BIN_DIR=$base/pipx-bin"
+          } >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -1007,10 +1023,10 @@ jobs:
           # user pip install with --break-system-packages if pipx is unavailable.
           if command -v pipx >/dev/null; then
             pipx install --quiet 'semgrep==1.169.0'
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
           else
             pip3 install --quiet --user --break-system-packages 'semgrep==1.169.0'
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            echo "$PYTHONUSERBASE/bin" >> "$GITHUB_PATH"
           fi
           test "$(semgrep --version)" = 1.169.0
       - name: gitleaks (full history scan)

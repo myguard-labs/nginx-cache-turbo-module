@@ -35,4 +35,17 @@ need python3 "apt-get install python3"
 # The check is whole-tree by nature -- a runner policy is a property of the SET
 # of workflows, not of one file -- so the file list above is only used to decide
 # whether this checker is RELEVANT to the change, never to narrow what it reads.
-exec python3 "$(git rev-parse --show-toplevel)/ci/linter/workflow_policy.py" runners
+#
+# The `home` subcommand rides on this wrapper: it is the same "properties of the
+# runner a workflow lands on" family, and a separate lint-*.sh would need its own
+# LINT_ONLY entry in the lint workflow. It forbids ~/.cache, ~/.local and their
+# $HOME spellings in workflows and composite actions (read-only pool homes).
+root="$(git rev-parse --show-toplevel)"
+rc=0
+python3 "$root/ci/linter/workflow_policy.py" runners || rc=$?
+home_rc=0
+python3 "$root/ci/linter/workflow_policy.py" home || home_rc=$?
+# 2 (could not run) outranks 1 (findings) outranks 0.
+[ "$rc" -eq 2 ] || [ "$home_rc" -eq 2 ] && exit 2
+[ "$rc" -ne 0 ] || [ "$home_rc" -ne 0 ] && exit 1
+exit 0

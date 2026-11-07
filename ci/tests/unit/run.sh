@@ -27,6 +27,7 @@ bash "$DIR/check_producer_status_controls.sh" "$(cd "$DIR/../../.." && pwd)"
 bash "$DIR/check_norm_args_tail.sh"
 bash "$DIR/check_norm_args_tail_control.sh"
 bash "$DIR/check_versions_env.sh"
+bash "$DIR/check_ci_build_ccache.sh"
 bash "$DIR/check_ttl_width.sh"
 
 SHM_COVERAGE_FLAGS=""
