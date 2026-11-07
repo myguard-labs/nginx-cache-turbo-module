@@ -8,7 +8,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 files=(ci/linter/run-semgrep.sh ci/linter/lint-semgrep-pin.sh ci/linter/lint-c.sh
        ci/linter/install-linters.sh
-       .github/workflows/security-scanners.yml .github/workflows/ci-deep.yml)
+       .github/workflows/static.yml .github/workflows/ci-deep.yml)
 for file in "${files[@]}"; do
     mkdir -p "$TMP/$(dirname "$file")"
     cp "$REPO/$file" "$TMP/$file"
@@ -24,12 +24,12 @@ expect_red() {
 }
 
 for file in ci/linter/lint-c.sh \
-            .github/workflows/security-scanners.yml .github/workflows/ci-deep.yml; do
+            .github/workflows/static.yml .github/workflows/ci-deep.yml; do
     sed -i 's;ci/linter/run-semgrep\.sh;ci/linter/run-semgrep-disabled.sh;' "$TMP/$file"
     expect_red "$file consumer"
     cp "$REPO/$file" "$TMP/$file"
 done
-for file in ci/linter/install-linters.sh .github/workflows/security-scanners.yml \
+for file in ci/linter/install-linters.sh .github/workflows/static.yml \
             .github/workflows/ci-deep.yml; do
     sed -i 's/semgrep==1\.169\.0/semgrep==1.169.1/' "$TMP/$file"
     expect_red "$file engine"

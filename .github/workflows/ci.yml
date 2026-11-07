@@ -1,80 +1,35 @@
-# sync-sha: 66a937f4ba8ca95709b356528f43161b60c2237ff6c25efbdf8694228075a326
+# sync-sha: b544425fcdde83e6dd3a6609ea9e7de56ba35f467ec99d9b2ef8de3e2df6f875
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
 # workflows, each carrying its own push/pull_request trigger, so a PR asked for
 # all of them at once.
 #
-# SCHEDULING MODEL -- the pool is sized at 4 concurrent slots, and at that width
-# this gate is WORK-BOUND, not latency-bound. That distinction drives every
-# decision in this file, so it is worth stating precisely:
+# LANES (CI-L3..L5). The PR suite is four lanes plus the gate; each lane is
+# one runner slot except A/UBSan, which is two self-contained jobs that run
+# concurrently:
 #
-#   critical path (longest dependency chain)  =  921s
-#   total work / 4 slots                      = 1001s   <-- the binding limit
+#   L-build   build-test.yml  build + unit (ASan/UBSan, TSan) + strict compile
+#                             + runtime suite + preset suite, sequential, no
+#                             artifact hop                         (~16-17m)
+#   L-asan1   asan.yml        ASan/UBSan build + single-process runtime (~15m)
+#   L-asan2   asan.yml        ASan/UBSan build + multi-worker runtime   (~16m)
+#   L-static  static.yml      lint + validation + security scanners + fuzz
+#                             regression + testkit prober, sequential (~15m)
 #
-# Because total work exceeds the critical path, makespan is set by the SUM of
-# job durations, not by the longest chain. The practical consequence is
-# counter-intuitive and has already been measured:
+# Earlier measurements showed this gate is WORK-bound at the pool's 4 slots, not
+# latency-bound, so sharding a job makes it slower (each shard re-pays fixture
+# setup) and only REMOVING work shortens it. Folding jobs into lanes removes the
+# repeated checkout/tool setup and the artifact upload/download; no test was
+# dropped (see the step inventory in the PR that introduced the lanes).
 #
-#   *** SHARDING A JOB MAKES THIS GATE SLOWER, NOT FASTER. ***
+# WHAT IS DELIBERATELY *NOT* HERE, and where it went: Valgrind memcheck lite ->
+# ci-deep.yml `memcheck`; CodeQL -> codeql.yml's own monthly cron. Fuzzing stays
+# at a reduced 60s/target budget; its recorded-crash REPLAY step is the actual
+# regression gate. Long exploration is ci-deep.yml's `fuzz` job.
 #
-# Splitting Runtime into 2 shards was simulated at 1433s vs 1232s unsharded;
-# 3 shards 1335s; sharding Fuzzing 1461s. Each shard re-pays the runtime
-# suite's fixture setup (redis + memcached + TLS cert generation, ~30s) and
-# there is no idle slot to absorb it. Only REMOVING work shortens this gate.
-# Do not "parallelize" anything here without re-running that arithmetic.
-#
-# LANE MAP -- measured, not estimated. Re-derive with:
-#
-#   gh run view <id> -R myguard-labs/nginx-cache-turbo-module --json jobs \
-#     -q '.jobs[] | [.name, .conclusion,
-#                    (((.completedAt|fromdate)-(.startedAt|fromdate))|tostring)+"s",
-#                    .startedAt, .completedAt] | @tsv'
-#
-# Medians over runs 32065061015 and 32061694088 (2026-08-17, both green 13/13):
-#
-#   changes        12s     Build&Test  Validation 50s, Build 157s,
-#   Lint           41s                 Presets 182s, Runtime 764s
-#   Scanners      174s     A/UBSan     Build 154s, single-process 725s,
-#                                      multi-worker 738s
-#   Fuzzing       ~370s (5 targets x 60s + replay; was 664s at 120s/target)
-#
-# Chains, measured:
-#
-#   A  A/UBSan     (154 build -> 725/738 parallel soaks)   = 892s
-#   B  Build&Test  (157 build -> 764/182 runtime+presets)  = 921s  <-- longest
-#   C  Fuzzing, and Security scanners beside it            = ~370s
-#
-# WHAT IS DELIBERATELY *NOT* HERE, and where it went. Each was removed because
-# ci-deep.yml already runs a strictly stronger version of it; the PR leg was
-# paying for a weaker duplicate:
-#
-#   Valgrind memcheck lite (60s soak, 158s job)
-#       -> ci-deep.yml `memcheck` (600s soak). ASan already covers memory
-#          errors on this leg, so the lite soak was the single cheapest cut:
-#          dropping it alone recovers 6-slot makespan at 4 slots.
-#   CodeQL (185s job)
-#       -> codeql.yml's OWN monthly cron ("47 4 5 * *") -- it was never
-#          exclusive to this gate, so nothing needed to move. Its findings
-#          overlap the scanners job on the PR leg.
-#
-# Fuzzing stays, at a reduced 60s/target budget: its recorded-crash REPLAY step
-# is the actual regression gate and is unaffected by that budget. Long
-# exploration (3600s/target) is ci-deep.yml's `fuzz` job.
-#
-# A lane is not a slot. Build&Test fans out into four jobs and A/UBSan into
-# three, so the initial peak still exceeds 4 and the pool serializes the tail.
-#
-# Lint is not laned -- no `needs:`, so it starts immediately.
-#
-# Follow-ups use !cancelled() so a FAILING first check does not suppress an
-# unrelated second one, and so a chain survives an earlier job being SKIPPED by
-# the changed-files gate below.
-#
-# NOTE: every job here, Lint included, resolves `runs-on` from vars.POOL and so
-# consumes a self-hosted slot. An earlier revision of this header claimed Lint
-# and CodeQL were hosted and slot-free; they were not, and the lane budget built
-# on that claim was wrong. There are no hosted jobs in this gate.
+# NOTE: every job here resolves `runs-on` from vars.POOL and so consumes a
+# self-hosted slot; there are no hosted jobs in this gate.
 #
 # No `push:` trigger, by repo policy: CI runs on the PR, and the merge commit is
 # identical to the tested PR head, so re-running it on merge buys nothing.
@@ -98,7 +53,7 @@ permissions:
 
 jobs:
   # --- changed-files gate --------------------------------------------------
-  # asan.yml and fuzzing.yml previously carried their own `paths:` filters. A
+  # asan.yml and fuzzing.yml (now static.yml) previously carried their own `paths:` filters. A
   # reusable workflow cannot filter its own triggering, so those gates move here
   # as explicit job-level `if`s over this job's outputs. Dropping them silently
   # would run the ~800s sanitizer and ~680s fuzz jobs on every docs-only PR.
@@ -156,7 +111,7 @@ jobs:
           else
             echo "asan=false" >> "$GITHUB_OUTPUT"
           fi
-          if printf '%s\n' "$changed" | grep -qE '^(src/|ci/fuzz/|ci/tools/assert-fixtures\.sh|\.github/actions/build-cache/|\.github/workflows/(fuzzing|ci)\.yml)'; then
+          if printf '%s\n' "$changed" | grep -qE '^(src/|ci/fuzz/|ci/tools/assert-fixtures\.sh|\.github/actions/build-cache/|\.github/workflows/(static|ci)\.yml)'; then
             echo "fuzz=true" >> "$GITHUB_OUTPUT"
           else
             echo "fuzz=false" >> "$GITHUB_OUTPUT"
@@ -187,9 +142,9 @@ jobs:
             echo "code=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # --- lane A: the budget-setting workflow, alone --------------------------
-  # A/UBSan's measured 154s build fans into 725s/738s terminals: 892s total.
-  # Nothing is chained behind either terminal.
+  # --- lane L-asan: two self-contained sanitizer jobs (CI-L4) ----------------
+  # asan.yml holds asan-single and asan-multi; each builds for itself (shared
+  # `asan` ccache key, no artifact hop) and runs its suite on its own port band.
   asan:
     name: A/UBSan
     needs: changes
@@ -198,13 +153,9 @@ jobs:
       contents: read
     uses: ./.github/workflows/asan.yml  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
 
-  # --- lane B: Build&Test, alone -------------------------------------------
-  # Its measured 157s build fans out to a 764s Runtime and 182s Presets:
-  # 921s total. Nothing independent follows it.
-  #
-  # On docs-only PRs, skip the expensive build/validation/runtime suite via
-  # skip-expensive-jobs=true. The required checks (runtime and prove jobs)
-  # still run but are quick no-ops, so branch protection is satisfied.
+  # --- lane L-build: build, units, strict compile, runtime, presets (CI-L3) --
+  # One job, sequential, no artifact hop. On docs-only PRs the whole lane is
+  # skipped via skip-expensive-jobs; the gate job counts a skipped lane as green.
   build-test:
     name: Build&Test
     needs: changes
@@ -214,66 +165,23 @@ jobs:
     with:
       skip-expensive-jobs: ${{ needs.changes.outputs.code == 'false' }}
 
-  # --- lane C: Fuzzing, and Security Scanners BESIDE it, not behind it -----
-  # Current measurements are about 370s and 174s. Keeping them side by side
-  # leaves lane C at about 370s and preserves headroom for normal variance.
-  #
-  # `needs: changes` is kept, and so is the `needs.changes.result == 'success'`
-  # guard: that job exits 1 rather than fail open when it cannot compute its
-  # diff, and a bare `!cancelled()` would run scanners anyway on a run whose
-  # gate never produced a verdict. Fail-loud stays fail-closed down the lane.
-  fuzzing:
-    name: Fuzzing
-    needs: changes
-    if: ${{ needs.changes.outputs.fuzz == 'true' }}
-    permissions:
-      contents: read
-    uses: ./.github/workflows/fuzzing.yml  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
-
-  # Scanners run on EVERY PR -- unlike asan/fuzzing they are not path-gated,
-  # because a scanner finding can come from any file (workflow YAML, scripts,
-  # docs with embedded commands), not only from src/. `needs: changes` is kept
-  # solely to inherit that job's fail-closed behaviour: `changes` exits 1 rather
-  # than fail open when it cannot compute its diff, and the explicit
-  # `result == 'success'` test means a run whose gate never produced a verdict
-  # does not silently scan anyway. A bare `!cancelled()` would lose that.
-  security-scanners:
-    name: Security Scanners
+  # --- lane L-static: lint, validation, scanners, fuzz, testkit (CI-L5) -------
+  # One job of sequential steps (static.yml). Each section is gated by the
+  # matching `changes` output; lint and the security scanners run on every PR
+  # (a scanner finding can come from any file, so they are not path-gated).
+  # `needs.changes.result == 'success'` keeps the fail-closed behaviour: a run
+  # whose `changes` gate never produced a verdict does not silently lint/scan.
+  static:
+    name: Static
     needs: changes
     if: ${{ needs.changes.result == 'success' }}
     permissions:
       contents: read
-    uses: ./.github/workflows/security-scanners.yml  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
-
-  # The testkit prober leg rides in lane C, beside Fuzzing rather than behind
-  # it. Lane C is the shortest lane (~370s against a 900s budget), and this job
-  # is dominated by one ccache-warm nginx build plus a 0.4s scenario -- so it
-  # lands in the lane with the most headroom instead of extending the two that
-  # set the makespan. It asserts a lens nothing else in this gate has: per-
-  # request allocation neutrality read out of the cycle pool. See testkit.yml's
-  # header for the measured costs and for why the leg cannot share Build&Test's
-  # tree.
-  testkit:
-    name: Testkit
-    needs: changes
-    if: ${{ needs.changes.outputs.testkit == 'true' }}
-    permissions:
-      contents: read
-    uses: ./.github/workflows/testkit.yml  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
+    uses: ./.github/workflows/static.yml  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
     with:
-      skip-expensive-jobs: ${{ needs.changes.outputs.code == 'false' }}
-
-  # --- unlaned --------------------------------------------------------------
-  # The ci/linter/ gate -- the same entry point .githooks/pre-commit runs, so a
-  # clone that never set core.hooksPath still cannot land a lint regression.
-  # Fastest job in the suite: it needs no nginx build. It stays outside the
-  # runtime lanes because it has no runtime dependency (but it DOES take a
-  # pool slot -- see the note in the header).
-  lint:
-    name: Lint
-    permissions:
-      contents: read
-    uses: ./.github/workflows/lint.yml  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
+      code: ${{ needs.changes.outputs.code == 'true' }}
+      fuzz: ${{ needs.changes.outputs.fuzz == 'true' }}
+      testkit: ${{ needs.changes.outputs.testkit == 'true' }}
 
   # --- result gate -----------------------------------------------------------
   # One stable check ("CI / gate") summarising every lane above, so branch
@@ -291,7 +199,7 @@ jobs:
   # asserts it.
   gate:
     name: gate
-    needs: [changes, asan, build-test, fuzzing, security-scanners, testkit, lint]
+    needs: [changes, asan, build-test, static]
     if: ${{ always() }}
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 5
