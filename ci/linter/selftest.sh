@@ -391,6 +391,14 @@ case_ 2 "lint-astgrep-essentials.sh: a missing pack root is exit 2" \
 case_ 0 "lint-astgrep-essentials.sh: ESSENTIALS_ADVISORY keeps errors non-blocking" \
     env ESSENTIALS_ADVISORY=1 ci/linter/lint-astgrep-essentials.sh "$ess_fx/error.lua"
 
+# A malformed ast-grep stream is "could not run" (2), not an error finding (1).
+bad_bin="$(mktemp -d "${TMPDIR:-/tmp}/essbad.XXXXXX")"
+printf '#!/bin/sh\necho "not json"\nexit 1\n' > "$bad_bin/ast-grep"
+chmod +x "$bad_bin/ast-grep"
+case_ 2 "lint-astgrep-essentials.sh: an unparseable stream is exit 2, not a finding" \
+    env PATH="$bad_bin:$PATH" ci/linter/lint-astgrep-essentials.sh "$ess_fx/error.lua"
+rm -rf "${bad_bin:?}"
+
 # Every PROMOTED name must be accepted by the guard against the REAL ruleset.
 # This is the control for the CI-only inversion fixed 2026-08-14: the guard was
 # built on `printf "%s\n" "${KNOWN[@]}" | grep -qx`, and when grep -q exited on

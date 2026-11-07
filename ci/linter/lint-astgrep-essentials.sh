@@ -77,9 +77,14 @@ with open(path, encoding="utf-8") as fh:
         line = line.strip()
         if not line:
             continue
-        d = json.loads(line)
-        row = (d["file"], d["range"]["start"]["line"] + 1, d["ruleId"],
-               d.get("severity", ""), " ".join(d.get("message", "").split()))
+        # A stream that stops parsing is "could not run" (2), never a finding (1).
+        try:
+            d = json.loads(line)
+            row = (d["file"], d["range"]["start"]["line"] + 1, d["ruleId"],
+                   d.get("severity", ""), " ".join(d.get("message", "").split()))
+        except (ValueError, KeyError, TypeError) as e:
+            print(f"ERROR: cannot parse ast-grep stream: {e!r}", file=sys.stderr)
+            sys.exit(2)
         (errors if row[3] == "error" else other).append(row)
 
 # ast-grep says "error found" (rc 1) and the parsed stream must agree, or the
