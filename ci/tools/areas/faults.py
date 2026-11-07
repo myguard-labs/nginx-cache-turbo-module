@@ -87,10 +87,11 @@ class _Sweep(_FaultAlloc):
         super().__init__(port)
         self.expect: dict[str, str] = {}
         self.slow: list[str] = []  # follow-ups that waited out a lock
-        # PURGE follow-ups that stalled because the failed allocation was the
-        # purge's own fire-and-forget DEL of the lock key (the lock is a
-        # previous fill's, not this request's): bounded by lock_timeout and
-        # reported, not failed (CT-ALLOC-FAIL-LOCK-HELD, PURGE decision).
+        # PURGE follow-ups that stalled after the PURGE itself reported the
+        # failure (non-200: the dropped lock DEL left a previous fill's lock,
+        # bounded by lock_timeout). Reported, not failed: the caller was told.
+        # A PURGE that answered 200 with a key left already failed in
+        # assert_purge_l2_state (CT-PURGE-L2-DEL-SILENT).
         self.purge_lock_left: list[str] = []
 
     def get_uri(self, uri: str, method: str = "GET",
@@ -119,31 +120,32 @@ class _Sweep(_FaultAlloc):
         assert calls > 0, f"{scn.name}: request made no funnel call: {r}"
         return calls
 
-    def purge_skipped_lock_del(self, scn: _Scenario, uri: str,
-                               fired: bool) -> bool:
-        """Did the injected failure make this PURGE skip its lock DEL? True
-        only with all of: the injection fired, the L2 object key is gone (the
-        object DEL went out) and the lock key is still there. The object and
-        lock DELs share allocation sites, so the site alone cannot tell them
-        apart; the keys can. _ready_purge guarantees the object is in L2 before
-        the PURGE, and the module's redis_del issues the object DEL before the
-        lock DEL (ngx_http_cache_turbo_redis.c), so a fired failure that left
-        the lock but removed the object skipped only the lock DEL. The DELs
-        are fire-and-forget, so give them a moment to land first."""
+    def assert_purge_l2_state(self, scn: _Scenario, uri: str, st: int | None,
+                              where: str) -> None:
+        """CT-PURGE-L2-DEL-SILENT: a PURGE that answers 200 has handed BOTH
+        L2 DELs (object key and lock key) to the transport, so neither key may
+        survive; a PURGE whose DEL was dropped before the wire answers 503
+        (any 5xx / dropped connection is also acceptable, it did not claim
+        success). The DELs are fire-and-forget, so give them a moment to
+        land before judging. Asserted by key state, not by allocation index,
+        so the seeded PR-mode sample needs no fixed N."""
         redis = self.redis
-        if scn.method != "PURGE" or redis is None or not fired:
-            return False
-        if not wait_for(lambda: redis.get_raw(l2_key(uri)) is None,
-                        timeout=0.5):
-            return False
-        return not wait_for(lambda: redis.get_raw(lock_key(uri)) is None,
-                            timeout=0.5)
+        if scn.method != "PURGE" or redis is None or st != 200:
+            return
+        assert wait_for(lambda: redis.get_raw(l2_key(uri)) is None,
+                        timeout=1.0), \
+            f"{where}: PURGE answered 200 but the L2 object key is left"
+        assert wait_for(lambda: redis.get_raw(lock_key(uri)) is None,
+                        timeout=1.0), \
+            f"{where}: PURGE answered 200 but the L2 lock key is left"
 
-    def note_stall(self, n: int, r: dict[str, str], tolerated: bool) -> None:
+    def note_stall(self, n: int, r: dict[str, str], scn: _Scenario,
+                   st: int | None) -> None:
         """Record a follow-up that waited out a lock, with its fault site.
-        Only a PURGE whose injected failure skipped the lock DEL is
-        tolerated; every other stall is a failure."""
+        Only a PURGE that did not answer 200 is tolerated; every other stall
+        is a failure."""
         site = r.get("site", "-").rsplit("/", 1)[-1]
+        tolerated = scn.method == "PURGE" and st != 200
         (self.purge_lock_left if tolerated else self.slow).append(
             f"N={n}@{site}")
 
@@ -297,7 +299,7 @@ def _step(sw: _Sweep, fa: Nginx, scn: _Scenario, n: int, count: int) -> bool:
         f"{where}: unclean answer {st} {h}"
     if st == 200 and expect_body is not None and scn.strict_body:
         assert body == expect_body, f"{where}: declined answer has a wrong body"
-    lock_left = sw.purge_skipped_lock_del(scn, uri, r["fired"] == "1")
+    sw.assert_purge_l2_state(scn, uri, st, where)
     # Next normal request, fresh connection (fetch_raw opens one).
     t0 = time.monotonic()
     try:
@@ -305,7 +307,7 @@ def _step(sw: _Sweep, fa: Nginx, scn: _Scenario, n: int, count: int) -> bool:
     except TimeoutError:
         raise AssertionError(f"{where}: follow-up request hung") from None
     if time.monotonic() - t0 > 0.9:
-        sw.note_stall(n, r, lock_left)
+        sw.note_stall(n, r, scn, st)
     assert st2 == 200 and body2, \
         f"{where}: follow-up request not served: {st2} {h2}"
     if expect_body is not None and scn.strict_body:
@@ -425,8 +427,8 @@ def test_alloc_fail_sweep(ng: Nginx, redis: RedisServer | None = None) -> None:
                   f"fired={fired} mode={'full' if full else 'pr'} "
                   f"seed={seed} lock-stalled follow-ups: "
                   f"{sw.slow or 'none'}"
-                  + (f" purge-left-lock (tolerated): {sw.purge_lock_left}"
-                     if sw.purge_lock_left else ""))
+                  + (f" purge-reported-failure stalls (tolerated): "
+                     f"{sw.purge_lock_left}" if sw.purge_lock_left else ""))
             # CT-ALLOC-FAIL-LOCK-HELD: a winner whose store fails releases
             # its cross-node lock, so no follow-up may wait it out.
             assert not sw.slow, \

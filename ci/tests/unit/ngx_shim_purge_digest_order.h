@@ -18,7 +18,9 @@ typedef unsigned char  u_char;
 #define NGX_ERROR                          -1
 #define NGX_DONE                           -4
 #define NGX_HTTP_OK                       200
+#define NGX_HTTP_SERVICE_UNAVAILABLE      503
 #define NGX_HTTP_INTERNAL_SERVER_ERROR    500
+#define NGX_LOG_ERR                         3
 #define NGX_LOG_WARN                        4
 #define NGX_LOG_DEBUG_HTTP                  0
 #define NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE 76
@@ -31,6 +33,9 @@ typedef struct {
     size_t   len;
     u_char  *data;
 } ngx_str_t;
+
+#define ngx_str_set(str, text)                                               \
+    (str)->len = sizeof(text) - 1; (str)->data = (u_char *) text
 
 typedef struct {
     u_char  storage[4096];
@@ -120,7 +125,7 @@ typedef struct {
 } ngx_cache_turbo_l1_backend_t;
 
 typedef struct {
-    void (*del)(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash);
+    ngx_int_t (*del)(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash);
     ngx_int_t (*purge_tag)(ngx_http_request_t *r,
         ngx_http_cache_turbo_loc_conf_t *clcf, u_char *name, size_t name_len,
         ngx_http_cache_turbo_redis_members_pt cb, void *data);

@@ -49,7 +49,9 @@ test_purge_key(ngx_http_cache_turbo_zone_t *z, u_char *key_hash, uint32_t hash)
     return 1;
 }
 
-static void
+static ngx_int_t l2_del_result = NGX_OK;
+
+static ngx_int_t
 test_del(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash)
 {
     (void) clcf;
@@ -57,6 +59,7 @@ test_del(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash)
         memcpy(deleted_keys[l2_del_calls], key_hash, 32);
     }
     l2_del_calls++;
+    return l2_del_result;
 }
 
 static ngx_int_t
@@ -133,6 +136,7 @@ reset_case(ngx_http_request_t *r, ngx_pool_t *pool,
     l1_lookup_calls = 0;
     l1_purge_calls = 0;
     l2_del_calls = 0;
+    l2_del_result = NGX_OK;
     l2_purge_tag_calls = 0;
     l2_purge_tag_result = NGX_DONE;
     marker_present = 0;
@@ -281,6 +285,26 @@ main(void)
               && strstr(ngx_test_warning_format,
                         "variants may remain resolvable") != NULL,
           "partial purge warning must name resolvable variant residue");
+
+    /* Single-key PURGE whose L2 delete was dropped before the wire must
+     * answer 503, log at ERR, and neither park nor run the variant purge. */
+    reset_case(&request, &pool, &connection, &clcf, &l1, &redis, &shm_zone);
+    l2_del_result = NGX_ERROR;
+    rc = ngx_http_cache_turbo_purge_request(&request, &clcf);
+    CHECK(rc == NGX_DONE, "dropped L2 delete must finish the request");
+    CHECK(request.send_calls == 1
+              && request.sent_status == NGX_HTTP_SERVICE_UNAVAILABLE,
+          "dropped L2 delete must answer HTTP 503");
+    CHECK(request.sent_body.len > sizeof("{\"error\"") - 1
+              && memcmp(request.sent_body.data, "{\"error\"",
+                        sizeof("{\"error\"") - 1) == 0,
+          "dropped L2 delete must carry a JSON error body");
+    CHECK(request.finalize_calls == 1,
+          "dropped L2 delete must finalize the request once");
+    CHECK(ngx_test_warning_calls == 1 && ngx_test_warning_level == NGX_LOG_ERR,
+          "dropped L2 delete must be logged at NGX_LOG_ERR");
+    CHECK(l2_del_calls == 1 && l2_purge_tag_calls == 0,
+          "dropped L2 delete must not continue into variant enumeration");
 
     /* Appended-case control: reset_case() must restore the configured backend
      * after the L1-only fixture above instead of leaking that case's mode. */
