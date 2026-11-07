@@ -1492,17 +1492,25 @@ static const char *const  ct_mantisbt_uris[] = {
     "/bugnote_add.php", "/bugnote_edit_page.php", "/proj_doc_add_page.php",
     "/proj_doc_edit_page.php", "/news_edit_page.php", "/query_store.php",
     NULL };
-static const char *const  ct_mantisbt_args[] = { NULL };
+/*
+ * `key` is the RSS feed login: issues_rss.php and news_rss.php take username +
+ * key from the query string and authenticate with no cookie, so a member's
+ * private issue feed would otherwise be cached under the public key.
+ */
+static const char *const  ct_mantisbt_args[] = { "key", NULL };
 
 /*
  * Plone. __ac is the stable frontend authentication cookie. Zope sessions,
  * status messages and the language override are user-specific state too. Plone
  * itself marks login/reset responses private; the URI tier is still valuable
  * when an operator weakens origin Cache-Control. Traversal views below content
- * (folder/@@edit) remain protected by the auth cookie.
+ * (folder/@@edit) remain protected by the auth cookie. `auth_token` is the
+ * cookie the Volto frontend (the Plone 6 default UI) sets at login and reads
+ * server-side; a preset in front of Volto sees no __ac, only this one.
  */
 static const char *const  ct_plone_cookies[] = {
-    "__ac=", "_ZopeId=", "statusmessages=", "I18N_LANGUAGE=", NULL };
+    "__ac=", "_ZopeId=", "statusmessages=", "I18N_LANGUAGE=", "auth_token=",
+    NULL };
 static const char *const  ct_plone_uris[] = {
     "/login", "/logout", "/register", "/passwordreset", "/mail_password",
     "/manage", "/@@login", NULL };
@@ -1513,8 +1521,9 @@ static const char *const  ct_plone_args[] = { NULL };
  * back-office cookie (default UMB_UCONTEXT), v17+ token cookies, preview/XSRF
  * cookies, and ASP.NET Identity's member cookie. UMB_EXTLOGIN and UMB_SESSION
  * remain conservative compatibility guards for legacy/optional integrations.
- * /umbraco contains the back office and management API; ordinary content and
- * the public Delivery API are left available for caching. Sites that rename
+ * /umbraco contains the back office and management API, and also the Delivery
+ * API (/umbraco/delivery/api/v{n}/), so that is bypassed too; ordinary content
+ * is left available for caching. Sites that rename
  * the member/back-office cookies must add their configured names explicitly
  * (see docs/umbraco.md).
  */
@@ -1542,7 +1551,7 @@ static const char *const  ct_dotclear_uris[] = {
 static const char *const  ct_dotclear_args[] = { NULL };
 
 /*
- * Wiki.js 2.x. Authentication is a fixed `jwt` cookie. Express-session is
+ * Wiki.js 2.x and 3.x. 2.x authentication is a fixed `jwt` cookie. Express-session is
  * installed globally but saveUninitialized=false leaves ordinary guests
  * cookie-free; OAuth strategies can create the default connect.sid session.
  * loginRedirect carries a private target across login. The URI tier keeps
@@ -1550,13 +1559,19 @@ static const char *const  ct_dotclear_args[] = { NULL };
  * a cookie exists. Published arbitrary-path pages remain available for shared
  * guest caching; their ACL/navigation view is guest-group-specific, while all
  * authenticated group variants carry jwt and bypass.
+ *
+ * Wiki.js 3.x (Fastify rewrite) uses a `wikiSession` session cookie instead
+ * (saveUninitialized=false, so guests stay cookie-free) and serves the private
+ * /_api, /_mcp, /_scim, /_terminal and /_collab routes; the 2.x rows are kept
+ * for installs still on 2.x. Verified against 2.5.315 and 3.1.1.
  */
 static const char *const  ct_wikijs_cookies[] = {
-    "jwt=", "connect.sid=", "loginRedirect=", NULL };
+    "jwt=", "connect.sid=", "loginRedirect=", "wikiSession=", NULL };
 static const char *const  ct_wikijs_uris[] = {
     "/a", "/d", "/e", "/h", "/p", "/s", "/u",
     "/login", "/logout", "/register", "/verify", "/login-reset",
-    "/graphql", "/graphql-subscriptions", NULL };
+    "/graphql", "/graphql-subscriptions", "/_api/auth", "/_mcp", "/_scim",
+    "/_terminal", "/_collab", NULL };
 static const char *const  ct_wikijs_args[] = { NULL };
 
 /*
@@ -1580,7 +1595,10 @@ static const char *const  ct_wikijs_args[] = { NULL };
  * /repository. On an open tracker those are the main public content and the
  * entire reason to cache it; public-vs-private there is a per-project ACL that
  * nginx cannot see, and the cookie rule is what protects a logged-in view of
- * them. Verified against redmine/redmine master (7.0.0 current 2026-07-26).
+ * them. `access_token` and `bearer_token` are Doorkeeper's default query-string OAuth
+ * token methods (Redmine overrides none), and the API key may also arrive in
+ * the cookieless X-Redmine-API-Key request header (api_key_from_request), so
+ * the header tier covers it. Verified against redmine/redmine 7.0.3.
  */
 static const char *const  ct_redmine_cookies[] = {
     "_redmine_session=", "autologin=", NULL };
@@ -1588,7 +1606,10 @@ static const char *const  ct_redmine_uris[] = {
     "/admin", "/my", "/login", "/logout", "/account",
     "/settings", "/enumerations", "/roles", "/trackers", "/custom_fields",
     "/auth_sources", "/mail_handler", NULL };
-static const char *const  ct_redmine_args[] = { "key", NULL };
+static const char *const  ct_redmine_args[] = {
+    "key", "access_token", "bearer_token", NULL };
+static const char *const  ct_redmine_headers[] = {
+    "X-Redmine-API-Key", NULL };
 
 /*
  * Flarum. The cookie tier matches ONLY `flarum_remember`, never
@@ -1613,8 +1634,11 @@ static const char *const  ct_redmine_args[] = { "key", NULL };
  * $prefix = $config['cookie.name'] ?? 'flarum', getName() returns
  * "{$prefix}_{$name}"), and `paths.admin`/`paths.api` are renameable the same
  * way; all three are matched at their stock values only. Verified against
- * flarum/framework v2.0.0-rc.8; the same cookie mechanics remain in the
- * v1.8.19 stable line (rechecked 2026-09-01).
+ * flarum/framework v2.0.2 (rechecked 2026-11-07).
+ *
+ * `locale` (unprefixed) is the guest language choice: SetLocale.php renders
+ * guests in that language, so it is a key cookie -- each value gets its own
+ * entry instead of one guest's choice poisoning the shared one.
  */
 static const char *const  ct_flarum_cookies[] = {
     "flarum_remember=", NULL };
@@ -1622,6 +1646,7 @@ static const char *const  ct_flarum_uris[] = {
     "/admin", "/api", "/login", "/logout", "/global-logout", "/register",
     "/reset", "/confirm", "/settings", "/notifications", NULL };
 static const char *const  ct_flarum_args[] = { NULL };
+static const char *const  ct_flarum_key_cookies[] = { "locale", NULL };
 
 /*
  * OpenCart. This preset is ARG-tier, not URI-tier, and that is forced by the
@@ -1655,13 +1680,16 @@ static const char *const  ct_flarum_args[] = { NULL };
  * so docs/opencart.md requires an application-provided identity boundary
  * before an operator considers overriding the global no-store policy.
  *
- * No key_cookies: OpenCart 4.x drives language and currency through the URL
- * (catalog/controller/common/language.php only reads request/config and
- * redirects with the arg — it sets no cookie), so there is no rendering cookie
- * to vary on. The 3.x-era `language`/`currency` cookies were checked for and
- * are NOT set by 4.x; do not add them back without re-verifying.
+ * Key cookie `currency`: catalog/controller/startup/currency.php reads it and
+ * sets it for every visitor that lacks one (and common/currency.php on a
+ * switch), so a guest's chosen currency changes the rendered prices. Any
+ * response that sets it carries Set-Cookie and is never stored, so keying on
+ * the cookie is safe. There is no language cookie in 4.x (language is
+ * URL-driven). Verified against 4.1.0.4. This stays defence in depth behind
+ * the origin no-store.
  */
 static const char *const  ct_opencart_cookies[] = { NULL };
+static const char *const  ct_opencart_key_cookies[] = { "currency", NULL };
 static const char *const  ct_opencart_uris[] = { NULL };
 static const char *const  ct_opencart_args[] = {
     "route=checkout/cart", "route=checkout/checkout", "route=checkout/confirm",
@@ -1777,7 +1805,9 @@ static const char *const  ct_servarr_args[] = {
  * There is no session cookie and no API key, so the tier is URI-only: the write
  * endpoint /cdb/, the per-user reading state (/book-set-last-read-position,
  * /book-set-annotations, /book-get-last-read-position,
- * /book-get-annotations), /interface-data/init (its ETag includes the
+ * /book-get-annotations, /book-get-storage, /book-set-storage), the KOReader
+ * sync server /kosync/ (per-user progress at a shared URL, identified by
+ * X-Auth-User, not Authorization), /interface-data/init (its ETag includes the
  * username) and /ajax-setup. The slash-less rows are
  * the full route names: the boundary rule only continues a match at `/` or `.`,
  * so a `/book-set-` stem would match nothing.
@@ -1786,7 +1816,8 @@ static const char *const  ct_calibre_cookies[] = { NULL };
 static const char *const  ct_calibre_uris[] = {
     "/cdb/", "/book-set-last-read-position", "/book-set-annotations",
     "/book-get-last-read-position", "/book-get-annotations",
-    "/interface-data/init", "/ajax-setup", NULL };
+    "/interface-data/init", "/ajax-setup", "/kosync/", "/book-get-storage",
+    "/book-set-storage", NULL };
 static const char *const  ct_calibre_args[] = { NULL };
 
 /*
@@ -1884,12 +1915,14 @@ const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
     { NGX_HTTP_CACHE_TURBO_BACKEND_WIKIJS,
       ct_wikijs_cookies, ct_wikijs_uris, ct_wikijs_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_REDMINE,
-      ct_redmine_cookies, ct_redmine_uris, ct_redmine_args, NULL, NULL, NULL },
+      ct_redmine_cookies, ct_redmine_uris, ct_redmine_args, NULL, NULL,
+      ct_redmine_headers },
     { NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM,
-      ct_flarum_cookies, ct_flarum_uris, ct_flarum_args, NULL, NULL, NULL },
+      ct_flarum_cookies, ct_flarum_uris, ct_flarum_args, NULL,
+      ct_flarum_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART,
       ct_opencart_cookies, ct_opencart_uris, ct_opencart_args,
-      NULL, NULL, NULL },
+      NULL, ct_opencart_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_NEXTJS,
       ct_nextjs_cookies, ct_nextjs_uris, ct_nextjs_args, NULL, NULL,
       ct_nextjs_headers },

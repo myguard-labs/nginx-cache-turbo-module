@@ -359,3 +359,34 @@ Cookie: __ac=YWxhZGRpbjplY2Q2MmE1YzI4YWUwNDQyNDg1YjRkY2FmYzA2ZGYyZWE=
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200]
+
+
+
+=== TEST 17: auth_token (Volto login cookie) bypasses
+# Plone 6's default Volto frontend sets auth_token at login and reads it during
+# server-side rendering; the backend __ac never reaches a proxy in front of Volto.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- more_headers
+Cookie: auth_token=eyJhbGciOiJIUzI1NiJ9.deadbeef
+--- request eval
+["GET /plone/volto-a", "GET /plone/volto-a"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 18: NEGATIVE -- a near-miss cookie name (auth_tokens) does NOT bypass
+# The needle is "auth_token=": "auth_tokens=x" does not contain it.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- more_headers
+Cookie: auth_tokens=x
+--- request eval
+["GET /plone/volto-b", "GET /plone/volto-b"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]

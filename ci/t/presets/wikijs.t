@@ -70,6 +70,12 @@ our $Config = ct_config(
     { path => '/login-reset',           backend => 'wikijs' },
     { path => '/graphql',               backend => 'wikijs' },
     { path => '/graphql-subscriptions', backend => 'wikijs' },
+    { path => '/_api/auth',             backend => 'wikijs' },
+    { path => '/_apix',                 backend => 'wikijs' },
+    { path => '/_mcp',                  backend => 'wikijs' },
+    { path => '/_scim',                 backend => 'wikijs' },
+    { path => '/_terminal',             backend => 'wikijs' },
+    { path => '/_collab',               backend => 'wikijs' },
     { path => '/about',                 backend => 'wikijs' },
     { path => '/api',                   backend => 'wikijs' },
     { path => '/articles',              backend => 'wikijs' },
@@ -364,6 +370,67 @@ Cookie: theme=dark
 Cookie: jwt=eyJhbGciOiJIUzI1NiJ9.deadbeef
 --- request eval
 ["GET /gen/topic-iso", "GET /gen/topic-iso"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 15: Wiki.js 3.x wikiSession cookie bypasses
+# 3.x (Fastify) replaced the 2.x jwt cookie with the wikiSession session cookie.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- more_headers
+Cookie: wikiSession=s%3Aabc.def
+--- request eval
+["GET /wiki/v3-a", "GET /wiki/v3-a"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 16: NEGATIVE -- a near-miss cookie name (wikiSessions) does NOT bypass
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- more_headers
+Cookie: wikiSessions=x
+--- request eval
+["GET /wiki/v3-b", "GET /wiki/v3-b"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 17: Wiki.js 3.x URI rows bypass at the root with no cookie
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /_api/auth/x", "GET /_api/auth/x",
+ "GET /_mcp", "GET /_mcp",
+ "GET /_scim", "GET /_scim",
+ "GET /_terminal", "GET /_terminal",
+ "GET /_collab", "GET /_collab"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
+
+
+
+=== TEST 18: NEGATIVE -- /_apix (not /_api/auth) does NOT bypass
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /_apix", "GET /_apix"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval

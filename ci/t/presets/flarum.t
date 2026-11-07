@@ -38,9 +38,9 @@
 # breaks if someone "fixes" the preset by adding the obvious session
 # cookie, the member half is what breaks if the remember row is dropped.
 #
-# ct_flarum_args[] is { NULL } and the preset row carries NULL in both
-# cookie_preds and key_cookies, so this file has no arg leg, no predicate
-# leg, and no value-keying leg.
+# ct_flarum_args[] is { NULL } and the preset row carries NULL cookie_preds, so
+# this file has no arg leg and no predicate leg. key_cookies is { "locale" }:
+# TEST 10 is the value-keying leg.
 #
 # THE URI LIST IS SLASH-LESS -- THE SEGMENT-TERMINATION BRANCH IS LIVE HERE
 # ------------------------------------------------------------------------
@@ -267,3 +267,30 @@ Cookie: flarum_remember=def.signed.token
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200]
+
+
+
+=== TEST 10: the guest `locale` cookie is VALUE-KEYED -- de, en and none are three entries
+# SetLocale renders guests in the language from the unprefixed `locale` cookie.
+# The body echo (ck=) proves each value got its own entry rather than the first
+# value's body being served to the others.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /flarum/d/1", "GET /flarum/d/1",
+ "GET /flarum/d/1", "GET /flarum/d/1",
+ "GET /flarum/d/1", "GET /flarum/d/1"]
+--- more_headers eval
+["Cookie: locale=de", "Cookie: locale=de",
+ "Cookie: locale=en", "Cookie: locale=en",
+ "", ""]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- response_body_like eval
+[qr/ck=locale=de/, qr/ck=locale=de/,
+ qr/ck=locale=en/, qr/ck=locale=en/,
+ qr/ck=\n/, qr/ck=\n/]
+--- error_code eval
+[200, 200, 200, 200, 200, 200]

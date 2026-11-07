@@ -1,6 +1,6 @@
 # calibre content server + cache-turbo
 
-_Last researched: 2026-10-06 (calibre master, `src/calibre/srv`)._
+_Last researched: 2026-11-07 (calibre 9.18.0, `src/calibre/srv`)._
 
 `calibre-server` ships with authentication **off**. In that default the whole
 library UI, the OPDS feed, covers and book downloads are anonymous, so a shared
@@ -20,7 +20,7 @@ cache_turbo_backend calibre;
 | Check | Values |
 | --- | --- |
 | Cookie substrings | none |
-| URI prefixes | `/cdb/`, `/book-set-last-read-position`, `/book-set-annotations`, `/book-get-last-read-position`, `/book-get-annotations`, `/interface-data/init`, `/ajax-setup` |
+| URI prefixes | `/cdb/`, `/book-set-last-read-position`, `/book-set-annotations`, `/book-get-last-read-position`, `/book-get-annotations`, `/interface-data/init`, `/ajax-setup`, `/kosync/`, `/book-get-storage`, `/book-set-storage` |
 | Query args | none |
 
 <!-- markdownlint-enable MD013 -->
@@ -32,7 +32,11 @@ is URI-only:
 - `/cdb/` is the write endpoint (needs `local_write` or `trusted_ips`);
 - the `/book-set-*` and `/book-get-*` routes carry per-user reading state;
 - `/interface-data/init` has an ETag that includes the username;
-- `/ajax-setup` is `no-cache, must-revalidate` upstream.
+- `/ajax-setup` is `no-cache, must-revalidate` upstream;
+- `/kosync/` is the KOReader sync server: per-user reading progress at a shared
+  URL, identified by `X-Auth-User` / `X-Auth-Key` headers rather than
+  `Authorization`, and with server auth off any `X-Auth-User` is accepted;
+- `/book-get-storage` and `/book-set-storage` are per-user key/value stores.
 
 The slash-less rows are the full route names on purpose. The URI matcher
 continues a slash-less needle only at `/` or `.`, so a `/book-set-` stem would
