@@ -92,6 +92,7 @@ ci/tests/unit/test_shm_state.c|ci/tests/unit/layout_check.c|ci/tests/unit/layout
 
 # --- fuzz and linter trees -------------------------------------------------
 ci/fuzz/*	clang	@fuzz-replay
+ci/fuzz/run-concurrent.sh|ci/fuzz/test_run_concurrent.sh	clang	bash ci/fuzz/test_run_concurrent.sh
 ci/linter/*	none	bash ci/linter/selftest.sh
 ci/tests/unit/test_vary_gen.c	none	ut vary_gen -
 ci/tests/unit/test_vary_encoding_collapse.c	none	ut vary_encoding_collapse -
