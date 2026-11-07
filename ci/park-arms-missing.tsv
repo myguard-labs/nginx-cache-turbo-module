@@ -1,0 +1,4 @@
+# Baseline of (park function, abort shape) pairs with no arm yet. Checked by ci/tools/lint-orphan-tests.py.
+# It only shrinks: a pair whose arm now exists, or whose site is gone, fails as stale. Shapes: http1_fin http1_rst h2_rst_stream h2_close poke.
+ngx_http_cache_turbo_redis_scan_del	poke
+ngx_http_cache_turbo_warm_file_start	poke

@@ -42,6 +42,12 @@ have to teach called_names() about ast.Attribute FIRST -- until then such a
 call is unreachable here and the test reports as an orphan, which is the safe
 direction to fail.
 
+Second check (BP-D1, abort-arm coverage): every site in ci/park-sites.tsv
+must have an arm for each of the five abort shapes (ABORT_SHAPES). The mapping
+is mechanical, see park_arm_matrix(). A (site, shape) pair with no arm must be
+listed in ci/park-arms-missing.tsv; the baseline can only shrink -- a listed
+pair whose arm now exists, or whose site is gone, fails as stale.
+
 Usage: ci/tools/lint-orphan-tests.py [path-to-test_runtime.py]
 Exit 0 + "OK" line on a clean run, exit 1 naming every orphaned test on a
 regression.
@@ -49,6 +55,7 @@ regression.
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -164,6 +171,116 @@ def load_suite(
     return tests, all_funcs, origin
 
 
+# --- BP-D1: abort-arm coverage matrix ------------------------------------- #
+#
+# Mapping method (derived from names only, never from test bodies):
+#  * site token: the park-sites.tsv `abort_tests` column lists tests named
+#    test_l2_abort_<token>_<shape>_<phase>; <token> is the part between
+#    "test_l2_abort_" and the first shape word (names with token "fixture" are
+#    the shared fixture-park smoke test, not a per-site token).
+#  * shape arm: a reachable test_l2_abort_<token>_<shape>_* exists, with
+#    <shape> in ABORT_SHAPES' name stems.
+#  * blocked-send-then-poke: the re-entry family test_l2_reentry_<rtoken>_poke
+#    (run_reentry_test(..., "poke")); <rtoken> equals the site token except for
+#    POKE_TOKEN_ALIAS, where the re-entry rig drives the walk through another
+#    name (the "purge_walk" rig PURGEs and parks in redis_sscan).
+ABORT_SHAPES: dict[str, str] = {
+    "http1_fin": "HTTP/1 FIN",
+    "http1_rst": "HTTP/1 RST",
+    "h2_rst_stream": "HTTP/2 RST_STREAM",
+    "h2_close": "HTTP/2 close",
+    "poke": "blocked-send-then-poke",
+}
+POKE_TOKEN_ALIAS: dict[str, str] = {"sscan_walk": "purge_walk"}
+_TOKEN_RE = re.compile(
+    r"^test_l2_abort_(?P<tok>.+?)_(?:http1_(?:rst|fin)|h2_(?:rst_stream|close)"
+    r"|clean|parks)(?:_|$)")
+
+
+def site_tokens(abort_tests: str) -> set[str]:
+    toks = set()
+    for name in filter(None, (t.strip() for t in abort_tests.split(","))):
+        m = _TOKEN_RE.match(name)
+        if m and m.group("tok") != "fixture":
+            toks.add(m.group("tok"))
+    return toks
+
+
+def read_tsv(path: Path) -> list[list[str]]:
+    rows = []
+    for line in path.read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            rows.append(line.split("\t"))
+    return rows
+
+
+def park_arm_matrix(
+    sites: list[list[str]], reached: set[str]
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """Return (covered, missing) sets of (function, shape) pairs.
+    A site whose abort_tests give no token covers nothing (all shapes missing)."""
+    covered: set[tuple[str, str]] = set()
+    missing: set[tuple[str, str]] = set()
+    for row in sites[1:]:  # row 0 is the header
+        func = row[1]
+        toks = site_tokens(row[5] if len(row) > 5 else "")
+        for shape in ABORT_SHAPES:
+            if shape == "poke":
+                rtoks = {POKE_TOKEN_ALIAS.get(t, t) for t in toks}
+                names = {f"test_l2_reentry_{t}_poke" for t in rtoks}
+                hit = any(n in reached for n in names)
+            else:
+                hit = any(n.startswith(f"test_l2_abort_{t}_{shape}_")
+                          for t in toks for n in reached)
+            (covered if hit else missing).add((func, shape))
+    return covered, missing
+
+
+def read_baseline(base_p: Path) -> tuple[set[tuple[str, str]], bool]:
+    """Parse the baseline; returns (pairs, ok)."""
+    pairs: set[tuple[str, str]] = set()
+    ok = True
+    for row in read_tsv(base_p):
+        if len(row) != 2 or row[1] not in ABORT_SHAPES:
+            print(f"lint-orphan-tests: {base_p}: bad baseline line {row!r} "
+                  f"(want <function><TAB><{'|'.join(ABORT_SHAPES)}>)",
+                  file=sys.stderr)
+            ok = False
+        else:
+            pairs.add((row[0], row[1]))
+    return pairs, ok
+
+
+def check_park_arms(facade: Path, reached: set[str]) -> int:
+    ci_dir = facade.parent.parent
+    try:
+        sites = read_tsv(ci_dir / "park-sites.tsv")
+        baseline, ok = read_baseline(ci_dir / "park-arms-missing.tsv")
+    except OSError as exc:
+        print(f"lint-orphan-tests: {exc}", file=sys.stderr)
+        return 1
+    if len(sites) < 2:
+        print("lint-orphan-tests: park-sites.tsv: no park sites -- refusing "
+              "a vacuous arm check", file=sys.stderr)
+        return 1
+    covered, missing = park_arm_matrix(sites, reached)
+    for func, shape in sorted(missing - baseline):
+        print(f"lint-orphan-tests: park-sites.tsv: {func} has no "
+              f"'{shape}' abort arm ({ABORT_SHAPES[shape]}) -- add the arm; "
+              "do not extend the baseline", file=sys.stderr)
+        ok = False
+    for func, shape in sorted(baseline - missing):
+        print(f"lint-orphan-tests: park-arms-missing.tsv: stale entry {func} "
+              f"{shape} (the arm exists or the site is gone) -- delete the "
+              "line", file=sys.stderr)
+        ok = False
+    if ok:
+        print(f"lint-orphan-tests: park arms OK ({len(sites) - 1} sites x "
+              f"{len(ABORT_SHAPES)} shapes: {len(covered)} covered, "
+              f"{len(missing & baseline)} in baseline)")
+    return 0 if ok else 1
+
+
 def main() -> int:
     facade = Path(sys.argv[1] if len(sys.argv) > 1 else "ci/tools/test_runtime.py")
     paths = suite_files(facade)
@@ -241,7 +358,7 @@ def main() -> int:
               f"{len(paths)} file(s), {len(reached)} reachable from "
               f"run_all(), {len(ALLOWED_ORPHANS)} explicit opt-outs)")
 
-    return status
+    return max(status, check_park_arms(facade, reached))
 
 
 if __name__ == "__main__":
