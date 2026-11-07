@@ -313,3 +313,38 @@ Cookie: PHPSESSID=deadbeef; smf_theme=2
  qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200, 200, 200]
+
+
+
+=== TEST 14: the cookieless signup / reminder / activation actions bypass
+# action=signup, signup2, reminder and activate are the registration, password
+# reminder and activation forms; each carries a per-session token. Own path per
+# case. Reverting a row to the base list turns its arm red.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /smf/s1.php?action=signup",   "GET /smf/s1.php?action=signup",
+ "GET /smf/s2.php?action=signup2",  "GET /smf/s2.php?action=signup2",
+ "GET /smf/s3.php?action=reminder", "GET /smf/s3.php?action=reminder",
+ "GET /smf/s4.php?action=activate", "GET /smf/s4.php?action=activate"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200, 200, 200, 200, 200]
+
+
+
+=== TEST 15: NEGATIVE -- near-miss actions (signups, reminders) still HIT
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /smf/n1.php?action=signups",   "GET /smf/n1.php?action=signups",
+ "GET /smf/n2.php?action=reminders", "GET /smf/n2.php?action=reminders"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200, 200]

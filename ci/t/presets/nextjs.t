@@ -436,3 +436,63 @@ __DATA__
 [qr/rsc=;/, qr/./, qr/^origin:\/bk\/page:rsc=;/, qr/./, qr/^origin:\/bk\/page:rsc=1;/]
 --- error_code eval
 [200, 502, 200, 502, 200]
+
+
+
+=== TEST 15: the __nextppronly arg bypasses a warm entry
+# base-server.ts switches a PPR page to its static shell on this arg (any value,
+# also bare). The key is $uri, so without the arg row it would HIT the warm entry.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /n/ppr", "GET /n/ppr", "GET /n/ppr?__nextppronly=1", "GET /n/ppr?__nextppronly=1",
+ "GET /n/ppr?__nextppronly", "GET /n/ppr?__nextppronly"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200, 200, 200]
+
+
+
+=== TEST 16: NEGATIVE -- near-miss arg __nextppronlyx does not bypass
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /n/pprnear?__nextppronlyx=1", "GET /n/pprnear?__nextppronlyx=1"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 17: the next-instant-navigation-testing cookie bypasses a warm entry
+# base-server.ts renders only the shell when this cookie is present.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /n/ppck", "GET /n/ppck", "GET /n/ppck", "GET /n/ppck", "GET /n/ppck"]
+--- more_headers eval
+["", "",
+ "Cookie: next-instant-navigation-testing=1",
+ "Cookie: theme=dark; next-instant-navigation-testing=1",
+ ""]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200, 200, 200]
+
+
+
+=== TEST 18: NEGATIVE -- a near-miss cookie name does not bypass
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /n/ppnear", "GET /n/ppnear", "GET /n/ppnear"]
+--- more_headers eval
+["", "", "Cookie: next-instant-navigation-testing-x=1"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200]

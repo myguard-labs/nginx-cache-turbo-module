@@ -332,3 +332,34 @@ Cookie: Bugzilla_login=alice@example.com
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200]
+
+
+
+=== TEST 17: the login / password WebService alias args bypass
+# API/1_0/Util.pm turns login=&password= into Bugzilla_login/Bugzilla_password.
+# Under /bugzilla/ (a path prefix) the byte-0 REST URI rows (/rest) cannot
+# match /bugzilla/rest/..., so only the arg rows protect it.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /bugzilla/rest/a?login=u", "GET /bugzilla/rest/a?login=u",
+ "GET /bugzilla/rest/b?password=p", "GET /bugzilla/rest/b?password=p"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
+=== TEST 18: NEGATIVE -- near-miss args (logins, passwords) still HIT
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /bugzilla/rest/c?logins=u", "GET /bugzilla/rest/c?logins=u",
+ "GET /bugzilla/rest/d?passwords=p", "GET /bugzilla/rest/d?passwords=p"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200, 200]

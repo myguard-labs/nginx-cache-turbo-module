@@ -289,3 +289,30 @@ Cookie: BLUDIT-KEY=xyz
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200]
+
+
+
+=== TEST 14: the API plugin's `authentication` user-token arg bypasses
+# A GET /api/... carrying token + authentication logs the admin in with no
+# cookie; without the arg row the response is cached under the public key.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /bludit/api/pages", "GET /bludit/api/pages",
+ "GET /bludit/api/pages?authentication=fixture", "GET /bludit/api/pages?authentication=fixture"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
+=== TEST 15: NEGATIVE -- near-miss arg `authentications` does not bypass
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /bludit/api/near?authentications=fixture", "GET /bludit/api/near?authentications=fixture"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]

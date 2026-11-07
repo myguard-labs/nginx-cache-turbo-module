@@ -94,6 +94,12 @@ our $Config = ct_config(
     { path => '/profile.php',  backend => 'punbb' },
     { path => '/register.php', backend => 'punbb' },
     { path => '/misc.php',     backend => 'punbb' },
+    { path => '/login/',       backend => 'punbb' },
+    { path => '/login.html',   backend => 'punbb' },
+    { path => '/register/',    backend => 'punbb' },
+    { path => '/register.html', backend => 'punbb' },
+    { path => '/loginZZ',      backend => 'punbb' },
+    { path => '/registerZZ',   backend => 'punbb' },
     { path => '/admin/',       backend => 'punbb' },
     { path => '/userlist.php', backend => 'punbb' },
     { path => '/search.php',   backend => 'punbb' },
@@ -152,20 +158,20 @@ __DATA__
 
 
 
-=== TEST 3: SEGMENT BOUNDARY -- /login.phpZZ must CACHE
-# "/login.php" is slash-less, so the boundary branch of
+=== TEST 3: SEGMENT BOUNDARY -- /loginZZ and /registerZZ must CACHE
+# "/login" and "/register" are slash-less, so the boundary branch of
 # ngx_http_cache_turbo_uri_prefix() is LIVE. The byte after the needle here is
 # 'Z', not '/' or '.' and not end-of-URI, so this is a different path segment
-# that merely shares the prefix and must cache. Served under the real
-# /login.php location so the HIT cannot pass for free on an implicit 404.
+# that merely shares the prefix and must cache. Served under dedicated
+# punbb locations so the HIT cannot pass for free on an implicit 404.
 --- http_config eval: $::HttpConfig
 --- config eval: $::Config
 --- request eval
-["GET /login.phpZZ", "GET /login.phpZZ"]
+["GET /loginZZ", "GET /loginZZ", "GET /registerZZ", "GET /registerZZ"]
 --- response_headers eval
-[qq{X-Cache: }, qq{X-Cache: HIT}]
+[qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
-[200, 200]
+[200, 200, 200, 200]
 
 
 
@@ -324,3 +330,26 @@ Cookie: forum_cookie=NDJ8YWJj
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200]
+
+
+
+=== TEST 14: the SEF login and register schemes bypass (slash-less needles)
+# include/url/*/forum_urls.php rewrites login.php / register.php to /login/,
+# login.html, /register/ and register.html. The old exact rows "/login.php" and
+# "/register.php" never matched those; "/login" and "/register" do, because
+# uri_prefix() continues a slash-less needle at '/' or '.'. Reverting either
+# row to its .php form turns the matching arms red.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /login/",         "GET /login/",
+ "GET /login.html",     "GET /login.html",
+ "GET /register/",      "GET /register/",
+ "GET /register.html",  "GET /register.html"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200, 200, 200, 200, 200]

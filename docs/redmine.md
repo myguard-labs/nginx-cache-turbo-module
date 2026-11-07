@@ -21,7 +21,7 @@ cache_turbo_backend redmine;
 | Check | Values |
 | --- | --- |
 | Cookie substrings | `_redmine_session=`, `autologin=` |
-| URI prefixes | `/admin`, `/my`, `/login`, `/logout`, `/account`, `/settings`, `/enumerations`, `/roles`, `/trackers`, `/custom_fields`, `/auth_sources`, `/mail_handler` |
+| URI prefixes | `/admin`, `/my`, `/login`, `/logout`, `/account`, `/settings`, `/enumerations`, `/roles`, `/trackers`, `/custom_fields`, `/auth_sources`, `/mail_handler`, `/oauth` |
 | Query args | `key`, `access_token`, `bearer_token` |
 | Request headers | `X-Redmine-API-Key` |
 

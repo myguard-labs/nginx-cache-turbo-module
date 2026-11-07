@@ -66,6 +66,8 @@ our $Config = ct_config(
     { path => '/custom_fields',backend => 'redmine' },
     { path => '/auth_sources', backend => 'redmine' },
     { path => '/mail_handler', backend => 'redmine' },
+    { path => '/oauth',        backend => 'redmine' },
+    { path => '/oauthx',       backend => 'redmine' },
     { path => '/redmine/',     backend => 'redmine' },
     { path => '/gen/',         backend => 'wordpress' },
 );
@@ -360,6 +362,34 @@ X-Redmine-API-Key: fixture
 X-Redmine-API: fixture
 --- request eval
 ["GET /redmine/issues-near.json", "GET /redmine/issues-near.json"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 18: the /oauth Doorkeeper mount bypasses (authorize, applications)
+# use_doorkeeper in routes.rb mounts /oauth/authorize, /oauth/applications ...
+# Served at the true root: uri_prefix() is byte-0 anchored.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /oauth/authorize", "GET /oauth/authorize",
+ "GET /oauth/applications", "GET /oauth/applications"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
+=== TEST 19: NEGATIVE -- /oauthx is another path segment and caches
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /oauthx", "GET /oauthx"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval

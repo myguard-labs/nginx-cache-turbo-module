@@ -1100,6 +1100,11 @@ static const char *const  ct_invision_key_cookies[] = {
  *
  * The 2FA companion cookie `<cookiename>_tfa` only exists mid-login and is
  * folded into the same presence rule for completeness.
+ *
+ * action=signup/signup2/reminder/activate are the cookieless registration,
+ * password-reminder and activation forms (Register.php, Reminder.php); they
+ * embed a per-session token, the same reason action=login is listed.
+ * Verified against SMF 2.1.8.
  */
 static const char *const  ct_smf_cookies[] = { "SMFCookie", NULL };
 static const char *const  ct_smf_uris[] = { NULL };
@@ -1107,6 +1112,7 @@ static const char *const  ct_smf_args[] = {
     "action=admin", "action=login", "action=login2", "action=logintfa",
     "action=logout", "action=profile", "action=pm", "action=post",
     "action=post2", "action=moderate", "action=reporttm", "action=xmlhttp",
+    "action=signup", "action=signup2", "action=reminder", "action=activate",
     NULL };
 
 /*
@@ -1216,13 +1222,20 @@ static const char *const  ct_punbb_cookies[] = {
  *     own extension paths, not these two names.
  *
  * Five real member/mutating scripts were missing and are now listed: edit.php,
- * delete.php, moderate.php, profile.php, register.php. search.php and
+ * delete.php, moderate.php, profile.php and register (the slash-less needle
+ * "/register", see below). search.php and
  * userlist.php are deliberately absent -- both are guest-reachable read
  * surfaces that cache correctly.
+ *
+ * "/login" and "/register" are slash-less needles on purpose: uri_prefix()
+ * continues them at '/' or '.', so they cover login.php, register.php AND the
+ * SEF schemes of include/url (/login/, /register/, login.html, register.html)
+ * with one row each. The numbered file_based forms (editN.html)
+ * stay inexpressible; members reach them with the cookie tier anyway.
  */
 static const char *const  ct_punbb_uris[] = {
-    "/admin/", "/login.php", "/post.php", "/edit.php", "/delete.php",
-    "/moderate.php", "/profile.php", "/register.php", "/misc.php", NULL };
+    "/admin/", "/login", "/post.php", "/edit.php", "/delete.php",
+    "/moderate.php", "/profile.php", "/register", "/misc.php", NULL };
 static const char *const  ct_punbb_args[] = { NULL };
 
 /*
@@ -1437,12 +1450,17 @@ static const char *const  ct_textpattern_args[] = { NULL };
  * bootstrap is session-free. The __Secure- spelling still contains BLUDIT-KEY,
  * and the two remember-me names are stable literals. /install.php is dynamic
  * setup state and must never be replayed from the page cache.
+ *
+ * The `authentication` arg is the API plugin's user-token credential
+ * (bl-plugins/api/plugin.php: a GET /api/... carrying token + authentication
+ * logs the admin in without a cookie), so a cookie-only rule would cache that
+ * admin view publicly. Verified against Bludit 3.22.0.
  */
 static const char *const  ct_bludit_cookies[] = {
     "BLUDIT-KEY", "BLUDITREMEMBERUSERNAME=", "BLUDITREMEMBERTOKEN=", NULL };
 static const char *const  ct_bludit_uris[] = {
     "/admin", "/install.php", NULL };
-static const char *const  ct_bludit_args[] = { NULL };
+static const char *const  ct_bludit_args[] = { "authentication", NULL };
 
 /*
  * SPIP prefixes all of its spip_* cookies with an operator-selected cookie
@@ -1471,7 +1489,10 @@ static const char *const  ct_spip_args[] = { "action", "var_mode", NULL };
  * member-only signals. API keys and tokens can authenticate entirely through
  * the query string. The URI list keeps login/account/mutation/admin/API entry
  * points out before a cookie exists while leaving show_bug.cgi, buglist.cgi
- * and reports cacheable for anonymous readers.
+ * and reports cacheable for anonymous readers. `login` + `password` are the
+ * WebService convenience aliases for Bugzilla_login/Bugzilla_password
+ * (API/1_0/Util.pm, release-5.3.3); the /rest and jsonrpc URI rows already
+ * cover them, the args cover an install behind a path prefix.
  */
 static const char *const  ct_bugzilla_cookies[] = {
     "Bugzilla_login=", "Bugzilla_logincookie=", NULL };
@@ -1490,7 +1511,7 @@ static const char *const  ct_bugzilla_uris[] = {
 static const char *const  ct_bugzilla_args[] = {
     "Bugzilla_api_key", "api_key", "Bugzilla_api_token", "Bugzilla_token",
     "Bugzilla_login", "Bugzilla_password", "Bugzilla_login_token", "token",
-    NULL };
+    "login", "password", NULL };
 
 /*
  * MantisBT. The install-selected cookie prefix is prepended to every symbolic
@@ -1629,14 +1650,16 @@ static const char *const  ct_wikijs_args[] = { NULL };
  * them. `access_token` and `bearer_token` are Doorkeeper's default query-string OAuth
  * token methods (Redmine overrides none), and the API key may also arrive in
  * the cookieless X-Redmine-API-Key request header (api_key_from_request), so
- * the header tier covers it. Verified against redmine/redmine 7.0.3.
+ * the header tier covers it. `/oauth` is the Doorkeeper mount (use_doorkeeper in
+ * routes.rb: authorize, token, applications): per-user consent and client
+ * secrets, never shared content. Verified against redmine/redmine 7.0.3.
  */
 static const char *const  ct_redmine_cookies[] = {
     "_redmine_session=", "autologin=", NULL };
 static const char *const  ct_redmine_uris[] = {
     "/admin", "/my", "/login", "/logout", "/account",
     "/settings", "/enumerations", "/roles", "/trackers", "/custom_fields",
-    "/auth_sources", "/mail_handler", NULL };
+    "/auth_sources", "/mail_handler", "/oauth", NULL };
 static const char *const  ct_redmine_args[] = {
     "key", "access_token", "bearer_token", NULL };
 static const char *const  ct_redmine_headers[] = {
@@ -1763,6 +1786,10 @@ static const char *const  ct_opencart_args[] = {
  *
  * `_rsc` is the client's cache-busting arg on every RSC fetch; bypassing on it
  * keeps a payload URL out of the cache even if a hop dropped the header.
+ * `__nextppronly` and the `next-instant-navigation-testing` cookie switch a PPR
+ * page to its static shell (base-server.ts); they only act when the origin
+ * enables the testing API or static-shell debugging, so these are floor rows
+ * that cost nothing on a stock build.
  *
  * Cookies: draft/preview mode (`__prerender_bypass`, `__next_preview_data`)
  * and the SESSION cookie of the common auth libraries -- Auth.js v4/v5
@@ -1778,11 +1805,13 @@ static const char *const  ct_opencart_args[] = {
  * location without the preset.
  */
 static const char *const  ct_nextjs_cookies[] = {
-    "__prerender_bypass", "__next_preview_data", "next-auth.session-token",
+    "__prerender_bypass", "__next_preview_data",
+    "next-instant-navigation-testing=", "next-auth.session-token",
     "authjs.session-token", "__session", "better-auth.session_token",
     "-auth-token", NULL };
 static const char *const  ct_nextjs_uris[] = { "/api/", NULL };
-static const char *const  ct_nextjs_args[] = { "_rsc", NULL };
+static const char *const  ct_nextjs_args[] = {
+    "_rsc", "__nextppronly", NULL };
 static const char *const  ct_nextjs_headers[] = {
     "RSC", "Next-Router-State-Tree", "Next-Router-Prefetch",
     "Next-Router-Segment-Prefetch", "Next-Url", "Next-Action",

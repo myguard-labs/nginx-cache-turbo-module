@@ -18,7 +18,7 @@ cache_turbo_backend bugzilla;
 | Check | Values |
 | --- | --- |
 | Cookie substrings | `Bugzilla_login=`, `Bugzilla_logincookie=` |
-| Query args | `Bugzilla_api_key`, `api_key`, `Bugzilla_api_token`, `Bugzilla_token`, `Bugzilla_login`, `Bugzilla_password`, `Bugzilla_login_token`, `token` |
+| Query args | `Bugzilla_api_key`, `api_key`, `Bugzilla_api_token`, `Bugzilla_token`, `Bugzilla_login`, `Bugzilla_password`, `Bugzilla_login_token`, `token`, `login`, `password` |
 | URI prefixes | account/login, create/update/request, admin/edit and JSON-RPC/XML-RPC/REST entry points (`/rest` and `/rest.cgi`) |
 
 <!-- markdownlint-enable MD013 -->
