@@ -952,37 +952,37 @@ storage; the trade is a lost cache hit, never a cacheable private request.
 | `woocommerce` | `/cart`, `/checkout`, `/my-account` | `wc-ajax` | `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_` |
 | `joomla`      | `/administrator/`, `/api/` | — | `joomla_remember_me_` ‡ |
 | `xenforo` † ¤ ✦ | `/admin.php`, `/install/`, `/api/`, `/login`, `/logout`, `/lost-password`, `/register`, `/account`, `/conversations`, `/direct-messages`, `/misc` | `_xfToken` | `xf_session`, `xf_user`, `xf_session_admin`, `xf_lscxf_logged_in`; *(key)* `xf_style_id`, `xf_style_variation`, `xf_language_id` |
-| `discourse` † | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` | `api_key`, `api_username`, `user_api_key` | `_t=` |
+| `discourse` † ◇ | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` | `api_key`, `api_username`, `user_api_key` | `_t=`; **◇ request headers** `Api-Key`, `User-Api-Key`, `X-Shared-Session-Key` bypass on presence |
 | `phpbb` †     | `/ucp.php`, `/mcp.php`, `/adm/`, `/posting.php`, `/memberlist.php`, `/search.php`, `/report.php` | `sid` | *(value)* `…_u != 1` ∆ |
 | `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php`, `/jsonapi`, `/oauth` | — | `SESS` ¥ |
 | `mediawiki` † | — ¶ | `veaction`, `returnto`, mutating `action=` values ‡ | `Token=`, `_session=`, `UserID=` |
 | `magento` † ✦ | `/checkout`, `/customer`, `/graphql`, `/rest`, `/soap`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` | — | *(key)* `X-Magento-Vary` ✦ |
 | `shopware6` † ✦ ∆ | `/account`, `/checkout`, `/admin`, `/api`, `/store-api` | — | *(key)* `sw-cache-hash` ✦; *(value)* `sw-cache-hash` = `not-cacheable` ∆ |
-| `ghost` †     | `/ghost/`, `/members/`, `/p/`, `/r/` | `uuid`, `key`, `token`, `gift` | `ghost-members-ssr`, `ghost-admin-api-session`, `ghost-admin-toolbar` |
+| `ghost` † ◇   | `/ghost/`, `/members/`, `/p/`, `/r/` | `uuid`, `key`, `token`, `gift` | `ghost-members-ssr`, `ghost-admin-api-session`, `ghost-admin-toolbar`; **◇ request header** `X-Ghost-Preview` bypasses on presence |
 | `wagtail` † § | `/admin/`, `/django-admin/`, `/documents/` | — | `sessionid` |
 | `kirby` † §   | `/panel` | — | `kirby_session` |
 | `typo3` † ※   | `/typo3` | `ADMCMD_prev` | `fe_typo_user`, `be_typo_user`, `ADMCMD_prev=` |
 | `invision` †  | `/admin`, `/login`, `/register`, `/lostpassword`, `/messenger` | `do=compose`, `do=post`, `do=reply`, `do=report`, `module=messaging` | `_loggedIn` (suffix); *(key)* `ips4_hasJS`, `ips4_theme`, `ips4_language` |
-| `smf` †       | — | `action=admin`, `action=login`, `action=login2`, `action=logintfa`, `action=logout`, `action=profile`, `action=pm`, `action=post`, `action=post2`, `action=moderate`, `action=reporttm`, `action=xmlhttp` | `SMFCookie` (presence-only) |
+| `smf` †       | — | `action=admin`, `action=login`, `action=login2`, `action=logintfa`, `action=logout`, `action=profile`, `action=pm`, `action=post`, `action=post2`, `action=moderate`, `action=reporttm`, `action=xmlhttp`, `action=signup`, `action=signup2`, `action=reminder`, `action=activate` | `SMFCookie` (presence-only) |
 | `vanilla` †   | `/dashboard`, `/entry/`, `/messages/`, `/post/`, `/api/` ⁂ | — | `Vanilla=` (legacy self-hosted only); SaaS `vf_*` names need an exact local rule |
-| `punbb` †     | `/admin.php`, `/admin/`, `/login.php`, `/post.php`, `/message_send.php`, `/message_delete.php`, `/misc.php` | — | `forum_cookie`, `punbb_cookie` (presence-only) |
+| `punbb` †     | `/admin/`, `/login`, `/post.php`, `/edit.php`, `/delete.php`, `/moderate.php`, `/profile.php`, `/register`, `/misc.php` | — | `forum_cookie`, `punbb_cookie` (presence-only) |
 | `phorum` †    | `admin.php`, `login.php`, `register.php`, `pm.php`, `posting.php`, `post.php`, `moderation.php`, `control.php`, `ajax.php`, `report.php`, `follow.php` | `phorum_session_v5` | `phorum_session_v5`, `phorum_session_st`, `phorum_admin_session`; *(key)* `list_style` |
 | `yabb` †      | — | `action=post`, `action=post2`, `action=login`, `action=login2`, `action=register`, `action=register2`, `action=admin`, `action=pm`, `action=imsend`, `action=imsend2` | `Y2User-`, `Y2Pass-`, `Y2Sess-` (prefix) |
 | `mybb` †      | `/member.php`, `/usercp.php`, `/private.php`, `/modcp.php`, `/newthread.php`, `/newreply.php`, `/editpost.php`, `/polls.php`, `/admin/`, `/xmlhttp.php`, `/task.php` | `action=login`, `action=do_login`, `action=logout`, `action=do_logout`, `action=register`, `action=do_register`, `action=activate`, `action=lostpw`, `action=do_lostpw`, `action=resetpassword` | `user` (suffix, presence); *(key)* `mybbtheme`, `mybblang` |
 | `vbulletin` † | `/login.php`, `/register.php`, `/usercp.php`, `/private.php`, `/profile.php`, `/cron.php`, `/admincp/` | — | `userid`, `password` (suffix, non-empty), `imloggedin` == `yes`; *(key)* `bb_languageid`, `bb_userstyleid` |
 | `textpattern` † | `/textpattern` | — | `txp_login_public`, `txp_login` |
-| `bludit` † | `/admin`, `/install.php` | — | `BLUDIT-KEY` (also `__Secure-`), `BLUDITREMEMBERUSERNAME`, `BLUDITREMEMBERTOKEN` |
+| `bludit` † | `/admin`, `/install.php` | `authentication` | `BLUDIT-KEY` (also `__Secure-`), `BLUDITREMEMBERUSERNAME`, `BLUDITREMEMBERTOKEN` |
 | `spip` † | `/ecrire` | `action`, `var_mode` | `_session`, `_admin`, `_lang`, `_lang_ecrire`, `_accepte_ajax` (suffix, non-empty) |
-| `bugzilla` † | account/login, mutation, admin/edit and API CGI entry points | `Bugzilla_api_key`, `api_key`, `Bugzilla_api_token`, `Bugzilla_token`, `Bugzilla_login`, `Bugzilla_password`, `Bugzilla_login_token`, `token` | `Bugzilla_login`, `Bugzilla_logincookie` |
+| `bugzilla` † | account/login, mutation, admin/edit and API CGI entry points | `Bugzilla_api_key`, `api_key`, `Bugzilla_api_token`, `Bugzilla_token`, `Bugzilla_login`, `Bugzilla_password`, `Bugzilla_login_token`, `token`, `login`, `password` | `Bugzilla_login`, `Bugzilla_logincookie` |
 | `mantisbt` † | login/signup/account/form, `/admin/`, `/api/` entry points | `key` | `_STRING_COOKIE`, `_PROJECT_COOKIE`, `_VIEW_ALL_COOKIE`, `_BUG_LIST_COOKIE`, `_collapse_settings` (suffix, non-empty); `PHPSESSID` |
 | `plone` † | `/login`, `/logout`, `/register`, `/passwordreset`, `/mail_password`, `/manage`, `/@@login` | — | `__ac`, `_ZopeId`, `statusmessages`, `I18N_LANGUAGE`, `auth_token` (Volto) |
 | `umbraco` † | `/umbraco` | — | `UMB_UCONTEXT`, back-office token/preview/XSRF cookies, `UMB_SESSION`, `.AspNetCore.Identity.Application` |
 | `dotclear` † | `/admin`, `/preview`, `/pagespreview` | — | `dcxd`, `dc_admin`, `dc_passwd` |
 | `wikijs` † | admin/editor/history/source/upload, login/identity and GraphQL routes (2.x); `/_api/auth`, `/_mcp`, `/_scim`, `/_terminal`, `/_collab` (3.x) | — | `jwt`, `connect.sid`, `loginRedirect` (2.x); `wikiSession` (3.x) |
-| `redmine` † ◇ | `/admin`, `/my`, `/login`, `/logout`, `/account`, `/settings`, `/enumerations`, `/roles`, `/trackers`, `/custom_fields`, `/auth_sources`, `/mail_handler` | `key`, `access_token`, `bearer_token` | `_redmine_session`, `autologin`; **◇ request header** `X-Redmine-API-Key` bypasses on presence |
+| `redmine` † ◇ | `/admin`, `/my`, `/login`, `/logout`, `/account`, `/settings`, `/enumerations`, `/roles`, `/trackers`, `/custom_fields`, `/auth_sources`, `/mail_handler`, `/oauth` | `key`, `access_token`, `bearer_token` | `_redmine_session`, `autologin`; **◇ request header** `X-Redmine-API-Key` bypasses on presence |
 | `flarum` † ✦ | `/admin`, `/api`, `/login`, `/logout`, `/global-logout`, `/register`, `/reset`, `/confirm`, `/settings`, `/notifications` | — | `flarum_remember` **only** — `flarum_session` is guest-issued and deliberately unmatched; *(key)* `locale` ✦ |
 | `opencart` † ✦ | — (all routing is `/index.php?route=`) | base `route=account/…` and `route=checkout/…` values, `user_token`, `customer_token`; method-qualified OpenCart 4 routes rely on origin `no-store` | — (no bypass cookie: `OCSESSID` is guest-issued, login state is server-side only); *(key)* `currency` ✦ |
-| `nextjs` † ◇ | `/api/` | `_rsc` | `__prerender_bypass`, `__next_preview_data`, `next-auth.session-token`, `authjs.session-token`, `__session`, `better-auth.session_token`, `-auth-token`; **◇ request headers** `RSC`, `Next-Router-State-Tree`, `Next-Router-Prefetch`, `Next-Router-Segment-Prefetch`, `Next-Url`, `Next-Action`, `X-Middleware-Prefetch`, `X-Nextjs-Data`, `X-Now-Route-Matches`, `X-Middleware-Subrequest` bypass on presence, and satisfy the matching `Vary` axes so App Router HTML caches while RSC payloads never do |
+| `nextjs` † ◇ | `/api/` | `_rsc`, `__nextppronly` | `__prerender_bypass`, `__next_preview_data`, `next-instant-navigation-testing=`, `next-auth.session-token`, `authjs.session-token`, `__session`, `better-auth.session_token`, `-auth-token`; **◇ request headers** `RSC`, `Next-Router-State-Tree`, `Next-Router-Prefetch`, `Next-Router-Segment-Prefetch`, `Next-Url`, `Next-Action`, `X-Middleware-Prefetch`, `X-Nextjs-Data`, `X-Now-Route-Matches`, `X-Middleware-Subrequest` bypass on presence, and satisfy the matching `Vary` axes so App Router HTML caches while RSC payloads never do |
 | `servarr` † (`sonarr`, `radarr`, `lidarr`) | `/api`, `/feed`, `/signalr`, `/initialize.json`, `/login`, `/logout`, `/loggedout`, `/logfile`, `/updatelogfile`, `/backup`, `/MediaCover`, `/MediaCoverProxy` | `apikey`, `access_token` | `Auth=`, `OIDC=` (`<InstanceName>Auth` / `<InstanceName>OIDC`) |
 | `calibre` † | `/cdb/`, `/book-set-last-read-position`, `/book-set-annotations`, `/book-get-last-read-position`, `/book-get-annotations`, `/interface-data/init`, `/ajax-setup`, `/kosync/`, `/book-get-storage`, `/book-set-storage` | — | — (no session cookie) |
 | `calibreweb` † (`calibre-web`) | `/login`, `/logout`, `/admin`, `/me`, `/download/`, `/show/`, `/send/`, `/ajax/`, `/read/`, `/kobo/`, `/kobo_auth/`, `/remote/login`, `/verify/` | — | `session=`, `remember_token=` |
@@ -1151,9 +1151,10 @@ all; `be_typo_user` and the `/typo3` entry point are configurable too
 (`BE/cookieName`, `BE/entryPoint`). `ADMCMD_prev`, the workspace-preview key,
 is matched as a cookie and a query argument. See [typo3.md](docs/typo3.md).
 
-◇ **A request-HEADER tier, and the only preset that changes what `Vary`
-accepts (`nextjs`; `redmine` uses the same tier for `X-Redmine-API-Key` only,
-which satisfies no `Vary` axis in practice).** Next.js serves two different bodies at one URL: the HTML document,
+◇ **A request-HEADER tier. Only `nextjs` changes what `Vary` accepts; `redmine`
+(`X-Redmine-API-Key`), `discourse` (`Api-Key`, `User-Api-Key`,
+`X-Shared-Session-Key`) and `ghost` (`X-Ghost-Preview`) use the same tier as a
+plain bypass-on-presence list that satisfies no `Vary` axis.** Next.js serves two different bodies at one URL: the HTML document,
 and — when the client router sends `RSC: 1` — the React Server Component
 payload (`text/x-component`). Every App Router response therefore carries
 `Vary: rsc, next-router-state-tree, next-router-prefetch,

@@ -20,6 +20,8 @@ origin:
 - **URI prefix** — protects a stable private route, but not a renamed or
   translated route;
 - **query argument** — protects front-controller and cookieless-token routes;
+- **request header** — protects clients that authenticate with a header alone
+  (`discourse`, `ghost`, `redmine`, `nextjs`); matched on presence, exact name;
 - **key cookie** — puts a shared presentation or commerce segment in the cache
   key instead of disabling caching for that segment.
 
@@ -44,12 +46,12 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | `woocommerce` | 3 | 3 | 1 | — | — | Implies `wordpress`; add translated or renamed cart/account slugs. |
 | `joomla` | 1 | 2 | — | — | — | Partial: ordinary frontend login uses an install-specific session cookie. |
 | `xenforo` | 4 | 11 | 1 | — | 3 | Safe but `xf_session` can reduce guest hit rate; custom cookie prefixes need local rules. |
-| `discourse` | 1 | 12 | 3 | — | — | Safe for the stock `_t` token cookie; a renamed token cookie needs a local rule. |
+| `discourse` | 1 | 12 | 3 | — | — | Safe for the stock `_t` token cookie; a renamed token cookie needs a local rule. Plus 3 request-header rows (`Api-Key`, `User-Api-Key`, `X-Shared-Session-Key`, presence bypass). |
 | `phpbb` | — | 7 | 1 | yes | — | Member `_u != 1` is detected without bypassing every guest session. |
 | `drupal` | 1 | 7 | — | — | — | `SESS`/`SSESS` names are covered; the broad substring can reduce hit rate on co-hosted apps. |
 | `mediawiki` | 3 | — | 15 | — | — | Query-driven private actions are covered without bypassing all `/index.php` articles. |
 | `magento` | — | 12 | — | — | 1 | `X-Magento-Vary` is value-keyed; do not convert it to presence bypass. |
-| `ghost` | 3 | 4 | 4 | — | — | Cookieless member and paid-content token arguments are covered. |
+| `ghost` | 3 | 4 | 4 | — | — | Cookieless member and paid-content token arguments are covered. Plus 1 request-header row (`X-Ghost-Preview`, presence bypass). |
 | `wagtail` | 1 | 3 | — | — | — | Safe while guests remain session-free; anonymous sessions fail safe by reducing hit rate. |
 | `kirby` | 1 | 1 | — | — | — | Safe while guests remain session-free; `csrf()` can make guest pages bypass. |
 | `shopware6` | — | 5 | — | yes | 1 | `sw-cache-hash` is value-keyed, except the `not-cacheable` marker, which bypasses; preserve that contract across Shopware upgrades. |
@@ -104,15 +106,15 @@ vendor-attested and were not re-verified.
 | `woocommerce` | 11.2.2 | No change. |
 | `joomla` | 6.2.0 | Added URI `/api/`: the Web Services application authenticates from the `X-Joomla-Token` header, never a cookie. |
 | `xenforo` | closed source | No change; vendor-attested, unverified. |
-| `discourse` | v2026.10.0 | Added arg `user_api_key`: read from the query on feed and bookmark paths; arg rows match exact names, so `api_key` does not cover it. |
+| `discourse` | v2026.10.0 | Added arg `user_api_key`: read from the query on feed and bookmark paths; arg rows match exact names, so `api_key` does not cover it. Added headers `Api-Key`, `User-Api-Key` and `X-Shared-Session-Key`: each authenticates a request on any route with no cookie or arg (`default_current_user_provider.rb`); Discourse's own anon cache refuses the first two. |
 | `phpbb` | 3.3.19 | No change. |
 | `drupal` | 11.4.12 | No change. |
 | `mediawiki` | 1.46.2 | No change. |
 | `magento` | 2.4.9 | No change. |
-| `ghost` | v6.75.0 | Added cookie `ghost-admin-toolbar`: the staff toolbar cookie is the only staff signal on site pages, because the admin session cookie is path-scoped to `/ghost`. |
+| `ghost` | v6.75.0 | Added cookie `ghost-admin-toolbar`: the staff toolbar cookie is the only staff signal on site pages, because the admin session cookie is path-scoped to `/ghost`. Added header `X-Ghost-Preview`: `theme-engine/preview.js` renders any page with the design settings carried in it, unauthenticated, so a stored response would serve a draft or attacker-chosen design to guests. |
 | `wagtail` | v8.1 (Django 6.1.3) | No change. |
 | `kirby` | 5.6.3 | No change. |
-| `shopware6` | v6.7.16.0 | Added predicate `sw-cache-hash` equals `not-cacheable` (Shopware's own "bypass the cache" marker); the key cookie stays. |
+| `shopware6` | v6.7.16.0 | Added predicate `sw-cache-hash` equals `not-cacheable` (Shopware's own "bypass the cache" marker); the key cookie stays. Rejected header `sw-access-key`: it names the sales channel, ships in every headless frontend and is read only under `/store-api` and `/api`, which the URI rows already bypass; the per-client `sw-context-token` is overwritten by the session on Storefront routes (`SalesChannelAuthenticationListener.php`, `SessionContextTokenAccessor.php`). |
 
 The same day the next 12 application presets (mantisbt, plone, umbraco,
 dotclear, wikijs, redmine, flarum, opencart, servarr, calibre, calibreweb,
