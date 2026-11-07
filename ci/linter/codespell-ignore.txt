@@ -34,3 +34,7 @@ bu
 te
 hel
 unparseable
+# fpr
+#     The GnuPG --with-colons record type for a key fingerprint, matched
+#     literally by .github/workflows/bump.yml. Not a misspelling of "for".
+fpr

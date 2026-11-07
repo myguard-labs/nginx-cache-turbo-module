@@ -1,4 +1,4 @@
-# sync-sha: c6f1951c670f1a923d256111d2f425b93dc6e3e4d9fc92daa852e299e26b7dd6
+# sync-sha: 727cdd867d5f05f188207cda44ee66c1c0b22dc588a86bdcf9f1d04003ada46c
 name: Bump versions
 
 env:
@@ -82,14 +82,43 @@ jobs:
           fi
 
       - name: Import bump-bot signing key
+        # Inline replacement for a third-party import action. The key goes to
+        # gpg on stdin (printf is a shell builtin, so it is never an argv
+        # token); the passphrase is preset into the per-run agent over stdin
+        # as well. GNUPGHOME is the per-run directory created above and is
+        # deleted by the always() cleanup step.
         id: import_gpg
         if: steps.check_changes.outputs.has_changes == 'true'
-        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
-        with:
-          gpg_private_key: ${{ secrets.BUMP_GPG_PRIVATE_KEY }}
-          passphrase: ${{ secrets.BUMP_GPG_PASSPHRASE }}
-          git_user_signingkey: true
-          git_commit_gpgsign: true
+        env:
+          BUMP_GPG_PRIVATE_KEY: ${{ secrets.BUMP_GPG_PRIVATE_KEY }}
+          BUMP_GPG_PASSPHRASE: ${{ secrets.BUMP_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          printf 'allow-preset-passphrase\n' > "$GNUPGHOME/gpg-agent.conf"
+          printf '%s\n' "$BUMP_GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          preset="$(gpgconf --list-dirs libexecdir)/gpg-preset-passphrase"
+          if [ ! -x "$preset" ]; then
+            echo "::error::gpg-preset-passphrase not found at $preset; cannot unlock the bump-bot key and will not fall back to an unsigned commit." >&2
+            exit 1
+          fi
+          gpgconf --kill gpg-agent || true
+          colons="$(gpg --batch --list-secret-keys --with-colons --with-keygrip)"
+          fingerprint="$(awk -F: '$1=="sec"{s=1;next} s&&$1=="fpr"{print $10; exit}' <<< "$colons")"
+          if [ -z "$fingerprint" ]; then
+            echo "::error::no secret key found after import; refusing to continue without a signing key." >&2
+            exit 1
+          fi
+          # Preset the passphrase for the primary key and every subkey keygrip.
+          grips="$(printf '%s\n' "$colons" | awk -F: '$1=="grp"{print $10}')"
+          for grip in $grips; do
+            printf '%s' "$BUMP_GPG_PASSPHRASE" | "$preset" --preset "$grip"
+          done
+          uid="$(awk -F: '$1=="uid"{print $10; exit}' <<< "$colons")"
+          git config user.name "$(printf '%s' "$uid" | sed 's/ *<.*//')"
+          git config user.email "$(printf '%s' "$uid" | sed -n 's/.*<\(.*\)>.*/\1/p')"
+          git config user.signingkey "$fingerprint"
+          git config commit.gpgsign true
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
 
       - name: Open update PR
         if: steps.check_changes.outputs.has_changes == 'true'
