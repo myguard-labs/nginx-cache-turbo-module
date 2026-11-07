@@ -108,19 +108,32 @@ class _Sweep(_FaultAlloc):
         assert calls > 0, f"{scn.name}: request made no funnel call: {r}"
         return calls
 
-    def purge_left_lock(self, scn: _Scenario, uri: str) -> bool:
-        """Did this PURGE leave the cross-node lock behind? Its DELs are
-        fire-and-forget, so give them a moment to land first."""
+    def purge_skipped_lock_del(self, scn: _Scenario, uri: str,
+                               fired: bool) -> bool:
+        """Did the injected failure make this PURGE skip its lock DEL? True
+        only with all of: the injection fired, the L2 object key is gone (the
+        object DEL went out) and the lock key is still there. The object and
+        lock DELs share allocation sites, so the site alone cannot tell them
+        apart; the keys can. _ready_purge guarantees the object is in L2 before
+        the PURGE, and the module's redis_del issues the object DEL before the
+        lock DEL (ngx_http_cache_turbo_redis.c), so a fired failure that left
+        the lock but removed the object skipped only the lock DEL. The DELs
+        are fire-and-forget, so give them a moment to land first."""
         redis = self.redis
-        if scn.method != "PURGE" or redis is None:
+        if scn.method != "PURGE" or redis is None or not fired:
+            return False
+        if not wait_for(lambda: redis.get_raw(l2_key(uri)) is None,
+                        timeout=0.5):
             return False
         return not wait_for(lambda: redis.get_raw(lock_key(uri)) is None,
                             timeout=0.5)
 
-    def note_stall(self, n: int, r: dict[str, str], lock_left: bool) -> None:
-        """Record a follow-up that waited out a lock, with its fault site."""
+    def note_stall(self, n: int, r: dict[str, str], tolerated: bool) -> None:
+        """Record a follow-up that waited out a lock, with its fault site.
+        Only a PURGE whose injected failure skipped the lock DEL is
+        tolerated; every other stall is a failure."""
         site = r.get("site", "-").rsplit("/", 1)[-1]
-        (self.purge_lock_left if lock_left else self.slow).append(
+        (self.purge_lock_left if tolerated else self.slow).append(
             f"N={n}@{site}")
 
 
@@ -248,7 +261,7 @@ def _step(sw: _Sweep, fa: Nginx, scn: _Scenario, n: int, count: int) -> bool:
         f"{where}: unclean answer {st} {h}"
     if st == 200 and expect_body is not None and scn.strict_body:
         assert body == expect_body, f"{where}: declined answer has a wrong body"
-    lock_left = sw.purge_left_lock(scn, uri)
+    lock_left = sw.purge_skipped_lock_del(scn, uri, r["fired"] == "1")
     # Next normal request, fresh connection (fetch_raw opens one).
     t0 = time.monotonic()
     try:
