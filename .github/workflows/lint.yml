@@ -1,4 +1,4 @@
-# sync-sha: 1c703c758a33bbbc15a4fe7e6c0e87772090a81a6a4eee5a2d4376caf9c174e3
+# sync-sha: dd6481e6b46763135cc5411a048c6708c347c57460e14ec8e02e0cbe50119f7d
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -56,6 +56,9 @@ jobs:
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
+      - name: CI-L1 negative control (forced failure)
+        run: exit 1
+
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
