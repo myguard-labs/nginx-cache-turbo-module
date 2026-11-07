@@ -521,7 +521,8 @@ fi
 # ccache, mirroring ci-build.sh: keyed by compiler CONTENT so a cache restored
 # onto a different runner is reusable. A content mismatch only ever MISSES.
 CC="${CC:-cc}"
-if command -v ccache >/dev/null 2>&1; then
+# CT_NO_CCACHE=1 forces the plain compiler, as in ci-build.sh.
+if [ "${CT_NO_CCACHE:-}" != 1 ] && command -v ccache >/dev/null 2>&1; then
     WITH_CC="ccache $CC"
     export CCACHE_COMPILERCHECK=content
 else
