@@ -23,6 +23,12 @@
 #              @area A [A...]    run_named.py over every test in areas/A.py
 #              @fuzz-replay      build ci/fuzz targets, replay regressions only
 #              @make-check       make -C ci/tests/unit check (nginx tree)
+#   Capability gating (same as run_all in ci/tools/test_runtime.py): tests that
+#   run_all calls only under `if ng.fault_injection:` are derived mechanically
+#   (ci/tools/fault_only_tests.py). On a build whose `nginx -V` lacks
+#   -DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1 an @area run drops them with one
+#   visible "SKIP fault-only" line each; on a fault build they run and
+#   run_named.py gets --fault-injection (as CI passes it).
 #   An @area group is also SKIPPED (FAIL under require) when the build is older
 #   than the module sources it exercises (stale build; rebuild first).
 #   An unmatched src/ path falls back to @make-check; any other unmatched
@@ -152,6 +158,11 @@ if [ -n "$NGX_DIR" ] && [ -x "$NGX_OBJS/nginx" ]; then
         fi
     done < <(tr ' ' '\n' <<<"$NGX_CONF_ARGS" | grep '^--add-module=' || true)
 fi
+# Fault injection is a build property (ci-build.sh adds the define to cc-opt).
+HAS_FAULTS=0
+if [ -n "${NGX_CONF_ARGS:-}" ] && grep -q 'NGX_HTTP_CACHE_TURBO_TEST_FAULTS=1' <<<"$NGX_CONF_ARGS"; then
+    HAS_FAULTS=1
+fi
 MODULE_ARG=()
 if [ -n "$MODULE" ] && [ "$STATIC_MODULE" = 0 ]; then
     MODULE_ARG=(--module "$MODULE")
@@ -192,6 +203,13 @@ area_l2_tests() {
             open = 0
             if (sig ~ /[(, ](mc|redis|redis_auth|redis_tls|redis_tls_untrusted|redis_tls_expired)[:,) =]/) print name
         }' "$ROOT/ci/tools/areas/$1.py"
+}
+
+# Tests the full suite runs only under `if ng.fault_injection:` (one per line).
+# Failing to derive them is an error: running ungated would reintroduce the
+# false failures, and skipping silently would hide coverage.
+fault_only_names() {
+    python3 -I "$HERE/fault_only_tests.py" --root "$ROOT"
 }
 
 # An override may be a bare name on PATH or a path; resolve it like the default.
@@ -244,7 +262,7 @@ need_ok() {
 }
 
 run_one() {
-    local cmd="$1" a names=() all=() l2=() srv=()
+    local cmd="$1" a n names=() all=() l2=() srv=() kept=() faultflag=()
     cd "$ROOT" || return 1
     case "$cmd" in
         "@area "*)
@@ -261,8 +279,23 @@ run_one() {
             # builds when told where the servers are; without them the fixture
             # is None and the test crashes on it. Same flags CI passes.
             [ "${#l2[@]}" -eq 0 ] || srv=(--redis-server "$REDIS_BIN" --memcached-server "$MC_BIN")
+            if [ "$HAS_FAULTS" = 1 ]; then
+                faultflag=(--fault-injection)
+            else
+                fault_only_names >"$PCT_TMP/gated" || { echo "precommit-tests: cannot derive the fault-only test set (see fault_only_tests.py)" >&2; return 1; }
+                for n in "${all[@]}"; do
+                    if grep -qxF -- "$n" "$PCT_TMP/gated"; then
+                        echo "precommit-tests: SKIP fault-only $n (build lacks NGX_HTTP_CACHE_TURBO_TEST_FAULTS; the full suite gates it the same way)"
+                    else
+                        kept+=("$n")
+                    fi
+                done
+                all=("${kept[@]}")
+                [ "${#all[@]}" -gt 0 ] || { echo "precommit-tests: every test of @area ${cmd#@area } is fault-only; nothing runs on this build"; return 0; }
+            fi
             python3 ci/tools/run_named.py --nginx-binary "$NGX_OBJS/nginx" \
-                ${MODULE_ARG[@]+"${MODULE_ARG[@]}"} --port "$PORT" ${srv[@]+"${srv[@]}"} "${all[@]}" ;;
+                ${MODULE_ARG[@]+"${MODULE_ARG[@]}"} --port "$PORT" ${srv[@]+"${srv[@]}"} \
+                ${faultflag[@]+"${faultflag[@]}"} "${all[@]}" ;;
         "@fuzz-replay") fuzz_replay ;;
         "@make-check")
             make -C ci/tests/unit --no-print-directory check \
@@ -275,12 +308,18 @@ run_one() {
 }
 
 dry_describe() {
-    local cmd="$1" a n
+    local cmd="$1" a n f
     case "$cmd" in
         "@area "*)
             for a in ${cmd#@area }; do
                 n=$(area_tests "$a" | wc -l)
-                echo "run_named.py ci/tools/areas/$a.py ($n tests)"
+                if f="$(fault_only_names 2>/dev/null)"; then
+                    printf '%s\n' "$f" >"$PCT_TMP/dry-gated"
+                    f=$(area_tests "$a" | grep -cxF -f "$PCT_TMP/dry-gated")
+                else
+                    f="?"
+                fi
+                echo "run_named.py ci/tools/areas/$a.py ($n tests, fault-only=$f gated on build capability)"
             done ;;
         *) echo "$cmd" ;;
     esac
