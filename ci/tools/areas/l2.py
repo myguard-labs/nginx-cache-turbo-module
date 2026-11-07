@@ -4193,6 +4193,57 @@ def _redis_get_abort_site(redis: RedisServer) -> AbortSite:
     )
 
 
+def test_l2_stale_park_resume_redis_get(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """BP-B2: a completion stamped one generation behind the live park is
+    dropped by the park-generation check (TEST_FAULTS tripwire), not delivered.
+
+    X-CT-Test-Stale-Park makes redis_get() complete a decoy op, stamped
+    one generation behind, through get_finish() right after each launch. A
+    cold node parks twice for one hit (vary marker, then object), so the
+    tripwire fires twice: exactly two "stale park resume redis_get" alerts.
+    The live ops still resume the request: 200 HIT with the primed body. The
+    next URI, without the header, is a clean HIT and logs nothing new."""
+    site = _redis_get_abort_site(redis)
+    with AbortRig(ng, site, "stale", 2) as rig:
+        uri, clean_uri = rig.uris
+        assert not rig.node.fatal_lines(), (
+            f"alerts before the injection: {rig.node.fatal_lines()}")
+        sock = socket.create_connection(("127.0.0.1", rig.node.port), timeout=5)
+        sock.sendall(f"GET {uri} HTTP/1.1\r\nHost: abort-fixture\r\n"
+                     f"X-CT-Test-Stale-Park: 1\r\n"
+                     f"Connection: close\r\n\r\n".encode())
+        sock.settimeout(10 * sanitizer_time_scale())
+        data = b""
+        try:
+            while chunk := sock.recv(65536):
+                data += chunk
+        finally:
+            sock.close()
+        head, _, body = data.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        headers = {k.lower(): v.strip() for k, _, v in
+                   (ln.partition(":") for ln in lines[1:])}
+        assert lines[0].split()[1:2] == ["200"], f"{uri}: {lines[0]!r}"
+        assert headers.get("x-cache") == site.served, (
+            f"{uri}: X-Cache={headers.get('x-cache')}, wanted {site.served}")
+        assert body == rig.bodies[uri], f"{uri}: body {body!r} is not the primed one"
+
+        fatal = rig.node.fatal_lines()
+        needle = "stale park resume redis_get"
+        assert len(fatal) == 2 and all(needle in ln for ln in fatal), (
+            f"wanted exactly two {needle!r} alerts (vary-marker park and "
+            f"object park), got {fatal}")
+
+        status, headers, body = Http1Client(rig.node.port, clean_uri).read_response()
+        assert status == 200 and headers.get("x-cache") == site.served, (
+            f"{clean_uri}: {status} X-Cache={headers.get('x-cache')}")
+        assert body == rig.bodies[clean_uri], f"{clean_uri}: wrong body"
+        assert rig.node.fatal_lines() == fatal, (
+            f"new alerts on the clean request: "
+            f"{rig.node.fatal_lines()[len(fatal):]}")
+
+
 def test_l2_abort_fixture_parks(
         ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     run_parks_test(

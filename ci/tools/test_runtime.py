@@ -501,6 +501,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_abort_scan_walk_h2_close_boundary(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
         test_l2_abort_scan_walk_clean_http1(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
         test_l2_abort_scan_walk_clean_http2(ng, origin, redis)  # CT-RESUME-FINALIZE-UAF
+        test_l2_stale_park_resume_redis_get(ng, origin, redis)  # BP-B2
         test_l2_reentry_redis_get_poke(ng, origin, redis)  # CT-PARKED-REENTRY
         test_l2_reentry_redis_get_rst(ng, origin, redis)  # CT-PARKED-REENTRY
         test_l2_reentry_redis_get_clean(ng, origin, redis)  # CT-PARKED-REENTRY
