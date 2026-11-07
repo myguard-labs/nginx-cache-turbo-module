@@ -36,6 +36,7 @@ from test_runtime_base import (
     RedisServer,
     fetch_raw,
     l2_key,
+    lock_key,
     wait_for,
     wait_for_l2_absent,
 )
@@ -79,6 +80,11 @@ class _Sweep(_FaultAlloc):
         super().__init__(port)
         self.expect: dict[str, str] = {}
         self.slow: list[str] = []  # follow-ups that waited out a lock
+        # PURGE follow-ups that stalled because the failed allocation was the
+        # purge's own fire-and-forget DEL of the lock key (the lock is a
+        # previous fill's, not this request's): bounded by lock_timeout and
+        # reported, not failed (CT-ALLOC-FAIL-LOCK-HELD, PURGE decision).
+        self.purge_lock_left: list[str] = []
 
     def get_uri(self, uri: str, method: str = "GET"):
         try:
@@ -101,6 +107,21 @@ class _Sweep(_FaultAlloc):
         calls = int(r["calls"])
         assert calls > 0, f"{scn.name}: request made no funnel call: {r}"
         return calls
+
+    def purge_left_lock(self, scn: _Scenario, uri: str) -> bool:
+        """Did this PURGE leave the cross-node lock behind? Its DELs are
+        fire-and-forget, so give them a moment to land first."""
+        redis = self.redis
+        if scn.method != "PURGE" or redis is None:
+            return False
+        return not wait_for(lambda: redis.get_raw(lock_key(uri)) is None,
+                            timeout=0.5)
+
+    def note_stall(self, n: int, r: dict[str, str], lock_left: bool) -> None:
+        """Record a follow-up that waited out a lock, with its fault site."""
+        site = r.get("site", "-").rsplit("/", 1)[-1]
+        (self.purge_lock_left if lock_left else self.slow).append(
+            f"N={n}@{site}")
 
 
 def _ready_nothing(sw: _Sweep, uri: str) -> None:
@@ -227,6 +248,7 @@ def _step(sw: _Sweep, fa: Nginx, scn: _Scenario, n: int, count: int) -> bool:
         f"{where}: unclean answer {st} {h}"
     if st == 200 and expect_body is not None and scn.strict_body:
         assert body == expect_body, f"{where}: declined answer has a wrong body"
+    lock_left = sw.purge_left_lock(scn, uri)
     # Next normal request, fresh connection (fetch_raw opens one).
     t0 = time.monotonic()
     try:
@@ -234,7 +256,7 @@ def _step(sw: _Sweep, fa: Nginx, scn: _Scenario, n: int, count: int) -> bool:
     except TimeoutError:
         raise AssertionError(f"{where}: follow-up request hung") from None
     if time.monotonic() - t0 > 0.9:
-        sw.slow.append(f"N={n}")
+        sw.note_stall(n, r, lock_left)
     assert st2 == 200 and body2, \
         f"{where}: follow-up request not served: {st2} {h2}"
     if expect_body is not None and scn.strict_body:
@@ -314,8 +336,15 @@ def test_alloc_fail_sweep(ng: Nginx, redis: RedisServer | None = None) -> None:
             print(f"alloc sweep {scn.name}: count={count} tried={len(ns)} "
                   f"fired={fired} mode={'full' if full else 'pr'} "
                   f"seed={seed} lock-stalled follow-ups: "
-                  f"{sw.slow or 'none'}")
-            sw.slow.clear()
+                  f"{sw.slow or 'none'}"
+                  + (f" purge-left-lock (tolerated): {sw.purge_lock_left}"
+                     if sw.purge_lock_left else ""))
+            # CT-ALLOC-FAIL-LOCK-HELD: a winner whose store fails releases
+            # its cross-node lock, so no follow-up may wait it out.
+            assert not sw.slow, \
+                f"{scn.name}: follow-ups waited out a held cross-node lock " \
+                f"(lock_timeout): {sw.slow}"
+            sw.purge_lock_left.clear()
             # A step that never reaches its Nth call would hide a hole.
             assert fired >= len(ns) - 2, \
                 f"{scn.name}: only {fired}/{len(ns)} injections fired"

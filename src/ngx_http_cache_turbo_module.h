@@ -2662,8 +2662,17 @@ typedef struct {
      * itself failed (timeout / connect error / EOF), distinct from a genuine
      * peer-holds-lock decline — the caller degrades to per-box single-flight
      * (regenerate locally) instead of suppressing the refresh, so a Redis
-     * outage cannot freeze every node on serve-stale / cold-wait. */
+     * outage cannot freeze every node on serve-stale / cold-wait.
+     *
+     * CT-ALLOC-FAIL-LOCK-HELD: lock_owner_rand is the random half of the owner
+     * value this request's SET NX wrote ("<pid>:<hex>"), so an error path that
+     * will never write L2 can release the lock it holds by owner (backend
+     * unlock). lock_released latches that release to exactly once. On LP64
+     * both sit in what was padding before lock_result, so the ctx size and
+     * every other offset are unchanged; on ILP32 the ctx grows by 4 bytes. */
     unsigned                 lock_done:1; /* NX reply landed                 */
+    unsigned                 lock_released:1; /* owner unlock already sent    */
+    uint32_t                 lock_owner_rand; /* random half of SET NX owner */
     ngx_int_t                lock_result; /* NGX_OK=hold; NGX_ERROR=L2 down   */
     /* Cold-miss single-flight (v10). A cold-miss LOSER parks on a short timer
      * and re-checks L1/L2 until the winner fills the entry or lock_timeout
@@ -3642,14 +3651,21 @@ struct ngx_cache_turbo_backend_s {
     /* Cross-node dogpile (v4-2): async SET <prefix>lock:<hex> <owner> NX PX
      * <ttl*1000>. Parks the request (count++, NGX_AGAIN); on reply ctx->lock_*
      * is set (NGX_OK = acquired). NGX_DECLINED synchronously if it could not
-     * start (L2 down) — caller falls back to single-box regen. `unlock` stays
-     * NULL: the lock is released by PX expiry, never by owner (see history.md
-     * v4-2 — early unlock would re-open the single-flight window). */
+     * start (L2 down) — caller falls back to single-box regen. A winner that
+     * fills L2 never unlocks: the lock is released by PX expiry (see
+     * history.md v4-2 — early unlock would re-open the single-flight window
+     * before the write-through is visible).
+     *
+     * `unlock` (CT-ALLOC-FAIL-LOCK-HELD) is only for a winner that will never
+     * write L2 because an error ended its store: fire-and-forget delete of
+     * the lock key only while it still holds ctx's owner value, so a lock
+     * that expired and was re-taken by another node is left alone. Callers
+     * check ownership and latch ctx->lock_released first. */
     ngx_int_t  (*lock)(ngx_http_request_t *r,
         ngx_http_cache_turbo_loc_conf_t *clcf,
         ngx_http_cache_turbo_ctx_t *ctx, time_t ttl);
-    ngx_int_t  (*unlock)(ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
-        ngx_str_t *owner);
+    void       (*unlock)(ngx_http_cache_turbo_loc_conf_t *clcf,
+        ngx_http_cache_turbo_ctx_t *ctx);
 };
 
 
