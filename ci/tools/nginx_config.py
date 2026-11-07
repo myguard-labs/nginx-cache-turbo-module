@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 
 # AUD-CIPORT3: single registry every fixture port -- main()'s visible
 # allocation block AND the ad-hoc ports a handful of test bodies stand up on
@@ -96,6 +97,23 @@ def _errlog_level() -> str:
         raise SystemExit(f"TEST_CT_ERRLOG={lvl!r} is not an nginx log level "
                          f"(one of: {', '.join(sorted(allowed))})")
     return lvl
+
+
+_FAULT_DIRECTIVE = re.compile(
+    r"^[ \t]*cache_turbo_test_\w+[ \t][^;\n]*;[ \t]*\n", re.MULTILINE)
+
+
+def strip_fault_directives(conf: str) -> str:
+    """Drop every `cache_turbo_test_*` directive line from a rendered config.
+
+    Those directives are compiled only into NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+    builds (src/ngx_http_cache_turbo_module.c); on any other binary `nginx -t`
+    rejects the config as "unknown directive", which broke every L2 fixture
+    run (they all carry cache_turbo_test_l2_promote_hold_ms and the scan
+    knobs) before a single test ran. Gating happens once on the rendered text
+    rather than per location so a newly added test directive is covered
+    without anyone having to remember to wrap it."""
+    return _FAULT_DIRECTIVE.sub("", conf)
 
 
 def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
@@ -1488,7 +1506,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 """
 
-    return f"""{load}worker_processes {workers};
+    conf = f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
 error_log {root}/logs/error.log {_errlog_level()};
 thread_pool cache_turbo_warm threads=1 max_queue=64;
@@ -4825,3 +4843,6 @@ http {{
     }}
 }}
 """
+    if not fault_injection:
+        conf = strip_fault_directives(conf)
+    return conf

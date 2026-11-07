@@ -1309,9 +1309,13 @@ def test_l2_stale_refetch_does_not_stall_on_lock(ng: Nginx, origin: Origin,
     cross-node NX lock expires.
 
     The trap: the winner takes `SET <prefix>lock:<hex> NX PX <lock_ttl*1000>`
-    (default 5s) and it is released ONLY by PX expiry -- `unlock` is
-    deliberately NULL (module.h), because an early unlock would re-open the
-    dogpile window. That is fine as long as waiters can serve the fill. But
+    (default 5s) and a winner that fills L2 releases it ONLY by PX expiry,
+    because an early unlock would re-open the dogpile window. The one early
+    release is the owner-checked error-path unlock (redis.c redis_unlock(),
+    CT-ALLOC-FAIL-LOCK-HELD): an EVAL that deletes the lock only if it still
+    holds this request's owner value, for a winner whose store failed and so
+    will never write L2. This test's winner stores fine, so its lock stays
+    until PX expiry. That is fine as long as waiters can serve the fill. But
     /l2sie/ sets cache_turbo_stale_mult 1, so stale_window == fresh_ttl == 1s:
     ~1s after the winner stores, the object is UNSERVEABLE while its lock is
     still alive for ~4s more. Every request in that gap lost the NX, entered
@@ -4212,22 +4216,10 @@ def test_l2_stale_park_resume_redis_get(
         uri, clean_uri = rig.uris
         assert not rig.node.fatal_lines(), (
             f"alerts before the injection: {rig.node.fatal_lines()}")
-        sock = socket.create_connection(("127.0.0.1", rig.node.port), timeout=5)
-        sock.sendall(f"GET {uri} HTTP/1.1\r\nHost: abort-fixture\r\n"
-                     f"X-CT-Test-Stale-Park: 1\r\n"
-                     f"Connection: close\r\n\r\n".encode())
-        sock.settimeout(10 * sanitizer_time_scale())
-        data = b""
-        try:
-            while chunk := sock.recv(65536):
-                data += chunk
-        finally:
-            sock.close()
-        head, _, body = data.partition(b"\r\n\r\n")
-        lines = head.decode("latin-1").split("\r\n")
-        headers = {k.lower(): v.strip() for k, _, v in
-                   (ln.partition(":") for ln in lines[1:])}
-        assert lines[0].split()[1:2] == ["200"], f"{uri}: {lines[0]!r}"
+        status, headers, body = Http1Client(
+            rig.node.port, uri,
+            headers={"X-CT-Test-Stale-Park": "1"}).read_response()
+        assert status == 200, f"{uri}: status {status}"
         assert headers.get("x-cache") == site.served, (
             f"{uri}: X-Cache={headers.get('x-cache')}, wanted {site.served}")
         assert body == rig.bodies[uri], f"{uri}: body {body!r} is not the primed one"
@@ -4634,24 +4626,12 @@ def test_l2_stale_park_resume_cold_wait(ng: Nginx, origin: Origin) -> None:
         assert not rig.node.fatal_lines(), (
             f"alerts before the injection: {rig.node.fatal_lines()}")
         anchor = rig.anchor(uri)
-        sock = socket.create_connection(("127.0.0.1", rig.node.port), timeout=5)
-        sock.sendall(f"GET {uri} HTTP/1.1\r\nHost: abort-fixture\r\n"
-                     "X-CT-Test-Stale-Park: 1\r\n"
-                     "Connection: close\r\n\r\n".encode())
+        client = Http1Client(rig.node.port, uri,
+                             headers={"X-CT-Test-Stale-Park": "1"})
         anchor.wait_parked()
-        sock.settimeout(10 * sanitizer_time_scale())
-        data = b""
-        try:
-            while chunk := sock.recv(65536):
-                data += chunk
-        finally:
-            sock.close()
+        status, headers, body = client.read_response()
         anchor.settle()
-        head, _, body = data.partition(b"\r\n\r\n")
-        lines = head.decode("latin-1").split("\r\n")
-        headers = {k.lower(): v.strip() for k, _, v in
-                   (ln.partition(":") for ln in lines[1:])}
-        assert lines[0].split()[1:2] == ["200"], f"{uri}: {lines[0]!r}"
+        assert status == 200, f"{uri}: status {status}"
         assert headers.get("x-cache") == site.served, (
             f"{uri}: X-Cache={headers.get('x-cache')}, wanted {site.served}")
         assert body == rig.bodies[uri], f"{uri}: body {body!r} is not the fill"
