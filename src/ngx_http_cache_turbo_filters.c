@@ -784,6 +784,30 @@ ngx_http_cache_turbo_header_filter_snapshot(ngx_http_request_t *r,
 }
 
 
+/* CT-ALLOC-FAIL-LOCK-HELD: an error has ended this response's store, so a
+ * cross-node lock this request won (SET NX answered +OK) guards a fill that
+ * will never reach L2. Release it by owner, at most once per ctx, so the next
+ * cold miss on any node goes to the origin instead of waiting lock_timeout.
+ * Only error paths call this: a winner that stores, or that declines to
+ * store by policy, keeps the PX-expiry-only release. */
+static void
+ngx_http_cache_turbo_l2_unlock_failed(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_ctx_t *ctx)
+{
+    if (!ctx->lock_done || ctx->lock_result != NGX_OK
+        || ctx->lock_released)
+    {
+        return;
+    }
+
+    ctx->lock_released = 1;
+
+    if (clcf->backend != NULL && clcf->backend->unlock != NULL) {
+        clcf->backend->unlock(clcf, ctx);
+    }
+}
+
+
 /* Body of the capture branch: flag an encoded-origin capture, resolve the
  * RFC 9111 SS3.5 reuse authorisation, build the key for a warm subrequest,
  * snapshot the upstream response, flag the capture, and emit Surrogate-Key.
@@ -1038,6 +1062,7 @@ ngx_http_cache_turbo_header_filter_capture(ngx_http_request_t *r,
         if (ngx_http_cache_turbo_header_filter_do_capture(r, ctx, clcf,
                 encoded_ok, encoded_class, &policy) != NGX_OK)
         {
+            ngx_http_cache_turbo_l2_unlock_failed(clcf, ctx);
             return;
         }
     } else if (gate_storable) {
@@ -2738,8 +2763,14 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
          * writers and by the Redis GET reply cap. Enforcing it only against
          * body bytes lets headers push the stored blob beyond the receive
          * ceiling and makes a legitimate write unreadable on the next miss. */
-        blob = clcf->max_size > 0 && blob_len > clcf->max_size
-               ? NULL : ngx_pnalloc(r->pool, blob_len);
+        if (clcf->max_size > 0 && blob_len > clcf->max_size) {
+            blob = NULL;
+        } else {
+            blob = ngx_pnalloc(r->pool, blob_len);
+            if (blob == NULL) {
+                ngx_http_cache_turbo_l2_unlock_failed(clcf, ctx);
+            }
+        }
     }
 
     if (blob == NULL) {
@@ -2933,6 +2964,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
     rc = ngx_http_cache_turbo_body_filter_capture(r, clcf, ctx, in, &last);
     if (rc == NGX_ERROR) {
+        ngx_http_cache_turbo_l2_unlock_failed(clcf, ctx);
         return NGX_ERROR;
     }
     if (rc == NGX_DECLINED) {

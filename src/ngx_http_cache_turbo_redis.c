@@ -2211,9 +2211,11 @@ ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
     }
 
     /* SET <prefix>lock:<hex> <owner> NX PX <ttl_ms>. The owner is unique per
-     * attempt (pid + random) for debuggability; it is never used to release the
-     * lock (no CAS unlock in v4-2 — the PX TTL is the only release), so its
-     * exact value does not affect correctness. */
+     * attempt (pid + random). A winner that fills L2 never releases by owner
+     * (PX expiry only, v4-2); redis_unlock() compares it only for a winner
+     * whose store failed (CT-ALLOC-FAIL-LOCK-HELD), so its random half is kept
+     * in ctx. ngx_random() is at most 31 bits, so uint32_t holds it whole. */
+    ctx->lock_owner_rand = (uint32_t) ngx_random();
     argv[0].data = (u_char *) "SET";
     argv[0].len = sizeof("SET") - 1;
     argv[1].data = lockbuf;
@@ -2221,7 +2223,7 @@ ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
                                                      ctx->key_hash, lockbuf);
     argv[2].data = ownerbuf;
     argv[2].len = (size_t) (ngx_sprintf(ownerbuf, "%P:%xL",
-                      ngx_pid, (int64_t) ngx_random()) - ownerbuf);
+                      ngx_pid, (int64_t) ctx->lock_owner_rand) - ownerbuf);
     argv[3].data = (u_char *) "NX";
     argv[3].len = sizeof("NX") - 1;
     argv[4].data = (u_char *) "PX";
@@ -2254,6 +2256,49 @@ ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
     r->write_event_handler = ngx_http_cache_turbo_parked_handler;
 
     return NGX_AGAIN;
+}
+
+
+/*
+ * CT-ALLOC-FAIL-LOCK-HELD: release the cross-node lock a winner took with
+ * redis_lock() when an error means it will never write L2. Without this the
+ * lock lives until PX expiry and every cold miss on the key, on any node,
+ * loses the NX and waits lock_timeout for a fill that is not coming.
+ *
+ * Compare-and-delete in one EVAL, so only the value this request's SET NX
+ * wrote is removed: if PX already expired and another node re-took the lock,
+ * the GET no longer matches and that node's lock stays. Fire-and-forget like
+ * del_raw: a failure here (no memory, Redis down, EVAL refused) leaves the
+ * lock to PX expiry, the behaviour before this release existed. The caller
+ * has checked that ctx holds the lock and latched lock_released.
+ */
+static void
+ngx_http_cache_turbo_redis_unlock(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_ctx_t *ctx)
+{
+    ngx_str_t  argv[5];
+    u_char     lockbuf[NGX_HTTP_CACHE_TURBO_L2_KEY_MAX + sizeof("lock:") - 1];
+    u_char     ownerbuf[NGX_INT_T_LEN + 1 + NGX_INT64_LEN];
+
+    if (!clcf->redis_enable
+        || clcf->redis_prefix.len
+           > sizeof(lockbuf) - (sizeof("lock:") - 1 + 64))
+    {
+        return;
+    }
+
+    ngx_str_set(&argv[0], "EVAL");
+    ngx_str_set(&argv[1], "if redis.call('GET',KEYS[1])==ARGV[1] then "
+                          "return redis.call('DEL',KEYS[1]) end return 0");
+    ngx_str_set(&argv[2], "1");
+    argv[3].data = lockbuf;
+    argv[3].len = ngx_http_cache_turbo_redis_lockkey(&clcf->redis_prefix,
+                                                     ctx->key_hash, lockbuf);
+    argv[4].data = ownerbuf;
+    argv[4].len = (size_t) (ngx_sprintf(ownerbuf, "%P:%xL",
+                      ngx_pid, (int64_t) ctx->lock_owner_rand) - ownerbuf);
+
+    ngx_http_cache_turbo_redis_fire_argv(clcf, argv, 5);
 }
 
 
@@ -5084,9 +5129,11 @@ ngx_http_cache_turbo_redis_op_fail(ngx_http_cache_turbo_redis_op_t *op)
 
 /* L2 backend instance. purge_tag is the SMEMBERS-based tag walk; scan_del is the
  * v4-2 SCAN MATCH-based whole-keyspace purge; lock is the v4-2 cross-node SET NX
- * PX single-flight. unlock stays NULL: the lock is released only by PX expiry,
- * never by owner (see history.md v4-2 — early unlock would re-open the
- * single-flight window and cause cross-node double-regen). */
+ * PX single-flight. A winner that fills L2 never unlocks: its lock is released
+ * only by PX expiry (see history.md v4-2 — early unlock would re-open the
+ * single-flight window and cause cross-node double-regen). unlock is the
+ * owner-checked release for a winner whose store failed and will never write
+ * L2 (CT-ALLOC-FAIL-LOCK-HELD). */
 ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend = {
     ngx_string("redis"),
     ngx_http_cache_turbo_redis_get,
@@ -5099,7 +5146,7 @@ ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend = {
     ngx_http_cache_turbo_redis_sscan,
     ngx_http_cache_turbo_redis_scan_del,
     ngx_http_cache_turbo_redis_lock,
-    NULL,   /* unlock — PX expiry only */
+    ngx_http_cache_turbo_redis_unlock,
 };
 
 #if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
