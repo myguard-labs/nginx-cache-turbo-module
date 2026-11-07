@@ -1,4 +1,4 @@
-# sync-sha: 2513961f201371c2da88f61799718d25cfef376017130a3c86a851a394979d3a
+# sync-sha: ee709001acca53162a62bfade2a67da592d46d629594f0e730b6e3a2e6d60e8b
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -89,6 +89,8 @@ jobs:
         # no: a selector that matches nothing must exit 2, not report clean.
         # The step below narrows the run with LINT_ONLY, so a silent selector
         # is exactly the failure that would make this whole job vacuous.
+        env:
+          AST_GREP_ESSENTIALS: ${{ github.workspace }}/.essentials
         run: ci/linter/selftest.sh
 
       - name: Configure an nginx tree for the carve-init parser

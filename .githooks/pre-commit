@@ -89,6 +89,17 @@ if [ -x "$ROOT/ci/tools/precommit-tests.sh" ]; then
         echo "pre-commit: mapped tests failed -- fix, or commit with --no-verify" >&2
         exit "$rc"
     fi
+else
+    # A selector that cannot run must not silently drop every mapped test.
+    case "${PRECOMMIT_TESTS:-auto}" in
+        off) ;;
+        require)
+            echo "pre-commit: ci/tools/precommit-tests.sh missing or not executable" \
+                 "(PRECOMMIT_TESTS=require)" >&2
+            exit 1 ;;
+        *) echo "pre-commit: SKIP mapped tests -- ci/tools/precommit-tests.sh" \
+                "missing or not executable" >&2 ;;
+    esac
 fi
 
 exit 0
