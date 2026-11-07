@@ -870,4 +870,11 @@ ngx_http_cache_turbo_redis_pool_blocks(ngx_pool_t *pool)
     return pool == NULL ? 0 : pool->token;
 }
 
+/* BP-B2 park-generation guard: the extracted callbacks see the release
+ * (empty) form, matching a build without TEST_FAULTS. */
+#define NGX_HTTP_CACHE_TURBO_PARK_GEN_FIELD
+#define CT_PARK_ENTER(r, op)
+#define CT_PARK_CHECK(r, op, site, drop)
+#define CT_PARK_TEST_STALE(r, op)
+
 #endif

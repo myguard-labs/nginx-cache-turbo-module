@@ -86,7 +86,7 @@ typedef struct {
     ngx_pool_t                  *pool;
     ngx_buf_t                   *send;     /* buffer currently being written  */
     ngx_msec_t                   timeout;
-
+    NGX_HTTP_CACHE_TURBO_PARK_GEN_FIELD
     ngx_http_request_t          *request;  /* GET/SMEMBERS/SCAN/lock: parked req */
     ngx_http_cache_turbo_ctx_t  *ctx;      /* GET/lock: request ctx to fill   */
     ngx_http_cache_turbo_loc_conf_t *clcf; /* DSN/TLS + SCAN rebuild + del_raw */
@@ -2163,14 +2163,14 @@ ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
         ngx_destroy_pool(pool);
         return NGX_DECLINED;
     }
-
+    CT_PARK_ENTER(r, op)
     /* Parked: hold a reference so the request survives until the reply resumes
      * it (released by ngx_http_finalize_request(NGX_DONE) in get_finish). A
      * terminate frees the request regardless of it; req_cln then tears the op
      * down (walk_detach), so the reply never reaches get_finish. */
     r->main->count++;
     r->write_event_handler = ngx_http_cache_turbo_parked_handler;
-
+    CT_PARK_TEST_STALE(r, op)
     return NGX_AGAIN;
 }
 
@@ -2249,7 +2249,7 @@ ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
         ngx_destroy_pool(pool);
         return NGX_DECLINED;
     }
-
+    CT_PARK_ENTER(r, op)
     r->main->count++;
     r->write_event_handler = ngx_http_cache_turbo_parked_handler;
 
@@ -2411,7 +2411,7 @@ ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
         ngx_destroy_pool(op->pool);
         return NGX_ERROR;
     }
-
+    CT_PARK_ENTER(r, op)
     /* Parked: released by ngx_http_finalize_request in walk_finish (reused
      * as the scan completion: cb(r, data, NULL, 0)) -- unless the request is
      * TERMINATED first, in which case walk_detach above takes over and the
@@ -2596,7 +2596,7 @@ ngx_http_cache_turbo_redis_sscan(ngx_http_request_t *r,
         ngx_destroy_pool(op->pool);
         return NGX_ERROR;
     }
-
+    CT_PARK_ENTER(r, op)
     /* Parked: released by ngx_http_finalize_request in walk_finish -- unless the
      * request is TERMINATED first, in which case walk_detach above takes over
      * and the walk tears itself down without ever touching the request. */
@@ -4483,7 +4483,7 @@ ngx_http_cache_turbo_redis_read_sscan(ngx_event_t *rev)
          * the terminal call reports INCOMPLETE and keeps the key. */
         if (nmembers > 0) {
             ngx_int_t  prc;
-
+            CT_PARK_CHECK(op->request, op, "redis_sscan", walk)
             /* Publish this walk for the duration of the callback so it can
              * reach walk_suspend(). Cleared unconditionally on return: a walk
              * must never be suspendable from outside its own page delivery. */
@@ -4704,7 +4704,7 @@ ngx_http_cache_turbo_redis_walk_finish(
         ngx_http_cache_turbo_redis_op_done(op);
         return;
     }
-
+    CT_PARK_CHECK(r, op, op->is_scan ? "redis_scan_del" : "redis_sscan", walk)
     /* Every successful/malformed reply passes through redis_fill(), which
      * clears unconnected on its first byte. A still-set flag here therefore
      * means the direct SMEMBERS/SCAN reader ended without any peer reply. */
@@ -4862,7 +4862,7 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
     ngx_http_cache_turbo_ctx_t       *ctx = op->ctx;
     ngx_connection_t                 *c = r->connection;
     u_char                           *copy;
-
+    CT_PARK_CHECK(r, op, "redis_get", redis)
     /* S231: read failures on a GET (timeout / fill error / malformed reply) are
      * reported straight here rather than through op_fail(), so the same
      * "still unconnected" classification has to be repeated at this other
@@ -5026,7 +5026,7 @@ ngx_http_cache_turbo_redis_lock_finish(ngx_http_cache_turbo_redis_op_t *op,
     ngx_http_request_t          *r = op->request;
     ngx_http_cache_turbo_ctx_t  *ctx = op->ctx;
     ngx_connection_t            *c = r->connection;
-
+    CT_PARK_CHECK(r, op, "redis_lock", redis)
     /* S231: same "still unconnected" arm as get_finish() -- the lock reader
      * calls this directly instead of through op_fail(). */
     if (result == NGX_ERROR) {
@@ -5101,5 +5101,211 @@ ngx_cache_turbo_backend_t  ngx_http_cache_turbo_redis_backend = {
     ngx_http_cache_turbo_redis_lock,
     NULL,   /* unlock — PX expiry only */
 };
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+
+/*
+ * BP-B2: park-generation tripwire (contract in testalloc.h). Defined here,
+ * after every other definition, so a release build sees no line shift.
+ */
+typedef struct {
+    ngx_http_request_t  *r;
+    ngx_uint_t           gen;
+} ngx_http_cache_turbo_test_park_rec_t;
+
+
+/* Tag handler of the record's r->pool cleanup: identifies the record. */
+void
+ngx_http_cache_turbo_test_park_rec_cleanup(void *data)
+{
+    ngx_http_cache_turbo_test_park_rec_t  *rec = data;
+
+    rec->r = NULL;
+}
+
+
+static ngx_http_cache_turbo_test_park_rec_t *
+ngx_http_cache_turbo_test_park_rec_find(ngx_http_request_t *r)
+{
+    ngx_pool_cleanup_t                    *cln;
+    ngx_http_cache_turbo_test_park_rec_t  *rec;
+
+    for (cln = r->pool->cleanup; cln != NULL; cln = cln->next) {
+        if (cln->handler != ngx_http_cache_turbo_test_park_rec_cleanup) {
+            continue;
+        }
+
+        rec = cln->data;
+        if (rec->r == r) {
+            return rec;
+        }
+    }
+
+    return NULL;
+}
+
+
+/* Stamp a fresh park. Completion is always asynchronous, so the stamp after
+ * a successful launch precedes any check. A record that cannot be allocated
+ * leaves gen 0, which the check accepts while no record exists. The
+ * parenthesised call bypasses the BP-B1 funnel so fault_alloc numbering does
+ * not change. */
+void
+ngx_http_cache_turbo_test_park_enter(ngx_http_request_t *r, ngx_uint_t *gen)
+{
+    ngx_pool_cleanup_t                    *cln;
+    ngx_http_cache_turbo_test_park_rec_t  *rec;
+
+    *gen = 0;
+
+    rec = ngx_http_cache_turbo_test_park_rec_find(r);
+    if (rec == NULL) {
+        cln = (ngx_pool_cleanup_add)(r->pool,
+                  sizeof(ngx_http_cache_turbo_test_park_rec_t));
+        if (cln == NULL) {
+            return;
+        }
+
+        rec = cln->data;
+        rec->r = r;
+        rec->gen = 0;
+        cln->handler = ngx_http_cache_turbo_test_park_rec_cleanup;
+    }
+
+    *gen = ++rec->gen;
+}
+
+
+/* NGX_OK: the park is current. NGX_ABORT: the request is gone. NGX_DECLINED:
+ * the request is finalized or a later park superseded this one. */
+ngx_int_t
+ngx_http_cache_turbo_test_park_check(ngx_http_request_t *r, ngx_uint_t gen,
+    const char *site)
+{
+    ngx_uint_t                             cur;
+    ngx_int_t                              rc;
+    ngx_http_cache_turbo_test_park_rec_t  *rec;
+
+    cur = 0;
+
+    if (r == NULL || r->pool == NULL || r->main == NULL
+        || r->main->count == 0)
+    {
+        rc = NGX_ABORT;
+
+    } else {
+        rec = ngx_http_cache_turbo_test_park_rec_find(r);
+        if (rec != NULL) {
+            cur = rec->gen;
+        }
+
+        rc = (r->done || gen != cur) ? NGX_DECLINED : NGX_OK;
+    }
+
+    if (rc == NGX_OK) {
+        return NGX_OK;
+    }
+
+    ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                  "cache_turbo: stale park resume %s (op gen %ui, request "
+                  "gen %ui, %s)", site, gen, cur,
+                  (rc == NGX_ABORT) ? "request gone"
+                                    : "request done or superseded");
+
+    return rc;
+}
+
+
+/* GET/lock op: the reply is dropped and the op torn down. When the request is
+ * gone its pool, and the req_cln record in it, is no longer ours to write. */
+void
+ngx_http_cache_turbo_test_park_drop_redis(void *data, ngx_int_t rc)
+{
+    ngx_http_cache_turbo_redis_op_t  *op = data;
+
+    if (rc == NGX_ABORT) {
+        op->req_cln = NULL;
+    }
+
+    ngx_http_cache_turbo_redis_op_done(op);
+}
+
+
+/* SCAN/SSCAN walk: disarm the connection before op_done closes or pools it,
+ * as walk_detach does. */
+void
+ngx_http_cache_turbo_test_park_drop_walk(void *data, ngx_int_t rc)
+{
+    ngx_http_cache_turbo_redis_op_t  *op = data;
+
+    if (rc == NGX_ABORT) {
+        op->req_cln = NULL;
+    }
+
+    (void) ngx_http_cache_turbo_redis_walk_disarm_conn(op->peer.connection);
+    ngx_http_cache_turbo_redis_op_done(op);
+}
+
+
+/* The stale-resume injection: with X-CT-Test-Stale-Park on the request, a
+ * decoy op (own pool, no connection, no request cleanup) stamped one
+ * generation behind the live park completes through get_finish. The check
+ * must log the alert and drop it; the live op then resumes the request. */
+void
+ngx_http_cache_turbo_test_park_stale_redis_get(ngx_http_request_t *r,
+    void *data)
+{
+    ngx_uint_t                        i;
+    ngx_list_part_t                  *part;
+    ngx_table_elt_t                  *h;
+    ngx_pool_t                       *pool;
+    ngx_http_cache_turbo_redis_op_t  *op = data;
+    ngx_http_cache_turbo_redis_op_t  *decoy;
+
+    static ngx_str_t  name = ngx_string("X-CT-Test-Stale-Park");
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                return;
+            }
+
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].key.len == name.len
+            && ngx_strncasecmp(h[i].key.data, name.data, name.len) == 0)
+        {
+            break;
+        }
+    }
+
+    pool = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
+    if (pool == NULL) {
+        return;
+    }
+
+    decoy = ngx_pcalloc(pool, sizeof(ngx_http_cache_turbo_redis_op_t));
+    if (decoy == NULL) {
+        ngx_destroy_pool(pool);
+        return;
+    }
+
+    decoy->pool = pool;
+    decoy->rpool = pool;
+    decoy->request = r;
+    decoy->ctx = op->ctx;
+    decoy->park_gen = op->park_gen - 1;
+
+    ngx_http_cache_turbo_redis_get_finish(decoy, NGX_DECLINED, NULL, 0);
+}
+
+#endif
 
 #pragma GCC visibility pop

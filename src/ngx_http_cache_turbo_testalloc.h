@@ -56,6 +56,7 @@
 
 #include <ngx_config.h>
 #include <ngx_core.h>
+#include <ngx_http.h>
 
 
 /* The gate, defined at the end of module.c. Traps a NULL pool (does not
@@ -218,6 +219,76 @@ ngx_http_cache_turbo_ta_pool_cleanup_add(ngx_pool_t *p, size_t size,
     ngx_http_cache_turbo_ta_alloc_chain_link(pool, __FILE__, __LINE__)
 #define ngx_pool_cleanup_add(p, size)                                         \
     ngx_http_cache_turbo_ta_pool_cleanup_add(p, size, __FILE__, __LINE__)
+
+
+/*
+ * BP-B2: PARK-GENERATION TRIPWIRE
+ *
+ *   A parked request (r->main->count++ while an L2 op is in flight) must only
+ *   be resumed by the op that parked it, while it is still alive. Each park
+ *   stamps the op with a generation taken from a per-request record; each
+ *   completion callback checks, before it touches the request, that
+ *
+ *     - the request still exists (r, r->pool non-NULL, r->main->count > 0),
+ *     - it is not finalized yet (r->done == 0),
+ *     - the op's generation is still the request's current one.
+ *
+ *   On failure it logs
+ *
+ *       [alert] cache_turbo: stale park resume <site> ...
+ *
+ *   drops the reply through the site's drop function and returns. The
+ *   runtime harness fails any test that logs an [alert].
+ *
+ *   The record is a TEST_FAULTS-only r->pool cleanup (tagged by its handler,
+ *   keyed by r because subrequests share their parent's pool), so no shipping
+ *   struct gains a field and walks without a request ctx are covered too. In
+ *   the op structs NGX_HTTP_CACHE_TURBO_PARK_GEN_FIELD replaces a blank line;
+ *   the macros sit on blank lines; module.h maps all of them to nothing
+ *   outside TEST_FAULTS, so a release object is byte-identical. Each macro
+ *   is a complete statement and its call sites carry no semicolon: a stray
+ *   `;` left behind in a release build is a null statement that still gets
+ *   a DWARF line-table row, which breaks the byte identity.
+ *
+ *   Drop kinds: redis (GET/lock op), walk (SCAN/SSCAN walk: disarm the
+ *   connection first), mc (memcached GET). Each clears the op's request
+ *   cleanup when the request is gone (NGX_ABORT), then tears the op down.
+ */
+#define NGX_HTTP_CACHE_TURBO_PARK_GEN_FIELD  ngx_uint_t  park_gen;
+
+#define CT_PARK_ENTER(r, op)                                                  \
+    ngx_http_cache_turbo_test_park_enter((r), &(op)->park_gen);
+
+#define CT_PARK_CHECK(r, op, site, drop)                                      \
+    do {                                                                      \
+        ngx_int_t  ct_park_rc_;                                               \
+                                                                              \
+        ct_park_rc_ = ngx_http_cache_turbo_test_park_check((r),               \
+                                                 (op)->park_gen, (site));     \
+        if (ct_park_rc_ != NGX_OK) {                                          \
+            ngx_http_cache_turbo_test_park_drop_##drop((op), ct_park_rc_);    \
+            return;                                                           \
+        }                                                                     \
+    } while (0);
+
+#define CT_PARK_TEST_STALE(r, op)                                             \
+    ngx_http_cache_turbo_test_park_stale_redis_get((r), (op));
+
+/* Defined at the end of redis.c (record, enter, check, redis drops and the
+ * redis_get stale-resume injection) and memcached.c (mc drop). */
+void ngx_http_cache_turbo_test_park_rec_cleanup(void *data);
+void ngx_http_cache_turbo_test_park_enter(ngx_http_request_t *r,
+    ngx_uint_t *gen);
+ngx_int_t ngx_http_cache_turbo_test_park_check(ngx_http_request_t *r,
+    ngx_uint_t gen, const char *site);
+void ngx_http_cache_turbo_test_park_drop_redis(void *op, ngx_int_t rc);
+void ngx_http_cache_turbo_test_park_drop_walk(void *op, ngx_int_t rc);
+void ngx_http_cache_turbo_test_park_drop_mc(void *op, ngx_int_t rc);
+
+/* Header X-CT-Test-Stale-Park on a request parking in redis_get: complete a
+ * decoy op stamped one generation behind, which the check must drop. */
+void ngx_http_cache_turbo_test_park_stale_redis_get(ngx_http_request_t *r,
+    void *op);
 
 
 #endif /* NGX_HTTP_CACHE_TURBO_TEST_FAULTS */
