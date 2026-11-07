@@ -740,7 +740,33 @@ def test_l2_restore_href_array_alignment_ubsan(ng: Nginx, origin: Origin,
                               _align_hdrs(24, 2), body_pad=pad)
         _href_align_roundtrip(ng, origin, redis, f"/l2e/href-align-48-p{pad}",
                               _align_hdrs(47, 3), body_pad=pad)
+    _href_align_unaligned_request_pool(ng, origin, redis)
 
+
+def _href_align_unaligned_request_pool(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """CT-ALIGN-POOL-UNALIGNED-CASE: deterministic odd request-pool offset
+    for the >24-header refs[] allocation, driven by the URI length rather than
+    the blob length.
+
+    A request pool's first block has only ~200-250 bytes free when the
+    restore runs, less than the 400-byte refs[] array of a 25-header blob, so
+    refs[] never lands at the first block's d.last (a fresh block starts
+    aligned). It lands in a LATER block, at that block's d.last, and that
+    block's offset is set by whatever byte-allocated (ngx_pnalloc) string
+    overflowed into it first. A short URI never overflows, so the 0..7-byte
+    body sweep above only works through the L2-fill blob copy. Here the blob is
+    fixed and the URI is longer than the first block's free space (400+ bytes),
+    so the key string opens the second block and its length residue becomes
+    the refs[] offset; growing the URI 0..7 bytes walks every residue mod 8
+    (observed offsets 2,3,..,7,0,1 for the first L2 read). A regressed
+    ngx_pnalloc() for refs[] then hands back a misaligned pointer and UBSan
+    alignment kills the worker on the very first residue != 0."""
+    hdrs = _align_hdrs(24, 2)                           # 25 hdrs: pool path
+    for extra in range(8):
+        _href_align_roundtrip(
+            ng, origin, redis,
+            "/l2e/href-align-long-uri-" + "u" * (400 + extra), hdrs)
 
 def _align_hdrs(n: int, pad: int) -> list[tuple[str, str]]:
     """n distinct custom headers; `pad` varies the value lengths so the

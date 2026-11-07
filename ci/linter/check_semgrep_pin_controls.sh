@@ -7,7 +7,7 @@ REPO="$(git rev-parse --show-toplevel)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 files=(ci/linter/run-semgrep.sh ci/linter/lint-semgrep-pin.sh ci/linter/lint-c.sh
-       ci/linter/install-linters.sh .pre-commit-config.yaml
+       ci/linter/install-linters.sh
        .github/workflows/security-scanners.yml .github/workflows/ci-deep.yml)
 for file in "${files[@]}"; do
     mkdir -p "$TMP/$(dirname "$file")"
@@ -23,7 +23,7 @@ expect_red() {
     echo "✓ $label mutation turns the Semgrep contract red"
 }
 
-for file in ci/linter/lint-c.sh .pre-commit-config.yaml \
+for file in ci/linter/lint-c.sh \
             .github/workflows/security-scanners.yml .github/workflows/ci-deep.yml; do
     sed -i 's;ci/linter/run-semgrep\.sh;ci/linter/run-semgrep-disabled.sh;' "$TMP/$file"
     expect_red "$file consumer"

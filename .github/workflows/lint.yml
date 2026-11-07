@@ -1,4 +1,4 @@
-# sync-sha: 22ed8813a819212139871ebb5b9c36e98cf018869c456705d34b1e4f30447192
+# sync-sha: ee709001acca53162a62bfade2a67da592d46d629594f0e730b6e3a2e6d60e8b
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -9,15 +9,19 @@ name: Lint
 #
 # LINT_ONLY leaves out the "c" checker: flawfinder/cppcheck/semgrep over src/
 # are already the job of security-scanners.yml, at the same thresholds
-# (ci/linter/lint-c.sh mirrors that workflow, and .pre-commit-config.yaml
-# mirrors both). Running them twice per PR buys nothing but queue time. That is
-# the ONE deliberate exclusion; every other lint-*.sh is named below.
+# (ci/linter/lint-c.sh mirrors that workflow). Running them twice per PR buys
+# nothing but queue time. That is the ONE deliberate exclusion; every other
+# lint-*.sh is named below.
 #
 # "astgrep" IS listed, and is not covered by that exclusion. No other workflow
 # runs the ci/ast-grep/ ruleset, so leaving it out would mean the structural
 # sweep gates the hook and never a PR -- the half-gate selftest.sh's LINT_ONLY
 # set-equality case exists to catch. It is also cheap (no nginx tree, no TU
 # parse) and its blocking tier is five promoted rules, not the whole ruleset.
+#
+# "astgrep-essentials" runs the FULL upstream ast-grep essentials pack (every
+# language), checked out below at a pinned commit. It blocks on severity
+# `error`; see the ESSENTIALS_ADVISORY note on the Run linters step.
 #
 # "shm-lock", "atomic-ordering", "suite-docs", "resume-order" and "park-contract" are this
 # module's own checkers and have no skeleton counterpart. They previously ran only from build-test.yml's
@@ -57,6 +61,18 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check out the ast-grep essentials pack
+        # Public repo, pinned by commit: a floating pack changes findings under
+        # an unchanged tree. Bump the ref deliberately, with a green full-pack
+        # scan. Inside the workspace (checkout requires it); git ls-files never
+        # lists it, so no other checker lints the pack itself.
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: myguard-labs/ast-grep-essentials
+          ref: c0d39c8a6823f187fcc04f9adc1e774b1434c1b1
+          path: .essentials
+          persist-credentials: false
+
       - name: Install linters
         # One installer for CI and for a fresh clone; a second apt list here
         # would be the thing that goes stale.
@@ -73,6 +89,8 @@ jobs:
         # no: a selector that matches nothing must exit 2, not report clean.
         # The step below narrows the run with LINT_ONLY, so a silent selector
         # is exactly the failure that would make this whole job vacuous.
+        env:
+          AST_GREP_ESSENTIALS: ${{ github.workspace }}/.essentials
         run: ci/linter/selftest.sh
 
       - name: Configure an nginx tree for the carve-init parser
@@ -111,5 +129,21 @@ jobs:
           # `sed -n 's/^ *LINT_ONLY: *//p'`, so wrapping it in a folded scalar
           # (`>-`) makes that parser read the literal ">-" and report EVERY
           # checker as missing. Rewrap only by teaching selftest.sh to parse YAML.
-          LINT_ONLY: nginx astgrep sh python perl yaml spelling semgrep-pin ci-runners ci-ports ci-cadence ci-secrets sync-stamp docs-drift shm-lock stripe-seam atomic-ordering carve-init suite-docs resume-order park-contract
+          # CI-P3 not landed: the full pack still reports error-severity hits
+          # (src/ngx_http_cache_turbo_internal.h and shell scripts under ci/).
+          # ADVISORY prints them as errors but does not fail the job. Delete
+          # this line when a full-pack scan of the tree reports 0 errors.
+          ESSENTIALS_ADVISORY: "1"
+          AST_GREP_ESSENTIALS: ${{ github.workspace }}/.essentials
+          LINT_ONLY: nginx astgrep astgrep-essentials sh python perl yaml spelling semgrep-pin ci-runners ci-ports ci-cadence ci-secrets sync-stamp docs-drift shm-lock stripe-seam atomic-ordering carve-init suite-docs resume-order park-contract
         run: ci/linter/run-all.sh
+
+      - name: Python unit tests (ci/tests)
+        # ci/tests/*.py (breadcrumb guard, abort-fixture accounting, pre-commit
+        # selector) were run by no workflow. A venv keeps pytest off the system
+        # interpreter (PEP 668) while --system-site-packages leaves the tests'
+        # own imports available.
+        run: |
+          python3 -m venv --system-site-packages "$RUNNER_TEMP/pytest-venv"
+          "$RUNNER_TEMP/pytest-venv/bin/python" -m pip install --quiet pytest==9.1.0
+          "$RUNNER_TEMP/pytest-venv/bin/python" -m pytest -q -p no:cacheprovider ci/tests/*.py

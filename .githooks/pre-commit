@@ -14,21 +14,28 @@
 #     ci/linter/run-all.sh
 #     pre-commit run --all-files
 #
-# TWO GATES, ONE ENTRY POINT, AND THE REASON THIS FILE CALLS BOTH.
+# THREE STEPS, ONE ENTRY POINT, EACH TOOL ONCE (CI-P1, CI-P5).
+#   1. ci/linter/run-all.sh --staged   every tool linter (flawfinder, cppcheck,
+#                                      semgrep, ast-grep, ruff, shellcheck,
+#                                      actionlint, ...) plus the workflow-policy
+#                                      and docs-drift checks. The ONLY owner of
+#                                      those tools, so CI and the hook agree.
+#   2. pre-commit run                  hygiene hooks and gitleaks from
+#                                      .pre-commit-config.yaml. It lists no tool
+#                                      that run-all owns; ci/linter/selftest.sh
+#                                      fails if one reappears, since each would
+#                                      then run twice per commit.
+#   3. ci/tools/precommit-tests.sh     only the tests the reviewed map names for
+#                                      the staged paths (never a whole suite).
+#                                      PRECOMMIT_TESTS=require makes a missing
+#                                      build a failure; PRECOMMIT_TESTS=off skips.
 #
-# `core.hooksPath` REPLACES .git/hooks/ -- git does not consult both. So the
-# hook that `pre-commit install` writes into .git/hooks/pre-commit becomes
-# unreachable the moment core.hooksPath is set, and .pre-commit-config.yaml
-# stops running on commit while still looking installed from every angle a
-# human checks: the config is present, `pre-commit install` reported success,
-# and the file is right there in .git/hooks/. Measured 2026-08-02 in this repo:
-# a file with trailing whitespace and no closing newline committed clean, past
-# hooks whose entire job is those two things -- and past detect-private-key,
-# flawfinder and semgrep with it.
-#
-# Neither list is a superset of the other (ci/linter/ owns the workflow-policy
-# and docs-drift checks; .pre-commit-config.yaml owns secret detection and the
-# C SAST gates), so this hook runs BOTH and fails on either.
+# Why step 2 is called from here at all: `core.hooksPath` REPLACES .git/hooks/,
+# so the hook `pre-commit install` writes there becomes unreachable and
+# .pre-commit-config.yaml stops running on commit while still looking installed
+# from every angle a human checks. Measured 2026-08-02 in this repo: a file with
+# trailing whitespace and no closing newline committed clean, past hooks whose
+# entire job is those two things.
 #
 # Exit 2 (a tool is not installed) blocks the commit on purpose: a gate that
 # skips itself when its tool is missing reports green while checking nothing.
@@ -70,6 +77,29 @@ if [ -f "$ROOT/.pre-commit-config.yaml" ]; then
              "with --no-verify. Fixer hooks may have rewritten files; re-stage." >&2
         exit "$rc"
     fi
+fi
+
+# Step 3: tests mapped to the staged paths (CI-P4 selector, CI-P5 wiring). A
+# docs-only commit selects none; a missing build is a loud SKIP unless
+# PRECOMMIT_TESTS=require.
+if [ -x "$ROOT/ci/tools/precommit-tests.sh" ]; then
+    "$ROOT/ci/tools/precommit-tests.sh" --staged
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "pre-commit: mapped tests failed -- fix, or commit with --no-verify" >&2
+        exit "$rc"
+    fi
+else
+    # A selector that cannot run must not silently drop every mapped test.
+    case "${PRECOMMIT_TESTS:-auto}" in
+        off) ;;
+        require)
+            echo "pre-commit: ci/tools/precommit-tests.sh missing or not executable" \
+                 "(PRECOMMIT_TESTS=require)" >&2
+            exit 1 ;;
+        *) echo "pre-commit: SKIP mapped tests -- ci/tools/precommit-tests.sh" \
+                "missing or not executable" >&2 ;;
+    esac
 fi
 
 exit 0

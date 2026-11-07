@@ -48,6 +48,28 @@ one or the other, never both. The tracked hook already invokes
 the other way silently disables every `.pre-commit-config.yaml` checker while
 looking correct from every angle you would think to check.
 
+### What the hook runs
+
+Three steps, each tool exactly once:
+
+1. `ci/linter/run-all.sh --staged` — every tool linter (flawfinder, cppcheck,
+   semgrep, ast-grep, ruff, shellcheck, actionlint, the full ast-grep
+   essentials pack, ...) over the staged files.
+2. `pre-commit run` — hygiene fixers, merge-conflict, large-file,
+   private-key and gitleaks hooks from `.pre-commit-config.yaml`. That file
+   lists no tool `run-all.sh` owns; `ci/linter/selftest.sh` fails if one
+   reappears.
+3. `ci/tools/precommit-tests.sh --staged` — only the tests the reviewed map
+   `ci/tools/precommit-test-map.tsv` names for the staged paths (never a whole
+   suite; a docs-only commit selects none). Runtime tests need a build under
+   `.build/`; without one the step prints a loud `SKIP`.
+
+Knobs: `PRECOMMIT_TESTS=require` turns a missing build or tool into a failure,
+`PRECOMMIT_TESTS=off` skips step 3. `AST_GREP_ESSENTIALS=<dir>` points step 1 at
+a checkout of `myguard-labs/ast-grep-essentials` (default
+`/opt/myguard/labs/ast-grep-essentials`; a missing pack is exit 2, not a pass).
+The pack blocks on severity `error` only; warnings and info are printed.
+
 Bypass in an emergency with `git commit --no-verify`, and expect `lint.yml` to
 catch on the PR what you skipped locally — it runs the same `run-all.sh`.
 
