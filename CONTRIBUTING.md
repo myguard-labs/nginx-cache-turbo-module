@@ -25,6 +25,10 @@ this code started by not knowing nginx internals either.
 - [ ] All CI checks green. No skipping, no "it works on my machine".
 - [ ] Commit messages: imperative subject, body explains *why*.
       No AI co-author trailers.
+- [ ] A new or changed request park follows the park contract: a row in
+      [ci/park-sites.tsv](ci/park-sites.tsv) (checked by
+      `ci/linter/lint-park-contract.sh`), the handler swap, detach, the
+      `CT_PARK_*` macros, the abort arms, and finalize before posted.
 
 ## Before your first commit
 
