@@ -20,6 +20,7 @@ from __future__ import annotations
 from areas.admin import *
 from areas.breaker import *
 from areas.core import *
+from areas.faults import *
 from areas.http import *
 from areas.l2 import *
 from areas.policy import *
@@ -69,6 +70,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_store_failure_cleans_up_cold_stub(ng, origin)
         test_dead_pool_alloc_trap(ng)                        # BP-B1
         test_fault_alloc_countdown(ng)                       # BP-C1
+        test_alloc_fail_sweep(ng, redis)                     # BP-C2
     test_max_size_not_cached(ng)
     test_suppress_native_variable(ng)
     test_auto_classify(ng, origin)
