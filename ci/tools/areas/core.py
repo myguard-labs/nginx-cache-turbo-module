@@ -9,8 +9,6 @@ star-imports this module, so every test stays reachable as
 
 from __future__ import annotations
 
-import resource
-
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
 from test_runtime_base import *
@@ -2206,13 +2204,14 @@ def test_dead_pool_alloc_trap(ng: Nginx) -> None:
     cmd = ng.runner + [str(ng.binary), "-p", str(trap),
                        "-c", str(trap / "conf" / "nginx.conf"), "-t"]
     # This child is EXPECTED to abort: no core file (CT-TRAP-TEST-CORE-DUMP).
-    # RLIMIT_CORE=0 is set in the child only, the parent keeps its limits.
-    def _no_core() -> None:
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
+    # The shell lowers the core limit in the child only, then execs the runner,
+    # so the abort status reaches this process unchanged. (preexec_fn is unsafe
+    # beside the running Origin thread: it can deadlock before exec, outside
+    # the timeout.)
+    cmd = ["/bin/sh", "-c", 'ulimit -c 0 && exec "$0" "$@"'] + cmd
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, timeout=20,
-                       env=config_check_env(), preexec_fn=_no_core)
+                       env=config_check_env())
     out = r.stdout
     log = trap / "logs" / "error.log"
     if log.exists():
