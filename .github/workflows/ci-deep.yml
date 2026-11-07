@@ -1,4 +1,4 @@
-# sync-sha: c1f5125012204cfbd8312e358467cbedafd718f69010bd7e24f2933f7e66c03b
+# sync-sha: fefd7efd44226db582dc64714ef5d9edf28e62271399bab875a161b82ea9a74f
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -1025,9 +1025,11 @@ jobs:
           if command -v pipx >/dev/null; then
             pipx install --quiet 'semgrep==1.169.0'
             echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
+            export PATH="$PIPX_BIN_DIR:$PATH"
           else
             pip3 install --quiet --user --break-system-packages 'semgrep==1.169.0'
             echo "$PYTHONUSERBASE/bin" >> "$GITHUB_PATH"
+            export PATH="$PYTHONUSERBASE/bin:$PATH"
           fi
           test "$(semgrep --version)" = 1.169.0
       - name: gitleaks (full history scan)

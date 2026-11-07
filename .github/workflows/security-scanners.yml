@@ -1,4 +1,4 @@
-# sync-sha: b8e256d44c78769b72f866e05f6c317cac1c06317425593b9e76b600fa12343a
+# sync-sha: 671488bb26f5c3a433165cba06ff3719e9937d9212ee2d7aecc6a913ec67d00a
 name: Security scanners
 
 # Static/security scanners gate (flawfinder, clang-tidy cert-*/security.*,
@@ -63,9 +63,11 @@ jobs:
           if command -v pipx >/dev/null; then
             pipx install --quiet 'semgrep==1.169.0'
             echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
+            export PATH="$PIPX_BIN_DIR:$PATH"
           else
             pip3 install --quiet --user --break-system-packages 'semgrep==1.169.0'
             echo "$PYTHONUSERBASE/bin" >> "$GITHUB_PATH"
+            export PATH="$PYTHONUSERBASE/bin:$PATH"
           fi
           test "$(semgrep --version)" = 1.169.0
       - name: Static-analysis negative controls
