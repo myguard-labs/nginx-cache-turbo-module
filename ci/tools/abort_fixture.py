@@ -865,11 +865,13 @@ class Http1Client:
     """One raw HTTP/1.1 request on its own connection, aborted or read to the
     end. GET by default; a POST (the admin purges) carries an empty body."""
 
-    def __init__(self, port: int, path: str, method: str = "GET") -> None:
+    def __init__(self, port: int, path: str, method: str = "GET",
+                 headers: dict[str, str] | None = None) -> None:
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
         length = "Content-Length: 0\r\n" if method != "GET" else ""
+        extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
         self.sock.sendall(f"{method} {path} HTTP/1.1\r\nHost: abort-fixture\r\n"
-                          f"{length}Connection: close\r\n\r\n".encode())
+                          f"{length}{extra}Connection: close\r\n\r\n".encode())
 
     def abort_rst(self) -> None:
         """SO_LINGER with a zero timeout: close() sends an RST at once."""
