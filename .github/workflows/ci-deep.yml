@@ -1,4 +1,4 @@
-# sync-sha: bae4de620f8b948afa275d1777fdd1fe47c246150d26fc49bfb49947d9c70c8f
+# sync-sha: 7d4dfc1b2b293df0882f7d5236d01e91cc530310c33f49f3ff537f7597f13493
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -196,39 +196,26 @@ jobs:
       - name: Build fuzz targets
         run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
 
-      - name: Fuzz each target
+      - name: Fuzz targets concurrently
         run: |
           set -euo pipefail
           cd ci/fuzz
-          # target:corpus:dict — each target gets the full per-target budget.
-          targets="fuzz_resp_parser:corpus:fuzz.dict \
-                   fuzz_norm_args:corpus_norm_args: \
-                   fuzz_mc_parser:corpus_mc:fuzz_mc.dict \
-                   fuzz_auto_classify:corpus_auto: \
-                   fuzz_blob:corpus_blob:"
-          for t in $targets; do
-            bin="${t%%:*}"; rest="${t#*:}"; corp="${rest%%:*}"; dict="${rest#*:}"
-            echo "=== $bin over $corp (${FUZZ_SECS}s)${dict:+ dict=$dict} ==="
-            args="-max_total_time=$FUZZ_SECS -print_final_stats=1 -artifact_prefix=crash-${bin}-"
-            [ -n "$dict" ] && args="$args -dict=$dict"
-            set +e
-            # shellcheck disable=SC2086
-            "./$bin" $args "$corp/"
-            rc=$?
-            set -e
-            [ $rc -eq 0 ] || { echo "❌ $bin crash (exit $rc)"; exit 1; }
-            echo "✓ $bin: no crashes in ${FUZZ_SECS}s"
-            mkdir -p "${corp}-min"
-            "./$bin" -merge=1 "${corp}-min/" "$corp/"
-            echo "merged $corp: $(find "${corp}-min" -type f | wc -l) units"
-          done
+          # Each target gets the full per-target FUZZ_SECS budget in its own
+          # libFuzzer process, at most FUZZ_JOBS (default 3) at once so every
+          # target keeps a core on a 4-vCPU runner; the rest queue. The runner
+          # waits on all of them and fails on a non-zero exit or any crash-/
+          # leak-/timeout-/oom- artifact (written as ci/fuzz/crash-<bin>-*,
+          # which the upload step below globs). Logs: ci/fuzz/fuzz-logs/.
+          bash run-concurrent.sh
 
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-deep-crashes
-          path: ${{ github.workspace }}/ci/fuzz/crash-*
+          path: |
+            ${{ github.workspace }}/ci/fuzz/crash-*
+            ${{ github.workspace }}/ci/fuzz/fuzz-logs/
           retention-days: 30
 
       - name: Upload minimized corpus
