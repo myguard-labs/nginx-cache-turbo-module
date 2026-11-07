@@ -424,6 +424,21 @@ static const char *const  ct_xf_key_cookies[] = {
  * config/routes.rb); the singular `/draft` shipped earlier matched only via the
  * old boundary-less prefix test and stops matching `/drafts.json` under the
  * segment-boundary matcher, so it is corrected to the real name here.
+ *
+ * HEADER TIER. Three request headers authenticate a client with no cookie and
+ * no query arg, on ANY route (DefaultCurrentUserProvider#current_user, checked
+ * against v2026.10.0): `Api-Key` (HEADER_API_KEY, :30, read at :126; the admin
+ * API key, with Api-Username naming the acting user), `User-Api-Key`
+ * (USER_API_KEY, :35, read at :125; the per-user key the mobile apps and
+ * DiscourseHub send) and `X-Shared-Session-Key` (:111-121; the message-bus
+ * shared-session key, which resolves a user from Redis before any other
+ * check). A GET /latest.json with one of them returns that user's private
+ * view under the same URL a guest uses, so the cookie and arg rows above see
+ * nothing. Discourse's own anon cache refuses the first two for the same
+ * reason (lib/middleware/anonymous_cache.rb no_cache_bypass, :237-243). A
+ * browser never sends any of them on a page navigation, so a presence bypass
+ * costs no guest hit. Api-Username / Api-User-Id are not listed: they select
+ * the acting user only together with Api-Key.
  */
 static const char *const  ct_discourse_cookies[] = { "_t=", NULL };
 static const char *const  ct_discourse_uris[] = {
@@ -432,6 +447,8 @@ static const char *const  ct_discourse_uris[] = {
     "/user_actions", NULL };
 static const char *const  ct_discourse_args[] = {
     "api_key", "api_username", "user_api_key", NULL };
+static const char *const  ct_discourse_headers[] = {
+    "Api-Key", "User-Api-Key", "X-Shared-Session-Key", NULL };
 
 /*
  * phpBB 3.x. NO COOKIE RULE — and that is deliberate, not an omission.
@@ -820,6 +837,17 @@ static const char *const  ct_magento_key_cookies[] = { "X-Magento-Vary", NULL };
  * ghost-admin-toolbar (frontend/web/middleware/admin-toolbar.js:5) is the only
  * staff signal on site pages: the admin session cookie is path-scoped to /ghost,
  * and Ghost itself marks toolbar responses private (frontend-caching.js:54).
+ *
+ * HEADER TIER: `X-Ghost-Preview`. Not an identity, but the same leak shape:
+ * theme-engine/preview.js (:5, :64-69) renders ANY site page with the accent
+ * colour, icon, logo, cover, description, fonts and custom theme settings
+ * carried in this header, with no authentication check. The admin design and
+ * announcement previews send it; so can anyone. Stored under the page URL, an
+ * unsaved draft design (or an attacker-chosen one) would be served to every
+ * guest. Ghost marks those responses no-cache (frontend-caching.js:50-52),
+ * but that floor is gone under `cache_turbo_cache_control ignore`, so the
+ * preset bypasses on presence. Browsers never send it on a navigation. Checked
+ * against v6.75.0.
  */
 static const char *const  ct_ghost_cookies[] = {
     "ghost-members-ssr", "ghost-admin-api-session", "ghost-admin-toolbar",
@@ -828,6 +856,7 @@ static const char *const  ct_ghost_uris[] = {
     "/ghost/", "/members/", "/p/", "/r/", NULL };
 static const char *const  ct_ghost_args[] = {
     "uuid", "key", "token", "gift", NULL };
+static const char *const  ct_ghost_headers[] = { "X-Ghost-Preview", NULL };
 
 /*
  * Wagtail (Django CMS). The first preset for an app whose auth cookie belongs to
@@ -953,6 +982,16 @@ static const char *const  ct_kirby_args[] = { NULL };
  * defence-in-depth (Shopware sends no-store on them anyway). /admin is the API +
  * Administration SPA. /store-api is the headless JSON API: it is context-sensitive
  * per sw-context-token and must never be shared.
+ *
+ * NO HEADER ROW, by decision (checked against v6.7.16.0). `sw-access-key` is
+ * not a client identity: it names the SALES CHANNEL, ships inside every
+ * headless frontend, and is read only for Store API routes
+ * (SalesChannelAuthenticationListener.php:67-71, StoreApiRouteScope) and the
+ * MCP endpoint, all under /store-api or /api, which the URI rows already
+ * bypass. The per-client header is `sw-context-token`, and on Storefront
+ * routes Shopware overwrites any client-sent value with the session's token
+ * (SessionContextTokenAccessor.php:85), so it cannot select a private
+ * Storefront page either.
  *
  * The one EQ predicate: sw-cache-hash == "not-cacheable" (Event/
  * HttpCacheCookieEvent.php:20-25, HttpCacheKeyGenerator.php:158; set for pending
@@ -1910,7 +1949,7 @@ const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
       ct_xf_cookies, ct_xf_uris, ct_xf_args, NULL, ct_xf_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_DISCOURSE,
       ct_discourse_cookies, ct_discourse_uris, ct_discourse_args,
-      NULL, NULL, NULL },
+      NULL, NULL, ct_discourse_headers },
     { NGX_HTTP_CACHE_TURBO_BACKEND_PHPBB,
       ct_phpbb_cookies, ct_phpbb_uris, ct_phpbb_args,
       ct_phpbb_preds, NULL, NULL },
@@ -1922,7 +1961,8 @@ const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
       ct_magento_cookies, ct_magento_uris, ct_magento_args, NULL,
       ct_magento_key_cookies, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_GHOST,
-      ct_ghost_cookies, ct_ghost_uris, ct_ghost_args, NULL, NULL, NULL },
+      ct_ghost_cookies, ct_ghost_uris, ct_ghost_args, NULL, NULL,
+      ct_ghost_headers },
     { NGX_HTTP_CACHE_TURBO_BACKEND_WAGTAIL,
       ct_wagtail_cookies, ct_wagtail_uris, ct_wagtail_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_KIRBY,

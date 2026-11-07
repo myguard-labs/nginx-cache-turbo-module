@@ -363,3 +363,118 @@ Cookie: _t=abc123deadbeef
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200]
+
+
+
+=== TEST 14: Api-Key header -- never stored, never served from the guest entry
+# HEADER TIER (ct_discourse_headers[]). Api-Key authenticates on any route
+# (default_current_user_provider.rb:30,126), so /latest.json with it is that
+# user's private view at the guest URL. Path A: two header requests first,
+# then guests -- the first guest is a MISS, so the header requests stored
+# nothing. Path B: guests warm the entry, then a header request must NOT be
+# served the guest copy. Row removed: the header requests MISS/HIT like a
+# guest and requests 2, 3 and 7 go red.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /disc/apikey-a.json", "GET /disc/apikey-a.json",
+ "GET /disc/apikey-a.json", "GET /disc/apikey-a.json",
+ "GET /disc/apikey-b.json", "GET /disc/apikey-b.json",
+ "GET /disc/apikey-b.json"]
+--- more_headers eval
+["Api-Key: fixture\nApi-Username: system", "Api-Key: fixture\nApi-Username: system",
+ "", "",
+ "", "",
+ "Api-Key: fixture\nApi-Username: system"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200, 200, 200, 200]
+
+
+
+=== TEST 15: User-Api-Key header -- never stored, never served from the guest entry
+# Per-user key sent by the mobile apps / DiscourseHub
+# (default_current_user_provider.rb:35,125). Same two-path shape as TEST 14.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /disc/userkey-a.json", "GET /disc/userkey-a.json",
+ "GET /disc/userkey-a.json", "GET /disc/userkey-a.json",
+ "GET /disc/userkey-b.json", "GET /disc/userkey-b.json",
+ "GET /disc/userkey-b.json"]
+--- more_headers eval
+["User-Api-Key: fixture", "User-Api-Key: fixture",
+ "", "",
+ "", "",
+ "User-Api-Key: fixture"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200, 200, 200, 200]
+
+
+
+=== TEST 16: X-Shared-Session-Key header -- never stored, never served from the guest entry
+# current_user resolves a user from this header before any cookie check
+# (default_current_user_provider.rb:111-121). Lower-case on the wire to pin
+# the case-insensitive name compare.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /disc/shared-a.json", "GET /disc/shared-a.json",
+ "GET /disc/shared-a.json", "GET /disc/shared-a.json",
+ "GET /disc/shared-b.json", "GET /disc/shared-b.json",
+ "GET /disc/shared-b.json"]
+--- more_headers eval
+["x-shared-session-key: fixture", "x-shared-session-key: fixture",
+ "", "",
+ "", "",
+ "x-shared-session-key: fixture"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200, 200, 200, 200]
+
+
+
+=== TEST 17: NEGATIVE -- near-miss header names (Api-Keys, Api-Username alone) still HIT
+# Header rows match the whole NAME. Api-Username without Api-Key selects no
+# user in Discourse, so it is deliberately not a row.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /disc/near-a.json", "GET /disc/near-a.json",
+ "GET /disc/near-b.json", "GET /disc/near-b.json"]
+--- more_headers eval
+["Api-Keys: fixture", "Api-Keys: fixture",
+ "Api-Username: system", "Api-Username: system"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
+=== TEST 18: the Api-Key header under /gen/ (wordpress backend) still HITs
+# Isolation control: the discourse header rows are opt-in per location.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- more_headers
+Api-Key: fixture
+--- request eval
+["GET /gen/apikey-iso", "GET /gen/apikey-iso"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]

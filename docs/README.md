@@ -22,13 +22,13 @@ One page per `cache_turbo_backend` preset:
 | `woocommerce` | [woocommerce.md](woocommerce.md) | ✅ yes — **implies `wordpress`** (naming it alone is safe) — plus `?wc-ajax=`, a cart fragment on *any* page URL |
 | `joomla` | [joomla.md](joomla.md) | ⚠️ **partial** (`joomla_remember_me_`) — a non-remember-me login is INVISIBLE (md5 session cookie); you must still add a `cache_turbo_bypass` **+ `cache_turbo_no_store`** |
 | `xenforo` | [xenforo.md](xenforo.md) | ⚠️ yes (`xf_session` + `xf_user` + `xf_session_admin`) — **stock XF has NO login-only cookie**; `xf_session` is guest-issued, so safety costs hit rate. Also bypasses `/api/` (REST, `XF-Api-Key` header) + `_xfToken`, and **value-keys** `xf_style_id`/`xf_style_variation`/`xf_language_id` |
-| `discourse` | [discourse.md](discourse.md) | ✅ yes (`_t`) — and the origin sends `no-store` anyway |
+| `discourse` | [discourse.md](discourse.md) | ✅ yes (`_t`) — and the origin sends `no-store` anyway — **plus `Api-Key`, `User-Api-Key` and `X-Shared-Session-Key` request headers, which authenticate a request with no cookie** |
 | `phpbb` | [phpbb.md](phpbb.md) | ✅ yes (`*_u != 1`, matched by cookie-name suffix) — the value predicate is built into the preset |
 | `drupal` | [drupal.md](drupal.md) | ✅ yes (`SESS`) — anon users DO get sessions, so the cookie rule is required; it over-matches `PHPSESSID` by design |
 | `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*Token`, `*_session`) — **no URI rules: `/index.php` is the article path on a stock wiki** |
 | `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`, value-keyed) — and the origin sends `no-store` on cart/checkout |
 | `shopware6` | [shopware6.md](shopware6.md) | ✅ yes (`sw-cache-hash`, value-keyed; `not-cacheable` bypasses) — same engine as `magento` |
-| `ghost` | [ghost.md](ghost.md) | ✅ yes (`ghost-members-ssr`) — **plus `?uuid=`/`?key=`/`?gift=`, which auth a member or unlock paid content with no cookie** |
+| `ghost` | [ghost.md](ghost.md) | ✅ yes (`ghost-members-ssr`) — **plus `?uuid=`/`?key=`/`?gift=`, which auth a member or unlock paid content with no cookie**, and the `X-Ghost-Preview` request header (an unauthenticated design override) bypasses |
 | `wagtail` | [wagtail.md](wagtail.md) | ⚠️ yes (`sessionid`) — **but only while nothing writes the session for guests**; fails safe |
 | `kirby` | [kirby.md](kirby.md) | ⚠️ yes (`kirby_session`) — **but a `csrf()` form page cookies guests**; fails safe |
 | `typo3` | [typo3.md](typo3.md) | ⚠️ yes (`fe_typo_user`, `be_typo_user`, plus the `ADMCMD_prev` workspace-preview cookie and argument) — **but the cookie names are admin-overridable via `FE/cookieName` and `BE/cookieName`**; fails **UNSAFE** |
