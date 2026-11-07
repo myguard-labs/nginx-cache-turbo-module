@@ -363,12 +363,6 @@ def _fault_alloc_l2_nginx(ng: Nginx, redis_port: int | None) -> Nginx:
         location /fa-sie/ {{
             cache_turbo          fa;
             cache_turbo_key      $arg_k;
-            # Even an unfailed stale-if-error serve leaves the miss lock held
-            # until lock_timeout (default 5s; measured 4.5s on the second
-            # request), which would stall every follow-up. A short timeout
-            # keeps the per-N follow-up budget meaningful. Reported as a
-            # finding (CT-SIE-LOCK-HELD), not asserted here.
-            cache_turbo_lock_timeout 300ms;
             cache_turbo_valid    1s;
             cache_turbo_stale_mult 1;
             cache_turbo_keep_stale off;
