@@ -96,3 +96,4 @@ ci/linter/*	none	bash ci/linter/selftest.sh
 ci/tests/unit/test_vary_gen.c	none	ut vary_gen -
 ci/tests/unit/test_vary_encoding_collapse.c	none	ut vary_encoding_collapse -
 ci/tests/unit/test_vary_marker_fastpath.c	none	ut vary_marker_fastpath -
+ci/tools/ci-gate-verdict.py|ci/tests/test_ci_gate_verdict.py|.github/workflows/ci.yml	none	python3 ci/tests/test_ci_gate_verdict.py

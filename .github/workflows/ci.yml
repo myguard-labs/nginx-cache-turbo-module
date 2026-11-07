@@ -1,4 +1,4 @@
-# sync-sha: b6ff2d35e870d36ca834ae5e81521f9675c02e371d71682ff6f9ead980eb4013
+# sync-sha: 66a937f4ba8ca95709b356528f43161b60c2237ff6c25efbdf8694228075a326
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
@@ -274,3 +274,34 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/lint.yml  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
+
+  # --- result gate -----------------------------------------------------------
+  # One stable check ("CI / gate") summarising every lane above, so branch
+  # protection can require a single name and lanes can be added, merged or
+  # renamed without touching it. `always()` makes it run even when a needed job
+  # failed or was cancelled; without it a failed lane would leave the gate
+  # skipped, which GitHub reports as passing for a required check.
+  #
+  # Verdict: any needed job failure/cancelled -> red; success or skipped ->
+  # green (change detection legitimately skips asan/fuzzing/testkit). A job
+  # skipped because its own upstream failed cannot hide: every lane's only
+  # upstream is `changes`, which is in `needs` and must be exactly `success`.
+  # An empty or malformed needs blob also fails (ci/tools/ci-gate-verdict.py).
+  # Keep `needs` equal to every other job; ci/tests/test_ci_gate_verdict.py
+  # asserts it.
+  gate:
+    name: gate
+    needs: [changes, asan, build-test, fuzzing, security-scanners, testkit, lint]
+    if: ${{ always() }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Evaluate lane results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: printf '%s' "$NEEDS" | python3 ci/tools/ci-gate-verdict.py
