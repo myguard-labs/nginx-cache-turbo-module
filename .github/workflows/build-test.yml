@@ -1,4 +1,4 @@
-# sync-sha: 62f56e33925af686d134a9347aefc868bd1cc3c2d2b3e3d1979d145d88d5acff
+# sync-sha: c0389c5ac52660886591c6d11a2086eedec861f92c879b0b9ea6c04f937de9f8
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -49,6 +49,7 @@ jobs:
             echo "PYTHONUSERBASE=$base/pyuser"
             echo "PIP_CACHE_DIR=$base/pip"
             echo "PIPX_HOME=$base/pipx"
+            echo "PIPX_MAN_DIR=$base/pipx-man"
             echo "PIPX_BIN_DIR=$base/pipx-bin"
           } >> "$GITHUB_ENV"
 

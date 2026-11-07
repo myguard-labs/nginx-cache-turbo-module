@@ -1,4 +1,4 @@
-# sync-sha: bd22d004870233b73cc2cdfffc034f3c893632b3957183d3ff300e0cb1fb542d
+# sync-sha: b8e256d44c78769b72f866e05f6c317cac1c06317425593b9e76b600fa12343a
 name: Security scanners
 
 # Static/security scanners gate (flawfinder, clang-tidy cert-*/security.*,
@@ -48,6 +48,7 @@ jobs:
             echo "PYTHONUSERBASE=$base/pyuser"
             echo "PIP_CACHE_DIR=$base/pip"
             echo "PIPX_HOME=$base/pipx"
+            echo "PIPX_MAN_DIR=$base/pipx-man"
             echo "PIPX_BIN_DIR=$base/pipx-bin"
           } >> "$GITHUB_ENV"
 

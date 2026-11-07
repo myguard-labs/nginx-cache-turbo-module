@@ -1,4 +1,4 @@
-# sync-sha: 8974b03af326624cb8d1f495369e50068086ec86bc2ca3e8fbd062a84c6568cc
+# sync-sha: 6014418f499b66bac99a6a684b0809518fa014c605a174b462c4f783e400ebda
 name: Build cache
 description: >-
   Restore the ccache + upstream-tarball caches for one build. Hybrid by design:
@@ -48,6 +48,7 @@ runs:
           echo "PYTHONUSERBASE=$base/pyuser"
           echo "PIP_CACHE_DIR=$base/pip"
           echo "PIPX_HOME=$base/pipx"
+          echo "PIPX_MAN_DIR=$base/pipx-man"
           echo "PIPX_BIN_DIR=$base/pipx-bin"
         } >> "$GITHUB_ENV"
         if [ "$CT_CCACHE_ON" != "true" ]; then

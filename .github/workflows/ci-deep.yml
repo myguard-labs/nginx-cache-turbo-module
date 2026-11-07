@@ -1,4 +1,4 @@
-# sync-sha: d1d7e15e6b7aba6b72e63b7db1d8e0158fc5b85256a513b8002c49cf36214c34
+# sync-sha: c1f5125012204cfbd8312e358467cbedafd718f69010bd7e24f2933f7e66c03b
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -1010,6 +1010,7 @@ jobs:
             echo "PYTHONUSERBASE=$base/pyuser"
             echo "PIP_CACHE_DIR=$base/pip"
             echo "PIPX_HOME=$base/pipx"
+            echo "PIPX_MAN_DIR=$base/pipx-man"
             echo "PIPX_BIN_DIR=$base/pipx-bin"
           } >> "$GITHUB_ENV"
 
