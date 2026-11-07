@@ -1,4 +1,4 @@
-# sync-sha: f7d515991c2b3e65b6162ef437abc023ae6e98120f0fcee10765b0e35b94a33f
+# sync-sha: 606d9183f68cc5ffbee39454f7494155917cb174c167782466cec899c8aa4426
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -18,8 +18,8 @@ name: ASan and UBSan
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v5         -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
-# actions/upload-artifact@v5  -> 330a01c490aca151604b8cf639adc76d48f6c5d4
-# actions/download-artifact@v5-> 634f93cb2916e3fdff6788551b99b062d0335ce0
+# actions/upload-artifact@v7.0.2 -> cf430e030ddbb5b0abf93d22962f4752f3646cd9
+# actions/download-artifact@v8.0.2 -> 9000827ccba6bdab643e8b6fd33ac0654aef8333
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -71,7 +71,7 @@ jobs:
           cp ".build/nginx-${NGINX_VERSION}/objs/nginx" artifact/
 
       - name: Upload ASan nginx binary
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nginx-asan
           path: artifact/
@@ -96,7 +96,7 @@ jobs:
           persist-credentials: false
 
       - name: Download ASan nginx binary
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nginx-asan
           path: nginx-bin
@@ -206,7 +206,7 @@ jobs:
 
       - name: Upload hang-capture artifacts
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: asan-hang-capture
           path: ci-hang-artifacts/
@@ -232,7 +232,7 @@ jobs:
           persist-credentials: false
 
       - name: Download ASan nginx binary
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nginx-asan
           path: nginx-bin
@@ -341,7 +341,7 @@ jobs:
 
       - name: Upload hang-capture artifacts (multi-worker)
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: asan-hang-capture-multiworker
           path: ci-hang-artifacts/

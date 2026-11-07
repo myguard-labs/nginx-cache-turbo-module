@@ -1,4 +1,4 @@
-# sync-sha: c0389c5ac52660886591c6d11a2086eedec861f92c879b0b9ea6c04f937de9f8
+# sync-sha: e947fc6b5fca7217f7df0b81bdb4b679e56987a7c676a331461bd4677271a894
 name: Build & Test
 
 # Runner labels live in the POOL repository variable. Every checked-in selector
@@ -373,7 +373,7 @@ jobs:
           cp ".build/nginx-${NGINX_VERSION}/objs/ngx_http_cache_turbo_module.so" artifact/
 
       - name: Upload nginx artifact
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nginx-mainline
           path: artifact/
@@ -422,7 +422,7 @@ jobs:
 
       - name: Download nginx artifact
         if: ${{ !inputs.skip-expensive-jobs }}
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nginx-mainline
           path: nginx-bin
@@ -506,7 +506,7 @@ jobs:
       # which is how earlier wedges produced no evidence. Mirrors asan.yml.
       - name: Upload hang-capture artifacts
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: runtime-hang-capture
           path: ci-hang-artifacts/
@@ -548,7 +548,7 @@ jobs:
 
       - name: Download nginx artifact
         if: ${{ !inputs.skip-expensive-jobs }}
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nginx-mainline
           path: nginx-bin

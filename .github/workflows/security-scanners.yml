@@ -1,4 +1,4 @@
-# sync-sha: 671488bb26f5c3a433165cba06ff3719e9937d9212ee2d7aecc6a913ec67d00a
+# sync-sha: 609d7185f23a74e7bfd5b494d54f976a8584787a52deb8f6d53c13f7f484b63b
 name: Security scanners
 
 # Static/security scanners gate (flawfinder, clang-tidy cert-*/security.*,
@@ -6,7 +6,7 @@ name: Security scanners
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
-# actions/upload-artifact@v5 -> 330a01c490aca151604b8cf639adc76d48f6c5d4
+# actions/upload-artifact@v7.0.2 -> cf430e030ddbb5b0abf93d22962f4752f3646cd9
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -171,7 +171,7 @@ jobs:
           ci/linter/run-semgrep.sh "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log
       - name: Upload reports
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-reports
           path: |

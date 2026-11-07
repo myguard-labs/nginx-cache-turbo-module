@@ -212,6 +212,19 @@ case "$MODE" in
         ;;
 esac
 
+# Legacy (pre-1.23) nginx core is built with -Werror and predates newer gcc
+# diagnostics: 1.22.1's ngx_http_v2_filter_module.c trips
+# -Wunterminated-string-initialization on gcc 15 (a core-source warning, not
+# module code). Demote ONLY that one diagnostic to a warning, ONLY for the pinned
+# legacy version, and ONLY when the compiler knows the option (probed; an older
+# compiler neither emits the warning nor needs the flag). Everything else,
+# including every module diagnostic, stays -Werror.
+if [ -n "${LEGACY_NGINX_VERSION:-}" ] && [ "$VERSION" = "$LEGACY_NGINX_VERSION" ] \
+   && echo 'int ct_probe;' | $CC -Werror -Wno-error=unterminated-string-initialization \
+        -x c -fsyntax-only - >/dev/null 2>&1; then
+    CC_OPT="$CC_OPT -Wno-error=unterminated-string-initialization"
+fi
+
 # mold: faster linker, auto-detected on PATH. Appended (never clobbering) so the
 # asan/coverage LD_OPT flags set in the case above are preserved. -fuse-ld=mold
 # is understood by both gcc and clang.

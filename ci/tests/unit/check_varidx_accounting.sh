@@ -44,7 +44,7 @@ fi
 
 INCS="-I$NGINX_SRC/core -I$NGINX_SRC/event -I$NGINX_SRC/event/modules \
       -I$NGINX_SRC/event/quic -I$NGINX_SRC/os/unix -I$NGINX_OBJS \
-      -I$NGINX_SRC/http -I$NGINX_SRC/http/modules"
+      -I$NGINX_SRC/http -I$NGINX_SRC/http/modules -I$NGINX_SRC/http/v2"
 
 check_site() {
     local src="$1" field="$2" label="$3"

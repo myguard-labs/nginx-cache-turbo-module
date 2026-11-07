@@ -1,4 +1,4 @@
-# sync-sha: fefd7efd44226db582dc64714ef5d9edf28e62271399bab875a161b82ea9a74f
+# sync-sha: d7d38b3fa690cb66389fb2a35664865e46f723e5039125da82de53962d37a06a
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -31,7 +31,7 @@ name: CI Deep
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
-# actions/upload-artifact@v5 -> 330a01c490aca151604b8cf639adc76d48f6c5d4
+# actions/upload-artifact@v7.0.2 -> cf430e030ddbb5b0abf93d22962f4752f3646cd9
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -225,7 +225,7 @@ jobs:
 
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-deep-crashes
           path: ${{ github.workspace }}/ci/fuzz/crash-*
@@ -233,7 +233,7 @@ jobs:
 
       - name: Upload minimized corpus
         if: success()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-corpus
           path: ${{ github.workspace }}/ci/fuzz/*-min
@@ -1098,7 +1098,7 @@ jobs:
           ci/linter/run-semgrep.sh "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log
       - name: Upload reports
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-reports
           path: |
@@ -1239,7 +1239,7 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-report
           path: ${{ github.workspace }}/coverage-report
