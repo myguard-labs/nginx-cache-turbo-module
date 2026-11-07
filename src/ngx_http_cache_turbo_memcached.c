@@ -720,28 +720,28 @@ ngx_http_cache_turbo_memcached_set(ngx_http_request_t *r,
 
 /* Fire-and-forget a "delete <key>\r\n" for an already-built raw key. The key
  * bytes are copied into the op pool, so they need only be valid for this call. */
-static void
-ngx_http_cache_turbo_memcached_del_raw(ngx_http_cache_turbo_loc_conf_t *clcf,
-    u_char *key, size_t key_len)
+static ngx_int_t
+ngx_http_cache_turbo_memcached_del_raw_rc(
+    ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key, size_t key_len)
 {
     ngx_buf_t                     *b;
     ngx_http_cache_turbo_mc_op_t  *op;
     u_char                        *p;
 
     if (!clcf->redis_enable) {
-        return;
+        return NGX_OK;
     }
 
     op = ngx_http_cache_turbo_mc_op_create(clcf);
     if (op == NULL) {
-        return;
+        return NGX_ERROR;
     }
 
     b = ngx_create_temp_buf(op->pool,
                             sizeof("delete ") - 1 + key_len + 2);
     if (b == NULL) {
         ngx_destroy_pool(op->pool);
-        return;
+        return NGX_ERROR;
     }
     p = ngx_cpymem(b->last, "delete ", sizeof("delete ") - 1);
     p = ngx_cpymem(p, key, key_len);
@@ -753,37 +753,54 @@ ngx_http_cache_turbo_memcached_del_raw(ngx_http_cache_turbo_loc_conf_t *clcf,
             ngx_http_cache_turbo_mc_read_drain) != NGX_OK)
     {
         ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
     }
+
+    return NGX_OK;
 }
 
 
 static void
+ngx_http_cache_turbo_memcached_del_raw(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key, size_t key_len)
+{
+    (void) ngx_http_cache_turbo_memcached_del_raw_rc(clcf, key, key_len);
+}
+
+
+static ngx_int_t
 ngx_http_cache_turbo_memcached_del(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash)
 {
     ngx_pool_t  *tmp;
     u_char      *keybuf;
     size_t       keylen;
+    ngx_int_t    rc;
 
     if (!clcf->redis_enable) {
-        return;
+        return NGX_OK;
     }
+
+    rc = NGX_OK;
 
     /* Build the hex L2 key in a short-lived pool; del_raw copies it before this
      * returns, so the pool can be torn down immediately afterwards. */
     tmp = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
     if (tmp == NULL) {
-        return;
+        return NGX_ERROR;
     }
 
     keybuf = ngx_pnalloc(tmp, clcf->redis_prefix.len + 64);
     if (keybuf != NULL) {
         keylen = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix, key_hash,
                                                 keybuf);
-        ngx_http_cache_turbo_memcached_del_raw(clcf, keybuf, keylen);
+        rc = ngx_http_cache_turbo_memcached_del_raw_rc(clcf, keybuf, keylen);
+    } else {
+        rc = NGX_ERROR;
     }
 
     ngx_destroy_pool(tmp);
+    return rc;
 }
 
 

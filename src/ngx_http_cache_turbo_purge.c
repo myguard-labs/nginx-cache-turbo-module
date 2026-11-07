@@ -126,7 +126,10 @@ ngx_http_cache_turbo_purge_auto_vary(ngx_http_request_t *r,
          * miss through to origin, not misresolve). Fire-and-forget, same as
          * every other write-through/delete on this path. */
         if (clcf->backend->del) {
-            clcf->backend->del(clcf, keys->marker);
+            /* The result is deliberately ignored: the marker is an
+             * optimisation (a stale L2 marker can only miss through to
+             * origin), so a dropped marker DEL must not fail the PURGE. */
+            (void) clcf->backend->del(clcf, keys->marker);
         }
 
         tp = ngx_pcalloc(r->pool, sizeof(*tp));
@@ -348,7 +351,21 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
 
     /* Drop from L2 too, so a purge can't be silently refilled from Redis. */
     if (clcf->backend) {
-        clcf->backend->del(clcf, ctx->key_hash);
+        if (clcf->backend->del(clcf, ctx->key_hash) != NGX_OK) {
+            ngx_str_t  errbody;
+
+            /* The object/lock DEL was dropped before the wire (backoff
+             * window, failed connect, alloc failure): L1 is purged but the
+             * L2 copy may still refill it, so do not report success. */
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "cache_turbo: PURGE could not send the L2 delete");
+            ngx_str_set(&errbody,
+                        "{\"error\":\"l2 delete not sent\"}\n");
+            drc = ngx_http_cache_turbo_send_json(r,
+                      NGX_HTTP_SERVICE_UNAVAILABLE, &errbody);
+            ngx_http_finalize_request(r, drc);
+            return NGX_DONE;
+        }
     }
 
     /* COR-5: a PURGE of the base URI must also invalidate every auto-Vary

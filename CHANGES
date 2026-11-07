@@ -1,5 +1,14 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Change: a single-URI PURGE now answers 503 with
+       {"error":"l2 delete not sent"} when its L2 delete of the cached object
+       or its stampede lock was dropped before it reached Redis or memcached
+       (L2 in its connect-backoff window, a failed connect, or an allocation
+       failure). It used to answer 200 while the L2 copy stayed behind and
+       refilled the purged entry. L1 is still purged, so the PURGE can be
+       retried once L2 is reachable. This means a single-URI PURGE answers
+       503 while L2 is down and backed off.
+
     *) Feature: cache_turbo_backend gains the presets "servarr" (aliases
        "sonarr", "radarr", "lidarr"), "calibre" and "calibreweb" (alias
        "calibre-web"). servarr bypasses the <InstanceName>Auth and

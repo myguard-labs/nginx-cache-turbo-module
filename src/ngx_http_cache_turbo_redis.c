@@ -1422,7 +1422,7 @@ ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
 /* Fire-and-forget a single RESP command (drains the reply, ignores it). The
  * argv bytes are copied into the op pool by encode, so they need only be valid
  * for the duration of this call. */
-static void
+static ngx_int_t
 ngx_http_cache_turbo_redis_fire_argv(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_str_t *argv, ngx_uint_t argc)
 {
@@ -1430,7 +1430,7 @@ ngx_http_cache_turbo_redis_fire_argv(ngx_http_cache_turbo_loc_conf_t *clcf,
 
     op = ngx_http_cache_turbo_redis_op_create(clcf);
     if (op == NULL) {
-        return;
+        return NGX_ERROR;
     }
 
     op->expected_replies = 1;              /* one command -> one RESP reply */
@@ -1438,25 +1438,28 @@ ngx_http_cache_turbo_redis_fire_argv(ngx_http_cache_turbo_loc_conf_t *clcf,
     op->send = ngx_http_cache_turbo_redis_encode(op->pool, argv, argc);
     if (op->send == NULL) {
         ngx_destroy_pool(op->pool);
-        return;
+        return NGX_ERROR;
     }
 
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
     {
         ngx_destroy_pool(op->pool);
+        return NGX_ERROR;
     }
+
+    return NGX_OK;
 }
 
 
-void
-ngx_http_cache_turbo_redis_del_raw(ngx_http_cache_turbo_loc_conf_t *clcf,
+static ngx_int_t
+ngx_http_cache_turbo_redis_del_raw_rc(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key, size_t key_len)
 {
     ngx_str_t  argv[2];
 
     if (!clcf->redis_enable) {
-        return;
+        return NGX_OK;
     }
 
     argv[0].data = (u_char *) "DEL";
@@ -1464,34 +1467,51 @@ ngx_http_cache_turbo_redis_del_raw(ngx_http_cache_turbo_loc_conf_t *clcf,
     argv[1].data = key;
     argv[1].len = key_len;
 
-    ngx_http_cache_turbo_redis_fire_argv(clcf, argv, 2);
+    return ngx_http_cache_turbo_redis_fire_argv(clcf, argv, 2);
 }
 
 
 void
+ngx_http_cache_turbo_redis_del_raw(ngx_http_cache_turbo_loc_conf_t *clcf,
+    u_char *key, size_t key_len)
+{
+    (void) ngx_http_cache_turbo_redis_del_raw_rc(clcf, key, key_len);
+}
+
+
+ngx_int_t
 ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash)
 {
     ngx_pool_t  *tmp;
     u_char      *keybuf, *lockbuf;
     size_t       keylen;
+    ngx_int_t    rc;
 
     if (!clcf->redis_enable) {
-        return;
+        return NGX_OK;
     }
+
+    rc = NGX_OK;
 
     /* Build the hex L2 key in a short-lived pool; del_raw copies it before this
      * returns, so the pool can be torn down immediately afterwards. */
     tmp = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
     if (tmp == NULL) {
-        return;
+        return NGX_ERROR;
     }
 
     keybuf = ngx_pnalloc(tmp, clcf->redis_prefix.len + 64);
     if (keybuf != NULL) {
         keylen = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix, key_hash,
                                                 keybuf);
-        ngx_http_cache_turbo_redis_del_raw(clcf, keybuf, keylen);
+        if (ngx_http_cache_turbo_redis_del_raw_rc(clcf, keybuf, keylen)
+            != NGX_OK)
+        {
+            rc = NGX_ERROR;
+        }
+    } else {
+        rc = NGX_ERROR;
     }
 
     /* Also drop the cross-node single-flight lock (v4-2 SET NX PX). It is held
@@ -1505,10 +1525,17 @@ ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
         size_t  locklen;
         locklen = ngx_http_cache_turbo_redis_lockkey(&clcf->redis_prefix,
                                                      key_hash, lockbuf);
-        ngx_http_cache_turbo_redis_del_raw(clcf, lockbuf, locklen);
+        if (ngx_http_cache_turbo_redis_del_raw_rc(clcf, lockbuf, locklen)
+            != NGX_OK)
+        {
+            rc = NGX_ERROR;
+        }
+    } else {
+        rc = NGX_ERROR;
     }
 
     ngx_destroy_pool(tmp);
+    return rc;
 }
 
 

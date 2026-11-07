@@ -273,8 +273,9 @@ void ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
 
 /* Async fire-and-forget DEL <key>: drop an entry from L2 so a purge that
  * cleared L1 cannot be refilled from Redis (issue P6). Own pool, never blocks,
- * survives the request. No-op when L2 is disabled. */
-void ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
+ * survives the request. No-op (NGX_OK) when L2 is disabled. NGX_ERROR when a
+ * DEL was dropped before the wire (tag_add contract). */
+ngx_int_t ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key_hash);
 
 /* Fire-and-forget DEL of an arbitrary raw key (e.g. an emptied tag set). The
