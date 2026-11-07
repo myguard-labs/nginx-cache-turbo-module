@@ -1,4 +1,4 @@
-# sync-sha: b889e4014d080f71a14c5fb0d7050a64e85f51b7a8d770a496b999ceb61c869e
+# sync-sha: d3cd95617510b3677776fe8fcb2747d682162ab70fa4bd83f61cb5fe8d5c2017
 name: Bump versions
 
 env:
@@ -103,7 +103,7 @@ jobs:
           fi
           gpgconf --kill gpg-agent || true
           colons="$(gpg --batch --list-secret-keys --with-colons --with-keygrip)"
-          fingerprint="$(printf '%s\n' "$colons" | awk -F: '$1=="sec"{s=1;next} s&&$1 ~ /^f.r$/{print $10; exit}')"
+          fingerprint="$(awk -F: '$1=="sec"{s=1;next} s&&$1 ~ /^f.r$/{print $10; exit}' <<< "$colons")"
           if [ -z "$fingerprint" ]; then
             echo "::error::no secret key found after import; refusing to continue without a signing key." >&2
             exit 1
@@ -113,7 +113,7 @@ jobs:
           for grip in $grips; do
             printf '%s' "$BUMP_GPG_PASSPHRASE" | "$preset" --preset "$grip"
           done
-          uid="$(printf '%s\n' "$colons" | awk -F: '$1=="uid"{print $10; exit}')"
+          uid="$(awk -F: '$1=="uid"{print $10; exit}' <<< "$colons")"
           git config user.name "$(printf '%s' "$uid" | sed 's/ *<.*//')"
           git config user.email "$(printf '%s' "$uid" | sed -n 's/.*<\(.*\)>.*/\1/p')"
           git config user.signingkey "$fingerprint"
