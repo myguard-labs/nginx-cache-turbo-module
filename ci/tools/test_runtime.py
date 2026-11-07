@@ -178,6 +178,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_abort_admin_warm_h2_rst_stream_before(ng, origin)  # CT-RESUME-FINALIZE-UAF
         test_l2_abort_admin_warm_h2_close_boundary(ng, origin)  # CT-RESUME-FINALIZE-UAF
         test_l2_abort_admin_warm_clean_http1(ng, origin)  # CT-RESUME-FINALIZE-UAF
+        test_l2_reentry_admin_warm_poke(ng, origin)  # BP-D1
     test_l2_reentry_cold_wait_poke(ng, origin)  # CT-PARKED-REENTRY
     test_l2_reentry_cold_wait_rst(ng, origin)  # CT-PARKED-REENTRY
     test_l2_reentry_cold_wait_clean(ng, origin)  # CT-PARKED-REENTRY
@@ -515,6 +516,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_reentry_redis_lock_rst(ng, origin, redis)  # CT-PARKED-REENTRY
         test_l2_reentry_redis_lock_clean(ng, origin, redis)  # CT-PARKED-REENTRY
         test_l2_reentry_redis_lock_control(ng, origin, redis)  # CT-PARKED-REENTRY
+        test_l2_reentry_scan_walk_poke(ng, origin, redis)  # BP-D1
         test_l2_reentry_purge_walk_poke(ng, origin, redis)  # CT-PARKED-REENTRY
         test_l2_reentry_purge_walk_rst(ng, origin, redis)  # CT-PARKED-REENTRY
         test_l2_reentry_purge_walk_clean(ng, origin, redis)  # CT-PARKED-REENTRY

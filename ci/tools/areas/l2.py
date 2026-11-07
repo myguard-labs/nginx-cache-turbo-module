@@ -5210,6 +5210,19 @@ def test_l2_reentry_purge_walk_poke(
     run_reentry_test(ng, origin, _purge_walk_reentry_site(redis), "poke")
 
 
+def test_l2_reentry_scan_walk_poke(
+        ng: Nginx, origin: Origin, redis: RedisServer) -> None:
+    """BP-D1: the all-purge SCAN walk (redis_scan_del) parked on a warmed
+    connection whose write event is active, then a client event."""
+    run_reentry_test(ng, origin, _scan_walk_abort_site(redis), "poke")
+
+
+def test_l2_reentry_admin_warm_poke(ng: Nginx, origin: Origin) -> None:
+    """BP-D1: the admin warm ?url_file= park (warm_file_start, TEST_FAULTS
+    .delay-fstat sleep in the thread task) with a client event while parked."""
+    run_reentry_test(ng, origin, _admin_warm_abort_site(ng), "poke")
+
+
 def test_l2_reentry_purge_walk_rst(
         ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     run_reentry_test(ng, origin, _purge_walk_reentry_site(redis), "rst")
