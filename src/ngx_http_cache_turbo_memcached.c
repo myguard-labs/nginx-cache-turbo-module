@@ -781,8 +781,6 @@ ngx_http_cache_turbo_memcached_del(ngx_http_cache_turbo_loc_conf_t *clcf,
         return NGX_OK;
     }
 
-    rc = NGX_OK;
-
     /* Build the hex L2 key in a short-lived pool; del_raw copies it before this
      * returns, so the pool can be torn down immediately afterwards. */
     tmp = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
