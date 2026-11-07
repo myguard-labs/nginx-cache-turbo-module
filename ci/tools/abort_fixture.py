@@ -76,6 +76,8 @@ ABORT_REPLY_DELAY = 0.1
 # or crashed. It must exceed the gap between a reply landing and nginx sending
 # its next command, so it is a real margin on a loaded host, not a tight fit.
 ABORT_SETTLE_MARGIN = 0.1
+# Gap between two scheduled proxy deliveries (see the reply ordering below).
+REPLY_ORDER_EPS = 1e-6
 
 # Boundary arm: offsets around the moment the reply lands, cycled over the keys.
 ABORT_BOUNDARY_OFFSETS = (-0.003, -0.002, -0.001, 0.0, 0.001, 0.002, 0.003)
@@ -119,6 +121,13 @@ class _Sighting:
     reply_at: float = 0.0     # time.monotonic() the first reply is released
     count: int = 0            # times the request was sent
     reply_head: bytes = b""   # first bytes of that first reply
+    # DelayProxy.hold(): the reply is released this many seconds after the
+    # backend sent it, instead of the proxy's delay. None: the proxy's delay.
+    hold: float | None = None
+    # nginx closed (FIN or RST) the connection the request first crossed on.
+    closed: threading.Event = dataclasses.field(
+        default_factory=threading.Event)
+    closed_at: float = 0.0    # time.monotonic() the proxy saw that close
 
 
 # Bytes of a watched reply the proxy keeps, enough to tell a hit from a miss.
@@ -299,6 +308,20 @@ class DelayProxy:
     def sighting(self, marker: bytes) -> _Sighting:
         return self._watch[marker]
 
+    def hold(self, marker: bytes, seconds: float) -> None:
+        """Release the reply to a watched marker `seconds` after the backend
+        sent it, whatever the proxy's delay: a backend that stalls one command
+        and answers the rest. A read carrying that reply is held as a whole, so
+        a reply coalesced with it waits as long."""
+        self._watch[marker].hold = seconds
+
+    def wait_closed(self, marker: bytes, timeout: float) -> float | None:
+        """Block until nginx closed the connection the marked request first
+        crossed on; return when, or None if it was still open at `timeout`
+        (seconds, not scaled: the caller times it against nginx's timers)."""
+        s = self._watch[marker]
+        return s.closed_at if s.closed.wait(timeout) else None
+
     def wait_seen(self, marker: bytes, timeout: float = 5.0) -> float:
         """Block until the marked request reached the backend; return when."""
         s = self._watch[marker]
@@ -333,7 +356,8 @@ class DelayProxy:
             time.sleep(min(remaining, deadline - now))
 
     def _note_request(self, data: bytes, old: int, now: float,
-                      pending: collections.deque[_Sighting | None]) -> None:
+                      pending: collections.deque[_Sighting | None],
+                      here: dict[int, _Sighting] | None = None) -> None:
         """Note the markers in `data`, whose first `old` bytes are the tail of
         the previous read, carried over so a marker split across two reads is
         still seen. A match ending inside that tail was counted last time: a
@@ -352,11 +376,14 @@ class DelayProxy:
             if not s.count:
                 s.seen_at = now
                 s.seen.set()
+                if here is not None:
+                    here[id(s)] = s
             s.count += 1
             pending.append(s)
 
     def _note_command(self, cmd: bytes, now: float,
-                      pending: collections.deque[_Sighting | None]) -> None:
+                      pending: collections.deque[_Sighting | None],
+                      here: dict[int, _Sighting] | None = None) -> None:
         """Queue exactly one entry for one framed command: its sighting when it
         carries a marker, else a placeholder (None), so an unwatched command
         pipelined ahead of a watched one takes its own reply, not the
@@ -374,15 +401,18 @@ class DelayProxy:
         if not s.count:
             s.seen_at = now
             s.seen.set()
+            if here is not None:
+                here[id(s)] = s
         s.count += 1
         pending.append(s)
 
     def _feed_request(self, tail: bytes, data: bytes, now: float,
-                      pending: collections.deque[_Sighting | None]) -> bytes:
+                      pending: collections.deque[_Sighting | None],
+                      here: dict[int, _Sighting] | None = None) -> bytes:
         """Scan one nginx-to-backend read; return the tail to carry into the
         next one. The tail is cut from the previous tail plus this read, so a
         marker spread over three or more reads is still found."""
-        self._note_request(tail + data, len(tail), now, pending)
+        self._note_request(tail + data, len(tail), now, pending, here)
         return (tail + data)[-self._tail_len:] if self._tail_len else b""
 
     async def _handle(self, cr: asyncio.StreamReader,
@@ -402,42 +432,71 @@ class DelayProxy:
             if not cw.is_closing():
                 cw.write(data)
 
+        # Ids of the sightings whose first crossing was on this connection:
+        # nginx closing it is what wait_closed() reports for them.
+        # Holds the sightings themselves: a watch() that replaces the set
+        # must not free one, or its id could be reused by a new sighting.
+        here: dict[int, _Sighting] = {}
+
         async def client_to_server() -> None:
             tail = b""
-            while data := await cr.read(65536):
-                self.request_bytes += len(data)
-                now = time.monotonic()
-                cmds, rest = splitter.feed(data)
-                for cmd in cmds:
-                    self._note_command(cmd, now, pending)
-                if rest:
-                    tail = self._feed_request(tail, rest, now, pending)
-                uw.write(data)
-                await uw.drain()
+            try:
+                while data := await cr.read(65536):
+                    self.request_bytes += len(data)
+                    now = time.monotonic()
+                    cmds, rest = splitter.feed(data)
+                    for cmd in cmds:
+                        self._note_command(cmd, now, pending, here)
+                    if rest:
+                        tail = self._feed_request(tail, rest, now, pending,
+                                                  here)
+                    uw.write(data)
+                    await uw.drain()
+            except ConnectionResetError:
+                pass
+            # nginx closed its end (a backend close cancels this task first,
+            # so it never reaches here).
+            now = time.monotonic()
+            for s in here.values():
+                if not s.closed.is_set():
+                    s.closed_at = now
+                    s.closed.set()
 
         async def server_to_client() -> None:
             counter = ReplyCounter()
+            last_due = 0.0
             while data := await ur.read(65536):
-                # loop.time() is time.monotonic() on Unix, so reply_at compares
-                # directly with the time the test aborts at.
-                due = loop.time() + self.delay
-                self._busy_until = max(self._busy_until, due)
                 # One sighting per complete reply, not per read: two replies
                 # coalesced in one read each take their own, and a reply split
                 # across reads takes its sighting only when it completes.
+                taken: list[tuple[_Sighting | None, bytes]] = []
                 for head in counter.feed(data):
                     if not pending:
                         break
+                    taken.append((pending.popleft(), head))
+                # loop.time() is time.monotonic() on Unix, so reply_at compares
+                # directly with the time the test aborts at. A held reply
+                # holds the whole read it arrived in.
+                delay = max([self.delay, *(s.hold for s, _ in taken
+                                           if s is not None
+                                           and s.hold is not None)])
+                # Never ahead of an earlier, held read: replies keep their order.
+                # Strictly after it, too: asyncio's timer heap does not keep
+                # insertion order among equal deadlines.
+                due = max(loop.time() + delay, last_due + REPLY_ORDER_EPS)
+                last_due = due
+                self._busy_until = max(self._busy_until, due)
+                for s, head in taken:
                     # A marker sent more than once (a walk's SELECT, one per
                     # op connection) keeps its first reply: that is the one
                     # ending the first park.
-                    s = pending.popleft()
                     if s is not None and not s.replied.is_set():
                         s.reply_at = due
                         s.reply_head = head
                         s.replied.set()
                 loop.call_at(due, deliver, data)
-            loop.call_at(loop.time() + self.delay, cw.close)
+            loop.call_at(max(loop.time() + self.delay,
+                                 last_due + REPLY_ORDER_EPS), cw.close)
 
         tasks = [asyncio.ensure_future(client_to_server()),
                  asyncio.ensure_future(server_to_client())]
@@ -2004,7 +2063,24 @@ SHUTDOWN_REPLY_DELAY = 0.75
 #               reload inside the first park, the vary-marker GET, which is a
 #               miss. Takes the site's `hit` predicate over the first bytes of
 #               that reply and fails unless every key's reply passes it.
-SHUTDOWN_ARMS = ("http1", "http2", "graceful", "http1_hit")
+# early_teardown  the http1 reload on a site whose L2 timeout (OWN_TIMEOUT)
+#               falls after the shutdown timer and before the backend reply.
+#               The request cleanup (redis_*_detach) must tear the op down when
+#               nginx frees the request, so the old worker exits before the
+#               op's own timer could fire and no "timed out" line is logged.
+#               The other arms wait out the reply, so an op that merely
+#               survived detached (ended later by its timer or the reply)
+#               passes them. A GET or lock op cannot end by its own timeout
+#               after the request is freed; only a suspended purge walk can.
+SHUTDOWN_ARMS = ("http1", "http2", "graceful", "http1_hit",
+                 "early_teardown")
+# early_teardown: the site's L2 timeout (AbortSite directive) and the proxy's
+# reply delay, seconds before sanitizer scaling. The timeout must sit past the
+# shutdown timer (reload + SHUTDOWN_TIMEOUT_MS, with a loaded-host margin) and
+# well before the reply.
+OWN_TIMEOUT = 1.0
+OWN_TIMEOUT_REPLY_DELAY = 2.5
+TIMED_OUT = "timed out"
 
 
 def redis_hit_reply(head: bytes) -> bool:
@@ -2017,11 +2093,12 @@ def memcached_hit_reply(head: bytes) -> bool:
     return head.startswith(b"VALUE ")
 
 
-def shutdown_site(site: AbortSite, timeout: bool) -> AbortSite:
+def shutdown_site(site: AbortSite, timeout: bool,
+                  delay: float = SHUTDOWN_REPLY_DELAY) -> AbortSite:
     """`site` with a reply delay longer than the shutdown timeout, and that
     timeout set unless `timeout` is false."""
     extra = f"\nworker_shutdown_timeout {SHUTDOWN_TIMEOUT_MS}ms;" if timeout else ""
-    return dataclasses.replace(site, proxy_delay=SHUTDOWN_REPLY_DELAY,
+    return dataclasses.replace(site, proxy_delay=delay,
                                main_extra=site.main_extra + extra)
 
 
@@ -2046,12 +2123,17 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
               "(single-process nginx has no master to reload)", flush=True)
         return
     protocol = "http2" if arm == "http2" else "http1"
-    site = shutdown_site(site, timeout=arm != "graceful")
+    own = arm == "early_teardown"
+    site = shutdown_site(site, timeout=arm != "graceful",
+                         delay=OWN_TIMEOUT_REPLY_DELAY if own
+                         else SHUTDOWN_REPLY_DELAY)
     name = f"{site.name} shutdown {arm}"
     scale = sanitizer_time_scale()
     problems: list[str] = []
     landings: list[Landing] = []
-    with AbortRig(ng, site, f"shutdown-{arm}", ABORT_KEYS) as rig:
+    # The op timeout lines are logged at info.
+    with AbortRig(ng, site, f"shutdown-{arm}", ABORT_KEYS,
+                  "info" if own else None) as rig:
         if protocol == "http2":
             rig.node.require_http2()
         assert rig.node.process is not None and not rig.node.single_process, (
@@ -2080,9 +2162,13 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
             _sleep_until(parked_at + 0.03 * scale)
             reloaded_at = time.monotonic()
             os.kill(rig.node.process.pid, signal.SIGHUP)
-            if not wait_for(lambda old=old: not (rig.node.worker_pids() & old),
-                            timeout=(SHUTDOWN_REPLY_DELAY + 5.0) * scale,
-                            interval=0.02):
+            exited_at: float | None = None
+            if wait_for(lambda old=old: not (rig.node.worker_pids() & old),
+                        timeout=(max(SHUTDOWN_REPLY_DELAY,
+                                     OWN_TIMEOUT_REPLY_DELAY) + 5.0) * scale,
+                        interval=0.02):
+                exited_at = time.monotonic()
+            else:
                 problems.append(f"key {i}: old worker never exited")
             anchor.settle()
             if arm == "graceful" and h1 is not None:
@@ -2116,6 +2202,19 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
                 in_phase = (bool(t.final_reply_at) and hit(head)
                             and t.final_seen_at <= reloaded_at
                             and fired < t.final_reply_at)
+            elif own:
+                # In phase only if the shutdown timer was due before the op's
+                # own timer, and the worker was gone before that timer: the
+                # request cleanup, not the timer or the late reply, ended the
+                # op.
+                timer_at = parked_at + OWN_TIMEOUT * scale
+                if exited_at is not None and exited_at >= timer_at:
+                    problems.append(
+                        f"key {i}: the worker outlived the op's own timeout "
+                        f"by {exited_at - timer_at:.3f}s, so the freed "
+                        "request did not tear the op down")
+                in_phase = (exited_at is not None
+                            and fired < timer_at and exited_at < timer_at)
             else:
                 in_phase = not end or fired < end
             landings.append(Landing(in_phase,
@@ -2130,6 +2229,13 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
             problems.extend(f"key {i}: client connection never closed: {h}"
                             for h in rig.node.wait_released())
         rig.node.stop()
+        if own:
+            late = [ln for ln in rig.node.diagnostics().splitlines()
+                    if TIMED_OUT in ln]
+            print(f"shutdown-arm {name}: {len(late)} op timeout lines",
+                  flush=True)
+            problems.extend(f"the op ended by its own timer: {ln[:160]}"
+                            for ln in late)
         fatal = rig.node.fatal_lines()
         result = ArmResult(name, landings, fatal + problems)
         print(f"shutdown-arm {result.describe()} problems={len(problems)}",
@@ -2138,3 +2244,200 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
             f"{result.describe()}\nfirst: {result.fatal[0]}")
         rig.assert_no_origin_traffic(origin, base)
         _check_stimulus(result, "before")
+
+
+# --------------------------------------------------------------------------- #
+# A suspended purge walk that outlives its request
+# --------------------------------------------------------------------------- #
+
+# CT-SHUTDOWN-OWN-TIMEOUT-ARM. A GET or lock op is torn down by its request's
+# cleanup the moment nginx frees the request (the early_teardown arm above), so
+# the only op that can still end on its own after that is a suspended walk: a
+# page's UNLINK is in flight on its own connection, walk_detach records the
+# doom and returns, and sscan_resume tears the walk down when that UNLINK ends.
+#
+# The request is freed the way the shutdown arms free it: a reload while the
+# walk waits on its UNLINK, whose worker_shutdown_timeout terminates the parked
+# request. A client abort cannot do it here: a parked HTTP/1 request does not
+# read its connection, so nginx only sees the abort when the walk answers.
+#
+# own_timeout  the backend never answers the UNLINK inside its timeout, so the
+#              UNLINK op's own timer ends it, and the walk is torn down then.
+# reply        the converse: the UNLINK reply lands before that timer, and the
+#              walk is torn down on the reply.
+#
+# Both arms then serve a fresh purge and a GET from the new worker and quit
+# nginx gracefully. A walk that is never torn down keeps its connection open
+# until the old worker exits, which reports it as an open socket (alert).
+WALK_TIMEOUT_ARMS = ("own_timeout", "reply")
+# The site's L2 timeout, seconds before sanitizer scaling (the caller builds
+# the site with walk_timeout_ms()). Past the reload plus the shutdown timer.
+WALK_OP_TIMEOUT = 1.5
+# How long the backend sits on the UNLINK reply in the reply arm, as a share
+# of that timeout.
+WALK_REPLY_SHARE = 0.5
+# The own_timeout arm holds the reply this long past the timeout.
+WALK_HOLD_PAST = 1.0
+# Slack for a timer that fires a little early (nginx rounds its clock to ms).
+WALK_TIMER_SLACK = 0.02
+
+
+def own_timeout_ms() -> str:
+    """The L2 timeout directive value for the early_teardown arm."""
+    return f"{round(OWN_TIMEOUT * sanitizer_time_scale() * 1000)}ms"
+
+
+def walk_timeout_ms() -> str:
+    """The L2 timeout directive value for a walk_timeout site."""
+    return f"{round(WALK_OP_TIMEOUT * sanitizer_time_scale() * 1000)}ms"
+
+
+def _wait_peer_closed(sock: socket.socket, timeout: float) -> float | None:
+    """Block until nginx closed this client connection (FIN or RST), reading
+    and dropping anything it sent first; return when, or None at `timeout`."""
+    deadline = time.monotonic() + timeout
+    sock.setblocking(False)
+    while (remaining := deadline - time.monotonic()) > 0:
+        readable, _, _ = select.select([sock], [], [], remaining)
+        if not readable:
+            continue
+        try:
+            if not sock.recv(65536):
+                return time.monotonic()
+        except BlockingIOError:
+            continue
+        except OSError:
+            return time.monotonic()
+    return None
+
+
+def run_walk_timeout_test(ng: Nginx, site: AbortSite) -> None:
+    """Both WALK_TIMEOUT_ARMS on a walk site built with walk_timeout_ms(). The
+    site's anchor names the walk's commands, its page read second to last and
+    the page's UNLINK last (the SSCAN tag walk). Fails on an alert, a sanitizer
+    report, a request that was not freed while the walk was suspended, a walk
+    connection nginx never closes or closes on the wrong event, a missing or
+    stray op timeout line, an old worker that never exits, a later purge or GET
+    that is not served, or a graceful quit that does not exit cleanly.
+
+    Multi-worker mode only, like run_shutdown_test: a single-process nginx has
+    no master to reload."""
+    if ng.single_process:
+        print(f"walk-timeout {site.name}: SKIPPED (single-process nginx has "
+              "no master to reload)", flush=True)
+        return
+    for arm in WALK_TIMEOUT_ARMS:
+        _walk_timeout_arm(ng, site, arm)
+
+
+def _walk_timeout_arm(ng: Nginx, site: AbortSite, arm: str) -> None:
+    scale = sanitizer_time_scale()
+    timeout = WALK_OP_TIMEOUT * scale
+    own = arm == "own_timeout"
+    hold = timeout + WALK_HOLD_PAST * scale if own else timeout * WALK_REPLY_SHARE
+    name = f"{site.name} walk {arm}"
+    problems: list[str] = []
+    site = shutdown_site(site, timeout=True, delay=0.0)
+    # The op timeout lines are logged at info.
+    with AbortRig(ng, site, f"walk-{arm}", 2, "info") as rig:
+        assert rig.node.process is not None and not rig.node.single_process
+        uri, fresh = rig.uris
+        anchor = rig.anchor(uri)
+        page, unlink = anchor.commands[-2], anchor.commands[-1]
+        rig.proxy.hold(unlink, hold)
+        old = rig.node.worker_pids()
+        h1 = Http1Client(rig.node.port, site.request_target(uri), site.method)
+        # The UNLINK crossing the proxy is the suspension: the walk suspends
+        # before it launches the page's UNLINK.
+        sent_at = rig.proxy.wait_seen(unlink)
+        os.kill(rig.node.process.pid, signal.SIGHUP)
+        freed_at = _wait_peer_closed(h1.sock, hold + 5.0 * scale)
+        h1.sock.close()
+        replied_at = rig.proxy.wait_replied(unlink)
+        walk_open = not rig.proxy.sighting(page).closed.is_set()
+        if freed_at is None:
+            problems.append("the shutdown timer never closed the client: the "
+                            "parked request was not terminated")
+        elif freed_at >= min(sent_at + timeout, replied_at):
+            problems.append(
+                f"fixture: the request was freed {freed_at - sent_at:.3f}s "
+                "after the UNLINK left, not while the walk was suspended, so "
+                "this arm proves nothing")
+        elif not walk_open:
+            problems.append("the walk connection closed with its request, "
+                            "while its UNLINK was in flight: the walk did not "
+                            "outlive the request")
+        closed_at = rig.proxy.wait_closed(page, hold + timeout + 5.0 * scale)
+        timer_at = sent_at + timeout - WALK_TIMER_SLACK
+        if closed_at is None:
+            problems.append("nginx never closed the walk's connection: the "
+                            "suspended walk was not torn down")
+        elif own and not timer_at <= closed_at < replied_at:
+            problems.append(
+                f"the walk closed {closed_at - sent_at:.3f}s after its UNLINK, "
+                f"wanted on the UNLINK's own {timeout:.3f}s timer, before the "
+                f"reply at {replied_at - sent_at:.3f}s")
+        elif not own and not replied_at <= closed_at < timer_at:
+            problems.append(
+                f"the walk closed {closed_at - sent_at:.3f}s after its UNLINK, "
+                f"wanted on the reply at {replied_at - sent_at:.3f}s, before "
+                f"the {timeout:.3f}s timer")
+        # Both closes can land in one proxy loop pass in either order.
+        unlink_closed = rig.proxy.wait_closed(unlink, ABORT_SETTLE_MARGIN * scale)
+        if own and (unlink_closed is None or unlink_closed >= replied_at):
+            problems.append("the UNLINK connection outlived the UNLINK's own "
+                            "timeout")
+        exited_at: float | None = None
+        if wait_for(lambda: not (rig.node.worker_pids() & old),
+                    timeout=hold + 5.0 * scale, interval=0.02):
+            exited_at = time.monotonic()
+        else:
+            problems.append("the old worker never exited")
+        # Let the held reply land on the closed connection before more traffic.
+        rig.proxy.wait_quiet(ABORT_SETTLE_MARGIN * scale, timeout=hold + 5.0)
+        rig.node.wait_worker()
+        late = [ln for ln in rig.node.diagnostics().splitlines()
+                if TIMED_OUT in ln]
+
+        def rel(at: float | None) -> str:
+            return "never" if at is None else f"{at - sent_at:+.3f}s"
+
+        print(f"walk-timeout {name}: request freed {rel(freed_at)}, walk "
+              f"closed {rel(closed_at)}, old worker exited {rel(exited_at)}, "
+              f"reply {rel(replied_at)}, timer {timeout:.3f}s, {len(late)} op "
+              "timeout lines", flush=True)
+        if own and not late:
+            problems.append("no op timeout line: the UNLINK did not end on "
+                            "its own timer")
+        if not own:
+            problems.extend(f"an op ended by its own timer: {ln[:160]}"
+                            for ln in late)
+        # A fresh purge and a GET are served once the walk is gone. The fresh
+        # walk's UNLINK carries the same bytes, so stop holding them first.
+        rig.proxy.watch([])
+        h1 = Http1Client(rig.node.port, site.request_target(fresh), site.method)
+        status, _, body = h1.read_response()
+        if site.verify is not None:
+            try:
+                site.verify(rig, fresh, status, body)
+            except AssertionError as exc:
+                problems.append(f"the next purge: {exc}")
+        status, _, _ = fetch(rig.node.port, f"/ab/{site.name}-walk-{arm}-get")
+        if status != 200:
+            problems.append(f"the next GET answered {status}")
+        # Graceful quit: a connection still held is an "open socket" alert.
+        os.kill(rig.node.process.pid, signal.SIGQUIT)
+        try:
+            rc = rig.node.process.wait(timeout=10.0 * scale)
+        except subprocess.TimeoutExpired:
+            rc = None
+            problems.append("nginx did not quit gracefully within "
+                            f"{10.0 * scale:.1f}s")
+        if rc is not None:
+            rig.node.process = None
+            if rc != 0:
+                problems.append(f"graceful quit exited with {rc}")
+        fatal = rig.node.fatal_lines() + problems
+        print(f"walk-timeout {name}: fatal={len(fatal)} "
+              f"problems={len(problems)}", flush=True)
+        assert not fatal, f"{name}: {len(fatal)} failures, first: {fatal[0]}"

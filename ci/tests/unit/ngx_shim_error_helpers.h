@@ -36,6 +36,7 @@ typedef struct {
 
 typedef struct ngx_pool_s {
     ngx_uint_t  token;
+    void       *log;
 } ngx_pool_t;
 
 typedef struct ngx_event_s ngx_event_t;

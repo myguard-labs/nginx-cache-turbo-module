@@ -577,6 +577,10 @@ ngx_http_cache_turbo_tag_purge_page_unlinked(void *data, ngx_int_t rc)
         void   *rdata = aw->resume_data;
 
         if (aw->page_pool) {
+            /* The pool was created with r->connection->log, which a
+             * terminated request has freed; debug ngx_destroy_pool reads
+             * pool->log (CT-SSCAN-PAGEPOOL-LOG-UAF). */
+            aw->page_pool->log = ngx_cycle->log;
             ngx_destroy_pool(aw->page_pool);
             aw->page_pool = NULL;
         }
