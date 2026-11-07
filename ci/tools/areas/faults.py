@@ -11,11 +11,22 @@ The scenario table is the extension point: a row is a ``_Scenario`` with a
 name, a ``uri`` factory (called once per step, so a MISS row can hand out a
 fresh key every time), a ``ready`` hook that puts the cache into the state the
 measured request needs, and the stable ``expect_x_cache`` of the follow-up.
+
+Sampling: by default (PR mode) each row fails a seeded, deterministic sample of
+N (always N=1 and N=count) so the whole sweep stays within ~60 s on the ASan
+build; the seed is printed in the summary and overridable with
+CT_ALLOC_SWEEP_SEED. ``CT_ALLOC_SWEEP=full`` fails every N.
+
+The sweep runs its own nginx root (``fault-alloc-sweep``), so its error log is
+never shared with test_fault_alloc_countdown, which asserts on exact notices
+in its own log: the two pass in either order in one process.
 """
 
 from __future__ import annotations
 
 import http.client
+import os
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -29,7 +40,11 @@ from test_runtime_base import (
     wait_for_l2_absent,
 )
 
-from areas.core import _fault_alloc_nginx, _FaultAlloc
+from areas.core import _fault_alloc_config, _fault_alloc_nginx, _FaultAlloc
+
+# Per-row sample size in PR mode, besides the always-included N=1 and N=count.
+_PR_SAMPLE = 10
+_DEFAULT_SEED = "1"
 
 
 @dataclass
@@ -77,8 +92,10 @@ class _Sweep(_FaultAlloc):
         uri = scn.uri(i)
         scn.ready(self, uri)
         self.ctl(f"?n={self.FAR}")
-        st, _, h = self.get_uri(uri, scn.method)
-        r = self.ctl("?n=0")
+        try:
+            st, _, h = self.get_uri(uri, scn.method)
+        finally:
+            r = self.ctl("?n=0")  # never leave the far arm set
         assert st == 200, f"{scn.name}: unarmed count run: {st} {h}"
         assert r["fired"] == "0", f"{scn.name}: far arm fired: {r}"
         calls = int(r["calls"])
@@ -138,8 +155,6 @@ def _fresh_uri(prefix: str) -> Callable[[int], str]:
     return make
 
 
-# PACKET 2b adds the L2 HIT, L2 MISS+store and PURGE rows; 2c adds admin
-# status and the seeded PR sample.
 _SCENARIOS = (
     _Scenario("MISS", _fresh_uri("/fa/sweep-miss-"), _ready_nothing,
               measured_hit=False),
@@ -152,6 +167,9 @@ _SCENARIOS = (
               _ready_nothing, measured_hit=False, needs_l2=True),
     _Scenario("PURGE", _fresh_uri("/fa2/sweep-purge-"), _ready_purge,
               measured_hit=False, method="PURGE", needs_l2=True),
+    # GET of the admin stats endpoint (cache_turbo_admin fa).
+    _Scenario("admin status", lambda i: "/fa-admin", _ready_nothing,
+              measured_hit=False),
 )
 
 
@@ -166,9 +184,14 @@ def _stable_count(sw: _Sweep, scn: _Scenario) -> int:
     return counts[-1]
 
 
-def _sweep_ns(count: int) -> list[int]:
-    """The N values to fail. Packet 2 swaps in the seeded PR sample."""
-    return list(range(1, count + 1))
+def _sweep_ns(name: str, count: int, seed: str, full: bool) -> list[int]:
+    """The N values to fail: all of 1..count in full mode, otherwise N=1,
+    N=count and a seeded sample of the rest (deterministic per seed+row)."""
+    if full or count <= _PR_SAMPLE + 2:
+        return list(range(1, count + 1))
+    rng = random.Random(f"{seed}:{name}")
+    mid = rng.sample(range(2, count), _PR_SAMPLE)
+    return sorted({1, count, *mid})
 
 
 def _assert_alive(fa: Nginx, where: str) -> None:
@@ -219,19 +242,31 @@ def _step(sw: _Sweep, fa: Nginx, scn: _Scenario, n: int, count: int) -> bool:
     return r["fired"] == "1"
 
 
-def _fault_alloc_l2_nginx(ng: Nginx, redis_port: int) -> Nginx:
+def _fault_alloc_l2_nginx(ng: Nginx, redis_port: int | None) -> Nginx:
     """The BP-C1 fault nginx plus /fa2/: the same zone with a Redis L2 and
     PURGE enabled (core.py's config has neither)."""
-    fa = _fault_alloc_nginx(ng)
-    base_write = fa.write_config
+    base = _fault_alloc_nginx(ng)
+    # Own root (and so error log): see the module docstring.
+    root = ng.root.parent / "fault-alloc-sweep"
+    fa = Nginx(ng.binary, ng.module, root, base.port, ng.origin_port,
+               ng.runner_raw, ng.single_process)
 
     def write_config(sr_off: bool = False) -> None:
-        base_write(sr_off)
-        conf = fa.root / "conf" / "nginx.conf"
-        text = conf.read_text(encoding="ascii")
+        del sr_off
+        (root / "conf").mkdir(parents=True, exist_ok=True)
+        (root / "logs").mkdir(parents=True, exist_ok=True)
+        text = _fault_alloc_config(root, fa.port, fa.module, fa.origin_port)
+        conf = root / "conf" / "nginx.conf"
         anchor = "        location /fa/ {"
         assert text.count(anchor) == 1, "fault config layout changed"
-        l2 = f"""        location /fa2/ {{
+        admin = """        location = /fa-admin {
+            cache_turbo_admin fa;
+        }
+
+"""
+        l2 = admin
+        if redis_port is not None:
+            l2 += f"""        location /fa2/ {{
             cache_turbo          fa;
             cache_turbo_key      $uri;
             cache_turbo_valid    300s;
@@ -257,8 +292,10 @@ def test_alloc_fail_sweep(ng: Nginx, redis: RedisServer | None = None) -> None:
     an L2 MISS+store and a PURGE in turn (see the module docstring for the
     per-step contract). The L2 rows need the Redis fixture and are skipped,
     loudly, without it."""
-    fa = (_fault_alloc_l2_nginx(ng, redis.port) if redis is not None
-          else _fault_alloc_nginx(ng))
+    fa = _fault_alloc_l2_nginx(ng, redis.port if redis is not None else None)
+    full = os.environ.get("CT_ALLOC_SWEEP", "") == "full"
+    seed = os.environ.get("CT_ALLOC_SWEEP_SEED") or _DEFAULT_SEED
+    t_start = time.monotonic()
     fa.write_config()
     fa.config_test()
     fa.start()
@@ -272,13 +309,18 @@ def test_alloc_fail_sweep(ng: Nginx, redis: RedisServer | None = None) -> None:
             count = _stable_count(sw, scn)
             assert count >= 5, \
                 f"{scn.name}: implausibly few allocations: {count}"
-            fired = sum(_step(sw, fa, scn, n, count) for n in _sweep_ns(count))
-            print(f"alloc sweep {scn.name}: count={count} fired={fired} "
-                  f"lock-stalled follow-ups: {sw.slow or 'none'}")
+            ns = _sweep_ns(scn.name, count, seed, full)
+            fired = sum(_step(sw, fa, scn, n, count) for n in ns)
+            print(f"alloc sweep {scn.name}: count={count} tried={len(ns)} "
+                  f"fired={fired} mode={'full' if full else 'pr'} "
+                  f"seed={seed} lock-stalled follow-ups: "
+                  f"{sw.slow or 'none'}")
             sw.slow.clear()
             # A step that never reaches its Nth call would hide a hole.
-            assert fired >= count - 2, \
-                f"{scn.name}: only {fired}/{count} injections fired"
+            assert fired >= len(ns) - 2, \
+                f"{scn.name}: only {fired}/{len(ns)} injections fired"
+        print(f"alloc sweep total: {time.monotonic() - t_start:.1f}s "
+              f"mode={'full' if full else 'pr'} seed={seed}")
         fa.stop()
         fa.assert_clean_logs()
     finally:
