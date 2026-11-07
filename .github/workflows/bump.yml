@@ -1,4 +1,4 @@
-# sync-sha: d3cd95617510b3677776fe8fcb2747d682162ab70fa4bd83f61cb5fe8d5c2017
+# sync-sha: 727cdd867d5f05f188207cda44ee66c1c0b22dc588a86bdcf9f1d04003ada46c
 name: Bump versions
 
 env:
@@ -103,7 +103,7 @@ jobs:
           fi
           gpgconf --kill gpg-agent || true
           colons="$(gpg --batch --list-secret-keys --with-colons --with-keygrip)"
-          fingerprint="$(awk -F: '$1=="sec"{s=1;next} s&&$1 ~ /^f.r$/{print $10; exit}' <<< "$colons")"
+          fingerprint="$(awk -F: '$1=="sec"{s=1;next} s&&$1=="fpr"{print $10; exit}' <<< "$colons")"
           if [ -z "$fingerprint" ]; then
             echo "::error::no secret key found after import; refusing to continue without a signing key." >&2
             exit 1
