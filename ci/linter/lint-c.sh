@@ -29,36 +29,10 @@
 lint_files_into FILES '^src/.*\.[ch]$' "$@"
 [ "${#FILES[@]}" -gt 0 ] || { echo "lint-c: no C files to check"; exit 0; }
 
-# SCOPED OUT OF HOOK MODE, and this is not a dropped gate (adoption step 35).
-#
-# All three scanners below -- flawfinder, cppcheck, semgrep -- also run as their
-# own hooks in .pre-commit-config.yaml, at byte-identical thresholds and over the
-# same '^src/.*\.[ch]$' selector. .githooks/pre-commit invokes BOTH gates (it has
-# to: core.hooksPath replaces .git/hooks/, so the pre-commit config is only
-# reachable because this hook calls it), which means a staged C commit was
-# running each scanner TWICE.
-#
-# Measured 2026-08-10 on a one-file staged commit: 7.4s total, of which lint-c
-# was 7.01s and semgrep alone 6.44s -- against step 35's ~2s budget. The cost is
-# semgrep's rule-pack load, which is per-invocation and does not shrink with the
-# file count, so --jobs/--metrics tuning (already applied) cannot recover it.
-# Paying it twice for one verdict is the whole overrun.
-#
-# What does NOT change: LINT_MODE=all still runs everything (that is what
-# `ci/linter/run-all.sh` does by hand and what `--all` means), and CI is
-# unaffected -- security-scanners.yml owns these three on the PR, which is why
-# lint.yml's LINT_ONLY excludes "c" in the first place. So every scanner still
-# gates every commit and every PR; only the duplicate invocation is gone.
-#
-# If the pre-commit hooks are ever removed, delete this block in the same commit
-# -- otherwise C stops being scanned at commit time and nothing says so.
-if [ "${LINT_MODE:-all}" = "staged" ] && [ "$#" -eq 0 ] \
-   && [ -f "$(repo_root)/.pre-commit-config.yaml" ] \
-   && grep -q 'id: semgrep' "$(repo_root)/.pre-commit-config.yaml"; then
-    echo "lint-c: ${#FILES[@]} file(s) -- deferred to the .pre-commit-config.yaml" \
-         "hooks, which run flawfinder/cppcheck/semgrep at the same thresholds"
-    exit 0
-fi
+# This script is the ONLY gate for flawfinder, cppcheck and semgrep at commit
+# time (CI-P1): .pre-commit-config.yaml no longer lists them, so a staged C
+# commit runs each exactly once. ci/linter/selftest.sh fails if a run-all-owned
+# tool reappears in that config.
 
 echo "lint-c: ${#FILES[@]} file(s)"
 rc=0
@@ -73,10 +47,7 @@ say "cppcheck (error,warning)"
 # are suppressed: this is a module compiled INTO nginx, so its headers and its
 # ngx_http_* callbacks are never resolvable or called from this tree alone.
 # RETARGET (adoption step 32): -I src -DNGX_PTR_SIZE=8 and the
-# unusedStructMember suppression mirror the cppcheck hook already in this
-# repo's .pre-commit-config.yaml. Both gates must run the SAME cppcheck
-# invocation or local-green stops predicting remote-green (step 33's threshold
-# mirror); move one, move both.
+# unusedStructMember suppression are this module's cppcheck contract.
 #
 # -DNGX_PTR_SIZE=8 is load-bearing, not cosmetic. cppcheck parses each header
 # standalone, without nginx's objs/ngx_auto_config.h, so the deliberate H-1

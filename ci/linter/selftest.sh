@@ -30,6 +30,13 @@ set -uo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT" || exit 2
 
+# Run as a commit hook (precommit-tests.sh maps ci/linter/* to this file), git
+# exports GIT_INDEX_FILE and friends. A fixture repo's `git -C <dir> add` would
+# then write into the COMMITTER'S index and the fixture file would land in the
+# commit (seen: an empty `src/space and<LF>newline.c`). Scrub every repo-binding
+# variable so each fixture repo is only ever its own.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX GIT_COMMON_DIR
+
 rc=0
 
 # case <expected-exit> <description> -- command...
@@ -307,29 +314,82 @@ fi
 case_ 0 "lint-spelling is dispatched by run-all.sh" \
     bash -c 'ci/linter/run-all.sh --list | grep -q lint-spelling.sh'
 
-# The ast-grep gate is defined TWICE -- as PROMOTED in ci/linter/lint-astgrep.sh
-# and as the --error= flags of the ast-grep hook in .pre-commit-config.yaml --
-# because the two run by different mechanisms. Two lists that must agree and are
-# only kept in step by a comment will drift, and the drift is invisible: the hook
-# passes while CI fails (or worse, the reverse), and neither output mentions the
-# other list. Compare them as sorted sets.
-pc="$(sed -n '/id: ast-grep/,/pass_filenames/p' .pre-commit-config.yaml \
-      | grep -oE '\-\-error=[a-z0-9-]+' | sed 's/--error=//' | sort -u)"
-ck="$(sed -n '/^PROMOTED=(/,/^)/p' ci/linter/lint-astgrep.sh \
-      | sed -nE 's/^[[:space:]]+([a-z0-9-]+)[[:space:]]*$/\1/p' | sort -u)"
-if [ -z "$pc" ] || [ -z "$ck" ]; then
-    # An empty side means a parse that stopped matching, not agreement. Two
-    # empty strings compare equal, so without this the control passes vacuously
-    # the moment either file is reformatted.
-    echo "FAIL ast-grep promoted-list control parsed nothing (pre-commit:$(printf '%s' "$pc" | wc -l), checker:$(printf '%s' "$ck" | wc -l))" >&2
-    rc=1
-elif [ "$pc" = "$ck" ]; then
-    echo "ok   ast-grep promoted set matches in lint-astgrep.sh and .pre-commit-config.yaml"
+# EACH TOOL RUNS ONCE PER COMMIT (CI-P1). .githooks/pre-commit runs run-all.sh
+# and then the pre-commit framework; a tool named by a run-all checker AND by a
+# hook in .pre-commit-config.yaml runs twice per commit and, worse, can have two
+# thresholds that drift apart (the ast-grep PROMOTED list used to be kept equal
+# to the hook's --error= flags by this very file). run-all owns these tools; the
+# config keeps only hygiene hooks and gitleaks, which no checker covers.
+run_all_tools="flawfinder semgrep cppcheck ast-grep ruff shellcheck actionlint"
+dup_tools() {
+    local cfg="$1" t found=""
+    for t in $run_all_tools; do
+        grep -qE "^[[:space:]]*- id: ${t}[[:space:]]*$" "$cfg" && found="$found $t"
+    done
+    printf '%s' "$found"
+}
+dupes="$(dup_tools .pre-commit-config.yaml)"
+if [ -z "$dupes" ]; then
+    echo "ok   no run-all.sh-owned tool is also a .pre-commit-config.yaml hook"
 else
-    echo "FAIL ast-grep promoted set differs between the hook and the checker" >&2
-    diff <(printf '%s\n' "$pc") <(printf '%s\n' "$ck") | sed 's/^/       | /' >&2
+    echo "FAIL tools listed in both run-all.sh and .pre-commit-config.yaml:$dupes" >&2
+    echo "       | each would run twice per commit; keep them in run-all only" >&2
     rc=1
 fi
+# Negative control: a config that re-adds one must be reported, or the check
+# above is vacuous (an empty answer is also what a broken grep returns).
+dupcfg="$(mktemp)"
+{ cat .pre-commit-config.yaml; printf '      - id: semgrep\n      - id: ruff\n'; } > "$dupcfg"
+dd="$(dup_tools "$dupcfg")"
+rm -f "$dupcfg"
+if [ "$dd" = " semgrep ruff" ]; then
+    echo "ok   duplicate-tool detector reports a re-added hook (control)"
+else
+    echo "FAIL duplicate-tool detector control: expected ' semgrep ruff', got '$dd'" >&2
+    rc=1
+fi
+
+# The tool checkers named above must still exist in run-all's glob, so "owned by
+# run-all" stays true.
+for t in lint-c lint-astgrep lint-python lint-sh lint-yaml lint-astgrep-essentials; do
+    [ -x "ci/linter/$t.sh" ] || { echo "FAIL run-all checker ci/linter/$t.sh missing or not executable" >&2; rc=1; }
+done
+
+ck="$(sed -n '/^PROMOTED=(/,/^)/p' ci/linter/lint-astgrep.sh \
+      | sed -nE 's/^[[:space:]]+([a-z0-9-]+)[[:space:]]*$/\1/p' | sort -u)"
+if [ -z "$ck" ]; then
+    # An empty set means a parse that stopped matching, not agreement.
+    echo "FAIL ast-grep PROMOTED parse found nothing in lint-astgrep.sh" >&2
+    rc=1
+fi
+
+# The hook invokes the selector after the linters (CI-P5), and each gate once.
+hook_line() { grep -nF -- "$1" .githooks/pre-commit | cut -d: -f1; }
+hook_run_all="$(hook_line 'run-all.sh" --staged')"
+hook_tests="$(hook_line 'precommit-tests.sh" --staged')"
+if [ -n "$hook_run_all" ] && [ -n "$hook_tests" ] \
+   && [ "$(grep -cF 'run-all.sh" --staged' .githooks/pre-commit)" -eq 1 ] \
+   && [ "$hook_run_all" -lt "$hook_tests" ]; then
+    echo "ok   the commit hook calls run-all.sh --staged once, then precommit-tests.sh --staged"
+else
+    echo "FAIL .githooks/pre-commit must call run-all.sh --staged once, before precommit-tests.sh --staged" >&2
+    rc=1
+fi
+
+# Full essentials pack (CI-P2): red on an error-severity hit, green on warnings
+# only and on a clean file, exit 2 when the pack root is missing.
+ess_fx=ci/linter/fixtures/essentials
+case_ 1 "lint-astgrep-essentials.sh: an error-severity hit blocks" \
+    ci/linter/lint-astgrep-essentials.sh "$ess_fx/error.lua"
+case_ 0 "lint-astgrep-essentials.sh: warning-only findings do not block" \
+    ci/linter/lint-astgrep-essentials.sh "$ess_fx/warning.lua"
+case_ 0 "lint-astgrep-essentials.sh: a clean file passes" \
+    ci/linter/lint-astgrep-essentials.sh "$ess_fx/clean.lua"
+case_ 2 "lint-astgrep-essentials.sh: a missing pack root is exit 2" \
+    env AST_GREP_ESSENTIALS=/nonexistent/essentials \
+    ci/linter/lint-astgrep-essentials.sh "$ess_fx/clean.lua"
+case_ 0 "lint-astgrep-essentials.sh: ESSENTIALS_ADVISORY keeps errors non-blocking" \
+    env ESSENTIALS_ADVISORY=1 ci/linter/lint-astgrep-essentials.sh "$ess_fx/error.lua"
 
 # Every PROMOTED name must be accepted by the guard against the REAL ruleset.
 # This is the control for the CI-only inversion fixed 2026-08-14: the guard was
@@ -454,6 +514,7 @@ WORKFLOWEOF
 done
 
 lint_file_wrappers=(
+    ci/linter/lint-astgrep-essentials.sh
     ci/linter/lint-astgrep.sh
     ci/linter/lint-atomic-ordering.sh
     ci/linter/lint-c.sh
@@ -928,7 +989,7 @@ case_ 2 "atomic-ordering: any other nonzero awk exit is exit 2" atomic_ordering_
 printf '#!/bin/sh\nexit %s\n' 1 > "$checkerroot/fakebin/awk"
 finding_case_ "atomic-ordering: awk exit 1 is still the weak-ordering finding" \
     'CI-ARM64-NO-LIVE-LANE' atomic_ordering_awk_failed
-rm -rf "$checkerroot/fakebin"
+rm -rf "${checkerroot:?}/fakebin"
 
 # resume-order: the resume-finalize order invariant. The scanner lives in the
 # wrapper itself, so --scan drives it over committed fixtures with no git
@@ -1252,7 +1313,7 @@ finding_case_ "shm-lock: awk exit 1 is still the R7 finding" 'FAIL: shm-mutex' \
     env -C "$checkerroot" PATH="$checkerroot/fakebin:$PATH" bash ci/tools/lint-shm-lock.sh src/control.c
 finding_case_ "stripe-seam: awk exit 1 is still the seam finding" 'FAIL: a site reaches' \
     env -C "$checkerroot" PATH="$checkerroot/fakebin:$PATH" bash ci/tools/lint-stripe-seam.sh src/control.c
-rm -rf "$checkerroot/fakebin"
+rm -rf "${checkerroot:?}/fakebin"
 rm -f "$checkerroot/src/control.c"
 #
 # THE FIXTURES ARE NOW COMPLETE, WELL-TYPED C. carve-init parses with clang

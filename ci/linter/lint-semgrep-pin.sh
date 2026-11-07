@@ -9,7 +9,7 @@ commit='40b8c63f75dc7c22c8a77482d73bfb864b146f7e'
 runner='ci/linter/run-semgrep.sh'
 installs=(ci/linter/install-linters.sh .github/workflows/security-scanners.yml
           .github/workflows/ci-deep.yml)
-consumers=(ci/linter/lint-c.sh .pre-commit-config.yaml
+consumers=(ci/linter/lint-c.sh
            .github/workflows/security-scanners.yml .github/workflows/ci-deep.yml)
 rules=(double-free insecure-use-gets-fn insecure-use-printf-fn
        insecure-use-scanf-fn insecure-use-strcat-fn insecure-use-string-copy-fn
