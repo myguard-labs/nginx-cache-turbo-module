@@ -48,6 +48,11 @@ is mechanical, see park_arm_matrix(). A (site, shape) pair with no arm must be
 listed in ci/park-arms-missing.tsv; the baseline can only shrink -- a listed
 pair whose arm now exists, or whose site is gone, fails as stale.
 
+Third check (CT-HOOK-AREA-FAULT-ONLY-TESTS): delegated to lint-fault-gate.py,
+which fails when a pre-commit @area map entry would run a test that run_all()
+calls only under `if ng.fault_injection:` without the selector's capability
+gate. Skipped (with a note) when the facade's repo has no precommit map.
+
 Usage: ci/tools/lint-orphan-tests.py [path-to-test_runtime.py]
 Exit 0 + "OK" line on a clean run, exit 1 naming every orphaned test on a
 regression.
@@ -56,6 +61,7 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -281,6 +287,17 @@ def check_park_arms(facade: Path, reached: set[str]) -> int:
     return 0 if ok else 1
 
 
+def check_fault_gate(facade: Path) -> int:
+    root = facade.resolve().parent.parent.parent
+    if not (root / "ci/tools/precommit-test-map.tsv").is_file():
+        print(f"lint-orphan-tests: fault-gate check skipped: no precommit map "
+              f"under {root}")
+        return 0
+    return subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent / "lint-fault-gate.py"),
+         "--root", str(root)], check=False).returncode
+
+
 def main() -> int:
     facade = Path(sys.argv[1] if len(sys.argv) > 1 else "ci/tools/test_runtime.py")
     paths = suite_files(facade)
@@ -358,7 +375,8 @@ def main() -> int:
               f"{len(paths)} file(s), {len(reached)} reachable from "
               f"run_all(), {len(ALLOWED_ORPHANS)} explicit opt-outs)")
 
-    return max(status, check_park_arms(facade, reached))
+    return max(status, check_park_arms(facade, reached),
+               check_fault_gate(facade))
 
 
 if __name__ == "__main__":
