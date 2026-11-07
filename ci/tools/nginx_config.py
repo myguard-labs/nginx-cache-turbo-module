@@ -3622,6 +3622,21 @@ http {{
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        # servarr / calibreweb: cookie (and servarr arg) prefilter mirror rows.
+        location /ct-servarr/ {{
+            cache_turbo         main;
+            cache_turbo_backend servarr;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /ct-calibreweb/ {{
+            cache_turbo         main;
+            cache_turbo_backend calibreweb;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 
         # A NAMED preset must pull in ONLY its own rules. `wordpress` here must
         # not react to /login, /user, /session, /index.php or another preset's

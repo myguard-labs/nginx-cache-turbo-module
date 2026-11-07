@@ -1210,6 +1210,8 @@ _COOKIE_NEEDLE_TABLE = {
                                      "authjs.session-token", "__session",
                                      "better-auth.session_token",
                                      "-auth-token"]),
+    "servarr":     ("/ct-servarr/", ["Auth=", "OIDC="]),
+    "calibreweb":  ("/ct-calibreweb/", ["session=", "remember_token="]),
 }
 
 
@@ -1852,6 +1854,7 @@ _ARG_NEEDLE_TABLE = {
                                       "route=account/authorize", "route=account/success",
                                       "user_token", "customer_token"]),
     "nextjs":      ("/ct-nextjs/", ["_rsc"]),
+    "servarr":     ("/ct-servarr/", ["apikey", "access_token"]),
 }
 
 

@@ -1683,6 +1683,117 @@ ngx_http_cache_turbo_arg_rules_match(const ngx_http_cache_turbo_argparse_t *ap,
 
 
 /*
+ * Servarr URI tier, ASCII case folded. Sonarr, Radarr and Lidarr are ASP.NET
+ * Core apps: endpoint routing and UsePathBase compare paths case-insensitively,
+ * so "/API/v3/series?h=x" and "/Initialize.json?h=x" reach the same handlers as
+ * the lowercase rows. The upstream `h`-arg rule marks those responses
+ * `public, max-age=31536000`, so with the byte-exact URI tier a cookieless
+ * authenticated client (External auth, an X-Api-Key API client) would have its
+ * API key or library JSON stored and replayed to the next anonymous request.
+ *
+ * Servarr only: every other preset keeps byte-exact rows, because those origins
+ * route byte-exact. The mount prefix is folded here too (UsePathBase), on a
+ * private copy of r->uri; the shared rebase in auto_skip() is unchanged. The
+ * segment boundary is the one ngx_http_cache_turbo_uri_prefix() applies.
+ * Self-contained ASCII fold: the fuzz shim carries no ngx_strncasecmp().
+ */
+static ngx_int_t
+ngx_http_cache_turbo_ascii_caseeq(const u_char *s, const u_char *p, size_t n)
+{
+    u_char  a, b;
+
+    while (n--) {
+        a = *s++;
+        b = *p++;
+
+        if (a >= 'A' && a <= 'Z') {
+            a |= 0x20;
+        }
+
+        if (b >= 'A' && b <= 'Z') {
+            b |= 0x20;
+        }
+
+        if (a != b) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+/* ngx_http_cache_turbo_uri_prefix() with the ASCII case fold: same segment
+ * boundary, and an empty needle never matches. */
+static ngx_int_t
+ngx_http_cache_turbo_uri_prefix_icase(ngx_str_t *uri, const char *pfx,
+    size_t l)
+{
+    u_char  next;
+
+    if (l == 0 || uri->len < l
+        || !ngx_http_cache_turbo_ascii_caseeq(uri->data, (const u_char *) pfx,
+                                              l))
+    {
+        return 0;
+    }
+
+    if (uri->len == l || pfx[l - 1] == '/') {
+        return 1;
+    }
+
+    next = uri->data[l];
+    return (next == '/' || next == '.');
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_servarr_uri_skip(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    const ngx_http_cache_turbo_preset_t  *ps;
+    const char *const                    *pp;
+    ngx_str_t                             uri;
+    size_t                                l;
+
+    if (!(clcf->backend_presets & NGX_HTTP_CACHE_TURBO_BACKEND_SERVARR)) {
+        return 0;
+    }
+
+    uri = r->uri;
+
+    if (clcf->backend_prefix != NULL
+        && clcf->backend_prefix != NGX_CONF_UNSET_PTR
+        && ngx_http_cache_turbo_uri_prefix_icase(&uri,
+               (const char *) clcf->backend_prefix->data,
+               clcf->backend_prefix->len))
+    {
+        l = clcf->backend_prefix->len;
+        uri.data += l - 1;              /* keep the mount's trailing '/' */
+        uri.len  -= l - 1;
+    }
+
+    for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
+        if (ps->bit != NGX_HTTP_CACHE_TURBO_BACKEND_SERVARR) {
+            continue;
+        }
+
+        for (pp = ps->uris; *pp; pp++) {
+            if (ngx_http_cache_turbo_uri_prefix_icase(&uri, *pp,
+                                                      ngx_strlen(*pp)))
+            {
+                return 1;
+            }
+        }
+
+        break;
+    }
+
+    return 0;
+}
+
+
+/*
  * Auto-classify gate. Returns 1 when the request matches a dynamic surface of
  * any active preset (login/session cookie, backend URI prefix, dynamic query
  * arg) and must therefore skip the cache entirely (origin, never capture). 0 =
@@ -1839,6 +1950,10 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
         }
     }
 #endif
+
+    if (ngx_http_cache_turbo_servarr_uri_skip(r, clcf)) {
+        return 1;
+    }
 
     return 0;
 }

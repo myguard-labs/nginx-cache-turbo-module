@@ -73,6 +73,9 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | `redmine` | 2 | 12 | 1 | — | — | Cookie login and cookieless `?key=` authentication are covered. |
 | `flarum` | 1 | 10 | — | — | — | Partial: login without remember-me is indistinguishable from a guest session; rechecked at 2.0.0-rc.8/1.8.19. |
 | `opencart` | — | — | 34 | — | — | Partial: base controller routes only. `OCSESSID` is identical for guests and members, so retain the application `no-store` policy; overriding it needs an application-exposed login boundary, then a fail-closed local map. |
+| `servarr` | 2 | 12 | 2 | — | — | Safety preset for Sonarr, Radarr and Lidarr (aliases `sonarr`, `radarr`, `lidarr`). The apps serve no anonymous HTML; the rows keep the login cookie, `/initialize.json` (API key under the upstream `?h=` public rule) and `/api` out of the cache. External auth needs a local bypass on the proxy SSO cookie. |
+| `calibre` | — | 7 | — | — | — | URI-only; there is no session cookie or API key. With server auth on, the `Authorization` floor already bypasses every request. |
+| `calibreweb` | 2 | 13 | — | — | — | Alias `calibre-web`. Safe only with anonymous browsing on and no reverse-proxy header login (cookieless auth); `session=` also matches guest search sessions, a lost hit only. |
 | `nextjs` | 7 | 1 | 1 | — | — | Plus 10 request-header rows (presence bypass; they also satisfy the matching App Router `Vary` axes). Safe for the default Auth.js/NextAuth, Clerk, Better Auth and Supabase session cookies; renamed cookies, Lucia and iron-session need local rules. `/api/` bypass is conservative. |
 
 <!-- markdownlint-enable MD013 -->
@@ -91,6 +94,13 @@ populated cookie and argument row.
 16.3.7). Its cookie and argument rows are in the same mirrors; its
 request-header tier and `Vary` handling are covered by
 `ci/t/presets/nextjs.t`. See [react.md](react.md).
+
+`servarr`, `calibre` and `calibreweb` were added after this review (researched
+2026-10-06, see [servarr.md](servarr.md), [calibre.md](calibre.md) and
+[calibreweb.md](calibreweb.md)). `spotweb` is documented without a preset
+([spotweb.md](spotweb.md)). Their rows are in the same mirrors where a cookie or
+argument row exists, and `ci/t/presets/{servarr,calibre,calibreweb}.t` cover each
+with a negative control.
 
 The 2026-09-01 online refresh also confirmed that XenForo 2.3.12 and Flarum
 2.0.0-rc.8 do not require literal changes. Two material documentation

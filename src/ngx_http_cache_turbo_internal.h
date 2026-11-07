@@ -444,7 +444,7 @@ ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
      | NGX_HTTP_CACHE_TURBO_USE_STALE_HTTP_504 \
      | NGX_HTTP_CACHE_TURBO_USE_STALE_ANY_5XX)
 
-/* backend preset bits WORDPRESS..NEXTJS (module.c only) */
+/* backend preset bits WORDPRESS..CALIBREWEB (module.c only) */
 /*
  * Auto-classify CMS backend presets (distinct from the stale-window PRESET_*
  * above). A bitmask in loc_conf->backend_presets; each bit pulls in one row of
@@ -515,6 +515,9 @@ ngx_int_t ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
 #define NGX_HTTP_CACHE_TURBO_BACKEND_FLARUM       0x100000000ull
 #define NGX_HTTP_CACHE_TURBO_BACKEND_OPENCART     0x200000000ull
 #define NGX_HTTP_CACHE_TURBO_BACKEND_NEXTJS       0x400000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_SERVARR      0x800000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_CALIBRE      0x1000000000ull
+#define NGX_HTTP_CACHE_TURBO_BACKEND_CALIBREWEB   0x2000000000ull
 
 /* ST_/SR_ serve outcome + reason enums (module.c only) */
 /* Per-request serve outcome (ctx.status), surfaced by $cache_turbo_status.

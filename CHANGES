@@ -1,5 +1,17 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Feature: cache_turbo_backend gains the presets "servarr" (aliases
+       "sonarr", "radarr", "lidarr"), "calibre" and "calibreweb" (alias
+       "calibre-web"). servarr bypasses the <InstanceName>Auth and
+       <InstanceName>OIDC login cookies, the API surface and the credential
+       args, which also keeps /initialize.json (it carries the API key) out of
+       the cache when the app marks it public through its ?h= rule. Its URI
+       rows ignore letter case, as the apps' routing does. calibre
+       bypasses the content server's write and per-user routes. calibreweb
+       bypasses the session and remember_token cookies and the private routes.
+       Spotweb is documented without a preset: it sets a fresh session cookie
+       on every request.
+
     *) Security: a reload or graceful shutdown with worker_shutdown_timeout
        no longer crashes the old worker when an HTTP/1 request is still
        waiting on a Redis cache GET, the Redis stampede lock or a memcached

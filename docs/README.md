@@ -53,6 +53,9 @@ One page per `cache_turbo_backend` preset:
 | `flarum` | [flarum.md](flarum.md) | ⚠️ **only with "remember me"** (`flarum_remember`) — `flarum_session` is issued to every guest and is deliberately NOT matched; a login without remember-me is invisible to the cookie tier, `/api` contains most of the exposure |
 | `opencart` | [opencart.md](opencart.md) | ⚠️ defense in depth only on 4.1.0.4 — base controller ARGs are matched, method-qualified routes are not; the global origin `no-store` keeps the default safe but also prevents page-cache hits |
 | `nextjs` | [react.md](react.md) | ✅ yes for Auth.js/NextAuth, Clerk, Better Auth and Supabase session cookies (renamed or other libraries need a local rule) — **plus a request-header tier**: RSC/prefetch requests bypass, so App Router HTML caches while the RSC payload at the same URL never does. Also covers React Router, Gatsby and Vite (no preset) |
+| `servarr` (`sonarr`, `radarr`, `lidarr`) | [servarr.md](servarr.md) | ✅ yes for Forms/OIDC login cookies (`<InstanceName>Auth`, `<InstanceName>OIDC`) — a **safety** preset: the apps serve no anonymous HTML, and the upstream `?h=` rule would otherwise let `/initialize.json` (API key) be cached; External auth needs a local bypass on the proxy SSO cookie |
+| `calibre` | [calibre.md](calibre.md) | ✅ URI-only (no session cookie, no API key): `/cdb/` writes, per-user reading state, `/interface-data/init`, `/ajax-setup`; with server auth on the `Authorization` floor already bypasses everything |
+| `calibreweb` (`calibre-web`) | [calibreweb.md](calibreweb.md) | ⚠️ yes for `session`/`remember_token` and the private routes — **only with anonymous browsing on and no reverse-proxy header login** (cookieless auth is invisible to the cookie tier); key on `Accept-Language` |
 
 `classicpress` is a source-verified alias for `wordpress`; `backdrop` is a
 source-verified alias for `drupal`. See the addenda in [wordpress.md](wordpress.md)
@@ -356,6 +359,12 @@ the site, even if they're not logged in"*). *Per-install*: Grav's session cookie
 `grav-site-<hash>`. Statamic manages **both at once** — `<APP_NAME>_session`, which
 is per-install *and* set for every guest. Grav is the painful one: flat-file traffic
 is the ideal shape for a page cache, and it still cannot be expressed.
+
+**[Spotweb](spotweb.md).** `spotsession=<sid>.<uid>` is set on **every** non-API
+request, anonymous ones included, with a fresh session id each time. Every browser
+response therefore carries a `Set-Cookie`, the storage floor stores none of them,
+and a cookie bypass would be 100% bypass. The API (`apikey` arg) is cookie-free but
+everything shares `index.php?page=`. Docs only: [spotweb.md](spotweb.md).
 
 **[NodeBB](nodebb.md).** Its only session cookie, `express.sid` (config-renameable via
 `sessionKey`), is issued to every visitor — guest and member alike — with an
