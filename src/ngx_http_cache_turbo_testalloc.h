@@ -36,11 +36,14 @@
  *   (ngx_array_init, ngx_list_init) were compiled before the macros exist and
  *   stay outside the funnel.
  *
- * EXTENSION POINT (BP-C1)
+ * INJECTED FAILURES (BP-C1)
  *   ngx_http_cache_turbo_test_alloc_gate() is the single decision point.
  *   NGX_OK lets the allocation proceed; any other value makes the wrapper
- *   return NULL without allocating, which is how an injected failure (the
- *   probe-armed fault_alloc=N countdown) plugs in without touching a macro.
+ *   return NULL without allocating. The fault_alloc=N countdown plugs in
+ *   there without touching a macro: a location with
+ *   `cache_turbo_test_fault_alloc;` arms it from a request (?n=N), and the
+ *   gate then fails exactly the Nth funnel call after that request finishes,
+ *   once, and disarms. See the countdown comment at the end of module.c.
  */
 
 #ifndef NGX_HTTP_CACHE_TURBO_TESTALLOC_H_INCLUDED_
@@ -56,7 +59,8 @@
 
 
 /* The gate, defined at the end of module.c. Traps a NULL pool (does not
- * return); otherwise NGX_OK to allocate, anything else to fail the call. */
+ * return); otherwise NGX_OK to allocate, NGX_DECLINED to fail the call (the
+ * armed fault_alloc countdown reaching its Nth call). */
 ngx_int_t ngx_http_cache_turbo_test_alloc_gate(ngx_pool_t *pool,
     const char *file, ngx_uint_t line);
 
@@ -66,6 +70,11 @@ ngx_int_t ngx_http_cache_turbo_test_alloc_gate(ngx_pool_t *pool,
 char *ngx_http_cache_turbo_test_dead_pool_alloc(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 
+/* `cache_turbo_test_fault_alloc;` (location level, no arguments): installs
+ * the content handler that reports and arms the fault_alloc=N countdown. */
+char *ngx_http_cache_turbo_test_fault_alloc(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+
 /* Spliced into ngx_http_cache_turbo_commands[] (module.c) in place of a
  * blank line, so module.c gains no line in any build. */
 #define NGX_HTTP_CACHE_TURBO_TEST_ALLOC_COMMANDS                              \
@@ -73,6 +82,12 @@ char *ngx_http_cache_turbo_test_dead_pool_alloc(ngx_conf_t *cf,
       NGX_HTTP_MAIN_CONF|NGX_CONF_NOARGS,                                     \
       ngx_http_cache_turbo_test_dead_pool_alloc,                              \
       0,                                                                      \
+      0,                                                                      \
+      NULL },                                                                 \
+    { ngx_string("cache_turbo_test_fault_alloc"),                             \
+      NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,                                      \
+      ngx_http_cache_turbo_test_fault_alloc,                                  \
+      NGX_HTTP_LOC_CONF_OFFSET,                                               \
       0,                                                                      \
       NULL },
 
