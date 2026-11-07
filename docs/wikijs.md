@@ -1,6 +1,6 @@
 # Wiki.js + cache-turbo
 
-_Last researched: 2026-07-26 (Wiki.js 2.5 `main`, v2.5.314 current)._
+_Last researched: 2026-11-07 (Wiki.js 3.1.1 and 2.5.315)._
 
 Wiki.js published pages can be shared for logged-out visitors. Authentication
 uses a fixed JWT cookie, while the globally installed Express session is not
@@ -18,8 +18,8 @@ cache_turbo_backend wikijs;
 
 | Check | Values |
 | --- | --- |
-| Cookie substrings | `jwt=`, `connect.sid=`, `loginRedirect=` |
-| URI prefixes | `/a`, `/d`, `/e`, `/h`, `/p`, `/s`, `/u`, `/login`, `/logout`, `/register`, `/verify`, `/login-reset`, `/graphql`, `/graphql-subscriptions` |
+| Cookie substrings | `jwt=`, `connect.sid=`, `loginRedirect=`, `wikiSession=` |
+| URI prefixes | `/a`, `/d`, `/e`, `/h`, `/p`, `/s`, `/u`, `/login`, `/logout`, `/register`, `/verify`, `/login-reset`, `/graphql`, `/graphql-subscriptions`, `/_api/auth`, `/_mcp`, `/_scim`, `/_terminal`, `/_collab` |
 | Query args | — |
 
 <!-- markdownlint-enable MD013 -->
@@ -37,9 +37,13 @@ The controller routes and ACL checks are visible in
 [`server/controllers/common.js`](https://github.com/requarks/wiki/blob/main/server/controllers/common.js).
 Published page HTML includes the effective permissions and navigation for the
 current group. All logged-in group variants carry `jwt` and bypass; logged-out
-visitors share the single guest-group representation. Wiki.js' latest listed
-release is v2.5.314; its own requirements page still describes 2.x while noting
-that a future 3.x changes platform support.
+visitors share the single guest-group representation. Wiki.js 3.x (Fastify, 3.1.1) replaces
+the `jwt` cookie with a `wikiSession` session cookie (`saveUninitialized: false`,
+so guests stay cookie-free; also set when a guest unlocks a password-protected
+page) and serves its private API on `/_api`, `/_mcp`, `/_scim`, `/_terminal`
+and `/_collab`. The 2.x rows are kept for installs still on 2.x. API keys in 3.x
+are `Bearer` only (generic floor); `/_user`, `/_site` and `/_icons` are public by
+design and stay cacheable.
 
 ## Reverse-proxy vhost core
 
@@ -97,8 +101,8 @@ curl -s -o /dev/null -D- https://wiki.example.com/e/guide | grep -i x-cache
 curl -s -o /dev/null -D- https://wiki.example.com/graphql | grep -i x-cache
 ```
 
-- This preset targets Wiki.js 2.x. Re-audit cookie and route literals before
-  using it with the forthcoming 3.x architecture.
+- This preset covers Wiki.js 2.x and 3.x (verified against 3.1.1). Re-audit
+  cookie and route literals after a major release.
 - Keep `cache_turbo_cache_control honor`. Token renewal explicitly emits
   `Cache-Control: no-store`, and the module's `Set-Cookie` floor is defence in
   depth for login redirects and third-party authentication strategies.

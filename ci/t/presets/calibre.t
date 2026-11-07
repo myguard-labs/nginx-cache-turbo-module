@@ -25,6 +25,11 @@ our $Config = ct_config(
     { path => '/book-get-annotations', backend => 'calibre' },
     { path => '/interface-data/init', backend => 'calibre' },
     { path => '/ajax-setup', backend => 'calibre' },
+    { path => '/kosync/', backend => 'calibre' },
+    { path => '/kosyncx', backend => 'calibre' },
+    { path => '/book-get-storage', backend => 'calibre' },
+    { path => '/book-get-storagex', backend => 'calibre' },
+    { path => '/book-set-storage', backend => 'calibre' },
     { path => '/calibre/', backend => 'calibre' },
     { path => '/static/', backend => 'calibre' },
     { path => '/gen/', backend => 'wordpress' },
@@ -145,3 +150,35 @@ Cookie: session=abc
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200]
+
+
+
+=== TEST 8: KOReader sync and per-user storage rows bypass at the root
+# /kosync/ serves per-user reading progress from X-Auth-User, not Authorization;
+# /book-get-storage and /book-set-storage are per-user key/value stores.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /kosync/syncs/progress/abc", "GET /kosync/syncs/progress/abc",
+ "GET /book-get-storage/lib/1/EPUB", "GET /book-get-storage/lib/1/EPUB",
+ "GET /book-set-storage/lib/1/EPUB", "GET /book-set-storage/lib/1/EPUB"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200, 200, 200]
+
+
+
+=== TEST 9: NEGATIVE -- /kosyncx and /book-get-storagex are different segments and cache
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /kosyncx", "GET /kosyncx",
+ "GET /book-get-storagex", "GET /book-get-storagex"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200, 200]

@@ -1,6 +1,6 @@
 # OpenCart + cache-turbo
 
-_Last researched: 2026-09-01 (OpenCart 4.1.0.4; account and checkout controller
+_Last researched: 2026-11-07 (OpenCart 4.1.0.4; account and checkout controller
 inventories rechecked)._
 
 OpenCart is the only shipped preset that classifies **entirely on query
@@ -22,6 +22,7 @@ cache_turbo_backend opencart;
 | --- | --- |
 | Cookie substrings | — (deliberately none; see below) |
 | URI prefixes | — (everything is `/index.php`) |
+| Key cookies (value folded into cache key) | `currency` |
 | Query args | Base controller values: `route=checkout/{cart,checkout,confirm,success,failure,payment_address,payment_method,shipping_address,shipping_method,register}`, `route=account/{account,login,logout,register,forgotten,edit,password,address,order,wishlist,download,returns,reward,transaction,subscription,newsletter,affiliate,custom_field,tracking,payment_method,authorize,success}`, plus `user_token`, `customer_token` |
 
 <!-- markdownlint-enable MD013 -->
@@ -161,18 +162,16 @@ check_uncached 'https://shop.example.com/index.php?route=common/home&user_token=
   trusting it, and fall back to a `map $request_uri` rule if needed.
 - The `/admin/` directory is renameable at install. It is not in the preset;
   route it around the cache yourself, as in the vhost above.
-- **No key cookies.** OpenCart 4.x drives language and currency through the
-  URL —
-  [`catalog/controller/common/language.php`][opencart-language]
-  only reads the request/config and redirects with the argument, setting no
-  cookie. The 3.x-era `language` / `currency` cookies were checked for and are
-  **not** set by 4.x; do not add them back without re-verifying against your own
-  install.
+- **Key cookie `currency`.** OpenCart 4.1.0.4's
+  `catalog/controller/startup/currency.php` reads the `currency` cookie and sets
+  it for every visitor that lacks one (and `common/currency.php` on a switch),
+  so the cookie changes the rendered prices. The preset folds its value into the
+  cache key; a response that sets it carries `Set-Cookie` and is never stored.
+  The value is client-controlled, so a client can create several entries per
+  URL. There is no language cookie in 4.x: language is URL-driven.
 - Keep `cache_turbo_cache_control honor`. OpenCart 4.1.0.4 emits `no-store`
   globally, not only on checkout; the unconditional `Set-Cookie` floor is an
   additional guard, not a replacement.
-
-[opencart-language]: https://github.com/opencart/opencart/blob/4.1.0.4/upload/catalog/controller/common/language.php
 
 ## Origin failure: stale-if-error
 

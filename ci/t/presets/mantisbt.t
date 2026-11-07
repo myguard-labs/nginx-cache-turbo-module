@@ -25,8 +25,8 @@
 # `_PROJECT_COOKIE`, `_VIEW_ALL_COOKIE`, `_BUG_LIST_COOKIE`, and
 # `_collapse_settings`. TEST 6 proves this works for both the common
 # "MANTIS" prefix and an arbitrary install-chosen prefix in the same
-# assertion. `ct_mantisbt_args[]` is `{ NULL }` -- no arg tier -- so no arg
-# rule is tested here.
+# assertion. `ct_mantisbt_args[]` is `{ "key" }` (the RSS feed login);
+# TESTS 13-14 cover it.
 #
 # THE NONEMPTY OPERATOR -- AN EMPTY VALUE DOES NOT BYPASS
 # ------------------------------------------------------------------------
@@ -320,6 +320,35 @@ Cookie: some_other_cookie=xyz
 Cookie: MANTIS_STRING_COOKIE=abc123
 --- request eval
 ["GET /gen/view-iso", "GET /gen/view-iso"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 13: the RSS feed `key` arg bypasses with NO cookie (issues_rss.php login)
+# issues_rss.php and news_rss.php authenticate from ?username=&key= alone, so a
+# member's private feed must never share the public cache key. Each fetched twice.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /mantisbt/issues_rss.php?username=u&key=k", "GET /mantisbt/issues_rss.php?username=u&key=k",
+ "GET /mantisbt/news_rss.php?key=k", "GET /mantisbt/news_rss.php?key=k"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
+=== TEST 14: NEGATIVE -- a near-miss arg name (`keys`) does NOT bypass
+# The arg rows are exact names: `keys` is not `key`, so the request caches.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /mantisbt/issues_rss.php?keys=k", "GET /mantisbt/issues_rss.php?keys=k"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval

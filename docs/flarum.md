@@ -1,7 +1,6 @@
 # Flarum + cache-turbo
 
-_Last researched: 2026-09-01 (flarum/framework v2.0.0-rc.8; identical cookie
-mechanics in the v1.8.19 stable line)._
+_Last researched: 2026-11-07 (flarum/framework v2.0.2)._
 
 Flarum is a single-page forum whose discussion URLs are perfectly cacheable for
 logged-out visitors. The one thing you must get right is **which** cookie means
@@ -22,8 +21,14 @@ cache_turbo_backend flarum;
 | Cookie substrings | `flarum_remember=` |
 | URI prefixes | `/admin`, `/api`, `/login`, `/logout`, `/global-logout`, `/register`, `/reset`, `/confirm`, `/settings`, `/notifications` |
 | Query args | — |
+| Key cookies (value folded into cache key) | `locale` |
 
 <!-- markdownlint-enable MD013 -->
+
+`locale` is the unprefixed guest language cookie: `SetLocale.php` renders guests
+in that language, so each value gets its own cache entry instead of one guest's
+choice poisoning the shared one. The value is client-controlled, so a client can
+create several entries per URL (same exposure as other key cookies).
 
 ## `flarum_session` is not a login signal
 

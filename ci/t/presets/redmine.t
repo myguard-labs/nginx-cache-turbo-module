@@ -308,3 +308,59 @@ Cookie: _redmine_session=42:deadbeef
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200]
+
+
+
+=== TEST 14: Doorkeeper OAuth token args (access_token, bearer_token) bypass with no cookie
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /redmine/oauth-a?access_token=t", "GET /redmine/oauth-a?access_token=t",
+ "GET /redmine/oauth-b?bearer_token=t", "GET /redmine/oauth-b?bearer_token=t"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
+=== TEST 15: NEGATIVE -- near-miss arg name (access_tokens) does NOT bypass
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /redmine/oauth-c?access_tokens=t", "GET /redmine/oauth-c?access_tokens=t"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 16: the X-Redmine-API-Key request header bypasses (cookieless API key)
+# api_key_from_request reads params[:key] OR this header; the header form has no
+# query arg and no cookie, so only the header tier can protect it.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- more_headers
+X-Redmine-API-Key: fixture
+--- request eval
+["GET /redmine/issues.json", "GET /redmine/issues.json"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 17: NEGATIVE -- near-miss header name (X-Redmine-API) does NOT bypass
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- more_headers
+X-Redmine-API: fixture
+--- request eval
+["GET /redmine/issues-near.json", "GET /redmine/issues-near.json"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]

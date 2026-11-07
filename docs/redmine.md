@@ -1,6 +1,6 @@
 # Redmine + cache-turbo
 
-_Last researched: 2026-07-26 (Redmine 7.0.0 current; mechanics unchanged since 5.x)._
+_Last researched: 2026-11-07 (Redmine 7.0.3; mechanics unchanged since 5.x)._
 
 Redmine is the cleanest of the trackers to cache: its session cookie name is a
 hardcoded string literal rather than a config-derived or hashed value, so the
@@ -22,7 +22,8 @@ cache_turbo_backend redmine;
 | --- | --- |
 | Cookie substrings | `_redmine_session=`, `autologin=` |
 | URI prefixes | `/admin`, `/my`, `/login`, `/logout`, `/account`, `/settings`, `/enumerations`, `/roles`, `/trackers`, `/custom_fields`, `/auth_sources`, `/mail_handler` |
-| Query args | `key` |
+| Query args | `key`, `access_token`, `bearer_token` |
+| Request headers | `X-Redmine-API-Key` |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -63,7 +64,11 @@ serve one user's private tracker to every subsequent visitor. This is the same
 class of hole the `ghost` preset's `?uuid=` / `?key=` / `?gift=` rows close.
 
 `Authorization` (OAuth via Doorkeeper, and HTTP Basic) is covered by
-cache-turbo's generic header floor and needs no preset row.
+cache-turbo's generic header floor and needs no preset row. Two more cookieless
+channels are not: `api_key_from_request` also reads the `X-Redmine-API-Key`
+request header (preset header row), and Doorkeeper's default token methods
+accept `?access_token=` and `?bearer_token=` (preset arg rows); Redmine
+overrides none of them.
 
 ## What is deliberately NOT bypassed
 

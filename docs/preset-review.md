@@ -1,6 +1,7 @@
 # Preset review and deployment checklist
 
-_Implementation reviewed: 2026-09-01 at `3db1ca9`; 13 original presets re-checked upstream 2026-11-07._
+_Implementation reviewed: 2026-09-01 at `3db1ca9`; 25 application presets
+re-checked upstream 2026-11-07 (13 original, 12 further)._
 
 This page records what was checked across every shipped
 `cache_turbo_backend` preset. The per-application guides remain the source for
@@ -65,16 +66,16 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | `bludit` | 3 | 2 | — | — | — | Stock auth and remember-me cookies are covered. |
 | `spip` | — | 1 | 2 | yes | — | Prefix-independent session/admin/state suffixes are covered conservatively. |
 | `bugzilla` | 2 | 35 | 8 | — | — | Login, token-bearing and administrative entry points are covered. |
-| `mantisbt` (`mantis`) | 1 | 32 | — | yes | — | Custom PHP `session.name` needs a local rule. |
-| `plone` | 4 | 7 | — | — | — | Auth, Zope session, status and language state are covered; retain origin cache headers. |
+| `mantisbt` (`mantis`) | 1 | 32 | 1 | yes | — | Custom PHP `session.name` needs a local rule. |
+| `plone` | 5 | 7 | — | — | — | Auth, Zope session, status and language state are covered; retain origin cache headers. |
 | `umbraco` | 10 | 1 | — | — | — | Stock member/back-office cookies are covered; custom schemes need local rules. |
 | `dotclear` | 3 | 3 | — | — | — | Custom `DC_SESSION_NAME` and same-host admin paths need local rules. |
-| `wikijs` | 3 | 14 | — | — | — | Covers Wiki.js 2.x; treat 3.x as a fresh preset review. |
-| `redmine` | 2 | 12 | 1 | — | — | Cookie login and cookieless `?key=` authentication are covered. |
-| `flarum` | 1 | 10 | — | — | — | Partial: login without remember-me is indistinguishable from a guest session; rechecked at 2.0.0-rc.8/1.8.19. |
-| `opencart` | — | — | 34 | — | — | Partial: base controller routes only. `OCSESSID` is identical for guests and members, so retain the application `no-store` policy; overriding it needs an application-exposed login boundary, then a fail-closed local map. |
+| `wikijs` | 4 | 19 | — | — | — | Covers Wiki.js 2.x and 3.x (3.1.1). |
+| `redmine` | 2 | 12 | 3 | — | — | Cookie login and cookieless `?key=`, `?access_token=`, `?bearer_token=` authentication are covered; plus 1 request-header row (`X-Redmine-API-Key`, presence bypass). |
+| `flarum` | 1 | 10 | — | — | 1 | Partial: login without remember-me is indistinguishable from a guest session; rechecked at v2.0.2. Guest `locale` cookie is value-keyed. |
+| `opencart` | — | — | 34 | — | 1 | Partial: base controller routes only. `OCSESSID` is identical for guests and members, so retain the application `no-store` policy; overriding it needs an application-exposed login boundary, then a fail-closed local map. The `currency` cookie is value-keyed. |
 | `servarr` | 2 | 12 | 2 | — | — | Safety preset for Sonarr, Radarr and Lidarr (aliases `sonarr`, `radarr`, `lidarr`). The apps serve no anonymous HTML; the rows keep the login cookie, `/initialize.json` (API key under the upstream `?h=` public rule) and `/api` out of the cache. External auth needs a local bypass on the proxy SSO cookie. |
-| `calibre` | — | 7 | — | — | — | URI-only; there is no session cookie or API key. With server auth on, the `Authorization` floor already bypasses every request. |
+| `calibre` | — | 10 | — | — | — | URI-only; there is no session cookie or API key. With server auth on, the `Authorization` floor already bypasses every request. |
 | `calibreweb` | 2 | 13 | — | — | — | Alias `calibre-web`. Safe only with anonymous browsing on and no reverse-proxy header login (cookieless auth); `session=` also matches guest search sessions, a lost hit only. |
 | `nextjs` | 7 | 1 | 1 | — | — | Plus 10 request-header rows (presence bypass; they also satisfy the matching App Router `Vary` axes). Safe for the default Auth.js/NextAuth, Clerk, Better Auth and Supabase session cookies; renamed cookies, Lucia and iron-session need local rules. `/api/` bypass is conservative. |
 
@@ -113,7 +114,28 @@ vendor-attested and were not re-verified.
 | `kirby` | 5.6.3 | No change. |
 | `shopware6` | v6.7.16.0 | Added predicate `sw-cache-hash` equals `not-cacheable` (Shopware's own "bypass the cache" marker); the key cookie stays. |
 
-`nextjs` was added after this review (researched 2026-09-29 against Next.js
+The same day the next 12 application presets (mantisbt, plone, umbraco,
+dotclear, wikijs, redmine, flarum, opencart, servarr, calibre, calibreweb,
+nextjs) were re-checked against the cited upstream source and changed in eight
+of them; umbraco changed only its comment and guide, and dotclear, servarr,
+calibreweb and nextjs needed no literal change.
+
+| Preset | Release checked | Result |
+| --- | --- | --- |
+| `mantisbt` | 2.28.4 | Added arg `key`: the RSS feeds (`issues_rss.php`, `news_rss.php`) log in from `?username=&key=` with no cookie. |
+| `plone` | 6.2.2 (Volto 19.7.0) | Added cookie `auth_token=`: the Volto frontend login cookie, read during server-side rendering. |
+| `umbraco` | 18.3.1 | No row change; comment and guide corrected: the Delivery API lives under `/umbraco/delivery/api/` and is bypassed by `/umbraco`. |
+| `dotclear` | 2.39.3 | No change. |
+| `wikijs` | 3.1.1 and 2.5.315 | Added cookie `wikiSession=` and URIs `/_api/auth`, `/_mcp`, `/_scim`, `/_terminal`, `/_collab` for the 3.x rewrite; every 2.x row is kept. |
+| `redmine` | 7.0.3 | Added args `access_token`, `bearer_token` (Doorkeeper defaults) and header `X-Redmine-API-Key` (cookieless API key). |
+| `flarum` | v2.0.2 | Added key cookie `locale`: guests render in the language from the unprefixed cookie. |
+| `opencart` | 4.1.0.4 | Added key cookie `currency`: 4.x sets it for every visitor; the earlier "not set by 4.x" claim was wrong. |
+| `servarr` | Sonarr v4.0.20, Radarr v6.4.4, Lidarr v3.1.6 | No change. |
+| `calibre` | v9.18.0 | Added URIs `/kosync/`, `/book-get-storage`, `/book-set-storage`: per-user state at shared URLs (KOReader sync authenticates by `X-Auth-User`, not `Authorization`). |
+| `calibreweb` | 0.6.27 | No change. |
+| `nextjs` | v16.4.5 | No change. |
+
+`nextjs` was added after the first review (researched 2026-09-29 against Next.js
 16.3.7). Its cookie and argument rows are in the same mirrors; its
 request-header tier and `Vary` handling are covered by
 `ci/t/presets/nextjs.t`. See [react.md](react.md).
@@ -151,7 +173,7 @@ remaining deployment checks are concentrated in six classes:
 5. test cookieless authentication paths (`ghost`, `redmine`, `bugzilla`, and
    application APIs);
 6. empirically verify closed-source or version-sensitive products (`invision`,
-   `vanilla`, `vbulletin`, and Wiki.js 3.x when released).
+   `vanilla`, and `vbulletin`).
 
 Run the anonymous/member `curl` probes in the application guide after every
 major application upgrade. A private request must never produce `HIT`; an

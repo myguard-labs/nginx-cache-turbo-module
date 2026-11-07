@@ -41,6 +41,8 @@
 # the only mutation target for the arg matcher is ngx_http_cache_turbo_arg_match()
 # itself (src ~4214).
 #
+# key_cookies is { "currency" } (TESTS 9-10): the guest currency is value-keyed.
+#
 # ct_opencart_args[] carries several prefix-related-looking route pairs
 # ("route=checkout/payment_address" / "route=checkout/payment_method" and
 # similar), but the matcher compares NAME=VALUE by EXACT BYTES, not prefix --
@@ -269,6 +271,45 @@ Cookie: OCSESSID=b7d3f1a9c2e4550188aa
 Cookie: OCSESSID=b7d3f1a9c2e4550188aa
 --- request eval
 ["GET /gen/product-iso", "GET /gen/product-iso"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 9: the guest `currency` cookie is VALUE-KEYED -- EUR and USD are distinct entries
+# catalog/controller/startup/currency.php renders prices in the currency from
+# this cookie, so each value must get its own entry. The body echo proves
+# separation.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /oc/index.php?route=product/category", "GET /oc/index.php?route=product/category",
+ "GET /oc/index.php?route=product/category", "GET /oc/index.php?route=product/category"]
+--- more_headers eval
+["Cookie: currency=EUR", "Cookie: currency=EUR",
+ "Cookie: currency=USD", "Cookie: currency=USD"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- response_body_like eval
+[qr/ck=currency=EUR/, qr/ck=currency=EUR/,
+ qr/ck=currency=USD/, qr/ck=currency=USD/]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
+=== TEST 10: NEGATIVE -- a near-miss cookie name (currencyx) is NOT keyed
+# Key cookies match the exact name: currencyx=EUR and currencyx=USD fold into
+# no key, so the second distinct value is served the first entry (HIT).
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /oc/index.php?route=product/manufacturer", "GET /oc/index.php?route=product/manufacturer"]
+--- more_headers eval
+["Cookie: currencyx=EUR", "Cookie: currencyx=USD"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval

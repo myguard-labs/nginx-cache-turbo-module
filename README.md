@@ -974,17 +974,17 @@ storage; the trade is a lost cache hit, never a cacheable private request.
 | `bludit` † | `/admin`, `/install.php` | — | `BLUDIT-KEY` (also `__Secure-`), `BLUDITREMEMBERUSERNAME`, `BLUDITREMEMBERTOKEN` |
 | `spip` † | `/ecrire` | `action`, `var_mode` | `_session`, `_admin`, `_lang`, `_lang_ecrire`, `_accepte_ajax` (suffix, non-empty) |
 | `bugzilla` † | account/login, mutation, admin/edit and API CGI entry points | `Bugzilla_api_key`, `api_key`, `Bugzilla_api_token`, `Bugzilla_token`, `Bugzilla_login`, `Bugzilla_password`, `Bugzilla_login_token`, `token` | `Bugzilla_login`, `Bugzilla_logincookie` |
-| `mantisbt` † | login/signup/account/form, `/admin/`, `/api/` entry points | — | `_STRING_COOKIE`, `_PROJECT_COOKIE`, `_VIEW_ALL_COOKIE`, `_BUG_LIST_COOKIE`, `_collapse_settings` (suffix, non-empty); `PHPSESSID` |
-| `plone` † | `/login`, `/logout`, `/register`, `/passwordreset`, `/mail_password`, `/manage`, `/@@login` | — | `__ac`, `_ZopeId`, `statusmessages`, `I18N_LANGUAGE` |
+| `mantisbt` † | login/signup/account/form, `/admin/`, `/api/` entry points | `key` | `_STRING_COOKIE`, `_PROJECT_COOKIE`, `_VIEW_ALL_COOKIE`, `_BUG_LIST_COOKIE`, `_collapse_settings` (suffix, non-empty); `PHPSESSID` |
+| `plone` † | `/login`, `/logout`, `/register`, `/passwordreset`, `/mail_password`, `/manage`, `/@@login` | — | `__ac`, `_ZopeId`, `statusmessages`, `I18N_LANGUAGE`, `auth_token` (Volto) |
 | `umbraco` † | `/umbraco` | — | `UMB_UCONTEXT`, back-office token/preview/XSRF cookies, `UMB_SESSION`, `.AspNetCore.Identity.Application` |
 | `dotclear` † | `/admin`, `/preview`, `/pagespreview` | — | `dcxd`, `dc_admin`, `dc_passwd` |
-| `wikijs` † | admin/editor/history/source/upload, login/identity and GraphQL routes | — | `jwt`, `connect.sid`, `loginRedirect` |
-| `redmine` † | `/admin`, `/my`, `/login`, `/logout`, `/account`, `/settings`, `/enumerations`, `/roles`, `/trackers`, `/custom_fields`, `/auth_sources`, `/mail_handler` | `key` | `_redmine_session`, `autologin` |
-| `flarum` † | `/admin`, `/api`, `/login`, `/logout`, `/global-logout`, `/register`, `/reset`, `/confirm`, `/settings`, `/notifications` | — | `flarum_remember` **only** — `flarum_session` is guest-issued and deliberately unmatched |
-| `opencart` † | — (all routing is `/index.php?route=`) | base `route=account/…` and `route=checkout/…` values, `user_token`, `customer_token`; method-qualified OpenCart 4 routes rely on origin `no-store` | — (none: `OCSESSID` is guest-issued, login state is server-side only) |
+| `wikijs` † | admin/editor/history/source/upload, login/identity and GraphQL routes (2.x); `/_api/auth`, `/_mcp`, `/_scim`, `/_terminal`, `/_collab` (3.x) | — | `jwt`, `connect.sid`, `loginRedirect` (2.x); `wikiSession` (3.x) |
+| `redmine` † ◇ | `/admin`, `/my`, `/login`, `/logout`, `/account`, `/settings`, `/enumerations`, `/roles`, `/trackers`, `/custom_fields`, `/auth_sources`, `/mail_handler` | `key`, `access_token`, `bearer_token` | `_redmine_session`, `autologin`; **◇ request header** `X-Redmine-API-Key` bypasses on presence |
+| `flarum` † ✦ | `/admin`, `/api`, `/login`, `/logout`, `/global-logout`, `/register`, `/reset`, `/confirm`, `/settings`, `/notifications` | — | `flarum_remember` **only** — `flarum_session` is guest-issued and deliberately unmatched; *(key)* `locale` ✦ |
+| `opencart` † ✦ | — (all routing is `/index.php?route=`) | base `route=account/…` and `route=checkout/…` values, `user_token`, `customer_token`; method-qualified OpenCart 4 routes rely on origin `no-store` | — (no bypass cookie: `OCSESSID` is guest-issued, login state is server-side only); *(key)* `currency` ✦ |
 | `nextjs` † ◇ | `/api/` | `_rsc` | `__prerender_bypass`, `__next_preview_data`, `next-auth.session-token`, `authjs.session-token`, `__session`, `better-auth.session_token`, `-auth-token`; **◇ request headers** `RSC`, `Next-Router-State-Tree`, `Next-Router-Prefetch`, `Next-Router-Segment-Prefetch`, `Next-Url`, `Next-Action`, `X-Middleware-Prefetch`, `X-Nextjs-Data`, `X-Now-Route-Matches`, `X-Middleware-Subrequest` bypass on presence, and satisfy the matching `Vary` axes so App Router HTML caches while RSC payloads never do |
 | `servarr` † (`sonarr`, `radarr`, `lidarr`) | `/api`, `/feed`, `/signalr`, `/initialize.json`, `/login`, `/logout`, `/loggedout`, `/logfile`, `/updatelogfile`, `/backup`, `/MediaCover`, `/MediaCoverProxy` | `apikey`, `access_token` | `Auth=`, `OIDC=` (`<InstanceName>Auth` / `<InstanceName>OIDC`) |
-| `calibre` † | `/cdb/`, `/book-set-last-read-position`, `/book-set-annotations`, `/book-get-last-read-position`, `/book-get-annotations`, `/interface-data/init`, `/ajax-setup` | — | — (no session cookie) |
+| `calibre` † | `/cdb/`, `/book-set-last-read-position`, `/book-set-annotations`, `/book-get-last-read-position`, `/book-get-annotations`, `/interface-data/init`, `/ajax-setup`, `/kosync/`, `/book-get-storage`, `/book-set-storage` | — | — (no session cookie) |
 | `calibreweb` † (`calibre-web`) | `/login`, `/logout`, `/admin`, `/me`, `/download/`, `/show/`, `/send/`, `/ajax/`, `/read/`, `/kobo/`, `/kobo_auth/`, `/remote/login`, `/verify/` | — | `session=`, `remember_token=` |
 
 `classicpress` is an alias for `wordpress`, and `backdrop` is an alias for
@@ -1075,8 +1075,8 @@ with a `cache_turbo_no_store` on the same cookie, since a bypass only skips the
 lookup and still stores — if the collision costs you. Note `NO_CACHE` is **not** matched: it is contrib (not core) and is set
 for *logged-out* visitors by design, so it would cost hits and buy no safety.
 
-✦ **A cookie VALUE folded into the cache KEY, not a bypass.** `magento` is the one
-preset that neither bypasses nor merely tests a cookie's value as a pass/fail
+✦ **A cookie VALUE folded into the cache KEY, not a bypass.** `magento` was the
+first preset that neither bypasses nor merely tests a cookie's value as a pass/fail
 predicate (∆, above) — it puts the cookie's **value** into the cache key itself,
 via a distinct `key_cookies` tier. `X-Magento-Vary` is Magento's
 `Context::getVaryString()` — a salted hash of the sorted tuple
@@ -1103,7 +1103,9 @@ just the first) because nginx's `$cookie_` variables cannot represent a
 hyphenated name (`$cookie_X_Magento_Vary` silently never matches — no `-`→`_`
 translation for cookie names, unlike `$http_*`). See [magento.md](docs/magento.md).
 
-`shopware6` uses the same tier on `sw-cache-hash`, and `xenforo` uses it on the
+`shopware6` uses the same tier on `sw-cache-hash`, `flarum` on the guest
+`locale` cookie and `opencart` on `currency` (both client-controlled values, so a
+client can create several entries per URL), and `xenforo` uses it on the
 presentation cookies `xf_style_id` / `xf_style_variation` (XF 2.3 light/dark) /
 `xf_language_id` — the visitor's chosen style, dark-mode variation and language
 each get their own *shared* cache entry rather than being dropped from the cache.
@@ -1148,7 +1150,8 @@ catches an editor previewing the frontend, who carries no `fe_typo_user` at
 all. See [typo3.md](docs/typo3.md).
 
 ◇ **A request-HEADER tier, and the only preset that changes what `Vary`
-accepts.** Next.js serves two different bodies at one URL: the HTML document,
+accepts (`nextjs`; `redmine` uses the same tier for `X-Redmine-API-Key` only,
+which satisfies no `Vary` axis in practice).** Next.js serves two different bodies at one URL: the HTML document,
 and — when the client router sends `RSC: 1` — the React Server Component
 payload (`text/x-component`). Every App Router response therefore carries
 `Vary: rsc, next-router-state-tree, next-router-prefetch,

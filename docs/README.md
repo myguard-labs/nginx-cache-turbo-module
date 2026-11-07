@@ -44,17 +44,17 @@ One page per `cache_turbo_backend` preset:
 | `bludit` | [bludit.md](bludit.md) | ✅ yes (`BLUDIT-KEY` plus remember-me cookies) — public bootstrap is session-free |
 | `spip` | [spip.md](spip.md) | ✅ yes (prefix-independent `_session`/`_admin` suffixes) — language/Ajax state bypasses conservatively |
 | `bugzilla` | [bugzilla.md](bugzilla.md) | ✅ yes (both login cookies plus cookieless API/login token args) — public bug/list/report pages remain cacheable |
-| `mantisbt` (`mantis`) | [mantisbt.md](mantisbt.md) | ✅ yes (prefix-independent login/state suffixes plus `PHPSESSID`) — custom PHP `session.name` needs a local rule |
-| `plone` | [plone.md](plone.md) | ✅ yes (`__ac`, Zope session/status/language state) — keep Plone's own cache headers enabled |
+| `mantisbt` (`mantis`) | [mantisbt.md](mantisbt.md) | ✅ yes (prefix-independent login/state suffixes plus `PHPSESSID`, and the RSS `?key=` ARG) — custom PHP `session.name` needs a local rule |
+| `plone` | [plone.md](plone.md) | ✅ yes (`__ac`, Zope session/status/language state, Volto `auth_token`) — keep Plone's own cache headers enabled |
 | `umbraco` | [umbraco.md](umbraco.md) | ⚠️ yes for stock cookie names — member/back-office auth names are configurable; renamed schemes need local rules |
 | `dotclear` | [dotclear.md](dotclear.md) | ⚠️ yes with stock `dcxd` session name — custom `DC_SESSION_NAME` and same-host admin paths need local rules |
-| `wikijs` | [wikijs.md](wikijs.md) | ✅ yes for Wiki.js 2.x (`jwt`; untouched guests get no Express session) — re-audit for 3.x |
-| `redmine` | [redmine.md](redmine.md) | ✅ yes (`_redmine_session`, a hardcoded literal, + `autologin`) — **and `?key=` is a bypass ARG**: it authenticates an Atom/API request with no cookie at all |
-| `flarum` | [flarum.md](flarum.md) | ⚠️ **only with "remember me"** (`flarum_remember`) — `flarum_session` is issued to every guest and is deliberately NOT matched; a login without remember-me is invisible to the cookie tier, `/api` contains most of the exposure |
-| `opencart` | [opencart.md](opencart.md) | ⚠️ defense in depth only on 4.1.0.4 — base controller ARGs are matched, method-qualified routes are not; the global origin `no-store` keeps the default safe but also prevents page-cache hits |
+| `wikijs` | [wikijs.md](wikijs.md) | ✅ yes for Wiki.js 2.x (`jwt`; untouched guests get no Express session) and 3.x (`wikiSession`, `/_api/auth` and the other `/_*` routes) |
+| `redmine` | [redmine.md](redmine.md) | ✅ yes (`_redmine_session`, a hardcoded literal, + `autologin`) — **and `?key=`, `?access_token=`, `?bearer_token=` are bypass ARGs and `X-Redmine-API-Key` a bypass header**: each authenticates a request with no cookie at all |
+| `flarum` | [flarum.md](flarum.md) | ⚠️ **only with "remember me"** (`flarum_remember`) — `flarum_session` is issued to every guest and is deliberately NOT matched; a login without remember-me is invisible to the cookie tier, `/api` contains most of the exposure; the guest `locale` cookie is value-keyed |
+| `opencart` | [opencart.md](opencart.md) | ⚠️ defense in depth only on 4.1.0.4 — base controller ARGs are matched, method-qualified routes are not; the global origin `no-store` keeps the default safe but also prevents page-cache hits; the `currency` cookie is value-keyed |
 | `nextjs` | [react.md](react.md) | ✅ yes for Auth.js/NextAuth, Clerk, Better Auth and Supabase session cookies (renamed or other libraries need a local rule) — **plus a request-header tier**: RSC/prefetch requests bypass, so App Router HTML caches while the RSC payload at the same URL never does. Also covers React Router, Gatsby and Vite (no preset) |
 | `servarr` (`sonarr`, `radarr`, `lidarr`) | [servarr.md](servarr.md) | ✅ yes for Forms/OIDC login cookies (`<InstanceName>Auth`, `<InstanceName>OIDC`) — a **safety** preset: the apps serve no anonymous HTML, and the upstream `?h=` rule would otherwise let `/initialize.json` (API key) be cached; External auth needs a local bypass on the proxy SSO cookie |
-| `calibre` | [calibre.md](calibre.md) | ✅ URI-only (no session cookie, no API key): `/cdb/` writes, per-user reading state, `/interface-data/init`, `/ajax-setup`; with server auth on the `Authorization` floor already bypasses everything |
+| `calibre` | [calibre.md](calibre.md) | ✅ URI-only (no session cookie, no API key): `/cdb/` writes, per-user reading state, `/interface-data/init`, `/ajax-setup`, `/kosync/` (KOReader sync), `/book-get-storage`, `/book-set-storage`; with server auth on the `Authorization` floor already bypasses everything |
 | `calibreweb` (`calibre-web`) | [calibreweb.md](calibreweb.md) | ⚠️ yes for `session`/`remember_token` and the private routes — **only with anonymous browsing on and no reverse-proxy header login** (cookieless auth is invisible to the cookie tier); key on `Accept-Language` |
 
 `classicpress` is a source-verified alias for `wordpress`; `backdrop` is a

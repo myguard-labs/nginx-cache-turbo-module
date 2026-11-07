@@ -1,6 +1,6 @@
 # MantisBT + cache-turbo
 
-_Last researched: 2026-07-26 (MantisBT `master`)._
+_Last researched: 2026-11-07 (MantisBT 2.28.4)._
 
 MantisBT (`cache_turbo_backend mantisbt;`, with `mantis` as an alias) has
 cacheable public issues and changelogs, but several kinds of visitor state. The
@@ -15,8 +15,13 @@ preset errs toward bypass for project/filter preferences.
 | Cookie-name suffix, non-empty | `_STRING_COOKIE`, `_PROJECT_COOKIE`, `_VIEW_ALL_COOKIE`, `_BUG_LIST_COOKIE`, `_collapse_settings` |
 | Cookie substring | `PHPSESSID=` |
 | URI prefixes | login/signup/account/form entry points, `/admin/`, `/api/` |
+| Query args | `key` |
 
 <!-- markdownlint-enable MD013 -->
+
+`key` is the RSS feed login: `issues_rss.php` and `news_rss.php` authenticate
+from `?username=&key=` with no cookie, so a member's private feed would
+otherwise be cached under the public key.
 
 Mantis prepends `$g_cookie_prefix` (default `MANTIS`) to the symbolic names in
 [`config_defaults_inc.php`](https://github.com/mantisbt/mantisbt/blob/master/config_defaults_inc.php),

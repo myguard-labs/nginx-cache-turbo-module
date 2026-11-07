@@ -1,6 +1,6 @@
 # Umbraco + cache-turbo
 
-_Last researched: 2026-08-17 (Umbraco CMS `main`, v17+ token-cookie code)._
+_Last researched: 2026-11-07 (Umbraco CMS 18.3.1, v17+ token-cookie code)._
 
 Umbraco serves shared published content, but it also has back-office, preview,
 member and optional ASP.NET session identities. The stock defaults are
@@ -31,8 +31,9 @@ The `.AspNetCore.Identity.Application=` row protects the stock member-login
 scheme. ASP.NET Core authentication scheme names are configurable: a custom
 member scheme can emit a different cookie and therefore needs matching
 `cache_turbo_bypass` and `cache_turbo_no_store` rules. `/umbraco` covers the
-back office and management API; the public Delivery API is intentionally left
-cacheable and still relies on origin `Cache-Control` for personalized output.
+back office, the management API and the Delivery API
+(`/umbraco/delivery/api/v{n}/`), so none of those are cached; ordinary content
+still relies on origin `Cache-Control` for personalized output.
 
 <!-- markdownlint-enable MD013 -->
 

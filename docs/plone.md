@@ -1,6 +1,6 @@
 # Plone + cache-turbo
 
-_Last researched: 2026-07-26 (Products.CMFPlone `master`)._
+_Last researched: 2026-11-07 (Plone 6.2.2; Volto 19.7.0)._
 
 Plone has a substantial anonymous publishing surface and a mature cache-header
 ecosystem. cache-turbo should complement those headers, not override them.
@@ -16,7 +16,7 @@ cache_turbo_backend plone;   # implies cache_turbo_cache_control honor
 
 | Check | Values |
 | --- | --- |
-| Cookie substrings | `__ac=`, `_ZopeId=`, `statusmessages=`, `I18N_LANGUAGE=` |
+| Cookie substrings | `__ac=`, `_ZopeId=`, `statusmessages=`, `I18N_LANGUAGE=`, `auth_token=` |
 | URI prefixes | `/login`, `/logout`, `/register`, `/passwordreset`, `/mail_password`, `/manage`, `/@@login` |
 | Query args | — |
 
@@ -30,6 +30,11 @@ The other cookies cover Zope browser sessions, flash/status messages and an
 explicit language override. `Products.statusmessages` stores its messages in the
 fixed `statusmessages` cookie; `Products.Sessions` defaults the browser ID to
 `_ZopeId`.
+
+`auth_token` is the login cookie of Volto, the default Plone 6 frontend: its
+server-side rendering reads it, and a proxy in front of Volto never sees the
+backend's `__ac`. API calls with a `Bearer` header are covered by the generic
+`Authorization` floor.
 
 Why bypass language instead of keying it? Plone can also negotiate language from
 host/path and `Accept-Language`; folding only one cookie into a cache key would
