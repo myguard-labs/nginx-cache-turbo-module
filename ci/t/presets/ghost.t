@@ -439,3 +439,62 @@ Cookie: _ga=GA1.2.3.4
  qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200, 200, 200]
+
+
+
+=== TEST 16: X-Ghost-Preview header -- never stored, never served from the guest entry
+# HEADER TIER (ct_ghost_headers[]). theme-engine/preview.js renders any page
+# with the design settings carried in this header, unauthenticated. Path A:
+# two preview requests first, then readers -- the first reader is a MISS, so
+# no preview render was stored. Path B: readers warm the entry, then a preview
+# request must NOT be served the reader copy. Lower-case, as the admin sends
+# it. Row removed: requests 2, 3 and 7 go red.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /blog/preview-a", "GET /blog/preview-a",
+ "GET /blog/preview-a", "GET /blog/preview-a",
+ "GET /blog/preview-b", "GET /blog/preview-b",
+ "GET /blog/preview-b"]
+--- more_headers eval
+["x-ghost-preview: c=%23ff0000&icon=null", "x-ghost-preview: c=%23ff0000&icon=null",
+ "", "",
+ "", "",
+ "x-ghost-preview: c=%23ff0000&icon=null"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200, 200, 200, 200]
+
+
+
+=== TEST 17: NEGATIVE -- a near-miss header name (X-Ghost-Previews) still HITs
+# Header rows match the whole NAME, not a prefix.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- more_headers
+X-Ghost-Previews: c=%23ff0000
+--- request eval
+["GET /blog/preview-near", "GET /blog/preview-near"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 18: the X-Ghost-Preview header under /gen/ (wordpress backend) still HITs
+# Isolation control: the ghost header row is opt-in per location.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- more_headers
+X-Ghost-Preview: c=%23ff0000
+--- request eval
+["GET /gen/preview-iso", "GET /gen/preview-iso"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]

@@ -54,6 +54,7 @@ cache_turbo_backend discourse;      # implies cache_turbo_cache_control honor
 | URI prefixes | `/admin`, `/session`, `/auth/`, `/login`, `/logout`, `/signup`, `/my/`, `/message-bus/`, `/drafts`, `/presence/`, `/notifications`, `/user_actions` |
 | Query args | `api_key`, `api_username`, `user_api_key` |
 | Cookie header substrings | `_t=` |
+| Request headers | `Api-Key`, `User-Api-Key`, `X-Shared-Session-Key` |
 
 > **Subdirectory installs.** The URI prefixes above are root-relative literals
 > matched from byte 0 of `r->uri`, so an install mounted under a subdirectory
