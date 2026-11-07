@@ -81,12 +81,16 @@ fi
 # ASan/coverage flags are already in the compile hash (they live in --with-cc-opt),
 # so those branches get their own cache namespace for free — no manual split.
 CC="${CC:-cc}"
-if command -v ccache >/dev/null 2>&1; then
+# CT_NO_CCACHE=1 forces the plain compiler even when ccache is installed: the
+# CodeQL build tracer must see every real compiler invocation, and a ccache hit
+# serves an object without running cc. The build-cache action exports it when
+# its `ccache` input is "false".
+if [ "${CT_NO_CCACHE:-}" != 1 ] && command -v ccache >/dev/null 2>&1; then
     WITH_CC="ccache $CC"
     # Key ccache objects by compiler CONTENT, not mtime/size. Without this a
     # cache restored onto a different runner (or after a toolchain reinstall
     # that changed the compiler mtime) is treated as stale and wholesale-missed;
-    # content hashing makes the cross-run/cross-runner ~/.cache/ccache that the
+    # content hashing makes the cross-run/cross-runner ccache directory that the
     # build-cache action persists actually reusable. Safe: a content mismatch
     # only ever MISSES, never serves a wrong object.
     export CCACHE_COMPILERCHECK=content

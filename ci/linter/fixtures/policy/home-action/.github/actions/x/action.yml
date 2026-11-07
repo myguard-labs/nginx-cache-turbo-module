@@ -1,0 +1,8 @@
+---
+name: x
+description: composite action with a runner-home cache path
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: ccache --dir "${HOME}/.cache/ccache" --show-stats

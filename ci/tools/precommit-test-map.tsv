@@ -62,6 +62,7 @@ ci/tests/unit/check_purge_partial_warn_control.sh	none	bash ci/tests/unit/check_
 ci/tests/unit/check_ttl_width.sh	none	bash ci/tests/unit/check_ttl_width.sh
 ci/tests/unit/check_variant_gen_normalize_control.sh	none	bash ci/tests/unit/check_variant_gen_normalize_control.sh
 ci/tests/unit/check_versions_env.sh	none	bash ci/tests/unit/check_versions_env.sh
+ci/tests/unit/check_ci_build_ccache.sh	none	bash ci/tests/unit/check_ci_build_ccache.sh
 ci/tests/unit/check_purge_snapshot_control.sh	build	bash ci/tests/unit/check_purge_snapshot_control.sh
 ci/tests/unit/check_purge_zero_skew_control.sh	build	bash ci/tests/unit/check_purge_zero_skew_control.sh
 ci/tests/unit/check_hash_diagnostic_controls.sh	build	bash ci/tests/unit/check_hash_diagnostic_controls.sh

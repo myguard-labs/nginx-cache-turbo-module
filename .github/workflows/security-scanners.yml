@@ -1,4 +1,4 @@
-# sync-sha: 725deebef6632ff8e64e95b1492b016c56ffb8cc0de0d38e655221574e32c44b
+# sync-sha: 671488bb26f5c3a433165cba06ff3719e9937d9212ee2d7aecc6a913ec67d00a
 name: Security scanners
 
 # Static/security scanners gate (flawfinder, clang-tidy cert-*/security.*,
@@ -35,6 +35,23 @@ jobs:
           fetch-depth: 0  # gitleaks scans git history
       - name: Load version pins
         run: bash .github/scripts/load-versions.sh
+      - name: Private cache and tool directories
+        run: |
+          set -euo pipefail
+          # Keep every cache and user-tool path under this job's own temp dir:
+          # a shared runner's home directory can be read-only or shared.
+          base="$RUNNER_TEMP/ci-cache"
+          mkdir -p "$base/ccache" "$base/xdg" "$base/pyuser" "$base/pip" "$base/pipx" "$base/pipx-bin"
+          {
+            echo "CCACHE_DIR=$base/ccache"
+            echo "XDG_CACHE_HOME=$base/xdg"
+            echo "PYTHONUSERBASE=$base/pyuser"
+            echo "PIP_CACHE_DIR=$base/pip"
+            echo "PIPX_HOME=$base/pipx"
+            echo "PIPX_MAN_DIR=$base/pipx-man"
+            echo "PIPX_BIN_DIR=$base/pipx-bin"
+          } >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -45,10 +62,12 @@ jobs:
           # user pip install with --break-system-packages if pipx is unavailable.
           if command -v pipx >/dev/null; then
             pipx install --quiet 'semgrep==1.169.0'
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
+            export PATH="$PIPX_BIN_DIR:$PATH"
           else
             pip3 install --quiet --user --break-system-packages 'semgrep==1.169.0'
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            echo "$PYTHONUSERBASE/bin" >> "$GITHUB_PATH"
+            export PATH="$PYTHONUSERBASE/bin:$PATH"
           fi
           test "$(semgrep --version)" = 1.169.0
       - name: Static-analysis negative controls

@@ -1,10 +1,10 @@
-# sync-sha: 5ef65b1acb5bd1929771eb0bda0d4a6d7a94cdf950ef0e48fbbd248cd3519a37
+# sync-sha: 6014418f499b66bac99a6a684b0809518fa014c605a174b462c4f783e400ebda
 name: Build cache
 description: >-
   Restore the ccache + upstream-tarball caches for one build. Hybrid by design:
-  on a PERSISTENT self-hosted runner ~/.cache/ccache and the tarball are already
-  warm on disk and this is nearly a no-op; on an ephemeral or hosted runner
-  actions/cache repopulates them. Keep both paths -- see "Why hybrid" below.
+  the ccache directory lives under the job's own temp dir (never the runner
+  home, which may be read-only or shared) and actions/cache repopulates it,
+  together with the tarball. See "Why hybrid" below.
 
 inputs:
   mode:
@@ -28,15 +28,39 @@ inputs:
 runs:
   using: composite
   steps:
-    # Why hybrid:
-    #   The builder runners are persistent incus containers today, so
-    #   ~/.cache/ccache survives between jobs on disk -- the fastest possible
-    #   cache, no upload/download at all. But that is a property of the CURRENT
-    #   runner topology, not a guarantee: an ephemeral conversion is possible,
-    #   and hosted runners (codeql.yml, fork PRs) never had it. actions/cache is
-    #   therefore the FALLBACK, not the primary: on a warm persistent runner it
-    #   costs one cheap key lookup; on an ephemeral/hosted one it is the only
-    #   thing between you and a cold build every job.
+    # Every cache and user-tool path goes under $RUNNER_TEMP, exported through
+    # GITHUB_ENV for the rest of the job. Nothing may depend on the runner's
+    # home directory: a pool slot can have it read-only or shared with another
+    # job, and the first write there fails the compile. ccache: "false" also
+    # exports CT_NO_CCACHE=1, which ci-build.sh honours by using the plain
+    # compiler (the CodeQL tracer must see every real compiler invocation).
+    - name: Private cache and tool directories
+      shell: bash
+      env:
+        CT_CCACHE_ON: ${{ inputs.ccache }}
+      run: |
+        set -euo pipefail
+        base="$RUNNER_TEMP/ci-cache"
+        mkdir -p "$base/ccache" "$base/xdg" "$base/pyuser" "$base/pip" "$base/pipx" "$base/pipx-bin"
+        {
+          echo "CCACHE_DIR=$base/ccache"
+          echo "XDG_CACHE_HOME=$base/xdg"
+          echo "PYTHONUSERBASE=$base/pyuser"
+          echo "PIP_CACHE_DIR=$base/pip"
+          echo "PIPX_HOME=$base/pipx"
+          echo "PIPX_MAN_DIR=$base/pipx-man"
+          echo "PIPX_BIN_DIR=$base/pipx-bin"
+        } >> "$GITHUB_ENV"
+        if [ "$CT_CCACHE_ON" != "true" ]; then
+          echo "CT_NO_CCACHE=1" >> "$GITHUB_ENV"
+        fi
+
+    # Why actions/cache and not the runner's own disk:
+    #   Persistent runners used to keep a warm ccache in the home directory
+    #   between jobs. That is a property of one runner topology, and it breaks
+    #   when a slot has a read-only or shared home, so the cache now lives in the
+    #   job's temp dir and actions/cache is the only thing carrying it from job
+    #   to job.
     #
     # No build-tree cache here, on purpose. ci-build.sh writes EVERY mode into
     # the SAME tree path (.build/<flavor>-<version>); debug/asan/module objects
@@ -60,9 +84,9 @@ runs:
     # way to get a rolling cache that folds in newly-compiled objects.
     - name: Restore ccache
       if: inputs.ccache == 'true'
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: ~/.cache/ccache
+        path: ${{ runner.temp }}/ci-cache/ccache
         key: ccache-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-${{ github.sha }}
         restore-keys: |
           ccache-${{ runner.os }}-${{ inputs.mode }}-${{ inputs.flavor }}-${{ inputs.nginx-version }}-
@@ -72,20 +96,22 @@ runs:
     # alone, no restore-keys ladder (a "close" tarball is the wrong tarball).
     # ci-build.sh skips the download when this file is already present.
     - name: Cache source tarball
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: .build/${{ inputs.flavor }}-${{ inputs.nginx-version }}.tar.gz
         key: src-${{ inputs.flavor }}-${{ inputs.nginx-version }}
 
     - name: Ensure ccache, mold and eatmydata are present
       shell: bash
+      env:
+        CT_CCACHE_ON: ${{ inputs.ccache }}
       run: |
         set -euo pipefail
         # Present on the builder runners already; installed only on a hosted
         # runner (codeql.yml, fork PRs). Cheap to check, and it keeps the
         # workflows portable to a fresh runner image.
         need=()
-        if [ "${{ inputs.ccache }}" = "true" ]; then
+        if [ "$CT_CCACHE_ON" = "true" ]; then
           command -v ccache >/dev/null || need+=(ccache)
         fi
         command -v mold      >/dev/null || need+=(mold)
@@ -94,6 +120,6 @@ runs:
           sudo apt-get update
           sudo apt-get install -y "${need[@]}"
         fi
-        if [ "${{ inputs.ccache }}" = "true" ]; then
+        if [ "$CT_CCACHE_ON" = "true" ]; then
           ccache --version | head -1
         fi
