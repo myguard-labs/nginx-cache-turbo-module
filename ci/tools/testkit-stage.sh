@@ -434,7 +434,7 @@ mkdir -p "$BUILD_ROOT"
 TMP=""
 cleanup() {
     if [ -n "$TMP" ] && [ "$KEEP_SRC" -eq 0 ]; then
-        rm -rf "$TMP" 2>/dev/null || true
+        rm -rf "${TMP:?}" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -468,7 +468,7 @@ elif [ "$COVERAGE" -eq 1 ]; then
     if [ -f "$BUILDDIR/configure" ]; then
         echo "==> reusing in-place coverage source tree $BUILDDIR"
     else
-        rm -rf "$BUILDDIR"
+        rm -rf "${BUILDDIR:?}"
         mkdir -p "$BUILDDIR"
         echo "==> fetching $URL"
         # TMP, not a separate FETCH_TMP -- TMP is the variable `cleanup`'s
@@ -492,7 +492,7 @@ elif [ "$COVERAGE" -eq 1 ]; then
         # what must be stable across runs, not the fetch tmpdir's randomized
         # name.
         cp -r "$TMP/$DIR/." "$BUILDDIR/"
-        rm -rf "$TMP" 2>/dev/null || true
+        rm -rf "${TMP:?}" 2>/dev/null || true
         TMP=""
     fi
 else
@@ -515,7 +515,7 @@ fi
 # precisely [[feedback-stale-so-fakes-negative-control]].
 if [ -d "$BUILDDIR/objs" ]; then
     echo "==> wiping $BUILDDIR/objs (a reused tree's old .so would be staged as if fresh)"
-    rm -rf "$BUILDDIR/objs"
+    rm -rf "${BUILDDIR:?}/objs"
 fi
 
 # ccache, mirroring ci-build.sh: keyed by compiler CONTENT so a cache restored
@@ -572,10 +572,10 @@ echo "==> building server + modules (-j$JOBS)"
 # is exactly as good as a copy and avoids doubling disk use for a tree gcov
 # needs to keep matching its .gcno forever.
 if [ "$COVERAGE" -eq 1 ]; then
-    rm -rf "$STAGE_DIR/objs"
+    rm -rf "${STAGE_DIR:?}/objs"
     ln -s "$BUILDDIR/objs" "$STAGE_DIR/objs"
 else
-    rm -rf "$STAGE_DIR"
+    rm -rf "${STAGE_DIR:?}"
     mkdir -p "$STAGE_DIR"
     cp -r "$BUILDDIR/objs" "$STAGE_DIR/objs"
 fi

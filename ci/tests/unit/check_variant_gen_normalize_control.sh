@@ -10,7 +10,7 @@ OUT="$TMP_DIR/control.out"
 restore() {
     CTRL_VARIANT_NO_GEN_NORMALIZE=0 \
         bash "$DIR/extract_variant_hash.sh" >/dev/null
-    rm -rf "$TMP_DIR"
+    rm -rf "${TMP_DIR:?}"
 }
 trap restore EXIT
 

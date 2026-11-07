@@ -1,4 +1,4 @@
-# sync-sha: ee709001acca53162a62bfade2a67da592d46d629594f0e730b6e3a2e6d60e8b
+# sync-sha: 1c703c758a33bbbc15a4fe7e6c0e87772090a81a6a4eee5a2d4376caf9c174e3
 name: Lint
 
 # The same ci/linter/ scripts a developer runs locally, run again on the PR --
@@ -21,7 +21,7 @@ name: Lint
 #
 # "astgrep-essentials" runs the FULL upstream ast-grep essentials pack (every
 # language), checked out below at a pinned commit. It blocks on severity
-# `error`; see the ESSENTIALS_ADVISORY note on the Run linters step.
+# `error`.
 #
 # "shm-lock", "atomic-ordering", "suite-docs", "resume-order" and "park-contract" are this
 # module's own checkers and have no skeleton counterpart. They previously ran only from build-test.yml's
@@ -129,11 +129,6 @@ jobs:
           # `sed -n 's/^ *LINT_ONLY: *//p'`, so wrapping it in a folded scalar
           # (`>-`) makes that parser read the literal ">-" and report EVERY
           # checker as missing. Rewrap only by teaching selftest.sh to parse YAML.
-          # CI-P3 not landed: the full pack still reports error-severity hits
-          # (src/ngx_http_cache_turbo_internal.h and shell scripts under ci/).
-          # ADVISORY prints them as errors but does not fail the job. Delete
-          # this line when a full-pack scan of the tree reports 0 errors.
-          ESSENTIALS_ADVISORY: "1"
           AST_GREP_ESSENTIALS: ${{ github.workspace }}/.essentials
           LINT_ONLY: nginx astgrep astgrep-essentials sh python perl yaml spelling semgrep-pin ci-runners ci-ports ci-cadence ci-secrets sync-stamp docs-drift shm-lock stripe-seam atomic-ordering carve-init suite-docs resume-order park-contract
         run: ci/linter/run-all.sh

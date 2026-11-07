@@ -39,7 +39,7 @@ if [ -n "$out" ]; then
 	exit 1
 fi
 
-out="$(bash -c '. "$1"; newest_of 1 "$2"' _ "$tmp/newest_of.sh" "$tmp/src")"
+out="$(NO_SH="$tmp/newest_of.sh" NO_SRC="$tmp/src" bash -c '. "$NO_SH"; newest_of 1 "$NO_SRC"')"
 case "$out" in
 *" $tmp/src/one.c") ;;
 *)
@@ -64,14 +64,14 @@ if ! awk '
 	printf '%s\n' 'stage inventory control: first inventory must clear inherited newest_rc' >&2
 	exit 1
 fi
-out="$(bash -c '
-	. "$1"
+out="$(NO_SH="$tmp/newest_of.sh" NO_SRC="$tmp/src" bash -c '
+	. "$NO_SH"
 	newest_rc=2
 	unset newest_rc
-	ct_ref="$(newest_of 1 "$2")" || newest_rc=$?
+	ct_ref="$(newest_of 1 "$NO_SRC")" || newest_rc=$?
 	[ "${newest_rc:-0}" -eq 0 ] || exit 2
 	printf "%s\\n" "$ct_ref"
-' _ "$tmp/newest_of.sh" "$tmp/src")"
+')"
 case "$out" in
 *" $tmp/src/one.c") ;;
 *)

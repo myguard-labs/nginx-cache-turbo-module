@@ -733,7 +733,7 @@ typedef struct {
  * Wire offsets (little-endian):
  *   0  u32 magic     ("CTB5")    16  u32 headers_len   32  u32 fresh_ttl
  *   4  u16 version   (= 5)       20  u32 body_len      36  u32 stale_ttl
- *   6  u16 flags     (BLOBF_*)   24  i64 created       40  u32 sie_ttl
+ *   6  u16 flags     (BLOBF_*)   24  s64 created       40  u32 sie_ttl
  *   8  u32 status    12 u32 nheaders
  *  44  u8  date_len  (== 29)     45  u8[29] date       74  u8[2] reserved (0)
  *                                                      76  = header size

@@ -54,7 +54,7 @@ cleanup() {
     if [ -n "${NGX_PID:-}" ] && [ "${NGX_PID:-0}" -gt 1 ]; then
         kill "$NGX_PID" 2>/dev/null || true
     fi
-    rm -rf "$WORK"
+    rm -rf "${WORK:?}"
 }
 trap cleanup EXIT INT TERM
 mkdir -p "$WORK/conf" "$WORK/logs" "$WORK/html"
@@ -137,7 +137,9 @@ batch() {  # stdin = paths
 log_mark() { wc -l < "$WORK/logs/access.log" 2>/dev/null || echo 0; }
 log_since() {  # $1 = mark -> emits the status column of lines after the mark
     sleep 0.3   # access_log is buffered per-request but written by the worker
-    tail -n +"$(( $1 + 1 ))" "$WORK/logs/access.log" 2>/dev/null \
+    mark="$1"
+    case "$mark" in ''|*[!0-9]*) mark=0 ;; esac   # digits only before arithmetic
+    tail -n +"$(( mark + 1 ))" "$WORK/logs/access.log" 2>/dev/null \
       | awk '$1 ~ /^\/hot/ {print $2}'
 }
 

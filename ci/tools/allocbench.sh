@@ -118,7 +118,7 @@ OUT="${OUT:-$PWD/ci/tools/perf-out}"
 cleanup() {
     trap - EXIT INT TERM
     if [ -n "${NGX_MASTER:-}" ]; then kill -QUIT "$NGX_MASTER" 2>/dev/null || true; fi
-    rm -rf "$WORK"
+    rm -rf "${WORK:?}"
 }
 trap cleanup EXIT INT TERM
 mkdir -p "$WORK/conf" "$WORK/logs" "$WORK/html" "$OUT"

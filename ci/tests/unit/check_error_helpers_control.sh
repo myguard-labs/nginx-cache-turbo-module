@@ -9,7 +9,7 @@ OUT="$TMP_DIR/control.out"
 
 restore() {
 	bash "$DIR/extract_error_helpers.sh" >/dev/null
-	rm -rf "$TMP_DIR"
+	rm -rf "${TMP_DIR:?}"
 }
 trap restore EXIT
 

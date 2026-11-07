@@ -17,7 +17,7 @@ OUT="$TMP_DIR/control.out"
 
 restore() {
     CTRL_HASH_DIAG_MUTATION='' bash "$DIR/extract_shm.sh" >/dev/null
-    rm -rf "$TMP_DIR"
+    rm -rf "${TMP_DIR:?}"
 }
 trap restore EXIT
 

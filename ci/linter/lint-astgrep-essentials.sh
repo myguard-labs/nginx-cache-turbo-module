@@ -19,9 +19,8 @@
 #
 # Env:   AST_GREP_ESSENTIALS=<dir>   pack root
 #        LINT_MODE=staged|all
-#        ESSENTIALS_ADVISORY=1       print errors as errors but exit 0 (CI uses
-#                                    this until CI-P3 clears the known hits;
-#                                    the hook never sets it)
+#        ESSENTIALS_ADVISORY=1       print errors as errors but exit 0 (a local
+#                                    triage aid; neither CI nor the hook sets it)
 #        ESSENTIALS_MAX_ADVISORY=N   advisory lines printed per run (default 40)
 # Usage: ci/linter/lint-astgrep-essentials.sh [files...]
 # Exit:  0 no error-severity finding, 1 an error-severity finding,

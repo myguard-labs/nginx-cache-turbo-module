@@ -9,7 +9,7 @@ OUT="$TMP_DIR/control.out"
 
 restore() {
 	bash "$DIR/extract_breaker_retry.sh" >/dev/null
-	rm -rf "$TMP_DIR"
+	rm -rf "${TMP_DIR:?}"
 }
 trap restore EXIT
 

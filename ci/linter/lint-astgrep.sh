@@ -36,9 +36,9 @@
 # describes. A rule joins PROMOTED only after its findings are measured on real
 # trees and confirmed real.
 #
-# Keep PROMOTED identical to the --error= list in .pre-commit-config.yaml's
-# ast-grep hook. Two gates disagreeing about what blocks is worse than one:
-# the hook passes, CI fails, and the difference is invisible in both outputs.
+# PROMOTED is the only list of rules that block, and ci/linter/run-all.sh is the
+# only gate that runs it (the commit hook and CI both call run-all), so there is
+# no second copy to keep in step.
 #
 # A PROMOTED NAME THAT DOES NOT EXIST IS SILENTLY IGNORED. Verified against
 # ast-grep 0.44.1 on 2026-08-10: `--error=no-such-rule-xyz` exits 0 without a
@@ -52,7 +52,7 @@
 # Exit:  0 clean, 1 a promoted rule fired, 2 ast-grep missing, config gone, or
 #        a PROMOTED name that no rule defines.
 # Extend: add rules via tools/vendor-astgrep-rules.py. Promote one by adding it
-# to PROMOTED here AND to the pre-commit hook, once its findings are confirmed.
+# to PROMOTED here, once its findings are confirmed.
 
 # shellcheck source=ci/linter/lib.sh
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
@@ -154,7 +154,7 @@ for r in "${PROMOTED[@]}"; do
 done
 [ -z "$unknown" ] || die "PROMOTED names no rule defines:$unknown
        | ast-grep ignores an unknown --error= silently, so these gate NOTHING.
-       | Fix the spelling or drop them; keep .pre-commit-config.yaml in step."
+       | Fix the spelling or drop them."
 
 ERRFLAGS=()
 for r in "${PROMOTED[@]}"; do ERRFLAGS+=("--error=$r"); done

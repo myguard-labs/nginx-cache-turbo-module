@@ -68,7 +68,7 @@ printf '/usr/bin/echo\0pbuilder\0' >"$tmp/5/cmdline"
 TESTKIT_PROC_ROOT="$tmp"
 export TESTKIT_PROC_ROOT
 testkit_package_build_running || fail "real package build was not detected"
-rm -rf "$tmp/1" "$tmp/2" "$tmp/3"
+rm -rf "${tmp:?}/1" "${tmp:?}/2" "${tmp:?}/3"
 if testkit_package_build_running; then
     fail "prose mentioning a package build was treated as a live build"
 fi

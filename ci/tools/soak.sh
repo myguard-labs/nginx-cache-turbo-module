@@ -86,7 +86,7 @@ cleanup() {
     if [ -n "${SOAK_LOG_COPY:-}" ] && [ -f "$WORK/logs/error.log" ]; then
         cp "$WORK/logs/error.log" "$SOAK_LOG_COPY" 2>/dev/null || true
     fi
-    rm -rf "$WORK"
+    rm -rf "${WORK:?}"
 }
 trap cleanup EXIT
 mkdir -p "$WORK/conf" "$WORK/logs" "$WORK/html"

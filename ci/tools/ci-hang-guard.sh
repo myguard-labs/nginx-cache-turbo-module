@@ -34,6 +34,7 @@ fi
 # Collect the PIDs of every descendant of $root (inclusive) by walking PPID links in
 # /proc. POSIX sh, no pgrep --ns / ps --ppid tree dependency.
 descendants() {
+    ppids=$(mktemp "${TMPDIR:-/tmp}/cihg-ppids.XXXXXX")
     root=$1
     # field 4 of /proc/<pid>/stat is PPID; field 2 (comm) may contain spaces/parens,
     # so key off the ")" that terminates comm and count back from there.
@@ -41,21 +42,21 @@ descendants() {
         pid=$(basename "$(dirname "$st")")
         ppid=$(sed -e 's/^[0-9]* (.*) [A-Za-z] //' "$st" 2>/dev/null | cut -d' ' -f1)
         echo "$pid $ppid"
-    done > /tmp/cihg-ppids.$$
+    done > "$ppids"
     # BFS from root over the ppid map.
     frontier=$root
     seen=" $root "
     while [ -n "$frontier" ]; do
         next=""
         for p in $frontier; do
-            kids=$(awk -v par="$p" '$2==par{print $1}' /tmp/cihg-ppids.$$)
+            kids=$(awk -v par="$p" '$2==par{print $1}' "$ppids")
             for k in $kids; do
                 case "$seen" in *" $k "*) : ;; *) seen="$seen$k "; next="$next $k" ;; esac
             done
         done
         frontier=$next
     done
-    rm -f /tmp/cihg-ppids.$$
+    rm -f "$ppids"
     echo "$seen"
 }
 
