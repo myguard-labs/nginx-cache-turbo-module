@@ -162,6 +162,7 @@ declare -A job_starts_suite      # "file:job" -> the invoking line, trimmed (bes
 declare -A job_passes_port       # "file:job" -> 1
 declare -A job_has_sweep         # "file:job" -> 1 -- PROPERTY signal, not name-based (AUD-CIPORT3)
 declare -A job_binds_literal     # "file:job" -> the offending line -- 4th signal, see check 3
+declare -A band_seen            # "file:job:port" -> 1; one job may repeat its own band
 interval_starts=()
 interval_ends=()
 interval_labels=()
@@ -222,7 +223,15 @@ for f in "${files[@]}"; do
             job_declares_band[$key]="$port"
             start="$port"
             end="$((port + BAND_WIDTH - 1))"
+            # A lane job that runs several suites in sequence (CI-L3/L5) sets its
+            # band at STEP level, so the same job repeats the same TEST_BASE_PORT
+            # line once per step. That is ONE band, not an overlap with itself.
+            # Two different jobs (or files) declaring the same port still collide.
+            new_band=1
+            [[ -n "${band_seen[$key:$port]:-}" ]] && new_band=0
+            band_seen[$key:$port]=1
             for i in "${!interval_starts[@]}"; do
+                [[ "$new_band" -eq 1 ]] || break
                 other_start="${interval_starts[$i]}"
                 other_end="${interval_ends[$i]}"
                 if [[ "$start" -le "$other_end" && "$other_start" -le "$end" ]]; then
@@ -230,9 +239,11 @@ for f in "${files[@]}"; do
                     status=1
                 fi
             done
-            interval_starts+=("$start")
-            interval_ends+=("$end")
-            interval_labels+=("'$job' ($f, [$start-$end])")
+            if [[ "$new_band" -eq 1 ]]; then
+                interval_starts+=("$start")
+                interval_ends+=("$end")
+                interval_labels+=("'$job' ($f, [$start-$end])")
+            fi
         fi
 
         # A job that starts the runtime suite -- directly, through the coverage

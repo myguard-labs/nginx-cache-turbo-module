@@ -1,14 +1,11 @@
 # nginx-cache-turbo-module
 
-[![Lint](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/lint.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/lint.yml)
+[![Static](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/static.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/static.yml)
 [![Build&Test](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/build-test.yml)
-[![Security Scanners](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/security-scanners.yml)
-[![Fuzzing](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/fuzzing.yml)
 [![CodeQL](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/codeql.yml)
 [![A/UBSan](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/asan.yml)
 [![CI Deep](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/ci-deep.yml)
 [![Valgrind](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/valgrind.yml)
-[![Testkit](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/testkit.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/testkit.yml)
 [![Testkit Valgrind](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/testkit-valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-cache-turbo-module/actions/workflows/testkit-valgrind.yml)
 
 A built-in page cache for nginx. Think of it as a tiny Varnish that lives
@@ -21,24 +18,21 @@ A built-in page cache for nginx. Think of it as a tiny Varnish that lives
 
 ## CI
 
-One `pull_request:` entry point. `ci.yml` orchestrates the six PR member
+One `pull_request:` entry point. `ci.yml` orchestrates the three PR member
 workflows, so a change gets exactly one run of each. CodeQL is scheduled or
-manual, Valgrind is manual, and the long testkit/deep workflows keep their own
+manual, Valgrind is manual, and the long deep and testkit-valgrind workflows keep their own
 scheduled/manual entry points. Lane measurements and the command to re-derive
 them live in `ci.yml`'s header comment.
 
 | Workflow | What it gates |
 |---|---|
-| [Lint](.github/workflows/lint.yml) | the `ci/linter/` gate: nginx conventions, ast-grep, shell, Python, Perl, YAML/actionlint/zizmor, spelling, the workflow-policy checks, and this module's own R7 shm-lock and suite-integrity checkers |
-| [Build&Test](.github/workflows/build-test.yml) | validation (shellcheck, ruff, sync-stamp, port bands), build, the Test::Nginx preset suite, and the runtime driver |
-| [Security Scanners](.github/workflows/security-scanners.yml) | flawfinder >=4, tracked-policy clang-tidy, advisory GCC `-fanalyzer`, and semgrep >=WARNING over `src/` |
-| [Fuzzing](.github/workflows/fuzzing.yml) | replay of every recorded regression, then a time-boxed run of the five libFuzzer targets |
+| [Static](.github/workflows/static.yml) | one job, sequential sections: the `ci/linter/` gate (nginx conventions, ast-grep, shell, Python, Perl, YAML/actionlint/zizmor, spelling, workflow-policy checks, this module's own R7 shm-lock and suite-integrity checkers), script/source validation, the scanners (flawfinder >=4, tracked-policy clang-tidy, advisory GCC `-fanalyzer`, semgrep >=WARNING, gitleaks), the libFuzzer regression replay plus time-boxed run, and the [nginx-module-testkit](https://github.com/myguard-labs/nginx-module-testkit) prober leg: per-request allocation neutrality read out of the cycle pool, asserted in both directions (a staged tree must assert, an unstaged one must SKIP cleanly) |
+| [Build&Test](.github/workflows/build-test.yml) | one job: build variants, unit ASan/TSan, strict compile, the runtime driver, then the Test::Nginx preset suite |
 | [CodeQL](.github/workflows/codeql.yml) | CodeQL over the module TU; keeps its own monthly `schedule:` |
 | [A/UBSan](.github/workflows/asan.yml) | ASan+UBSan single-process and multi-worker soaks, static `--add-module` build |
 | [CI Deep](.github/workflows/ci-deep.yml) | monthly: long fuzz campaigns, memcheck soak, the nginx/angie compatibility matrix |
 | [Valgrind](.github/workflows/valgrind.yml) | on-demand 60s memcheck soak; the monthly deep workflow carries the scheduled 600s soak |
-| [Testkit](.github/workflows/testkit.yml) | the [nginx-module-testkit](https://github.com/myguard-labs/nginx-module-testkit) prober leg: per-request allocation neutrality read out of the cycle pool, asserted in both directions (a staged tree must assert, an unstaged one must SKIP cleanly) |
-| [Testkit Valgrind](.github/workflows/testkit-valgrind.yml) | weekly: the same prober scenarios as Testkit, staged as a plain DEBUG build and run under valgrind memcheck instead of the probe's own fd/pool-delta accounting, asserted in both directions the same way |
+| [Testkit Valgrind](.github/workflows/testkit-valgrind.yml) | weekly: the same prober scenarios as the Static testkit leg, staged as a plain DEBUG build and run under valgrind memcheck instead of the probe's own fd/pool-delta accounting, asserted in both directions the same way |
 | [Bump versions](.github/workflows/bump.yml) | weekly refresh of the pinned nginx/angie versions and verified archive digests |
 
 ### The testkit prober leg

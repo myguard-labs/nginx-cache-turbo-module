@@ -1,4 +1,4 @@
-# sync-sha: 606d9183f68cc5ffbee39454f7494155917cb174c167782466cec899c8aa4426
+# sync-sha: 59a75aa04f5c2e0175c3ca96722ddb4105a7f11bf0bc5f14b2b838986179c349
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -6,20 +6,23 @@ name: ASan and UBSan
 # or this workflow). A docs/memory/other-workflow PR skips it entirely instead
 # of paying the ~16-minute sanitizer build+suite for zero possible signal.
 #
-# Structure — compile ONCE, run the two suite modes as PARALLEL jobs:
-#   build-asan            compile the static --add-module ASan binary, upload it
-#   asan-single-process   needs build-asan; --single-process suite (own allocs,
-#                         R6b event-loop hang, ci-hang-guard armed)
-#   asan-multi-worker     needs build-asan; master + 4-worker suite (cross-worker
-#                         shm-zone UAF / race the 1-worker run cannot reach)
-# Wall-clock ~= build + max(single, multi) instead of build + single + multi.
-# ASan links the module statically into the nginx binary (no .so), so only the
-# nginx binary is passed through the artifact and to --nginx-binary.
+# Structure (CI-L4) -- two SELF-CONTAINED jobs that run in parallel:
+#   asan-single   builds the static --add-module ASan binary, then runs the
+#                 --single-process suite (own allocs, R6b event-loop hang,
+#                 ci-hang-guard armed)
+#   asan-multi    builds the same binary, then runs the master + 4-worker suite
+#                 (cross-worker shm-zone UAF / race the 1-worker run cannot reach)
+# There is no artifact hop: each job builds for itself. Both restore the same
+# build-cache mode (`asan`, one shared ccache key), so whichever build runs
+# second is mostly cache hits. ASan links the module statically into the nginx
+# binary (no .so), so only the nginx binary is passed to --nginx-binary.
+#
+# Port bands: the two jobs run concurrently on the shared runner, so each keeps
+# its own TEST_BASE_PORT band (ci/tools/lint-ci-ports.sh fails CI on overlap).
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v5         -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
 # actions/upload-artifact@v7.0.2 -> cf430e030ddbb5b0abf93d22962f4752f3646cd9
-# actions/download-artifact@v8.0.2 -> 9000827ccba6bdab643e8b6fd33ac0654aef8333
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -36,10 +39,17 @@ permissions:
   contents: read
 
 jobs:
-  build-asan:
-    name: Build (ASan/UBSan)
+  asan-single:
+    name: ASan single-process
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    timeout-minutes: 30
+    # The suite plus the CT-RESUME-FINALIZE-UAF abort/re-entry arms (~18 min of
+    # them alone under ASan) no longer fits 30 min / a 1200s hang guard.
+    timeout-minutes: 60
+    # AUD-CIPORT1: own 64-wide port band, distinct from every other
+    # runtime-bearing job on this shared runner. See
+    # ci/tools/lint-ci-ports.sh (fails CI on a collision or a hardcoded sweep).
+    env:
+      TEST_BASE_PORT: 18944
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -62,44 +72,6 @@ jobs:
 
       - name: Build with sanitizers
         run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
-
-      - name: Stage artifact
-        run: |
-          # ASan build is static --add-module: the module is linked into the
-          # nginx binary, there is no separate .so to ship.
-          mkdir artifact
-          cp ".build/nginx-${NGINX_VERSION}/objs/nginx" artifact/
-
-      - name: Upload ASan nginx binary
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: nginx-asan
-          path: artifact/
-          retention-days: 1
-
-  asan-single-process:
-    name: ASan single-process
-    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    # The suite plus the CT-RESUME-FINALIZE-UAF abort/re-entry arms (~18 min of
-    # them alone under ASan) no longer fits 30 min / a 1200s hang guard.
-    timeout-minutes: 60
-    needs: build-asan
-    # AUD-CIPORT1: own 64-wide port band, distinct from every other
-    # runtime-bearing job on this shared runner. See
-    # ci/tools/lint-ci-ports.sh (fails CI on a collision or a hardcoded sweep).
-    env:
-      TEST_BASE_PORT: 18944
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-
-      - name: Download ASan nginx binary
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: nginx-asan
-          path: nginx-bin
 
       - name: Install runtime dependencies
         run: |
@@ -187,7 +159,6 @@ jobs:
         # tree. `set -o pipefail` inside that inner bash makes the wrapper's exit
         # status the suite's, not tee's, so a failing suite still fails this step.
         run: |
-          chmod +x nginx-bin/nginx
           bash ci/tools/ci-hang-guard.sh 2700 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
@@ -197,7 +168,7 @@ jobs:
                 --port "$TEST_BASE_PORT" \
                 --redis-server /usr/bin/redis-server \
                 --memcached-server /usr/bin/memcached \
-                --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+                --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx" \
                 | tee runtime-suite-single.log
             '
 
@@ -213,13 +184,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  asan-multi-worker:
+  asan-multi:
     name: ASan multi-worker
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     # The suite plus the CT-RESUME-FINALIZE-UAF abort/re-entry arms (~18 min of
     # them alone under ASan) no longer fits 30 min / a 1200s hang guard.
     timeout-minutes: 60
-    needs: build-asan
     # AUD-CIPORT1: own 64-wide port band, distinct from every other
     # runtime-bearing job on this shared runner. See
     # ci/tools/lint-ci-ports.sh (fails CI on a collision or a hardcoded sweep).
@@ -231,11 +201,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download ASan nginx binary
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold zlib1g-dev
+
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
         with:
-          name: nginx-asan
-          path: nginx-bin
+          mode: asan
+          nginx-version: ${{ env.NGINX_VERSION }}
+
+      - name: Build with sanitizers
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" asan
 
       - name: Install runtime dependencies
         run: |
@@ -322,7 +303,6 @@ jobs:
           # it to hanging-test.txt so the backtrace is labelled with the culprit.
           CT_TEST_BREADCRUMB: ${{ github.workspace }}/ci-hang-artifacts/current-test.txt
         run: |
-          chmod +x nginx-bin/nginx
           bash ci/tools/ci-hang-guard.sh 2700 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
@@ -332,7 +312,7 @@ jobs:
                 --port "$TEST_BASE_PORT" \
                 --redis-server /usr/bin/redis-server \
                 --memcached-server /usr/bin/memcached \
-                --nginx-binary "$GITHUB_WORKSPACE/nginx-bin/nginx" \
+                --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx" \
                 | tee runtime-suite-multiworker.log
             '
 

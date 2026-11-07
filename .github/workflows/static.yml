@@ -1,0 +1,808 @@
+# sync-sha: a07ba394def53530cbb9f47a49b935b09da2d42d6b11c0160a318ccdf611762b
+name: Static
+
+# Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
+# and the testkit prober, as ONE job of sequential steps. They used to be five
+# reusable workflows (lint.yml, build-test.yml's `validation` job,
+# security-scanners.yml, fuzzing.yml, testkit.yml), each paying its own runner
+# slot, checkout, version-pin load and tool setup.
+#
+# Every section is gated by the matching `changes` output from ci.yml:
+#   lint, scanners   always
+#   validation       inputs.code     (anything that is not docs-only)
+#   fuzz regression  inputs.fuzz     (src/, ci/fuzz/, ...)
+#   testkit prober   inputs.testkit  (src/, prober scenarios, ...)
+# Order matters: validation's unit suite auto-discovers .build/ trees and must
+# run before the scanners build the module there; the testkit stage uses its own
+# .build/<flavor>-<version>-testkit directory. Steps are sequential and
+# fail-fast on purpose (no continue-on-error): the first red step stops the lane.
+#
+# Port band: only the testkit prober binds ports here; it keeps band 19456 as
+# STEP-level TEST_BASE_PORT (ci/tools/lint-ci-ports.sh scans step-level too).
+#
+# LINT_ONLY below is read by ci/linter/selftest.sh, which asserts it equals the
+# lint-*.sh glob minus "c" -- keep it on ONE line.
+#
+# Action pins (keep in sync with build-test.yml header):
+# actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/upload-artifact@v7.0.2 -> cf430e030ddbb5b0abf93d22962f4752f3646cd9
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  # Triggered by ci.yml, like every other member of the suite. No
+  # push/pull_request trigger here: two entry points would run it twice per PR,
+  # which ci/linter/lint-ci-cadence.sh fails the build for.
+  workflow_call:
+    inputs:
+      code:
+        description: "false on docs-only PRs: skips validation and the testkit prober"
+        required: false
+        default: true
+        type: boolean
+      fuzz:
+        description: "run the fuzz regression section"
+        required: false
+        default: true
+        type: boolean
+      testkit:
+        description: "run the testkit prober section"
+        required: false
+        default: true
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      code:
+        description: "false skips validation and the testkit prober"
+        required: false
+        default: true
+        type: boolean
+      fuzz:
+        description: "run the fuzz regression section"
+        required: false
+        default: true
+        type: boolean
+      testkit:
+        description: "run the testkit prober section"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: static-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: Static
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    # Sum of the five former jobs' measured wall (~41s + 50s + 174s + 370s +
+    # a ccache-warm testkit build) plus setup; 45 min is a hang bound only.
+    timeout-minutes: 45
+    env:
+      # Single source for the per-target fuzz exploration budget (REGRESSION
+      # gate: the recorded-crash replay is what proves known bugs stay fixed and
+      # is unaffected by this budget; long exploration lives in ci-deep.yml).
+      FUZZ_SECONDS: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # gitleaks scans git history
+
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+
+      # Band sweep + verify sit at the top of the job: workflow_policy.py wants the
+      # verifier above the FIRST step whose text names a port-binding driver.
+      - name: Sweep stale test listeners
+        if: ${{ inputs.testkit && inputs.code }}
+        env:
+          TEST_BASE_PORT: 19456
+        run: |
+          # Kill leftovers from earlier crashed runs still holding test ports in
+          # THIS job's own band. Must never widen beyond it -- a wider sweep
+          # kills a SIBLING job's live fixtures on the shared runner, which is
+          # the defect AUD-CIPORT1 fixed.
+          command -v fuser >/dev/null || sudo apt-get install -y psmisc
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + 63))); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          sleep 1
+      - name: Verify runtime port band
+        if: ${{ inputs.testkit && inputs.code }}
+        env:
+          TEST_BASE_PORT: 19456
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
+      - name: Private cache and tool directories
+        run: |
+          set -euo pipefail
+          # Keep every cache and user-tool path under this job's own temp dir:
+          # a shared runner's home directory can be read-only or shared.
+          base="$RUNNER_TEMP/ci-cache"
+          mkdir -p "$base/ccache" "$base/xdg" "$base/pyuser" "$base/pip" "$base/pipx" "$base/pipx-bin"
+          {
+            echo "CCACHE_DIR=$base/ccache"
+            echo "XDG_CACHE_HOME=$base/xdg"
+            echo "PYTHONUSERBASE=$base/pyuser"
+            echo "PIP_CACHE_DIR=$base/pip"
+            echo "PIPX_HOME=$base/pipx"
+            echo "PIPX_MAN_DIR=$base/pipx-man"
+            echo "PIPX_BIN_DIR=$base/pipx-bin"
+          } >> "$GITHUB_ENV"
+          # The redirected pipx/pip bin dirs must be on PATH for the lint
+          # section: the old lint job used the default ~/.local/bin, which
+          # install-linters.sh puts on PATH itself; these are not.
+          {
+            echo "$base/pipx-bin"
+            echo "$base/pyuser/bin"
+          } >> "$GITHUB_PATH"
+
+      # === lint (was lint.yml) ===============================================
+      - name: Check out the ast-grep essentials pack
+        # Public repo, pinned by commit: a floating pack changes findings under
+        # an unchanged tree. Bump the ref deliberately, with a green full-pack
+        # scan. Inside the workspace (checkout requires it); git ls-files never
+        # lists it, so no other checker lints the pack itself.
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: myguard-labs/ast-grep-essentials
+          ref: c0d39c8a6823f187fcc04f9adc1e774b1434c1b1
+          path: .essentials
+          persist-credentials: false
+      - name: Install linters
+        # One installer for CI and for a fresh clone; a second apt list here
+        # would be the thing that goes stale.
+        run: ci/linter/install-linters.sh
+      - name: Verify the toolchain is complete
+        # A linter missing from PATH makes its check exit 2, which run-all.sh
+        # reports as a failure rather than skipping -- this step just surfaces
+        # WHICH one before the findings scroll past.
+        run: ci/linter/install-linters.sh --check
+      - name: Selftest the gate
+        # Before trusting the next step's verdict, prove the gate can still say
+        # no: a selector that matches nothing must exit 2, not report clean.
+        # The step below narrows the run with LINT_ONLY, so a silent selector
+        # is exactly the failure that would make this whole job vacuous.
+        env:
+          AST_GREP_ESSENTIALS: ${{ github.workspace }}/.essentials
+        run: ci/linter/selftest.sh
+      - name: Configure an nginx tree for the carve-init parser
+        # lint-carve-init.sh parses the module header with clang against
+        # nginx's real include set, so it needs a tree where ./configure has
+        # run -- ALL_INCS does not exist before that. It does NOT need one that
+        # has been compiled, and `configure` mode stops before make, so this
+        # costs seconds.
+        #
+        # Before that checker used clang it read the header as text and needed
+        # nothing, which is why this job never had a tree. Dropping carve-init
+        # from LINT_ONLY instead would be the cheaper edit and the wrong one:
+        # selftest.sh asserts LINT_ONLY equals the lint-*.sh glob minus "c",
+        # and a checker that runs on the hook but never on a PR is the quieter
+        # half of a gate that is not really a gate.
+        run: |
+          # BUILD_ROOT keeps this tree OUT of .build/, which ci/tests/unit/run.sh
+          # auto-discovers. That suite gates on objs/ngx_auto_config.h and is
+          # meant to SKIP in this job -- the Runtime job, which has a COMPILED
+          # tree, is the one that runs it. `configure` mode stops before make,
+          # so a tree at the default path would satisfy that gate with no .o
+          # files behind it and the suite would die measuring the shm node.
+          tree="$(BUILD_ROOT="$PWD/.carve-tree" bash ci/tools/ci-build.sh nginx "" configure | sed -n 's/^tree=//p')"
+          [ -n "$tree" ] || { echo "ci-build.sh printed no tree= line" >&2; exit 1; }
+          echo "NGX_SRC_TREE=$tree" >> "$GITHUB_ENV"
+      - name: Run linters
+        env:
+          # Every checker except "c" -- adding a lint-*.sh without adding its
+          # name here leaves it running locally and never in CI, which is the
+          # quieter half of a gate that is not really a gate. selftest.sh
+          # asserts this set equals the ci/linter/lint-*.sh glob minus "c".
+          #
+          # ONE LINE, even though it trips yamllint's 120-column warning (which
+          # does not block). selftest.sh reads this value with a line-based
+          # `sed -n 's/^ *LINT_ONLY: *//p'`, so wrapping it in a folded scalar
+          # (`>-`) makes that parser read the literal ">-" and report EVERY
+          # checker as missing. Rewrap only by teaching selftest.sh to parse YAML.
+          AST_GREP_ESSENTIALS: ${{ github.workspace }}/.essentials
+          LINT_ONLY: nginx astgrep astgrep-essentials sh python perl yaml spelling semgrep-pin ci-runners ci-ports ci-cadence ci-secrets sync-stamp docs-drift shm-lock stripe-seam atomic-ordering carve-init suite-docs resume-order park-contract
+        run: ci/linter/run-all.sh
+      - name: Python unit tests (ci/tests)
+        # ci/tests/*.py (breadcrumb guard, abort-fixture accounting, pre-commit
+        # selector) were run by no workflow. A venv keeps pytest off the system
+        # interpreter (PEP 668) while --system-site-packages leaves the tests'
+        # own imports available.
+        run: |
+          python3 -m venv --system-site-packages "$RUNNER_TEMP/pytest-venv"
+          "$RUNNER_TEMP/pytest-venv/bin/python" -m pip install --quiet pytest==9.1.0
+          "$RUNNER_TEMP/pytest-venv/bin/python" -m pytest -q -p no:cacheprovider ci/tests/*.py
+
+      # === validation (was build-test.yml `validation`) ======================
+      - name: Install validation tools
+        if: ${{ inputs.code }}
+        run: |
+          sudo apt-get update
+          # dwarves provides pahole, which ci/tests/unit/extract_shm.sh needs to
+          # measure ngx_http_cache_turbo_node_t (P2-3 slab-class assertion).
+          # The build job below already installs it for the same reason; this
+          # job runs the same unit suite and never did. It passed anyway on a
+          # hosted runner, whose image happens to ship pahole -- on a POOL
+          # runner without it the suite dies at the first measurement.
+          sudo apt-get install -y cppcheck dwarves shellcheck python3-pip pipx
+          # ruff is pinned so a new release cannot add a rule to the selected
+          # tiers and land this job red on an unrelated PR.
+          #
+          # Same pipx-with-pip-fallback shape as the semgrep install in
+          # security-scanners.yml: PEP 668 blocks a bare pip3 install into the
+          # system Python on Ubuntu 24.04. Both paths
+          # land the binary in $PIPX_BIN_DIR / $PYTHONUSERBASE/bin, which is NOT on the runner's
+          # default PATH -- without the GITHUB_PATH append the next step dies
+          # with "ruff: command not found", i.e. a gate that fails for a reason
+          # that has nothing to do with the code.
+          if command -v pipx >/dev/null; then
+            # --force: the lint section's install-linters.sh already put ruff 0.16.1 in
+            # this PIPX_HOME; without it pipx keeps that one and this step's pin is moot.
+            pipx install --quiet --force 'ruff==0.15.20'
+            echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
+          else
+            pip3 install --quiet --user --break-system-packages 'ruff==0.15.20'
+            echo "$PYTHONUSERBASE/bin" >> "$GITHUB_PATH"
+          fi
+      - name: ruff (correctness tiers F,B,I,PLE,RET,RUF059)
+        if: ${{ inputs.code }}
+        run: |
+          set -euo pipefail
+          # ci/tools/test_runtime.py IS the runtime suite (~15.6k lines) and
+          # went unlinted before this gate. RUF059 (unused-unpacked-variable)
+          # is the reason this gate exists: a captured-then-never-read variable
+          # is the tell for the vacuous-assertion class that produced a test
+          # whose only surviving assertion was satisfied by BOTH the pass and
+          # the fail state. Mirrors the ruff hook in .pre-commit-config.yaml --
+          # move both together.
+          #
+          # I (import sorting) joined the gate 2026-08-02: measured across all
+          # nine module repos it is 100% safe-autofixable (`--select I --fix`),
+          # so it cannot land red on arrival. The rest of the nominally "cheap"
+          # tier (N, C4, SIM, UP, PLW, RUF) was measured at 84 findings here
+          # with only 21 safe-autofixable, i.e. 63 hand-edits to the test
+          # harness for no correctness gain -- left out deliberately, see the
+          # ruff hook comment in .pre-commit-config.yaml for the full reasoning.
+          #
+          # Style tiers (PT018, E501) are deliberately excluded: 257 findings
+          # would land this red on arrival and train --no-verify.
+          ruff --version          # records which ruff resolved off PATH
+          ruff check --select F,B,I,PLE,RET,RUF059 ci/
+      - name: Validate scripts and source
+        if: ${{ inputs.code }}
+        run: |
+          # ci/linter/*.sh joins the glob with the linter gate itself: without
+          # it the checker scripts were the only shell in the repo CI never
+          # syntax-checked, which is the wrong file set to leave uncovered.
+          # Default severity (no -S), so info-level findings are fatal here
+          # even though the pre-commit hook gates at -S warning.
+          bash -n ci/tools/*.sh ci/fuzz/*.sh ci/linter/*.sh
+          shellcheck ci/tools/*.sh ci/fuzz/*.sh ci/linter/*.sh
+          # The runtime suite is a package (facade + ci/tools/areas/*.py), so
+          # compile every part: a single-file py_compile of the facade would
+          # let a syntax error in an area module reach the suite run instead
+          # of failing in this cheap gate. The glob is nullglob-free on
+          # purpose -- if areas/ ever disappears this errors rather than
+          # silently checking one file.
+          python3 -m py_compile ci/tools/test_runtime.py
+          if [ -d ci/tools/areas ]; then
+            python3 -m py_compile ci/tools/areas/*.py
+          fi
+          LINT_ONLY=ci-runners ci/linter/run-all.sh
+          bash ci/tools/lint-ci-ports.sh
+          python3 ci/tools/lint-orphan-tests.py
+          python3 ci/tools/lint-doc-preset-count.py
+          # P4-2-s3a: the admin reply buffers size themselves from a
+          # hand-maintained fixed term that had drifted 237 bytes BELOW the
+          # prose it must render. Measures it against the format string instead.
+          python3 ci/tools/lint-admin-buffer-budget.py
+          python3 ci/tools/test-tls-fixture-cleanup.py
+          # Each stamped .github/ file carries a `# sync-sha:` of its own
+          # content, so a `--list` diff against nginx-skeleton-module names
+          # exactly which copies have drifted. The stamps are only worth
+          # reading if they cannot go stale, hence this gate: edit a workflow
+          # without running ci/tools/sync-stamp.sh and the PR goes red here.
+          bash ci/tools/sync-stamp.sh --check
+      - name: Reject corrupt downloaded inputs
+        if: ${{ inputs.code }}
+        run: |
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          printf corrupt > "$tmp/nginx-1.31.1.tar.gz"
+          if bash ci/tools/verify-download.sh "$tmp/nginx-1.31.1.tar.gz"; then
+            echo "corrupt nginx archive passed checksum verification" >&2
+            exit 1
+          fi
+      - name: Static analysis (R7 shm-lock + P4-2-s3b stripe seam + CARVE-INIT + cppcheck + whitespace)
+        if: ${{ inputs.code }}
+        run: |
+          bash ci/tools/lint-shm-lock.sh
+          # CARVE-INIT: every shctx member must be initialised at zone carve.
+          # ngx_slab_alloc() does not zero, but the fresh-carve path lands on
+          # kernel-zeroed pages, so a forgotten member reads 0 anyway and no
+          # runtime test can observe the omission -- only this gate can.
+          #
+          # This checker PARSES the module with clang rather than lexing it,
+          # so it needs an nginx tree whose ./configure has run -- that is
+          # where ALL_INCS comes from. `configure` mode stops before make, so
+          # this costs seconds, not a build. It is deliberately NOT reusing the
+          # build job's tree: this job runs first and must stay independent of
+          # it, and a gate that silently skipped when the tree was absent would
+          # be the silent-green this checker exists to prevent (it exits 2).
+          # ci-build.sh sources .github/versions.env itself and prints the
+          # tree it produced, so the path is READ BACK from that line rather
+          # than re-derived here. Re-deriving it would put the pinned version
+          # in two places, and a drift between them would point NGX_SRC_TREE at
+          # a directory that does not exist -- which this gate reports as
+          # exit 2, correctly but confusingly.
+          # BUILD_ROOT keeps this tree OUT of .build/, which ci/tests/unit/run.sh
+          # auto-discovers. That suite gates on objs/ngx_auto_config.h and is
+          # meant to SKIP in this job -- the Runtime job, which has a COMPILED
+          # tree, is the one that runs it. `configure` mode stops before make,
+          # so a tree at the default path would satisfy that gate with no .o
+          # files behind it and the suite would die measuring the shm node.
+          tree="$(BUILD_ROOT="$PWD/.carve-tree" bash ci/tools/ci-build.sh nginx "" configure | sed -n 's/^tree=//p')"
+          [ -n "$tree" ] || { echo "ci-build.sh printed no tree= line" >&2; exit 1; }
+          NGX_SRC_TREE="$tree" bash ci/tools/lint-carve-init.sh
+          # P4-2-s3b: no site may reach a stripe's slab pool outside the
+          # resolver. At N == 1 a stray bare `z->shpool` behaves identically to
+          # the resolver, so no runtime test can see it -- this is the only
+          # gate that can.
+          bash ci/tools/lint-stripe-seam.sh
+          # Scan every source (CI-4): the explicit list previously omitted
+          # src/ngx_http_cache_turbo_autotune.c. A glob keeps new sources covered.
+          # -DNGX_PTR_SIZE=8: the breaker probe-word layout selects on it and
+          # #errors when it is undefined (H-1 -- an undefined macro in #if
+          # silently evaluates to 0 and picked the wrong layout for the whole
+          # unit suite). It normally arrives from nginx's generated
+          # objs/ngx_auto_config.h, which cppcheck never sees here, so it has to
+          # be supplied. 8 matches every target this module builds for.
+          # --suppress=unusedStructMember and -I src mirror the pre-commit hook.
+          # cppcheck analyses one TU at a time here, so it cannot see a struct
+          # member read from another file and reports every one of them as
+          # unused; unsuppressed it is a false-positive generator. -I src lets
+          # headers next to the sources resolve instead of being reported
+          # missing. The config header's rule is that a divergence gets fixed
+          # toward CI, never by relaxing the hook.
+          cppcheck \
+            --enable=warning,performance,portability \
+            --error-exitcode=1 \
+            --suppress=missingIncludeSystem \
+            --suppress=normalCheckLevelMaxBranches \
+            --suppress=unusedFunction \
+            --suppress=unusedStructMember \
+            -I src \
+            -DNGX_PTR_SIZE=8 \
+            src/*.c
+          git diff --check
+      - name: Pure-math unit tests (SWR + autotune boundary branches)
+        if: ${{ inputs.code }}
+        run: |
+          # Fast, hermetic, no nginx: compiles the shipped src units verbatim
+          # against a shim and drives the fixed-point boundary branches the HTTP
+          # runtime suite cannot reach. check_constants.sh guards shim drift.
+          bash ci/tests/unit/run.sh
+      # Re-run the width-sensitive extracted-production subset with 32-bit
+      # pointers, size_t, long and time_t. Crypto-linked controls remain in the
+      # full-width lane because this runner's i386 OpenSSL and amd64 MyGuard
+      # libzstd packages are not co-installable.
+      - name: Install 32-bit unit-test toolchain
+        if: ${{ inputs.code }}
+        run: |
+          sudo apt-get -o DPkg::Lock::Timeout=120 install -y \
+            gcc-multilib
+      - name: Pure-math unit tests (32-bit)
+        if: ${{ inputs.code }}
+        run: |
+          printf '_Static_assert(sizeof(void *) == 4, "not 32-bit");\n' \
+            | gcc -m32 -x c -fsyntax-only -
+          if printf '_Static_assert(sizeof(void *) == 8, "mutant survived");\n' \
+               | gcc -m32 -x c -fsyntax-only - >/dev/null 2>&1; then
+            echo "32-bit negative control unexpectedly compiled" >&2
+            exit 1
+          fi
+          EXPECT_TIME_T_BYTES=4 UNIT_CFLAGS=-m32 UNIT_WIDTH_ONLY=1 \
+            bash ci/tests/unit/run.sh
+      - name: Lint workflows
+        if: ${{ inputs.code }}
+        run: |
+          version=1.7.7
+          archive="/tmp/actionlint_${version}_linux_amd64.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          bash ci/tools/verify-download.sh "$archive"
+          tar -xzf "$archive" -C /tmp actionlint
+          # -config-file explicitly: auto-discovery of .github/actionlint.yaml
+          # is not reliable across checkout layouts, and without the config the
+          # self-hosted runner labels are flagged as unknown.
+          /tmp/actionlint -color -config-file .github/actionlint.yaml \
+            .github/workflows/*.yml
+
+      # === security scanners (was security-scanners.yml) =====================
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bear build-essential ccache curl eatmydata flawfinder clang-tidy \
+            libpcre2-dev libssl-dev mold python3 python3-pip pipx zlib1g-dev
+          # semgrep: isolate via pipx (PEP 668 blocks a bare pip3 install into the
+          # system Python on the Ubuntu 24.04 self-hosted runner). Fall back to a
+          # user pip install with --break-system-packages if pipx is unavailable.
+          if command -v pipx >/dev/null; then
+            pipx install --quiet 'semgrep==1.169.0'
+            echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
+            export PATH="$PIPX_BIN_DIR:$PATH"
+          else
+            pip3 install --quiet --user --break-system-packages 'semgrep==1.169.0'
+            echo "$PYTHONUSERBASE/bin" >> "$GITHUB_PATH"
+            export PATH="$PYTHONUSERBASE/bin:$PATH"
+          fi
+          test "$(semgrep --version)" = 1.169.0
+      - name: Static-analysis negative controls
+        run: bash ci/tools/test-analysis-controls.sh
+      - name: gitleaks (full history scan)
+        run: |
+          set -euo pipefail
+          version=8.30.1
+          archive="/tmp/gitleaks_${version}_linux_x64.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz"
+          bash ci/tools/verify-download.sh "$archive"
+          tar -xzf "$archive" -C /tmp gitleaks
+          /tmp/gitleaks git --no-banner .
+      - name: Restore build caches
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
+        with:
+          mode: module
+          nginx-version: ${{ env.NGINX_VERSION }}
+      - name: Build module and capture the real compile flags
+        run: |
+          set -euo pipefail
+          tree="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}"
+          # bear only records compiles that execute. Force just this module's
+          # objects cold so a warm build cache cannot yield a valid empty db.
+          rm -rf "$tree/objs/addon" "$tree"/objs/*.so
+          bear --output compile_commands.json -- \
+            bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
+      - name: Verify compilation database covers src/
+        env:
+          WS: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          ws = pathlib.Path(os.environ["WS"])
+          want = {p.resolve() for p in (ws / "src").glob("*.c")}
+          db = json.loads((ws / "compile_commands.json").read_text())
+          got = {pathlib.Path(e["file"]).resolve() for e in db}
+          missing = want - got
+          if not want:
+              sys.exit("no src/*.c found")
+          if missing:
+              sys.exit("compile_commands.json missing: "
+                       + ", ".join(sorted(p.name for p in missing)))
+          print(f"compilation database covers all {len(want)} module sources")
+          PY
+      - name: flawfinder (gate on >=4)
+        run: |
+          set -euo pipefail
+          # minlevel=3: level 1-2 is dominated by token-matches on the struct
+          # field op->recv (not the recv(2) syscall) and on FF1029 sites that
+          # contain no loop. 34 such alerts were dismissed as false positives.
+          #
+          # REPORT at 3, GATE at 4. This step previously had no
+          # --error-level at all, so it could not fail whatever it found, while
+          # .pre-commit-config.yaml gated locally at 4 -- a finding blocked a
+          # commit and then sailed through CI. 4 is the pre-commit threshold;
+          # keep the two equal or local-green stops predicting remote-green.
+          # Verified 0 hits at level 4 when this gate was turned on.
+          #
+          # pipefail is load-bearing: without it `tee` supplies the exit status
+          # and the gate silently passes on every finding.
+          flawfinder --minlevel=3 --error-level=4 \
+            "$GITHUB_WORKSPACE"/src/*.c 2>&1 | tee flawfinder.log
+      - name: clang-tidy (cert-*, security.*)
+        run: |
+          set -euo pipefail
+          status=0
+          for f in "$GITHUB_WORKSPACE"/src/*.c; do
+            # Checks and warning promotion live in the tracked .clang-tidy;
+            # command-line copies would silently override that policy.
+            clang-tidy "$f" -p "$GITHUB_WORKSPACE" \
+              2>&1 | tee -a clang-tidy.log || status=1
+          done
+          exit "$status"
+      - name: gcc -fanalyzer (advisory)
+        continue-on-error: true
+        run: bash ci/tools/fanalyzer.sh "$GITHUB_WORKSPACE"
+      - name: semgrep (gate on >=WARNING)
+        run: |
+          set -euo pipefail
+          # GATED. This step previously ended in `|| true`,
+          # so it reported and never blocked, while .pre-commit-config.yaml
+          # gated locally with --error at the same severity floor. Matching
+          # thresholds is the point: pre-commit exists to predict this job.
+          #
+          # WARNING not ERROR: the registry's ERROR tier has no C rules that
+          # fire on this kind of code, so an ERROR-only gate could never go red.
+          # Verified 0 findings at this floor when the gate was turned on.
+          #
+          # -j 1 IS LOAD-BEARING. Parallel semgrep-core shards allocate one
+          # io_uring each, blow past RLIMIT_MEMLOCK and die with
+          #     Unix_error: Cannot allocate memory io_uring_queue_init
+          # which surfaces as a stack trace and EXIT CODE 0 -- a crashed
+          # scanner that reads as a clean scan. Same reason the pre-commit hook
+          # sets require_serial. Do not "speed this up" by dropping it.
+          #
+          # pipefail likewise: without it `tee` supplies the status.
+          ci/linter/run-semgrep.sh "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: security-reports
+          path: |
+            ${{ github.workspace }}/flawfinder.log
+            ${{ github.workspace }}/clang-tidy.log
+            ${{ github.workspace }}/fanalyzer.log
+            ${{ github.workspace }}/semgrep.log
+          retention-days: 14
+
+      # === fuzz regression (was fuzzing.yml) =================================
+      - name: Install clang + libFuzzer
+        if: ${{ inputs.fuzz }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+      - name: Restore build caches
+        if: ${{ inputs.fuzz }}
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
+        with:
+          mode: debug
+          nginx-version: ${{ env.NGINX_VERSION }}
+      - name: Build fuzz targets
+        if: ${{ inputs.fuzz }}
+        run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz"
+      - name: Smoke absent and present-empty Cookie headers under ASan/UBSan
+        if: ${{ inputs.fuzz }}
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ci/fuzz/auto_classify_empty_smoke
+      # Recorded crashes first: deterministic, seconds, and a returning bug fails
+      # here rather than waiting on the fresh budget below to rediscover it.
+      # Each unit is replayed as a single input (no -max_total_time): libFuzzer
+      # runs the file once and exits non-zero if it still reproduces.
+      - name: Replay recorded regressions
+        if: ${{ inputs.fuzz }}
+        run: |
+          set -euo pipefail
+          cd ci/fuzz
+          total=0
+          failed=0
+          for dir in regressions/*/; do
+            bin="$(basename "$dir")"
+            [ -x "./$bin" ] || { echo "❌ no such fuzz target: $bin"; exit 1; }
+            # Real units only; README.md and an empty dir are both fine.
+            n=0
+            bad=0
+            for unit in $(find "$dir" -type f ! -name 'README.md' | sort); do
+              n=$((n + 1))
+              total=$((total + 1))
+              # One unit per invocation, status checked individually. Do NOT
+              # batch these through xargs: xargs reports its own 123 rather than
+              # the target's exit code, so a crashing unit reads as a pass.
+              set +e
+              out=$("./$bin" -runs=1 "$unit" 2>&1)
+              rc=$?
+              set -e
+              if [ $rc -ne 0 ]; then
+                bad=$((bad + 1))
+                failed=$((failed + 1))
+                echo "❌ $bin: $unit still reproduces (exit $rc)"
+                printf '%s\n' "$out" | tail -30
+              fi
+            done
+            if [ "$n" -eq 0 ]; then
+              echo "— $bin: no recorded regressions"
+            elif [ "$bad" -eq 0 ]; then
+              echo "✓ $bin: all $n replayed clean"
+            fi
+          done
+          [ "$failed" -eq 0 ] || { echo "❌ $failed recorded regression(s) reproduce"; exit 1; }
+          if [ "$total" -eq 0 ]; then
+            # Loud, not a failure: an empty regressions/ tree is the documented
+            # normal state for targets that have never crashed (see
+            # regressions/README.md). But a step that silently replays nothing
+            # reads exactly like a step that replayed something and passed —
+            # make the no-op explicit so this gate cannot go vacuous unnoticed.
+            echo "⚠ replayed 0 recorded regression(s) across all targets — this step is"
+            echo "  currently a no-op (no crash has ever been recorded; see regressions/README.md)"
+          else
+            echo "replayed $total recorded regression(s) across all targets, all clean"
+          fi
+      # Name carries the literal, not ${{ env.FUZZ_SECONDS }}: the run: block
+      # below is the single consumer of that value, and a step name is not
+      # worth an expression. Update both together if the budget changes.
+      - name: Run each target 60s
+        if: ${{ inputs.fuzz }}
+        run: |
+          set -euo pipefail
+          cd ci/fuzz
+          # target:corpus:dict — dict empty where a token dictionary does not help.
+          targets="fuzz_resp_parser:corpus:fuzz.dict \
+                   fuzz_norm_args:corpus_norm_args: \
+                   fuzz_mc_parser:corpus_mc:fuzz_mc.dict \
+                   fuzz_auto_classify:corpus_auto: \
+                   fuzz_blob:corpus_blob:"
+          for t in $targets; do
+            bin="${t%%:*}"; rest="${t#*:}"; corp="${rest%%:*}"; dict="${rest#*:}"
+            echo "=== $bin over $corp (${FUZZ_SECONDS}s)${dict:+ dict=$dict} ==="
+            args="-max_total_time=${FUZZ_SECONDS} -print_final_stats=1 -artifact_prefix=crash-${bin}-"
+            [ -n "$dict" ] && args="$args -dict=$dict"
+            set +e
+            # shellcheck disable=SC2086
+            "./$bin" $args "$corp/"
+            rc=$?
+            set -e
+            [ $rc -eq 0 ] || { echo "❌ $bin crash (exit $rc)"; exit 1; }
+            echo "✓ $bin: no crashes in ${FUZZ_SECONDS}s"
+          done
+      - name: Upload crash artifacts
+        if: ${{ failure() && inputs.fuzz }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-fast-crashes
+          path: |
+            ${{ github.workspace }}/ci/fuzz/crash-*
+          retention-days: 14
+
+      # === testkit prober (was testkit.yml) ==================================
+      # The harness is a SIBLING REPO, not a submodule and not vendored.
+      #
+      # Vendoring was rejected: testkit's t/module/config compiles sources by
+      # relative climb out of its own tree (../../src/ngx_test_probe.c), so a
+      # partial copy does not build; and a vendored copy drifts from upstream
+      # while the port-back never happens -- which is precisely how testkit's
+      # own untracked consumers/ snapshot of THIS repo rotted a month stale.
+      #
+      # A submodule was rejected too: this repo has no .gitmodules today, and
+      # adding one changes clone/CI semantics repo-wide for a single test leg.
+      # A pinned checkout keeps the coupling local to this job.
+      - name: Check out nginx-module-testkit
+        if: ${{ inputs.testkit && inputs.code }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: myguard-labs/nginx-module-testkit
+          # Pinned, not a floating branch: an unpinned harness means a red leg
+          # whose cause is a commit in another repo that this PR never touched.
+          # Bump deliberately, in its own PR, so the bump is what gets blamed.
+          #
+          # This pin moved f8e09995 -> 27f7240 (testkit PR #220) IN the S11 PR
+          # rather than ahead of it, and that is the one case the rule above
+          # yields to: 27f7240 is the commit that ADDS the fanout/quiesce/
+          # zone_invariant directives, so shm-coherence-varidx cannot parse --
+          # let alone assert -- on any earlier pin. Splitting the bump into its
+          # own PR would land a pin bump that changes no behaviour, followed by
+          # a scenario PR that is red until it merges. The bump and the only
+          # consumer of what it adds are one change.
+          ref: 27f724082e16f6d9bd8a2a0ee944ef9dd551ab7e
+          path: .testkit
+          persist-credentials: false
+      - name: Install build dependencies
+        if: ${{ inputs.testkit && inputs.code }}
+        run: |
+          sudo apt-get update
+          # openssl + zlib headers are for the PROBER CLIENT itself (its
+          # body_sha256 oracle links OpenSSL, its gunzip oracle links zlib),
+          # not for this module -- cache-turbo's Redis driver is native nginx.
+          # redis-server + redis-tools are for shm-coherence-varidx: the
+          # varidx_inflight counter it asserts on moves ONLY on the
+          # Redis-backed variant-index write path, and redis-cli is that
+          # scenario's anti-vacuity oracle (it reads the variant-index set's
+          # cardinality out of Redis). Without them the scenario SKIPs
+          # cleanly -- correct behaviour, and zero coverage of the only
+          # automated COR-5 guard there is.
+          sudo apt-get install -y build-essential ccache curl eatmydata \
+            libpcre2-dev libssl-dev redis-server redis-tools zlib1g-dev
+      - name: Restore build caches
+        if: ${{ inputs.testkit && inputs.code }}
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
+        with:
+          # A distinct ccache namespace. This tree's configure differs from
+          # every other mode's (it binds two dynamic modules and carries
+          # testkit's -DNGX_TEST_HARNESS in the global CFLAGS), so sharing a
+          # namespace with `debug` would trade hits for pointless misses.
+          mode: testkit
+          nginx-version: ${{ env.NGINX_VERSION }}
+      - name: Stage cache-turbo + testkit ref probe into one tree
+        if: ${{ inputs.testkit && inputs.code }}
+        env:
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: ci/tools/testkit-stage.sh --version "$NGINX_VERSION"
+      - name: Report compiler-cache effectiveness
+        if: ${{ inputs.testkit && inputs.code }}
+        run: ccache --show-stats
+      # --- the two directions -------------------------------------------------
+      # Both are required. The pass direction alone cannot detect a regression
+      # to permanent-SKIP (that exits 0 and reads green); the skip direction
+      # alone cannot detect a broken oracle.
+      - name: Scenario asserts on a staged tree
+        if: ${{ inputs.testkit && inputs.code }}
+        env:
+          TEST_BASE_PORT: 19456
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: |
+          # consumer-cache-turbo is testkit-run.sh's default; shm-coherence-varidx
+          # is named explicitly because naming ANY scenario replaces that
+          # default rather than adding to it.
+          #
+          # shm-coherence-varidx is the cross-process shm invariant lens against
+          # this module's own shared counters, and the only automated guard on
+          # COR-5 (the varidx_inflight strand, PR #443). It boots four workers
+          # and needs redis-server + redis-cli; its ./requires gate SKIPs
+          # cleanly without them, which is correct but zero coverage -- so if
+          # this leg ever starts reporting `1..0 # SKIP`, that is a finding,
+          # not a pass.
+          #
+          # fault-slab-store (S24) is the probe-armed slab-allocation fault: it
+          # arms `fault_slab=` through the probe, forces store_locked()'s node
+          # allocation to fail, and asserts the error path is resource-neutral
+          # (cycle_used / cycle_blocks / cycle_large / fds flat across the
+          # faulting request). It belongs in the PR gate rather than in
+          # ci-deep's sanitizer job because it is CHEAP -- one worker, no
+          # reload, no soak, ~10 bounded requests total and no external
+          # fixture, so it needs no service container and adds seconds. The
+          # error paths it reaches are reachable no other way in this repo:
+          # exhausting a zone for real is slow AND perturbs the very counters
+          # the oracle reads.
+          # redis-connect-backoff (S17/S18) adds the missing Redis topology:
+          # a closed peer must arm the window and one immediate retry must
+          # increment the fail-fast counter exactly once. Two cold L1 zones
+          # sharing a healthy Redis provide the negative control and must
+          # produce an L2 HIT without either failure oracle.
+          # alloc-per-request / fd-starve / multi-worker (S25) are CT-authored
+          # ports of testkit's generic prober scenarios of the same name,
+          # rebuilt against a REAL cache_turbo HIT path
+          # (ci/prober-scenarios/<name>/nginx.conf) rather than testkit's own
+          # bare `return 200`: each conf's traffic goes through a `cache_turbo`
+          # location and every case that claims to measure a HIT asserts
+          # `X-Cache: HIT` on the wire first, so a pass-through conf (the
+          # vacuous-green class this job's own header warns about) cannot pass
+          # them. All three are single-shot -- no reload, no soak loop -- so
+          # they stay in the PR gate rather than ci-deep.yml's sanitizer job;
+          # the reload- and loop-shaped ports (reload-mid-upload, rss-slope)
+          # are in ci-deep.yml instead. Non-vacuity for each was proven by a
+          # planted mutation (see the scenario's own header comment) observed
+          # red, then reverted to green.
+          source ci/tools/testkit-scenarios.sh
+          ci/tools/testkit-run.sh --version "$NGINX_VERSION" \
+            -- "${TESTKIT_SCENARIOS_PLAIN[@]}"
+      - name: Scenario SKIPs cleanly on an unstaged tree
+        if: ${{ inputs.testkit && inputs.code }}
+        env:
+          TEST_BASE_PORT: 19456
+          TESTKIT_ROOT: ${{ github.workspace }}/.testkit
+        run: |
+          # A version nothing stages. The gate must SKIP -- not fail: a missing
+          # consumer .so is an environment fact, and a red here would train
+          # people to ignore this leg.
+          #
+          # fault-slab-store, redis-connect-backoff, alloc-per-request,
+          # fd-starve and multi-worker
+          # are all named explicitly for the same reason: naming
+          # any scenario REPLACES testkit-run.sh's default rather than adding
+          # to it, so a scenario absent from this list has its own ./requires
+          # gate untested in the skip direction -- exactly the gate that
+          # refuses a non-harness .so, and a gate nothing exercises is how a
+          # scenario silently degrades to permanent-SKIP in the direction
+          # that reads green.
+          source ci/tools/testkit-scenarios.sh
+          ci/tools/testkit-run.sh --expect-skip --version "${NGINX_STABLE:-1.30.4}" \
+            -- "${TESTKIT_SCENARIOS_ALL[@]}"
