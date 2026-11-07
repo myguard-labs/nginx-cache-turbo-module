@@ -1070,6 +1070,12 @@ finding_case_ "park-contract: a missing abort test name is caught" \
 finding_case_ "park-contract: a detach symbol absent from the function is caught" \
     'fx_park: \(c\) detach symbol fx_detach not found' \
     ci/linter/lint-park-contract.sh --root "$pk_fx/park-no-detach"
+finding_case_ "park-contract: a park with no CT_PARK_ENTER is caught" \
+    'fx_park: \(e\) park has no CT_PARK_ENTER' \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-no-enter"
+finding_case_ "park-contract: a park with no CT_PARK_CHECK for its site is caught" \
+    'fx_park: \(e\) no CT_PARK_CHECK / CT_PARK_CHECK_SLOT for site "fx_park"' \
+    ci/linter/lint-park-contract.sh --root "$pk_fx/park-no-check"
 case_ 0 "park-contract: a fully registered access park passes" \
     ci/linter/lint-park-contract.sh --root "$pk_fx/park-good"
 case_ 0 "park-contract: a content-phase park needs no handler swap" \

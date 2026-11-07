@@ -41,9 +41,9 @@ Request-lifetime detectors for this module (plan row BP-E1). They complement
   build the database with `-DNGX_HTTP_CACHE_TURBO_TEST_FAULTS=1`.
   `ci/tools/ci-build.sh` sets it in every mode. If the macro expands to
   nothing, nothing counts as a guard and the query reports the read anyway.
-- Until BP-B2 adds `CT_PARK_CHECK`, query (b) reports the five completion
-  sites on `main`. Wire query (a) as a gate now, and query (b) once BP-B2
-  lands (BP-W1).
+- BP-B2 added `CT_PARK_CHECK` (and `CT_PARK_CHECK_SLOT`) at the completion
+  sites, so query (b) no longer reports them on a TEST_FAULTS build. Wire
+  query (a) as a gate now, and query (b) in BP-W1.
 
 ## Running
 

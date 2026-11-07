@@ -19,6 +19,10 @@
 #       events, or a stray read re-enters the phase engine);
 #   (c) the `detach` symbol appears in the function, or in the function named
 #       by `detach_via`; `none:<reason>` needs a non-empty reason and is exempt;
+#   (e) test-build tripwire (BP-B2): the park function carries CT_PARK_ENTER or
+#       CT_PARK_ENTER_SLOT, and its file carries a CT_PARK_CHECK or
+#       CT_PARK_CHECK_SLOT naming the site (function minus the module prefix,
+#       as a string literal) in the completion path;
 #   (d) every abort_tests name (comma list) exists as `def test_` in
 #       ci/tools/areas/*.py.
 # Whole-tree by nature: the staged list only decides relevance.
@@ -96,6 +100,7 @@ FNR == 1 { infn = 0; fn = ""; inblk = 0 }
     if (infn) {
         key = FILENAME SUBSEP fn
         body[key] = body[key] " " code
+        if (code ~ /CT_PARK_CHECK(_SLOT)?[ \t]*\(/) chkraw[FILENAME] = chkraw[FILENAME] " " line
         if (code ~ /r[ \t]*->[ \t]*main[ \t]*->[ \t]*count[ \t]*\+\+/) {
             if (!(key in row)) {
                 print FILENAME ":" FNR ": (a) r->main->count++ park in " fn "() is not registered in " tsv
@@ -118,6 +123,15 @@ END {
                 print rowname[k] ": (b) " phase[k] "-phase park does not assign r->write_event_handler = " handler[k]
                 found = 1
             }
+        }
+        if (body[k] !~ /(^|[^A-Za-z0-9_])CT_PARK_ENTER(_SLOT)?[ \t]*\(/) {
+            print rowname[k] ": (e) park has no CT_PARK_ENTER / CT_PARK_ENTER_SLOT"
+            found = 1
+        }
+        site = substr(k, index(k, SUBSEP) + 1); sub(/^ngx_http_cache_turbo_/, "", site)
+        if (index(chkraw[substr(k, 1, index(k, SUBSEP) - 1)], "\"" site "\"") == 0) {
+            print rowname[k] ": (e) no CT_PARK_CHECK / CT_PARK_CHECK_SLOT for site \"" site "\" in the completion path"
+            found = 1
         }
         if (detach[k] ~ /^none:/) {
             if (length(detach[k]) <= 5) { print tsv ": (c) " rowname[k] ": detach=none: needs a reason"; found = 1 }
