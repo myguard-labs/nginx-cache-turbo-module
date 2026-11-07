@@ -67,6 +67,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_restore_allocation_failure_fails_closed(ng, origin)
         test_file_backed_delegate_never_stores(ng, origin)
         test_store_failure_cleans_up_cold_stub(ng, origin)
+        test_dead_pool_alloc_trap(ng)                        # BP-B1
     test_max_size_not_cached(ng)
     test_suppress_native_variable(ng)
     test_auto_classify(ng, origin)

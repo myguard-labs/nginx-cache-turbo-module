@@ -670,7 +670,7 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, test_l2_promote_hold_ms),
       NULL },
-
+    NGX_HTTP_CACHE_TURBO_TEST_ALLOC_COMMANDS
     /* S231-SIE-MIDBODY: deterministically simulate an upstream that dies
      * AFTER headers were sent but BEFORE last_buf, so the pre-flush SIE
      * body rescue can be exercised without racing real connection teardown.
@@ -5837,5 +5837,67 @@ ngx_http_cache_turbo_init(ngx_conf_t *cf)
 
     return NGX_OK;
 }
+
+
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+
+/*
+ * BP-B1: the TEST_FAULTS allocation funnel's gate and its trap directive (see
+ * ngx_http_cache_turbo_testalloc.h). Defined after every other function in
+ * this file so a release build, which compiles none of it, keeps every line
+ * number above unchanged.
+ *
+ * A NULL pool is a use of request or connection state that is already gone.
+ * Letting the allocation run would fault inside nginx core with no module
+ * frame in the message; trapping here names the module call site instead.
+ * ngx_debug_point() reads the core conf through ngx_cycle->conf_ctx, which is
+ * still NULL while the first configuration is parsed (nginx -t, startup), so
+ * it is only consulted once a cycle exists. The abort follows either way:
+ * nothing after this point could use the result.
+ *
+ * BP-C1 hooks its countdown in after the NULL check and returns NGX_DECLINED
+ * for the selected call, which makes the wrapper return NULL.
+ */
+ngx_int_t
+ngx_http_cache_turbo_test_alloc_gate(ngx_pool_t *pool, const char *file,
+    ngx_uint_t line)
+{
+    if (pool != NULL) {
+        return NGX_OK;
+    }
+
+    ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                  "cache_turbo: alloc on dead pool at %s:%ui", file, line);
+
+    if (ngx_cycle->conf_ctx != NULL) {
+        ngx_debug_point();
+    }
+
+    ngx_abort();
+
+    return NGX_ERROR;
+}
+
+
+/*
+ * `cache_turbo_test_dead_pool_alloc;` -- the deliberate dead-pool allocation
+ * that proves the trap fires and names this file and line. Never returns when
+ * the gate works: a NULL result or a return means the funnel is not wired.
+ */
+char *
+ngx_http_cache_turbo_test_dead_pool_alloc(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_pool_t  *dead;
+
+    dead = NULL;
+
+    (void) ngx_palloc(dead, 1);
+
+    return "allocated on a dead pool without trapping";
+}
+
+#endif
 
 #pragma GCC visibility pop

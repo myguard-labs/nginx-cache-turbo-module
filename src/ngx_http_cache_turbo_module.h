@@ -3876,4 +3876,13 @@ ngx_int_t ngx_http_cache_turbo_warm_one(ngx_http_request_t *r,
 ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
 
 
+
+/* BP-B1: TEST_FAULTS-only allocation funnel. Kept LAST so a release build
+ * sees no line shift in this header. */
+#if defined(NGX_HTTP_CACHE_TURBO_TEST_FAULTS) \
+    && NGX_HTTP_CACHE_TURBO_TEST_FAULTS
+#include "ngx_http_cache_turbo_testalloc.h"
+#endif
+
+
 #endif /* NGX_HTTP_CACHE_TURBO_MODULE_H_INCLUDED_ */

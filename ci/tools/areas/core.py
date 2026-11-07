@@ -2181,6 +2181,46 @@ def test_invalid_backend_name(ng: Nginx) -> None:
 
 
 
+def test_dead_pool_alloc_trap(ng: Nginx) -> None:
+    """BP-B1: the TEST_FAULTS allocation funnel traps an allocation on a dead
+    (NULL) pool and names the module call site.
+
+    `cache_turbo_test_dead_pool_alloc;` makes its directive handler call
+    ngx_palloc() on a NULL pool at parse time. The funnel must log
+    `[alert] cache_turbo: alloc on dead pool at <file>:<line>` with this
+    module's module.c as <file>, then abort. Without the funnel (or with its
+    NULL check gone) the same call faults inside nginx core: nginx -t still
+    fails, but with no alert and no module file:line, so the message asserts
+    are the oracle, not the exit status alone."""
+    trap = ng.root.parent / "dead-pool-trap"
+    (trap / "conf").mkdir(parents=True, exist_ok=True)
+    (trap / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = nginx_config(trap, ng.port, ng.module, ng.origin_port, 1)
+    anchor = "http {"
+    assert anchor in cfg, "nginx_config() output has no http block"
+    cfg = cfg.replace(anchor,
+                      anchor + "\n    cache_turbo_test_dead_pool_alloc;", 1)
+    (trap / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+    cmd = ng.runner + [str(ng.binary), "-p", str(trap),
+                       "-c", str(trap / "conf" / "nginx.conf"), "-t"]
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=20,
+                       env=config_check_env())
+    out = r.stdout
+    log = trap / "logs" / "error.log"
+    if log.exists():
+        out += log.read_text(encoding="utf-8", errors="replace")
+    assert r.returncode != 0, \
+        f"dead-pool allocation did not stop nginx -t:\n{out}"
+    m = re.search(r"\[alert\].*cache_turbo: alloc on dead pool at "
+                  r"(\S*ngx_http_cache_turbo_module\.c):(\d+)", out)
+    assert m is not None, \
+        f"funnel did not trap the dead-pool allocation with its site:\n{out}"
+    assert int(m.group(2)) > 0, f"trap reported line 0:\n{out}"
+    assert "allocated on a dead pool without trapping" not in out, \
+        f"dead-pool allocation returned to its caller:\n{out}"
+
+
 
 def test_invalid_cache_turbo_mode(ng: Nginx) -> None:
     """cache_turbo takes a zone name and nothing else. Any 2nd token is rejected
