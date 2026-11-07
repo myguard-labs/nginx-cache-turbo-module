@@ -2504,9 +2504,9 @@ ngx_http_cache_turbo_shm_owns(ngx_http_cache_turbo_zone_t *z,
 }
 
 
-/* Remove a leftover cold-miss stub (v10). Only acts if the node is still a stub
- * (data == NULL / len == 0) — a real entry stored in the meantime is left
- * intact. Called when a cold-miss winner's response was non-cacheable so the
+/* Remove a leftover cold-miss stub (v10). Only frees the node if it is still a
+ * stub (data == NULL / len == 0) — a real entry is never freed, though an
+ * owned single-flight lease on an expired entry is released. Called when a cold-miss winner's response was non-cacheable so the
  * in-flight marker would otherwise block waiters until refresh_lock_until. */
 void
 ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
@@ -2548,7 +2548,11 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
      * min_uses 4, a config where counters never reach here at all. Evidence of
      * absence, mistaken for absence of the path.
      *
-     * An ENTRY is never touched: it holds a body someone may still serve.
+     * An ENTRY is never freed (it holds a body someone may still serve), but a
+     * lease its caller still owns IS released: claim() puts the single-flight
+     * lease on the EXPIRED entry itself, so a winner that serves stale-if-error
+     * or gets a non-cacheable 5xx never stores, and without this release the
+     * lease would hold every later request until refresh_lock_until.
      *
      * ⚠ CTXRDR-ADOPT-LEASE: the owner test is NOT a fourth shape check to be
      * folded into the ones above -- it is an identity check, and it is what makes
@@ -2558,7 +2562,8 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
      * every waiter to stampede the origin. Mismatch => someone else's lease, and
      * the only correct action is to leave the node completely alone. */
     if (ctn != NULL
-        && ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER
+        && (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER
+            || ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_ENTRY)
         && ctn->refreshing
         && ctn->refresh_owner == owner)
     {
@@ -2571,7 +2576,9 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
          * progress and no live negative memo. Either one means the node still
          * carries state the caller never asked to discard, so it stays as a plain
          * COUNTER and expires on its own terms. */
-        if (ctn->miss_count == 0 && ctn->l2_neg_until <= ngx_time()) {
+        if (ctn->kind == NGX_HTTP_CACHE_TURBO_NODE_COUNTER
+            && ctn->miss_count == 0 && ctn->l2_neg_until <= ngx_time())
+        {
             ngx_http_cache_turbo_lru_unlink(z, ctn);
             ngx_http_cache_turbo_zone_sh(z)->n_entries--;
             ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);

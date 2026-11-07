@@ -3170,7 +3170,9 @@ ngx_uint_t ngx_http_cache_turbo_shm_sketch_estimate(
 
 /* Remove a leftover cold-miss STUB (v10): drops the node ONLY if it is still a
  * stub (len == 0), so a real entry stored by someone else is never touched.
- * Used when a cold-miss winner's response turned out non-cacheable.
+ * Used when a cold-miss winner's response turned out non-cacheable. An owned
+ * single-flight lease on an expired ENTRY (stale-if-error serve, non-cacheable
+ * 5xx) is released too; the entry itself is never freed.
  *
  * CTXRDR-ADOPT-LEASE: `owner` is the token claim() issued to the caller. The
  * lease is released ONLY if the node still carries that exact token, so a
