@@ -54,10 +54,11 @@
 # The /typo3 entry point is stable -- TYPO3 does not randomise it the way
 # magento randomises /admin -- so there is no per-install-path caveat here.
 #
-# NO ARGS, NO KEY COOKIES, NO PREDICATES -- ct_typo3_args[] is { NULL }, and the
-# typo3 row in ngx_http_cache_turbo_presets[] carries NULL for both cookie_preds
-# and key_cookies. This file therefore has no arg leg, no predicate leg and no
-# value-keying leg. Only the URI and cookie-bypass legs apply.
+# ONE ARG, NO KEY COOKIES, NO PREDICATES -- ct_typo3_args[] is { "ADMCMD_prev" }
+# (the workspace-preview key, sysext/workspaces WorkspacePreview.php:61; TESTS
+# 10-12 pin the cookie and the argument), and the typo3 row in
+# ngx_http_cache_turbo_presets[] carries NULL for both cookie_preds and
+# key_cookies. This file therefore has no predicate leg and no value-keying leg.
 #
 # See ci/t/presets/xenforo.t for why every bypass case is fetched TWICE (a
 # bypass and a first-time MISS both lack X-Cache, so a single fetch proves
@@ -302,6 +303,67 @@ __DATA__
 ["Cookie: fe_typo_user=abc123",
  "Cookie: fe_typo_user=abc123",
  "", ""]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
+=== TEST 10: the ADMCMD_prev= workspace-preview cookie bypasses on its own
+# WorkspacePreview.php:140-142 sets this cookie for a no-login preview visitor
+# and :263-265 reads it from the query OR the cookie, so the unpublished
+# workspace content renders for a visitor holding neither fe nor be cookie. It
+# is sent ALONE so removing "ADMCMD_prev=" from ct_typo3_cookies[] goes red on
+# this row. The cookie rule is a substring rule: "ADMCMD_pre=" (a near name
+# without the 'v') and "ADMCMD_prevx=" (the needle name continued, so no '='
+# right after "prev") do NOT contain "ADMCMD_prev=" and must cache.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /t3/prev-a", "GET /t3/prev-a",
+ "GET /t3/prev-b", "GET /t3/prev-b",
+ "GET /t3/prev-c", "GET /t3/prev-c"]
+--- more_headers eval
+["Cookie: ADMCMD_prev=LIVE",
+ "Cookie: ADMCMD_prev=LIVE",
+ "Cookie: ADMCMD_pre=x",
+ "Cookie: ADMCMD_pre=x",
+ "Cookie: ADMCMD_prevx=1",
+ "Cookie: ADMCMD_prevx=1"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200, 200, 200, 200]
+
+
+
+=== TEST 11: the ?ADMCMD_prev= query argument bypasses
+# The preview link itself carries the key as a query argument, before the
+# middleware turns it into a cookie. The arg rule is an exact NAME match.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /t3/prev-d?ADMCMD_prev=LIVE", "GET /t3/prev-d?ADMCMD_prev=LIVE"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 12: near-miss argument names still cache
+# "ADMCMD_prevx" continues the needle name and "ADMCMD_pre" stops short of it;
+# an exact-name match accepts neither. Pinned so the arg row is not a prefix
+# rule that would take unrelated parameters off cache.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /t3/prev-e?ADMCMD_prevx=1", "GET /t3/prev-e?ADMCMD_prevx=1",
+ "GET /t3/prev-f?ADMCMD_pre=1",   "GET /t3/prev-f?ADMCMD_pre=1"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT},
  qq{X-Cache: }, qq{X-Cache: HIT}]

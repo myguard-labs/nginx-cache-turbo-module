@@ -1,6 +1,6 @@
 # Vanilla Forums + cache-turbo
 
-_Last researched: 2026-09-01_
+_Last researched: 2026-11-07_
 
 Caching a legacy self-hosted Vanilla Forums board. The stock preset does **not**
 match current Vanilla SaaS cookie names; identify which product you run and
@@ -8,6 +8,7 @@ verify its cookie on the wire before relying on it.
 
 - [The short version](#the-short-version)
 - [The identity cookie, and the caveat](#the-identity-cookie-and-the-caveat)
+- [The API (`/api/`) and the front-controller caveat](#the-api-api-and-the-front-controller-caveat)
 - [Vhost](#vhost)
 - [Checking it works](#checking-it-works)
 - [Gotchas](#gotchas)
@@ -90,23 +91,24 @@ no guest response is captured under a shared key. You do not need
 anonymous traffic is the tell — and if it costs you too much, narrow the rule
 with a hand-verified `cache_turbo_bypass` on a cookie your guests do not get.
 
-## Known gap: the API (`/api`) has no rule
+## The API (`/api/`) and the front-controller caveat
 
 Vanilla's API v2 is **Bearer-authenticated**, which makes it the same
-header-auth class as `magento /rest`, `drupal /jsonapi` and `xenforo /api/` —
-all of which *do* ship a URI rule. An API client sends no `Vanilla=` cookie, so
-the cookie rule above is structurally blind to it.
+header-auth class as `magento /rest`, `drupal /jsonapi` and `xenforo /api/`. An
+API client sends no `Vanilla=` cookie, so the cookie rule above is structurally
+blind to it; the preset therefore ships the URI row **`/api/`**.
 
-**No `/api` row is shipped, deliberately.** `github.com/vanilla/vanilla` now
-404s (repo, raw and API alike; the org survives), so there is no upstream tree
-left to verify the prefix against, and every surviving reference is a
-Garden-era fork last pushed in 2013. Adding a row from recollection is what
-produced the dead `/admin.php` and `/message_send.php` rows in the PunBB
-preset, so it is not being repeated here.
+The prefix comes from the official `vanilla` organisation's current client
+(`knowledge-porter`, `src/HttpClients/VanillaClient.php:49` sends
+`Authorization: Bearer` and `:60` requests `GET /api/v2/knowledge-bases`), as
+the former `github.com/vanilla/vanilla` repository no longer exists. There is
+no release to cite.
 
-If you serve the API behind the PHP front controller, classify the original
-request URI. A `cache_turbo_bypass_uri /api;` placed in the PHP location sees
-the internally redirected `/index.php` and does not match:
+The row sees `r->uri`. If the front controller internally redirects the API
+request to `/index.php` (the vhost below does, with `try_files`), the URI the
+rule sees in the PHP location is `/index.php` and the row does not match there.
+In that layout classify the original request URI, as below, and keep the
+`/api/` row for a location that serves the API directly:
 
 ```nginx
 map $request_uri $vanilla_api {

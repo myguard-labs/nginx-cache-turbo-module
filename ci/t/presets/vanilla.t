@@ -44,30 +44,20 @@
 # implies (ngx_http_cache_turbo_cookie_has() scans for a substring anywhere in the
 # Cookie header, not an anchored match): `MyVanilla=` also bypasses.
 #
-# NO /api ROW, DELIBERATELY, AND THIS IS AN UNRESOLVED GAP
+# THE /api/ ROW (TESTS 11-12)
 # ------------------------------------------------------------------------
-# Verbatim from the ct_vanilla_uris[] header comment in src:
-#
-#   NO /api ROW, DELIBERATELY, and this is an unresolved gap rather than a
-#   decision. Vanilla's API v2 is Bearer-authenticated, so it is exactly the
-#   header-auth surface the cookie tier cannot see -- the same class as
-#   magento /rest, drupal /jsonapi and xenforo /api/, all of which ARE
-#   listed.
-#
-#   It is not listed here because it cannot be verified: github.com/vanilla/
-#   vanilla now 404s (repo, raw and API alike; the org survives), so there is
-#   no upstream tree left to check the prefix against, and every surviving
-#   reference is a Garden-era fork last pushed in 2013. Adding a row from
-#   recollection is exactly what produced the dead /admin.php and
-#   /message_send.php rows in punbb, so it is not being done. An operator
-#   running Vanilla's API adds their own:
-#       cache_turbo_bypass_uri /api;
-#   See docs/vanilla.md.
+# Vanilla's API v2 is Bearer-authenticated, so it is exactly the header-auth
+# surface the cookie tier cannot see -- the same class as magento /rest, drupal
+# /jsonapi and xenforo /api/. The prefix is taken from the official vanilla
+# org's knowledge-porter VanillaClient.php:49 (Authorization: Bearer) and :60
+# (GET /api/v2/knowledge-bases). Like xenforo.t, the row is exercised from a
+# ROOT location; docs/vanilla.md notes that behind a front controller that
+# internally redirects to /index.php the URI the rule sees is /index.php.
 #
 # ct_vanilla_args[] is { NULL } and the preset row carries NULL in both
 # cookie_preds and key_cookies, so this file has no arg leg, no predicate
 # leg, and no value-keying leg. No row is a prefix of another row
-# ("/dashboard", "/entry/", "/messages/", "/post/" -- checked pairwise), so
+# ("/dashboard", "/entry/", "/messages/", "/post/", "/api/" -- checked pairwise), so
 # the #222 prefix-row rule does not apply here.
 #
 # "/dashboard" IS SLASH-LESS -- THE SEGMENT-TERMINATION BRANCH IS LIVE HERE
@@ -109,6 +99,8 @@ our $Config = ct_config(
     { path => '/entry/',     backend => 'vanilla' },
     { path => '/messages/',  backend => 'vanilla' },
     { path => '/post/',      backend => 'vanilla' },
+    { path => '/api/',       backend => 'vanilla' },
+    { path => '/apis',       backend => 'vanilla' },
     { path => '/vanilla/',   backend => 'vanilla' },
     { path => '/gen/',       backend => 'wordpress' },
 );
@@ -283,6 +275,35 @@ Cookie: Vanilla
 Cookie: Vanilla=abc.signed.payload
 --- request eval
 ["GET /gen/topic-iso", "GET /gen/topic-iso"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 11: /api/ bypasses -- the Bearer-authenticated API v2
+# Authorization: Bearer is invisible to the cookie tier, so the URI row is the
+# only protection. /api/v2/discussions is the shape the official client uses.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /api/v2/discussions", "GET /api/v2/discussions"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 12: NEAR MISS -- /apis shares the prefix text but caches
+# "/api/" ends in '/', so it is a plain byte-0 prefix: "/apis" does not start
+# with "/api/" and must cache. Served under its own REAL location so the HIT
+# cannot pass for free on an implicit 404.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /apis", "GET /apis"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval

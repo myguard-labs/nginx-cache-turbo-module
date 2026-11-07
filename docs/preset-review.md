@@ -1,7 +1,7 @@
 # Preset review and deployment checklist
 
-_Implementation reviewed: 2026-09-01 at `3db1ca9`; 25 application presets
-re-checked upstream 2026-11-07 (13 original, 12 further)._
+_Implementation reviewed: 2026-09-01 at `3db1ca9`; 38 application presets
+re-checked upstream 2026-11-07 (13 original, 12 further, 13 last)._
 
 This page records what was checked across every shipped
 `cache_turbo_backend` preset. The per-application guides remain the source for
@@ -53,15 +53,15 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | `wagtail` | 1 | 3 | — | — | — | Safe while guests remain session-free; anonymous sessions fail safe by reducing hit rate. |
 | `kirby` | 1 | 1 | — | — | — | Safe while guests remain session-free; `csrf()` can make guest pages bypass. |
 | `shopware6` | — | 5 | — | yes | 1 | `sw-cache-hash` is value-keyed, except the `not-cacheable` marker, which bypasses; preserve that contract across Shopware upgrades. |
-| `typo3` | 2 | 1 | — | — | — | Unsafe after an unmirrored `FE/cookieName` rename; add local bypass and no-store rules. |
-| `invision` | — | 5 | 5 | yes | 3 | Vendor-attested closed-source rules; verify cookies on the deployed release. |
+| `typo3` | 3 | 1 | 1 | — | — | Unsafe after an unmirrored `FE/cookieName`, `BE/cookieName` or `BE/entryPoint` change; add local bypass and no-store rules. Workspace-preview key `ADMCMD_prev` is covered as cookie and argument. |
+| `invision` | — | 5 | 5 | yes | 3 | Vendor-attested closed-source rules, unverified 2026-11-07; verify cookies on the deployed release. |
 | `smf` | 1 | — | 12 | — | — | Safe but presence-only session matching can bypass guests. |
-| `vanilla` | 1 | 4 | — | — | — | Legacy self-hosted only; current SaaS `vf_*` login-cookie names are per-site and need local rules. |
+| `vanilla` | 1 | 5 | — | — | — | Legacy self-hosted only; current SaaS `vf_*` login-cookie names are per-site and need local rules. The Bearer-authenticated `/api/` is bypassed. |
 | `punbb` | 2 | 9 | — | — | — | Covers stock and legacy prefixes; guest-issued cookies reduce hit rate. |
-| `phorum` | 3 | 12 | — | — | 1 | Fixed member cookies and language key are covered. |
+| `phorum` | 3 | 12 | 1 | — | 1 | Fixed member cookies and language key are covered; set `use_cookies` to "Require cookies" so the session id never travels in the URI. |
 | `yabb` | 3 | — | 11 | — | — | Random cookie suffixes are covered by stable prefixes. |
-| `mybb` | — | 10 | 10 | yes | 2 | Prefix-independent member predicate plus language/theme value keys. |
-| `vbulletin` | — | 7 | — | yes | 1 | Closed-source/version-sensitive; verify current vBulletin cookies before rollout. |
+| `mybb` | — | 11 | 10 | yes | 2 | Prefix-independent member predicate plus language/theme value keys. |
+| `vbulletin` | — | 7 | — | yes | 2 | Closed-source/version-sensitive. `bb_userid`/`bb_password` exist only after a Remember Me login; non-Remember-Me members need an `imloggedin`-style login flag or a local rule (deployment prerequisite). |
 | `textpattern` | 2 | 1 | — | — | — | Add a URI rule when the admin directory is renamed. |
 | `bludit` | 3 | 2 | — | — | — | Stock auth and remember-me cookies are covered. |
 | `spip` | — | 1 | 2 | yes | — | Prefix-independent session/admin/state suffixes are covered conservatively. |
@@ -134,6 +134,29 @@ calibreweb and nextjs needed no literal change.
 | `calibre` | v9.18.0 | Added URIs `/kosync/`, `/book-get-storage`, `/book-set-storage`: per-user state at shared URLs (KOReader sync authenticates by `X-Auth-User`, not `Authorization`). |
 | `calibreweb` | 0.6.27 | No change. |
 | `nextjs` | v16.4.5 | No change. |
+
+The same day the last 13 application presets (typo3, invision, smf, vanilla,
+punbb, phorum, yabb, mybb, vbulletin, textpattern, bludit, spip, bugzilla) were
+re-checked against the cited upstream source and changed in five of them; the
+other eight needed no literal change. Invision and vBulletin are closed source,
+so their rows stay vendor-attested; the vBulletin 4 evidence comes from
+third-party copies of 4.1.11.
+
+| Preset | Release checked | Result |
+| --- | --- | --- |
+| `typo3` | v14.3.10 | Added cookie `ADMCMD_prev=` and arg `ADMCMD_prev`: the workspace-preview key renders unpublished content for a visitor with no login cookie. Comment and guide corrected: `BE/cookieName` and `BE/entryPoint` are configurable. |
+| `invision` | closed source | No change; vendor-attested, unverified at 2026-11-07. |
+| `smf` | 2.1.8 | No change. |
+| `vanilla` | knowledge-porter and garden-sites (no release; the former main repository is gone) | Added URI `/api/`: the API v2 authenticates by `Authorization: Bearer`, never a cookie. |
+| `punbb` | v1.4.4 (no newer tag) | No change. |
+| `phorum` | v6.0.6 | Added arg `phorum_session_v5` (URI authentication while `use_cookies` is below 2). Exact-name matching misses the comma form `?1,2,phorum_session_v5=x`; the guide tells operators to require cookies. |
+| `yabb` | 2.5.2 (newest downloadable) | No change; verified at 2.5.2, 2.6 and later unverified. |
+| `mybb` | 1.8.41 | Added URI `/task.php` (scheduled-task runner). |
+| `vbulletin` | closed source; vB 4.1.11 third-party copies | Key cookie `bb_language` corrected to `bb_languageid` and `bb_userstyleid` added (no `bb_language` cookie exists). Documented: login cookies exist only with Remember Me. |
+| `textpattern` | 4.9.2 | No change. |
+| `bludit` | 3.22.0 | No change. |
+| `spip` | 4.4.30 | No change. |
+| `bugzilla` | release-5.3.3 | No change. |
 
 `nextjs` was added after the first review (researched 2026-09-29 against Next.js
 16.3.7). Its cookie and argument rows are in the same mirrors; its

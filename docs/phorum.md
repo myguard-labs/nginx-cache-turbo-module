@@ -1,6 +1,6 @@
 # Phorum + cache-turbo
 
-_Last researched: 2026-07-26_
+_Last researched: 2026-11-07 (Phorum v6.0.6)_
 
 Caching a Phorum board. The clean case: presence alone is a safe, sufficient
 signal, no value predicate, no per-install hash.
@@ -34,8 +34,18 @@ own. The long-term `phorum_session_v5` cookie (value `user_id:sessid`) is the
 load-bearing member signal.
 
 > Verified against Phorum `Core` at the
-> [v6.0.4 release](https://github.com/Phorum/Core/releases/tag/v6.0.4)
-> (`include/api/user.php` lines 59–74, `common.php:88`), 2026-07-26.
+> [v6.0.6 release](https://github.com/Phorum/Core/releases/tag/v6.0.6)
+> (`include/api/user.php` lines 59–74, `common.php:88`), 2026-11-07; the cookie
+> constants are unchanged since v6.0.4.
+
+**Require cookies.** While the admin setting `use_cookies` is below 2 (the
+default is 1, "Can use cookies"), Phorum accepts the session id from the
+request itself (`include/api/user.php:2416-2442`), so `?phorum_session_v5=...`
+authenticates a member with no cookie. The preset bypasses that query argument
+by exact name (`phorum_session_v5`), but it cannot see Phorum's comma-separated
+argument form (`?1,2,phorum_session_v5=...`). Set `use_cookies` to **Require
+cookies** (2) so a session id is never accepted from the URI. The documented
+`$host$request_uri` key also keeps a URI-carried session id in the cache key.
 
 `phorum_tmp_cookie` **is** guest-issued — a one-shot cookie-support probe with
 no identity value, destroyed on login — and is deliberately absent from the

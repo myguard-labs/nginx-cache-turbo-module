@@ -24,9 +24,11 @@
 # rare manual FULL rename still evades it -- a documented gap, same class as
 # every other admin-configurable-name caveat in this registry.
 #
-# WHY THERE IS ONLY ONE KEY COOKIE
-# --------------------------------
-# `bb_language` only. `bb_lastvisit` and `bb_lastactivity` are presentation
+# WHY THERE ARE ONLY TWO KEY COOKIES
+# ----------------------------------
+# `bb_languageid` and `bb_userstyleid` (the real cookie names, init.php
+# COOKIE_PREFIX.'languageid' / 'userstyleid'; there is no 'language' cookie).
+# `bb_lastvisit` and `bb_lastactivity` are presentation
 # cookies too, but they are per-visit TIMESTAMPS that change on essentially every
 # request. Keying on them gave each visitor a private bucket the next request
 # already invalidated -- a hit rate near zero on a board that otherwise caches
@@ -278,8 +280,8 @@ Cookie: bb_sessionhash=abcdef; bb_lastvisit=1700000000
 
 
 
-=== TEST 12: bb_language is VALUE-KEYED, and each value hits its own entry
-# The one key cookie. A SHARED variant -- everyone reading in German sees the
+=== TEST 12: bb_languageid is VALUE-KEYED, and each value hits its own entry
+# The language key cookie. A SHARED variant -- everyone reading in German sees the
 # same page -- so it must cache, repeat-hit its OWN entry, and not collide with
 # a different value. The body echo proves separation; the X-Cache sequence alone
 # would only show request 3 was not a HIT, not that it got its own body.
@@ -288,13 +290,13 @@ Cookie: bb_sessionhash=abcdef; bb_lastvisit=1700000000
 --- request eval
 ["GET /vb/variant-lang", "GET /vb/variant-lang", "GET /vb/variant-lang"]
 --- more_headers eval
-["Cookie: bb_language=en",
- "Cookie: bb_language=en",
- "Cookie: bb_language=de"]
+["Cookie: bb_languageid=en",
+ "Cookie: bb_languageid=en",
+ "Cookie: bb_languageid=de"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: }]
 --- response_body_like eval
-[qr/bb_language=en/, qr/bb_language=en/, qr/bb_language=de/]
+[qr/bb_languageid=en/, qr/bb_languageid=en/, qr/bb_languageid=de/]
 --- error_code eval
 [200, 200, 200]
 
@@ -313,8 +315,8 @@ Cookie: bb_sessionhash=abcdef; bb_lastvisit=1700000000
 --- request eval
 ["GET /vb/nokey-ts", "GET /vb/nokey-ts"]
 --- more_headers eval
-["Cookie: bb_language=en; bb_lastvisit=1700000000",
- "Cookie: bb_language=en; bb_lastvisit=1799999999"]
+["Cookie: bb_languageid=en; bb_lastvisit=1700000000",
+ "Cookie: bb_languageid=en; bb_lastvisit=1799999999"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
@@ -324,11 +326,11 @@ Cookie: bb_sessionhash=abcdef; bb_lastvisit=1700000000
 
 === TEST 14: a key cookie name is matched EXACTLY -- no client-chosen folding
 # The security half of the exact-match rule (see ci/t/presets/mybb.t). If a
-# suffix matched here, `evilbb_language` would select the bucket a real
-# `bb_language=de` reader uses while the origin returns the default page to be
+# suffix matched here, `evilbb_languageid` would select the bucket a real
+# `bb_languageid=de` reader uses while the origin returns the default page to be
 # stored there.
 #
-# The assertion is POSITIVE: a request carrying only `evilbb_language` must key
+# The assertion is POSITIVE: a request carrying only `evilbb_languageid` must key
 # IDENTICALLY to one carrying no language cookie, and READ the entry a
 # cookie-less request warmed (requests 1-3). The genuine cookie does fold, so it
 # must miss that entry and get its own (requests 4-5).
@@ -339,15 +341,15 @@ Cookie: bb_sessionhash=abcdef; bb_lastvisit=1700000000
  "GET /vb/evil-key", "GET /vb/evil-key"]
 --- more_headers eval
 ["", "",
- "Cookie: evilbb_language=de",
- "Cookie: bb_language=de",
- "Cookie: bb_language=de"]
+ "Cookie: evilbb_languageid=de",
+ "Cookie: bb_languageid=de",
+ "Cookie: bb_languageid=de"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: HIT},
  qq{X-Cache: }, qq{X-Cache: HIT}]
 --- response_body_like eval
 [qr/ck=$/, qr/ck=$/, qr/ck=$/,
- qr/ck=bb_language=de/, qr/ck=bb_language=de/]
+ qr/ck=bb_languageid=de/, qr/ck=bb_languageid=de/]
 --- error_code eval
 [200, 200, 200, 200, 200]
 
@@ -367,3 +369,43 @@ Cookie: bb_userid=42; bbimloggedin=yes
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200]
+
+
+
+=== TEST 16: bb_userstyleid is VALUE-KEYED too, in its own buckets
+# The style selector is the second key cookie. Each value hits its OWN entry and
+# a repeat of a value hits it; the body echo proves separation.
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /vb/variant-style", "GET /vb/variant-style", "GET /vb/variant-style"]
+--- more_headers eval
+["Cookie: bb_userstyleid=2",
+ "Cookie: bb_userstyleid=2",
+ "Cookie: bb_userstyleid=3"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: }]
+--- response_body_like eval
+[qr/bb_userstyleid=2/, qr/bb_userstyleid=2/, qr/bb_userstyleid=3/]
+--- error_code eval
+[200, 200, 200]
+
+
+
+=== TEST 17: the OLD name bb_language folds NOTHING -- it shares the default bucket
+# The earlier table keyed "bb_language", which vBulletin never sends. Near-miss
+# negative: a request carrying only bb_language=2 must key IDENTICALLY to a
+# cookie-less one and read the entry it warmed (requests 1-2); the real
+# bb_languageid=2 must miss that entry (request 3).
+--- http_config eval: $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /vb/oldname-key", "GET /vb/oldname-key", "GET /vb/oldname-key"]
+--- more_headers eval
+["", "Cookie: bb_language=2", "Cookie: bb_languageid=2"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: }]
+--- response_body_like eval
+[qr/ck=$/, qr/ck=$/, qr/ck=bb_languageid=2/]
+--- error_code eval
+[200, 200, 200]
