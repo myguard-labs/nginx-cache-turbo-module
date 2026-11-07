@@ -7,7 +7,7 @@
 #   exit-only  : a target exits non-zero without an artifact -> non-zero
 #   stale-art  : a leftover crash-<bin>-* from a clean run still fails (closed)
 # Needs clang with libFuzzer. Usage: bash ci/fuzz/test_run_concurrent.sh
-# shellcheck disable=SC2016,SC2317  # bash -c bodies are single-quoted on purpose; helpers are called via chk
+# shellcheck disable=SC2016,SC2317,SC2329  # bash -c bodies are single-quoted on purpose; helpers are called via chk
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN="$HERE/run-concurrent.sh"
