@@ -18,7 +18,7 @@ cache_turbo_backend bludit;
 | --- | --- |
 | Cookie substrings | `BLUDIT-KEY` (also catches `__Secure-BLUDIT-KEY`), `BLUDITREMEMBERUSERNAME=`, `BLUDITREMEMBERTOKEN=` |
 | URI prefixes | `/admin`, `/install.php` |
-| Query args | — |
+| Query args | `authentication` |
 
 <!-- markdownlint-enable MD013 -->
 

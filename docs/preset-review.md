@@ -55,7 +55,7 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | `shopware6` | — | 5 | — | yes | 1 | `sw-cache-hash` is value-keyed, except the `not-cacheable` marker, which bypasses; preserve that contract across Shopware upgrades. |
 | `typo3` | 3 | 1 | 1 | — | — | Unsafe after an unmirrored `FE/cookieName`, `BE/cookieName` or `BE/entryPoint` change; add local bypass and no-store rules. Workspace-preview key `ADMCMD_prev` is covered as cookie and argument. |
 | `invision` | — | 5 | 5 | yes | 3 | Vendor-attested closed-source rules, unverified 2026-11-07; verify cookies on the deployed release. |
-| `smf` | 1 | — | 12 | — | — | Safe but presence-only session matching can bypass guests. |
+| `smf` | 1 | — | 16 | — | — | Safe but presence-only session matching can bypass guests. |
 | `vanilla` | 1 | 5 | — | — | — | Legacy self-hosted only; current SaaS `vf_*` login-cookie names are per-site and need local rules. The Bearer-authenticated `/api/` is bypassed. |
 | `punbb` | 2 | 9 | — | — | — | Covers stock and legacy prefixes; guest-issued cookies reduce hit rate. |
 | `phorum` | 3 | 12 | 1 | — | 1 | Fixed member cookies and language key are covered; set `use_cookies` to "Require cookies" so the session id never travels in the URI. |
@@ -63,21 +63,21 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | `mybb` | — | 11 | 10 | yes | 2 | Prefix-independent member predicate plus language/theme value keys. |
 | `vbulletin` | — | 7 | — | yes | 2 | Closed-source/version-sensitive. `bb_userid`/`bb_password` exist only after a Remember Me login; non-Remember-Me members need an `imloggedin`-style login flag or a local rule (deployment prerequisite). |
 | `textpattern` | 2 | 1 | — | — | — | Add a URI rule when the admin directory is renamed. |
-| `bludit` | 3 | 2 | — | — | — | Stock auth and remember-me cookies are covered. |
+| `bludit` | 3 | 2 | 1 | — | — | Stock auth and remember-me cookies are covered. |
 | `spip` | — | 1 | 2 | yes | — | Prefix-independent session/admin/state suffixes are covered conservatively. |
-| `bugzilla` | 2 | 35 | 8 | — | — | Login, token-bearing and administrative entry points are covered. |
+| `bugzilla` | 2 | 35 | 10 | — | — | Login, token-bearing and administrative entry points are covered. |
 | `mantisbt` (`mantis`) | 1 | 32 | 1 | yes | — | Custom PHP `session.name` needs a local rule. |
 | `plone` | 5 | 7 | — | — | — | Auth, Zope session, status and language state are covered; retain origin cache headers. |
 | `umbraco` | 10 | 1 | — | — | — | Stock member/back-office cookies are covered; custom schemes need local rules. |
 | `dotclear` | 3 | 3 | — | — | — | Custom `DC_SESSION_NAME` and same-host admin paths need local rules. |
 | `wikijs` | 4 | 19 | — | — | — | Covers Wiki.js 2.x and 3.x (3.1.1). |
-| `redmine` | 2 | 12 | 3 | — | — | Cookie login and cookieless `?key=`, `?access_token=`, `?bearer_token=` authentication are covered; plus 1 request-header row (`X-Redmine-API-Key`, presence bypass). |
+| `redmine` | 2 | 13 | 3 | — | — | Cookie login and cookieless `?key=`, `?access_token=`, `?bearer_token=` authentication are covered; plus 1 request-header row (`X-Redmine-API-Key`, presence bypass). |
 | `flarum` | 1 | 10 | — | — | 1 | Partial: login without remember-me is indistinguishable from a guest session; rechecked at v2.0.2. Guest `locale` cookie is value-keyed. |
 | `opencart` | — | — | 34 | — | 1 | Partial: base controller routes only. `OCSESSID` is identical for guests and members, so retain the application `no-store` policy; overriding it needs an application-exposed login boundary, then a fail-closed local map. The `currency` cookie is value-keyed. |
 | `servarr` | 2 | 12 | 2 | — | — | Safety preset for Sonarr, Radarr and Lidarr (aliases `sonarr`, `radarr`, `lidarr`). The apps serve no anonymous HTML; the rows keep the login cookie, `/initialize.json` (API key under the upstream `?h=` public rule) and `/api` out of the cache. External auth needs a local bypass on the proxy SSO cookie. |
 | `calibre` | — | 10 | — | — | — | URI-only; there is no session cookie or API key. With server auth on, the `Authorization` floor already bypasses every request. |
 | `calibreweb` | 2 | 13 | — | — | — | Alias `calibre-web`. Safe only with anonymous browsing on and no reverse-proxy header login (cookieless auth); `session=` also matches guest search sessions, a lost hit only. |
-| `nextjs` | 7 | 1 | 1 | — | — | Plus 10 request-header rows (presence bypass; they also satisfy the matching App Router `Vary` axes). Safe for the default Auth.js/NextAuth, Clerk, Better Auth and Supabase session cookies; renamed cookies, Lucia and iron-session need local rules. `/api/` bypass is conservative. |
+| `nextjs` | 8 | 1 | 2 | — | — | Plus 10 request-header rows (presence bypass; they also satisfy the matching App Router `Vary` axes). Safe for the default Auth.js/NextAuth, Clerk, Better Auth and Supabase session cookies; renamed cookies, Lucia and iron-session need local rules. `/api/` bypass is conservative. |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -116,9 +116,10 @@ vendor-attested and were not re-verified.
 
 The same day the next 12 application presets (mantisbt, plone, umbraco,
 dotclear, wikijs, redmine, flarum, opencart, servarr, calibre, calibreweb,
-nextjs) were re-checked against the cited upstream source and changed in eight
-of them; umbraco changed only its comment and guide, and dotclear, servarr,
-calibreweb and nextjs needed no literal change.
+nextjs) were re-checked against the cited upstream source and changed in nine
+of them; umbraco changed only its comment and guide, and dotclear, servarr and
+calibreweb needed no literal change. Nextjs gained its floor rows in the
+low-priority follow-up pass.
 
 | Preset | Release checked | Result |
 | --- | --- | --- |
@@ -127,18 +128,20 @@ calibreweb and nextjs needed no literal change.
 | `umbraco` | 18.3.1 | No row change; comment and guide corrected: the Delivery API lives under `/umbraco/delivery/api/` and is bypassed by `/umbraco`. |
 | `dotclear` | 2.39.3 | No change. |
 | `wikijs` | 3.1.1 and 2.5.315 | Added cookie `wikiSession=` and URIs `/_api/auth`, `/_mcp`, `/_scim`, `/_terminal`, `/_collab` for the 3.x rewrite; every 2.x row is kept. |
-| `redmine` | 7.0.3 | Added args `access_token`, `bearer_token` (Doorkeeper defaults) and header `X-Redmine-API-Key` (cookieless API key). |
+| `redmine` | 7.0.3 | Added URI `/oauth` (Doorkeeper mount). Added args `access_token`, `bearer_token` (Doorkeeper defaults) and header `X-Redmine-API-Key` (cookieless API key). |
 | `flarum` | v2.0.2 | Added key cookie `locale`: guests render in the language from the unprefixed cookie. |
 | `opencart` | 4.1.0.4 | Added key cookie `currency`: 4.x sets it for every visitor; the earlier "not set by 4.x" claim was wrong. |
 | `servarr` | Sonarr v4.0.20, Radarr v6.4.4, Lidarr v3.1.6 | No change. |
 | `calibre` | v9.18.0 | Added URIs `/kosync/`, `/book-get-storage`, `/book-set-storage`: per-user state at shared URLs (KOReader sync authenticates by `X-Auth-User`, not `Authorization`). |
 | `calibreweb` | 0.6.27 | No change. |
-| `nextjs` | v16.4.5 | No change. |
+| `nextjs` | v16.4.5 | Added cookie `next-instant-navigation-testing=` and arg `__nextppronly` (shell-only rendering switches; only active when the origin enables the testing API, so a free floor). |
 
 The same day the last 13 application presets (typo3, invision, smf, vanilla,
 punbb, phorum, yabb, mybb, vbulletin, textpattern, bludit, spip, bugzilla) were
-re-checked against the cited upstream source and changed in five of them; the
-other eight needed no literal change. Invision and vBulletin are closed source,
+re-checked against the cited upstream source and changed in nine of them (five
+in the first pass, smf, punbb, bludit and bugzilla in the low-priority
+follow-up pass); invision, yabb, textpattern and spip needed no literal
+change. Invision and vBulletin are closed source,
 so their rows stay vendor-attested; the vBulletin 4 evidence comes from
 third-party copies of 4.1.11.
 
@@ -146,17 +149,29 @@ third-party copies of 4.1.11.
 | --- | --- | --- |
 | `typo3` | v14.3.10 | Added cookie `ADMCMD_prev=` and arg `ADMCMD_prev`: the workspace-preview key renders unpublished content for a visitor with no login cookie. Comment and guide corrected: `BE/cookieName` and `BE/entryPoint` are configurable. |
 | `invision` | closed source | No change; vendor-attested, unverified at 2026-11-07. |
-| `smf` | 2.1.8 | No change. |
+| `smf` | 2.1.8 | Added args `action=signup`, `action=signup2`, `action=reminder`, `action=activate` (cookieless forms carrying per-session tokens). |
 | `vanilla` | knowledge-porter and garden-sites (no release; the former main repository is gone) | Added URI `/api/`: the API v2 authenticates by `Authorization: Bearer`, never a cookie. |
-| `punbb` | v1.4.4 (no newer tag) | No change. |
+| `punbb` | v1.4.4 (no newer tag) | URI `/login.php` and `/register.php` became the slash-less needles `/login` and `/register`, which also cover the SEF schemes (`/login/`, `login.html`, ...). |
 | `phorum` | v6.0.6 | Added arg `phorum_session_v5` (URI authentication while `use_cookies` is below 2). Exact-name matching misses the comma form `?1,2,phorum_session_v5=x`; the guide tells operators to require cookies. |
-| `yabb` | 2.5.2 (newest downloadable) | No change; verified at 2.5.2, 2.6 and later unverified. |
-| `mybb` | 1.8.41 | Added URI `/task.php` (scheduled-task runner). |
+| `yabb` | 2.5.2 (newest downloadable) | No change; verified at 2.5.2, 2.6 and later unverified. The rows `action=admin` and `action=pm` match no 2.5.2 action (admin is `AdminIndex.pl`, PMs are `imsend`/`mycenter`); kept: a dead row costs nothing and later releases are unverified. |
+| `mybb` | 1.8.41 | Added URI `/task.php` (scheduled-task runner). The row `action=do_logout` is not a `member.php` action in 1.8.41; kept as harmless (a dead row costs nothing). |
 | `vbulletin` | closed source; vB 4.1.11 third-party copies | Key cookie `bb_language` corrected to `bb_languageid` and `bb_userstyleid` added (no `bb_language` cookie exists). Documented: login cookies exist only with Remember Me. |
 | `textpattern` | 4.9.2 | No change. |
-| `bludit` | 3.22.0 | No change. |
+| `bludit` | 3.22.0 | Added arg `authentication` (API plugin user token; logs an admin in without a cookie). |
 | `spip` | 4.4.30 | No change. |
-| `bugzilla` | release-5.3.3 | No change. |
+| `bugzilla` | release-5.3.3 | Added args `login` and `password` (WebService aliases for `Bugzilla_login`/`Bugzilla_password`; matters for an install behind a path prefix, where the REST URI rows cannot match). |
+
+Low-priority follow-ups from the same review, decided 2026-11-07:
+
+- Key-cookie cardinality (flarum `locale`, opencart `currency`, shopware6
+  `sw-cache-hash`): not changed. A client-chosen value fans out one cache entry
+  per distinct value, but every key cookie works this way (xenforo, magento,
+  mybb) and the module has no per-value allowlist to configure. The bound is
+  `cache_turbo_min_uses` (an entry is stored only after N misses, so one-off
+  values never mint an entry) plus the zone size limit. A value allowlist would
+  be a new directive and belongs to its own change.
+- YaBB `action=admin`/`action=pm` and MyBB `action=do_logout`: kept, see the
+  per-preset rows above.
 
 `nextjs` was added after the first review (researched 2026-09-29 against Next.js
 16.3.7). Its cookie and argument rows are in the same mirrors; its

@@ -196,8 +196,10 @@ PunBB-specific only; generic PHP-FPM tuning lives in the other backend guides.
   writable by PHP. It is orthogonal to cache-turbo's full-page store — never
   point the nginx zone at it, and clearing one does not clear the other.
 - **Admin / posting / login stay dynamic.** The preset's never-cache URI list
-  covers `admin/`, `login.php`, `post.php`, `edit.php`, `delete.php`,
-  `moderate.php`, `profile.php`, `register.php` and `misc.php`; PunBB
+  covers `admin/`, `login`, `post.php`, `edit.php`, `delete.php`,
+  `moderate.php`, `profile.php`, `register` and `misc.php`; `login` and
+  `register` are slash-less needles that also match the SEF forms
+  (`/login/`, `login.html`, `/register/`, `register.html`); PunBB
   guards these in PHP too (`admin/*` checks `$forum_user['g_id'] != FORUM_ADMIN`),
   so a cached admin page is never a risk even if a URI is missed — the member
   cookie already forces BYPASS.

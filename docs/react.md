@@ -33,9 +33,9 @@ cache_turbo_backend nextjs;
 | Check | Values |
 | --- | --- |
 | Request headers (presence, any value) | `RSC`, `Next-Router-State-Tree`, `Next-Router-Prefetch`, `Next-Router-Segment-Prefetch`, `Next-Url`, `Next-Action`, `X-Middleware-Prefetch`, `X-Nextjs-Data`, `X-Now-Route-Matches`, `X-Middleware-Subrequest` |
-| Cookie substrings | `__prerender_bypass`, `__next_preview_data`, `next-auth.session-token`, `authjs.session-token`, `__session`, `better-auth.session_token`, `-auth-token` |
+| Cookie substrings | `__prerender_bypass`, `__next_preview_data`, `next-auth.session-token`, `authjs.session-token`, `__session`, `better-auth.session_token`, `-auth-token`, `next-instant-navigation-testing=` |
 | URI prefixes | `/api/` |
-| Query args | `_rsc` |
+| Query args | `_rsc`, `__nextppronly` |
 
 <!-- markdownlint-enable MD013 -->
 

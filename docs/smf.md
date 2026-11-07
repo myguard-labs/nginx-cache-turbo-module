@@ -212,7 +212,9 @@ SMF-specific knobs that interact with this preset:
   `post`/`post2` are state-changing or per-member and must never be served from
   cache. `SMFCookie` presence covers logged-in members, but a logged-out visitor
   hitting `?action=login` (or `logout`, `post`, `pm`) must not be cached either —
-  if you widen guest caching, exclude the mutating actions explicitly.
+  if you widen guest caching, exclude the mutating actions explicitly. The
+  cookieless `signup`, `signup2`, `reminder` and `activate` forms embed a
+  per-session token and are bypassed too (SMF 2.1.8).
 - **SMF separates query arguments with `;`, not `&`.** A real board URL looks
   like `index.php?topic=12.0;action=post`, and PHP's `arg_separator.input`
   accepts it. The preset's argument scanner splits on both `;` and `&`, checks
