@@ -1,7 +1,7 @@
 # Ruff configuration.
 #
-# The selected rule tiers live in .pre-commit-config.yaml and in the CI lint
-# step (F,B,I,PLE,RET,RUF059), not here -- this file only records the
+# The selected rule tiers live in ci/linter/lint-python.sh (RUFF_SELECT:
+# F,B,I,PLE,RET,RUF059), not here -- this file only records the
 # exceptions those tiers cannot express, so widening a tier stays a one-place
 # edit.
 

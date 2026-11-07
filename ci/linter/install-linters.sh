@@ -235,12 +235,12 @@ install_actionlint() {
         echo "actionlint ${ver}: sha256 mismatch" >&2
         echo "  expected: $sha" >&2
         echo "  got:      $(sha256sum < "$tmp/al.tgz" | cut -d' ' -f1)" >&2
-        rm -rf "$tmp"
+        rm -rf "${tmp:?}"
         return 1
     fi
     tar -xzf "$tmp/al.tgz" -C "$tmp" actionlint || return 1
     $SUDO install -m0755 "$tmp/actionlint" /usr/local/bin/actionlint || return 1
-    rm -rf "$tmp"
+    rm -rf "${tmp:?}"
 }
 
 step "actionlint"
@@ -274,15 +274,15 @@ install_astgrep() {
         echo "ast-grep ${ver}: sha256 mismatch" >&2
         echo "  expected: $sha" >&2
         echo "  got:      $(sha256sum < "$tmp/ag.zip" | cut -d' ' -f1)" >&2
-        rm -rf "$tmp"
+        rm -rf "${tmp:?}"
         return 1
     fi
     # The zip carries both `ast-grep` and its short alias `sg`. Only ast-grep is
     # installed: `sg` collides with util-linux's setgid tool on Debian, and
-    # ci/linter/ and .pre-commit-config.yaml both spell it out in full.
+    # ci/linter/ spells it out in full.
     unzip -qo "$tmp/ag.zip" ast-grep -d "$tmp" || return 1
     $SUDO install -m0755 "$tmp/ast-grep" /usr/local/bin/ast-grep || return 1
-    rm -rf "$tmp"
+    rm -rf "${tmp:?}"
 }
 
 step "ast-grep"
@@ -320,12 +320,12 @@ install_gitleaks() {
         echo "gitleaks ${ver}: sha256 mismatch" >&2
         echo "  expected: $sha" >&2
         echo "  got:      $(sha256sum < "$tmp/gl.tgz" | cut -d' ' -f1)" >&2
-        rm -rf "$tmp"
+        rm -rf "${tmp:?}"
         return 1
     fi
     tar -xzf "$tmp/gl.tgz" -C "$tmp" gitleaks || return 1
     $SUDO install -m0755 "$tmp/gitleaks" /usr/local/bin/gitleaks || return 1
-    rm -rf "$tmp"
+    rm -rf "${tmp:?}"
 }
 
 step "gitleaks"

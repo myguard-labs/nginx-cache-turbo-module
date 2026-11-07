@@ -84,7 +84,7 @@ cleanup() {
     if [ -n "${NGX_PID:-}" ] && [ "${NGX_PID:-0}" -gt 1 ]; then
         kill "$NGX_PID" 2>/dev/null || true
     fi
-    rm -rf "$WORK"
+    rm -rf "${WORK:?}"
 }
 trap cleanup EXIT INT TERM
 mkdir -p "$WORK/conf" "$WORK/logs" "$WORK/html"

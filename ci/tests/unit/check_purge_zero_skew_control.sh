@@ -13,7 +13,7 @@ OUT="$TMP_DIR/control.out"
 
 restore() {
     CTRL_PURGE_SKIP_ZERO_CHECK=0 bash "$DIR/extract_shm.sh" >/dev/null
-    rm -rf "$TMP_DIR"
+    rm -rf "${TMP_DIR:?}"
 }
 trap restore EXIT
 

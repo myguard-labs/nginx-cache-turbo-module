@@ -10,7 +10,7 @@ OUT="$TMP_DIR/control.out"
 restore() {
 	CTRL_PURGE_NO_PARTIAL_WARN=0 \
 		bash "$DIR/extract_purge_digest_order.sh" >/dev/null
-	rm -rf "$TMP_DIR"
+	rm -rf "${TMP_DIR:?}"
 }
 trap restore EXIT
 
