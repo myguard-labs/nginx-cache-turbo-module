@@ -1383,6 +1383,9 @@ def test_sie_midbody_rescue(ng: Nginx, origin: Origin) -> None:
     sent so sie_armed stays 0 for every request -- the fault must not
     fabricate a body out of nothing; the (fault-truncated) response passes
     through unchanged."""
+    if not ng.fault_injection:  # run_all gates this on the TEST_FAULTS build
+        print("SIE midbody: SKIPPED (not a fault-injection build)")
+        return
     # Prime /midbody/ with a real (non-fault) response so a snapshot lands
     # armed with an SIE window, exactly as /sieserve/'s own prime does.
     s0, b0, _ = fetch(ng.port, "/midbody/sieserve-mb1")
@@ -1448,6 +1451,9 @@ def test_sie_midbody_rescue_declines_on_length_mismatch(ng: Nginx,
     test a duplicate of the /midbodycold/ control and vacuous as a framing
     oracle. Mutation-verified: with the framing check forced to always-pass,
     this test must FAIL."""
+    if not ng.fault_injection:  # run_all gates this on the TEST_FAULTS build
+        print("SIE midbody: SKIPPED (not a fault-injection build)")
+        return
     key = "/midbody/sieserve-mismatch-mb1"
 
     s0, b0, _ = fetch(ng.port, key)
@@ -1521,6 +1527,82 @@ def test_sie_serves_counter(ng: Nginx, origin: Origin) -> None:
         assert after_neg == after_pos, \
             ("sie_serves moved on a plain 503 with no armed SIE snapshot -- "
              f"{after_pos} -> {after_neg}")
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_sie_serve_releases_miss_lock(ng: Nginx, origin: Origin) -> None:
+    """CT-SIE-LOCK-HELD: a stale-if-error serve must release the single-flight
+    lease its request took on the expired entry. Otherwise the next request
+    for the same key parks as a cold-miss loser until cache_turbo_lock_timeout
+    (default 5s on /sieserve/) before it goes to the origin itself.
+
+    Two serve-on-error requests in a row against a failing origin: the second
+    must also be a STALE-IF-ERROR serve, and must not wait out the lock. The
+    threshold (1s) sits far below the 5s lock_timeout and far above a normal
+    origin round trip, so a held lease reads red and scheduling noise does not.
+    lock_waits must not move either: a released lease means no request parks."""
+    path = "/sieserve/sieserve-lock-k1"
+    s0, b0, _ = fetch(ng.port, path)
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(1.3)     # past fresh (1s), stale_mult 1 -> 1s window: expired
+    origin.fail = True
+    try:
+        s1, b1, h1 = fetch(ng.port, path, timeout=10.0)
+        assert s1 == 200 and b1 == b0, \
+            f"first SIE serve returned {s1} {b1!r}, expected stale {b0!r}"
+        assert h1.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected STALE-IF-ERROR, got x-cache={h1.get('x-cache')}"
+
+        waits0 = _admin_lock_waits(ng)
+        t0 = time.monotonic()
+        s2, b2, h2 = fetch(ng.port, path, timeout=10.0)
+        elapsed = time.monotonic() - t0
+        assert s2 == 200 and b2 == b0, \
+            f"second SIE serve returned {s2} {b2!r}, expected stale {b0!r}"
+        assert h2.get("x-cache") == "STALE-IF-ERROR", \
+            f"expected STALE-IF-ERROR, got x-cache={h2.get('x-cache')}"
+        assert elapsed < 1.0, \
+            (f"second request waited {elapsed:.2f}s: the first request's "
+             "stale-if-error serve left the miss lock held")
+        waits = _admin_lock_waits(ng) - waits0
+        assert waits == 0, \
+            f"second request parked on the miss lock ({waits} lock_waits)"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def test_plain_5xx_releases_miss_lock(ng: Nginx, origin: Origin) -> None:
+    """CT-SIE-LOCK-HELD companion: an expired entry with NO stale-if-error
+    window, origin failing with 503. The winner's 503 is non-cacheable, so it
+    never stores; shm_unstub must still release the lease it took on the
+    expired entry. Otherwise the next request parks until lock_timeout
+    (5s on /sieserve/). Both responses are the origin's 503; the second must
+    return in well under the lock_timeout."""
+    path = "/sieserve/plain-lock-k9"
+    s0, b0, _ = fetch(ng.port, path)
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+
+    time.sleep(2.5)     # past fresh (1s) + stale window: fully expired
+    origin.fail = True
+    try:
+        s1, _, _ = fetch(ng.port, path, timeout=10.0)
+        assert s1 == 503, f"first request returned {s1}, expected origin 503"
+
+        waits0 = _admin_lock_waits(ng)
+        t0 = time.monotonic()
+        s2, _, _ = fetch(ng.port, path, timeout=10.0)
+        elapsed = time.monotonic() - t0
+        assert s2 == 503, f"second request returned {s2}, expected origin 503"
+        assert elapsed < 1.0, \
+            (f"second request waited {elapsed:.2f}s: the first request's "
+             "non-cacheable 503 left the miss lock held")
+        waits = _admin_lock_waits(ng) - waits0
+        assert waits == 0, \
+            f"second request parked on the miss lock ({waits} lock_waits)"
     finally:
         origin.fail = False
         drain_origin(origin)
@@ -2444,6 +2526,9 @@ def test_store_failure_cleans_up_cold_stub(ng: Nginx, origin: Origin) -> None:
     stays 0), request 2 claims a virgin key, lock_waits does not move.
     Buggy build: the stub survives with a live lease, request 2 parks,
     lock_waits increments."""
+    if not ng.fault_injection:  # run_all gates this on the TEST_FAULTS build
+        print("store-failure cold stub: SKIPPED (not a fault-injection build)")
+        return
     uri = f"/storefail/stub-{time.time()}"
 
     w0 = _admin_lock_waits(ng, "/_cache_storefail")
@@ -2542,6 +2627,42 @@ def _evblind_trip_breaker(ng: Nginx, origin: Origin) -> None:
         f"(breaker_state={state!r})")
 
 
+def test_evict_blind_negative_control_closed_breaker_evicts_normally(
+        ng: Nginx) -> None:
+    """S231-EVICT-BLIND negative control: with the breaker CLOSED (its
+    default state -- this test runs standalone against evblindz and never
+    trips it), a live-SIE-shaped entry gets NO second chance at all -- it is
+    evicted on the very first pass, exactly like the pre-S231-EVICT-BLIND
+    behaviour. This isolates that the spare is conditioned on breaker_open,
+    not on "this key looks like it could carry an SIE window" alone -- a
+    build that always spares a live-SIE candidate (breaker state ignored)
+    would fail this control by keeping the tracked key resident.
+
+    Deliberately evblindz (not /e/'s shared `tiny` 8m zone, which needs
+    ~200 keys to force eviction and is shared with test_lru_eviction and
+    test_p1_coarse_lru_splice_keeps_hot_key_resident -- a borderline fill
+    count on an already-populated shared zone risks the control passing for
+    the wrong reason). evblindz's own /evblind/sieserve/ location DOES carry
+    a live stale-if-error window, so this control also proves the
+    SIE-liveness half is insufficient alone: the entries here ARE live-SIE,
+    and still get no spare, because the breaker was never tripped."""
+    tracked = "/evblind/sieserve/control-tracked"
+
+    s, _, h = fetch(ng.port, tracked)
+    assert s == 200, f"control: tracked-key store returned {s}"
+
+    for i in range(120):
+        s, _, _ = fetch(ng.port, f"/evblind/sieserve/control-fill-{i}")
+        assert s == 200, f"control: fill key {i} returned {s}"
+
+    s, _, h = fetch(ng.port, tracked)
+    st = h.get("x-ct-status", "")
+    assert s == 200 and st == "MISS", (
+        f"control: tracked key survived a single eviction pass under a "
+        f"CLOSED breaker (status={st!r}, expected MISS) -- no second chance "
+        "should apply here at all")
+
+
 def test_evict_blind_second_chance(ng: Nginx, origin: Origin) -> None:
     """S231-EVICT-BLIND reachability smoke test.
 
@@ -2602,42 +2723,6 @@ def test_evict_blind_second_chance(ng: Nginx, origin: Origin) -> None:
     st = h.get("x-ct-status", "")
     assert st in ("HIT", "STALE"), (
         f"evblind: expected a cache-served status while OPEN, got {st!r}")
-
-
-def test_evict_blind_negative_control_closed_breaker_evicts_normally(
-        ng: Nginx) -> None:
-    """S231-EVICT-BLIND negative control: with the breaker CLOSED (its
-    default state -- this test runs standalone against evblindz and never
-    trips it), a live-SIE-shaped entry gets NO second chance at all -- it is
-    evicted on the very first pass, exactly like the pre-S231-EVICT-BLIND
-    behaviour. This isolates that the spare is conditioned on breaker_open,
-    not on "this key looks like it could carry an SIE window" alone -- a
-    build that always spares a live-SIE candidate (breaker state ignored)
-    would fail this control by keeping the tracked key resident.
-
-    Deliberately evblindz (not /e/'s shared `tiny` 8m zone, which needs
-    ~200 keys to force eviction and is shared with test_lru_eviction and
-    test_p1_coarse_lru_splice_keeps_hot_key_resident -- a borderline fill
-    count on an already-populated shared zone risks the control passing for
-    the wrong reason). evblindz's own /evblind/sieserve/ location DOES carry
-    a live stale-if-error window, so this control also proves the
-    SIE-liveness half is insufficient alone: the entries here ARE live-SIE,
-    and still get no spare, because the breaker was never tripped."""
-    tracked = "/evblind/sieserve/control-tracked"
-
-    s, _, h = fetch(ng.port, tracked)
-    assert s == 200, f"control: tracked-key store returned {s}"
-
-    for i in range(120):
-        s, _, _ = fetch(ng.port, f"/evblind/sieserve/control-fill-{i}")
-        assert s == 200, f"control: fill key {i} returned {s}"
-
-    s, _, h = fetch(ng.port, tracked)
-    st = h.get("x-ct-status", "")
-    assert s == 200 and st == "MISS", (
-        f"control: tracked key survived a single eviction pass under a "
-        f"CLOSED breaker (status={st!r}, expected MISS) -- no second chance "
-        "should apply here at all")
 
 
 def _admin_l2_misses(ng: Nginx) -> int:

@@ -380,6 +380,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_unbuf_streamed_store_and_hit(ng)                   # UNBUF streamed store + HIT round-trip
     test_unbuf_oversize_abort_mid_stream(ng, origin)        # UNBUF oversize mid-stream abort
     test_sie_serves_counter(ng, origin)                     # S7.1 sie_serves counter
+    test_sie_serve_releases_miss_lock(ng, origin)           # CT-SIE-LOCK-HELD
+    test_plain_5xx_releases_miss_lock(ng, origin)           # CT-SIE-LOCK-HELD companion
     test_sie_origin_recovers_serves_fresh(ng, origin)       # RFC-2 success not hijacked
     test_keep_stale_serves_dead_origin(ng, origin)          # S2.2 keep_stale fallback
     test_keep_stale_shipped_default_serves_dead_origin(ng, origin)  # S231-DEFAULTS
