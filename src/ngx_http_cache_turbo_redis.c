@@ -1357,7 +1357,7 @@ ngx_http_cache_turbo_redis_op_create(ngx_http_cache_turbo_loc_conf_t *clcf)
 }
 
 
-void
+ngx_int_t
 ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
     u_char *blob, size_t blob_len, time_t fresh_ttl, time_t retain_ttl)
@@ -1368,18 +1368,18 @@ ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     u_char                           *keybuf, *blobcopy, *msbuf;
 
     if (!clcf->redis_enable) {
-        return;
+        return NGX_DECLINED;
     }
 
     /* L2 entry lives as long as the caller says it should (retain_ttl) --
      * the backend no longer derives its own window from fresh_ttl. */
     if (retain_ttl <= 0) {
-        return;
+        return NGX_DECLINED;
     }
 
     op = ngx_http_cache_turbo_redis_op_create(clcf);
     if (op == NULL) {
-        return;
+        return NGX_ERROR;
     }
     pool = op->pool;
 
@@ -1389,7 +1389,7 @@ ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     msbuf = ngx_pnalloc(pool, NGX_INT64_LEN);
     if (blobcopy == NULL || keybuf == NULL || msbuf == NULL) {
         ngx_destroy_pool(pool);
-        return;
+        return NGX_ERROR;
     }
     ngx_memcpy(blobcopy, blob, blob_len);
 
@@ -1408,23 +1408,28 @@ ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     op->send = ngx_http_cache_turbo_redis_encode(pool, argv, 5);
     if (op->send == NULL) {
         ngx_destroy_pool(pool);
-        return;
+        return NGX_ERROR;
     }
 
     if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
     {
         ngx_destroy_pool(pool);
+        return NGX_ERROR;
     }
+
+    return NGX_OK;
 }
 
 
 /* Fire-and-forget a single RESP command (drains the reply, ignores it). The
  * argv bytes are copied into the op pool by encode, so they need only be valid
- * for the duration of this call. */
+ * for the duration of this call. `done`, when not NULL, is the op's drain_cb
+ * (called once with NULL data: NGX_OK only for a clean, non-error reply);
+ * it is not called when this returns NGX_ERROR. */
 static ngx_int_t
 ngx_http_cache_turbo_redis_fire_argv(ngx_http_cache_turbo_loc_conf_t *clcf,
-    ngx_str_t *argv, ngx_uint_t argc)
+    ngx_str_t *argv, ngx_uint_t argc, void (*done)(void *data, ngx_int_t rc))
 {
     ngx_http_cache_turbo_redis_op_t  *op;
 
@@ -1434,6 +1439,7 @@ ngx_http_cache_turbo_redis_fire_argv(ngx_http_cache_turbo_loc_conf_t *clcf,
     }
 
     op->expected_replies = 1;              /* one command -> one RESP reply */
+    op->drain_cb = done;
 
     op->send = ngx_http_cache_turbo_redis_encode(op->pool, argv, argc);
     if (op->send == NULL) {
@@ -1467,7 +1473,7 @@ ngx_http_cache_turbo_redis_del_raw_rc(ngx_http_cache_turbo_loc_conf_t *clcf,
     argv[1].data = key;
     argv[1].len = key_len;
 
-    return ngx_http_cache_turbo_redis_fire_argv(clcf, argv, 2);
+    return ngx_http_cache_turbo_redis_fire_argv(clcf, argv, 2, NULL);
 }
 
 
@@ -2286,6 +2292,48 @@ ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
 }
 
 
+/* CT-L2-UNLOCK-EVAL-SILENT: drain callback of the owner-checked unlock. A
+ * release Redis did not confirm (an error reply such as an ACL user without
+ * +eval or disabled scripting, a timeout, a lost connection) leaves the lock
+ * to PX expiry; say so at warn, at most once a minute per worker, with a
+ * count of the reports held back in between. The reply text itself is
+ * read_drain's info line. */
+#define NGX_HTTP_CACHE_TURBO_REDIS_UNLOCK_LOG_MS  60000
+
+static ngx_msec_t  ngx_http_cache_turbo_redis_unlock_log_next;
+static ngx_uint_t  ngx_http_cache_turbo_redis_unlock_log_held;
+static ngx_uint_t  ngx_http_cache_turbo_redis_unlock_log_armed;
+
+
+static void
+ngx_http_cache_turbo_redis_unlock_done(void *data, ngx_int_t rc)
+{
+    if (rc == NGX_OK) {
+        return;
+    }
+
+    if (ngx_http_cache_turbo_redis_unlock_log_armed
+        && (ngx_msec_int_t) (ngx_current_msec
+                             - ngx_http_cache_turbo_redis_unlock_log_next) < 0)
+    {
+        ngx_http_cache_turbo_redis_unlock_log_held++;
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
+                  "cache_turbo: redis did not confirm a cross-node lock "
+                  "release (EVAL refused, e.g. an ACL without +eval or "
+                  "scripting disabled, or the reply failed); the lock stays "
+                  "until its PX expiry (%ui more held back since the last "
+                  "report)", ngx_http_cache_turbo_redis_unlock_log_held);
+
+    ngx_http_cache_turbo_redis_unlock_log_held = 0;
+    ngx_http_cache_turbo_redis_unlock_log_armed = 1;
+    ngx_http_cache_turbo_redis_unlock_log_next =
+        ngx_current_msec + NGX_HTTP_CACHE_TURBO_REDIS_UNLOCK_LOG_MS;
+}
+
+
 /*
  * CT-ALLOC-FAIL-LOCK-HELD: release the cross-node lock a winner took with
  * redis_lock() when an error means it will never write L2. Without this the
@@ -2296,8 +2344,13 @@ ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
  * wrote is removed: if PX already expired and another node re-took the lock,
  * the GET no longer matches and that node's lock stays. Fire-and-forget like
  * del_raw: a failure here (no memory, Redis down, EVAL refused) leaves the
- * lock to PX expiry, the behaviour before this release existed. The caller
- * has checked that ctx holds the lock and latched lock_released.
+ * lock to PX expiry, the behaviour before this release existed. The release
+ * needs its own op pool, so under real memory pressure the allocation that
+ * failed the store may fail here too; nothing is preallocated for it because
+ * that would cost every lock winner a pool for a rare error path, and the PX
+ * expiry still bounds the wait. The caller has checked that ctx holds the
+ * lock and latched lock_released. A release Redis did not confirm is
+ * reported by unlock_done above.
  */
 static void
 ngx_http_cache_turbo_redis_unlock(ngx_http_cache_turbo_loc_conf_t *clcf,
@@ -2325,7 +2378,8 @@ ngx_http_cache_turbo_redis_unlock(ngx_http_cache_turbo_loc_conf_t *clcf,
     argv[4].len = (size_t) (ngx_sprintf(ownerbuf, "%P:%xL",
                       ngx_pid, (int64_t) ctx->lock_owner_rand) - ownerbuf);
 
-    ngx_http_cache_turbo_redis_fire_argv(clcf, argv, 5);
+    (void) ngx_http_cache_turbo_redis_fire_argv(clcf, argv, 5,
+                    ngx_http_cache_turbo_redis_unlock_done);
 }
 
 

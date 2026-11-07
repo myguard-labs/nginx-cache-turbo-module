@@ -2889,10 +2889,17 @@ ngx_http_cache_turbo_body_filter_store_tail(ngx_http_request_t *r,
      * truncate the L2 key's PX/EXPIRE to the stale deadline, so an
      * SIE-armed object's L2 copy is already gone by the time an origin
      * failure needs it — the access handler's SIE-from-L2 path would
-     * then always miss. */
-    if (clcf->backend) {
-        clcf->backend->set(r, clcf, store_key,
-                           blob, blob_len, ttl, retain_ttl);
+     * then always miss.
+     *
+     * CT-L2-SET-FAIL-LOCK-HELD: a SET dropped before the wire (NGX_ERROR)
+     * means this winner will never write L2, so a cross-node lock it holds
+     * guards nothing: release it by owner, or every other node's cold miss
+     * waits lock_timeout for a fill that is not coming. */
+    if (clcf->backend
+        && clcf->backend->set(r, clcf, store_key,
+                              blob, blob_len, ttl, retain_ttl) == NGX_ERROR)
+    {
+        ngx_http_cache_turbo_l2_unlock_failed(clcf, ctx);
     }
 
     if (clcf->backend && clcf->backend->tag_add && clcf->tag) {

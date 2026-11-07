@@ -3616,8 +3616,16 @@ struct ngx_cache_turbo_backend_s {
      * must survive: the full serveable window (fresh ∪ stale ∪ any wider
      * retention the caller has decided on). The caller computes retain_ttl;
      * the backend must use it as-is and must NOT re-derive it from
-     * fresh_ttl. */
-    void       (*set)(ngx_http_request_t *r,
+     * fresh_ttl.
+     *
+     * Same launch contract as del/tag_add (CT-L2-SET-FAIL-LOCK-HELD): NGX_OK
+     * = the SET was HANDED TO the transport (fire-and-forget, not an
+     * acknowledgement); NGX_DECLINED = not attempted by policy (L2 disabled,
+     * no retention window, a value over the backend's size ceiling);
+     * NGX_ERROR = DROPPED before the wire (alloc failure, armed S231
+     * backoff window, failed connect). A store winner that holds the
+     * cross-node lock releases it by owner on NGX_ERROR only. */
+    ngx_int_t  (*set)(ngx_http_request_t *r,
         ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
         u_char *blob, size_t blob_len, time_t fresh_ttl, time_t retain_ttl);
     /* Same NGX_OK/NGX_ERROR launch contract as tag_add: NGX_OK = the object

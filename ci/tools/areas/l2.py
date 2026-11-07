@@ -47,6 +47,8 @@ from test_runtime_base import (
     _redis_conns_received,
 )
 
+from areas.core import _fault_alloc_config, _FaultAlloc
+
 
 def test_redis_param_reject_keeps_own_diagnostic(ng: Nginx) -> None:
     """MAINT-C1b regression: a REJECTED redis parameter must keep its own
@@ -3771,6 +3773,208 @@ def test_cold_single_flight_cross_node(ng: Nginx, origin: Origin,
         b.assert_clean_logs()
     finally:
         b.stop()
+        drain_origin(origin)
+
+
+# CT-L2-SET-FAIL-LOCK-HELD / CT-L2-UNLOCK-EVAL-SILENT: a one-worker fault_alloc
+# node (core.py's BP-C1 config) with two L2 locations. /coldl2/ mirrors the
+# main harness's /coldl2/ (same $uri key and ct: prefix, so the same lock key)
+# so the main node can act as the second node on one Redis. /l2noeval/ logs
+# in as an ACL user without EVAL.
+_L2LOCK_NOEVAL_USER = "ctnoeval"
+_L2LOCK_SET_FN = "ngx_http_cache_turbo_redis_set"
+_L2LOCK_SRC = pathlib.Path(__file__).resolve().parents[3] / "src"
+
+
+def _l2lock_node(ng: Nginx, redis_port: int) -> Nginx:
+    root = ng.root.parent / "fault-alloc-l2lock"
+    node = Nginx(ng.binary, ng.module, root,
+                 ng.port + PORT_OFFSETS["fault_alloc"], ng.origin_port,
+                 ng.runner_raw, ng.single_process)
+
+    def write_config(sr_off: bool = False) -> None:
+        del sr_off
+        (root / "conf").mkdir(parents=True, exist_ok=True)
+        (root / "logs").mkdir(parents=True, exist_ok=True)
+        text = _fault_alloc_config(root, node.port, node.module,
+                                   node.origin_port)
+        anchor = "        location /fa/ {"
+        assert text.count(anchor) == 1, "fault config layout changed"
+        redis = f"127.0.0.1:{redis_port} prefix=ct: timeout=250ms"
+        extra = f"""        location /coldl2/ {{
+            cache_turbo          fa;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_lock_ttl 5s;
+            cache_turbo_redis    {redis};
+            proxy_pass http://127.0.0.1:{node.origin_port}/;
+        }}
+
+        location /l2noeval/ {{
+            cache_turbo          fa;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_lock_ttl 5s;
+            cache_turbo_redis    {redis} user={_L2LOCK_NOEVAL_USER} password=x;
+            proxy_pass http://127.0.0.1:{node.origin_port}/;
+        }}
+
+"""
+        (root / "conf" / "nginx.conf").write_text(
+            text.replace(anchor, extra + anchor), encoding="ascii")
+
+    node.write_config = write_config  # type: ignore[method-assign]
+    return node
+
+
+def _site_function(site: str) -> str:
+    """Name of the module function containing a fault site "<file>:<line>":
+    the nearest definition line above it (nginx style puts the name at
+    column 0, return type on the line before)."""
+    path, line = site.rsplit(":", 1)
+    lines = (_L2LOCK_SRC / pathlib.Path(path).name).read_text(
+        encoding="utf-8").splitlines()
+    for text in reversed(lines[:int(line)]):
+        m = re.match(r"(ngx_\w+)\(", text)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _fail_l2_set(c: _FaultAlloc, redis: RedisServer, loc: str,
+                 tag: str) -> tuple[str, int, int]:
+    """Fail one allocation inside redis_set() on a cold miss at `loc`.
+
+    Measures the funnel calls of a cold miss (fresh key, far arm), then arms
+    N = count .. 1 (the store is the tail of the request), each on a fresh
+    key, until the injected failure lands in redis_set. Returns the key's
+    uri, its status and N. Each probe's keys are deleted from Redis."""
+    def fresh(i: int) -> str:
+        return f"{loc}{tag}-{i}"
+
+    uri = fresh(0)
+    c.ctl(f"?n={c.FAR}")
+    try:
+        st, _, h = fetch_raw(c.port, uri)
+    finally:
+        r = c.ctl("?n=0")
+    assert st == 200 and r["fired"] == "0", \
+        f"{loc}: unarmed cold miss: {st} {h} {r}"
+    count = int(r["calls"])
+    redis.cli("DEL", l2_key(uri), lock_key(uri))
+    sites = []
+    for n in range(count, 0, -1):
+        uri = fresh(n)
+        c.ctl(f"?n={n}")
+        try:
+            st, _, _ = fetch_raw(c.port, uri)
+        finally:
+            r = c.ctl("?n=0")
+        if r["fired"] == "1":
+            fn = _site_function(r["site"])
+            if fn == _L2LOCK_SET_FN:
+                return uri, st, n
+            sites.append(f"{n}:{fn}")
+        redis.cli("DEL", l2_key(uri), lock_key(uri))
+    raise AssertionError(f"{loc}: no allocation of {count} landed in "
+                         f"{_L2LOCK_SET_FN}: {sites}")
+
+
+def test_l2_set_fail_releases_cross_node_lock(ng: Nginx, origin: Origin,
+                                              redis: RedisServer) -> None:
+    """CT-L2-SET-FAIL-LOCK-HELD: a cold-miss winner whose L2 SET is dropped
+    before the wire (here: an injected allocation failure inside redis_set)
+    will never write L2, so it must release the cross-node lock it won.
+
+    Before the fix set() returned void: the store went to L1 only and the
+    lock lived until PX expiry (lock_ttl 5s), so node A itself never
+    noticed (its follow-ups hit L1) while every other node's cold miss lost
+    the SET NX and waited lock_timeout (5s) for a fill that never came.
+
+    Node A is a one-worker fault_alloc node; node B is the main harness,
+    whose /coldl2/ shares A's key and prefix. Oracles: the lock key is gone
+    from Redis (external to the module), L2 holds no object, and B's cold
+    miss for the same key reaches the origin well inside lock_timeout.
+
+    Negative control: drop the l2_unlock_failed() call after the
+    backend->set() in body_filter_store_tail (filters.c); the lock-key wait
+    below fails with the lock still held (PTTL ~5000)."""
+    node = _l2lock_node(ng, redis.port)
+    node.write_config()
+    node.config_test()
+    node.start()
+    try:
+        c = _FaultAlloc(node.port)
+        uri, st, n = _fail_l2_set(c, redis, "/coldl2/", "setfail")
+        assert st == 200, f"set failure at N={n} must still serve: {st}"
+        assert wait_for(lambda: redis.cli("EXISTS", lock_key(uri)) == "0",
+                        timeout=1.5), (
+            f"N={n}: the winner's L2 SET failed but its cross-node lock is "
+            f"still held (PTTL {redis.cli('PTTL', lock_key(uri))}ms): every "
+            f"other node waits lock_timeout")
+        assert redis.cli("EXISTS", l2_key(uri)) == "0", \
+            f"N={n}: the failed SET still wrote L2"
+
+        base = origin.hits
+        t0 = time.time()
+        sb, _, hb = fetch(ng.port, uri)
+        elapsed = time.time() - t0
+        assert sb == 200 and "x-cache" not in hb, \
+            f"node B cold miss after A's failed store: {sb} {hb}"
+        assert origin.hits - base == 1, "node B did not reach the origin"
+        budget = 2.0 * sanitizer_time_scale()
+        assert elapsed < budget, (
+            f"node B took {elapsed:.2f}s: it waited out node A's lock "
+            f"(lock_timeout 5s) instead of regenerating (<{budget:.1f}s)")
+        node.stop()
+        node.assert_clean_logs()
+    finally:
+        node.stop()
+        drain_origin(origin)
+
+
+def test_l2_unlock_refused_is_logged(ng: Nginx, origin: Origin,
+                                     redis: RedisServer) -> None:
+    """CT-L2-UNLOCK-EVAL-SILENT: when Redis refuses the owner-checked unlock
+    EVAL (an ACL user without +eval, or scripting disabled), the module says
+    so at warn instead of leaving the lock to PX expiry in silence.
+
+    /l2noeval/ logs in as an ACL user that may GET/SET but not EVAL. A store
+    failure (injected in redis_set) makes the winner send the unlock EVAL,
+    which Redis answers -NOPERM. The lock stays (PX expiry is the documented
+    fallback) and error.log, at the harness's notice level, carries the warn
+    line. Before the fix the only trace was an info-level reply line, below
+    notice, so nothing was logged.
+
+    Negative control: set the unlock's drain callback to NULL in
+    redis_unlock() (redis.c); the log assertion fails."""
+    redis.cli("ACL", "SETUSER", _L2LOCK_NOEVAL_USER, "reset", "on",
+              "nopass", "~*", "&*", "+@all", "-eval", "-evalsha")
+    node = _l2lock_node(ng, redis.port)
+    node.write_config()
+    node.config_test()
+    node.start()
+    log = node.root / "logs" / "error.log"
+    want = "redis did not confirm a cross-node lock release"
+    try:
+        c = _FaultAlloc(node.port)
+        uri, st, n = _fail_l2_set(c, redis, "/l2noeval/", "noeval")
+        assert st == 200, f"set failure at N={n} must still serve: {st}"
+        assert wait_for(lambda: want in log.read_text(errors="replace"),
+                        timeout=2.0), \
+            f"N={n}: the refused unlock EVAL left no warn line in {log}"
+        pttl = int(redis.cli("PTTL", lock_key(uri)))
+        assert pttl > 0, \
+            f"N={n}: a refused EVAL cannot have released the lock: {pttl}"
+        lines = [ln for ln in log.read_text(errors="replace").splitlines()
+                 if want in ln]
+        assert len(lines) == 1 and "[warn]" in lines[0], \
+            f"wanted one warn line, got {lines}"
+        node.stop()
+        node.assert_clean_logs()
+    finally:
+        node.stop()
+        redis.cli("ACL", "DELUSER", _L2LOCK_NOEVAL_USER)
         drain_origin(origin)
 
 
