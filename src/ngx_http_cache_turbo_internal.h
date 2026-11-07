@@ -266,8 +266,9 @@ size_t ngx_http_cache_turbo_redis_tagkey(ngx_str_t *prefix, u_char *name,
  * the request being finalised. Best-effort: failures are logged, not fatal.
  * retain_ttl is the caller-computed L2 key lifetime (see the `set` slot doc
  * comment on ngx_cache_turbo_backend_s) -- this function no longer derives
- * it from fresh_ttl. */
-void ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
+ * it from fresh_ttl. Returns the `set` slot's launch verdict (NGX_OK sent,
+ * NGX_DECLINED not attempted, NGX_ERROR dropped before the wire). */
+ngx_int_t ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
     u_char *blob, size_t blob_len, time_t fresh_ttl, time_t retain_ttl);
 

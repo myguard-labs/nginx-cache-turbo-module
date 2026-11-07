@@ -831,8 +831,8 @@ ngx_http_cache_turbo_marker_store_key(ngx_http_request_t *r,
      * index, but `set` IS implemented on both backends, so this write-through
      * is not gated on backend->tag_add the way the variant index is). */
     if (clcf->backend && clcf->backend->set && r != NULL) {
-        clcf->backend->set(r, clcf, marker_key, blob, sizeof(blob), ttl,
-                           retain_ttl);
+        (void) clcf->backend->set(r, clcf, marker_key, blob, sizeof(blob),
+                                  ttl, retain_ttl);
     }
 
     return NGX_OK;

@@ -646,7 +646,7 @@ ngx_http_cache_turbo_mc_op_create(ngx_http_cache_turbo_loc_conf_t *clcf)
 }
 
 
-static void
+static ngx_int_t
 ngx_http_cache_turbo_memcached_set(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
     u_char *blob, size_t blob_len, time_t fresh_ttl, time_t retain_ttl)
@@ -658,19 +658,19 @@ ngx_http_cache_turbo_memcached_set(ngx_http_request_t *r,
     size_t                         keylen, hdr;
 
     if (!clcf->redis_enable) {
-        return;
+        return NGX_DECLINED;
     }
 
     /* memcached rejects an item at/above its 1 MiB ceiling; skip oversize so it
      * delegates to L1-only (or native cache, when stacked) without a wire error. */
     if (blob_len >= NGX_HTTP_CACHE_TURBO_MC_MAX_VALUE) {
-        return;
+        return NGX_DECLINED;
     }
 
     /* L2 entry lives as long as the caller says it should (retain_ttl) --
      * the backend no longer derives its own window from fresh_ttl. */
     if (retain_ttl <= 0) {
-        return;
+        return NGX_DECLINED;
     }
     /* memcached interprets an exptime > 30 days as an ABSOLUTE Unix timestamp,
      * not a relative duration. A large relative window would otherwise be read
@@ -682,14 +682,14 @@ ngx_http_cache_turbo_memcached_set(ngx_http_request_t *r,
 
     op = ngx_http_cache_turbo_mc_op_create(clcf);
     if (op == NULL) {
-        return;
+        return NGX_ERROR;
     }
     pool = op->pool;
 
     keybuf = ngx_pnalloc(pool, clcf->redis_prefix.len + 64);
     if (keybuf == NULL) {
         ngx_destroy_pool(pool);
-        return;
+        return NGX_ERROR;
     }
     keylen = ngx_http_cache_turbo_redis_key(&clcf->redis_prefix, key_hash,
                                             keybuf);
@@ -700,7 +700,7 @@ ngx_http_cache_turbo_memcached_set(ngx_http_request_t *r,
     b = ngx_create_temp_buf(pool, hdr + blob_len + 2);
     if (b == NULL) {
         ngx_destroy_pool(pool);
-        return;
+        return NGX_ERROR;
     }
 
     p = ngx_sprintf(b->last, "set %*s 0 %T %uz\r\n", keylen, keybuf,
@@ -714,7 +714,10 @@ ngx_http_cache_turbo_memcached_set(ngx_http_request_t *r,
             ngx_http_cache_turbo_mc_read_drain) != NGX_OK)
     {
         ngx_destroy_pool(pool);
+        return NGX_ERROR;
     }
+
+    return NGX_OK;
 }
 
 

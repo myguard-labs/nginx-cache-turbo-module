@@ -636,6 +636,9 @@ def run_all(ng: Nginx, origin: Origin,
         test_cross_node_won_stale_body(ng, origin, redis)  # S231-PERF-BGSNAP
         test_lock_self_heal(ng, origin, redis)
         test_cold_single_flight_cross_node(ng, origin, redis)
+        if ng.fault_injection:
+            test_l2_set_fail_releases_cross_node_lock(ng, origin, redis)
+            test_l2_unlock_refused_is_logged(ng, origin, redis)
         test_cross_node_winner_owner_token_preserved(ng, origin, redis)  # AUD-NXLOCK-OWNER
         test_l2_miss_counted_once_on_cold_park(ng, origin)  # double-count guard
         test_l2_db_select(ng, origin, redis)         # SELECT-only preamble
