@@ -29,6 +29,7 @@ them live in `ci.yml`'s header comment.
 | [Static](.github/workflows/static.yml) | one job, sequential sections: the `ci/linter/` gate (nginx conventions, ast-grep, shell, Python, Perl, YAML/actionlint/zizmor, spelling, workflow-policy checks, this module's own R7 shm-lock and suite-integrity checkers), script/source validation, the scanners (flawfinder >=4, tracked-policy clang-tidy, advisory GCC `-fanalyzer`, semgrep >=WARNING, gitleaks), the libFuzzer regression replay plus time-boxed run, and the [nginx-module-testkit](https://github.com/myguard-labs/nginx-module-testkit) prober leg: per-request allocation neutrality read out of the cycle pool, asserted in both directions (a staged tree must assert, an unstaged one must SKIP cleanly) |
 | [Build&Test](.github/workflows/build-test.yml) | one job: build variants, unit ASan/TSan, strict compile, the runtime driver, then the Test::Nginx preset suite |
 | [CodeQL](.github/workflows/codeql.yml) | CodeQL over the module TU; keeps its own monthly `schedule:` |
+| [CodeQL lifetime](.github/workflows/codeql-lifetime.yml) | Per-PR request-lifetime query gate |
 | [A/UBSan](.github/workflows/asan.yml) | ASan+UBSan single-process and multi-worker soaks, static `--add-module` build |
 | [CI Deep](.github/workflows/ci-deep.yml) | monthly: long fuzz campaigns, memcheck soak, the nginx/angie compatibility matrix |
 | [Valgrind](.github/workflows/valgrind.yml) | on-demand 60s memcheck soak; the monthly deep workflow carries the scheduled 600s soak |

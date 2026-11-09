@@ -1,4 +1,4 @@
-# sync-sha: 72ac944d918728728da958b6d98467f650aeeb074682c9ca929c369dcddfd72a
+# sync-sha: 0b8eb1ec764b9009dc8690807f3f6e528b5caf802f47e66ee659401f239a206c
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
@@ -69,6 +69,7 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       testkit: ${{ steps.filter.outputs.testkit }}
       width: ${{ steps.filter.outputs.width }}
+      lifetime: ${{ steps.filter.outputs.lifetime }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -91,6 +92,7 @@ jobs:
               echo "code=true"
               echo "testkit=true"
               echo "width=true"
+              echo "lifetime=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -132,6 +134,15 @@ jobs:
           # NUL-delimited Git output preserves unusual filenames; diff errors fail the job.
           width=$(python3 ci/tools/width-impact-filter.py "$BASE_SHA")
           echo "width=$width" >> "$GITHUB_OUTPUT"
+          lifetime_paths='^(src/|ci/codeql/nginx-lifetime/|ci/tools/codeql-lifetime-gate\.py$'
+          lifetime_paths+='|ci/tests/test_codeql_lifetime_gate\.py$|\.github/workflows/(ci|codeql-lifetime)\.yml$'
+          lifetime_paths+='|\.github/actions/build-cache/|ci/tools/ci-build\.sh$'
+          lifetime_paths+='|\.github/scripts/load-versions\.sh$|\.github/versions\.env$)'
+          if grep -qE "$lifetime_paths" <<<"$changed"; then
+            echo "lifetime=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "lifetime=false" >> "$GITHUB_OUTPUT"
+          fi
           # code: detect changes to code, CI workflows, or tests (anything that
           # isn't docs-only). gates Build&Test to skip on docs-only PRs.
           # NOTE: this must anchor the DOCS-ONLY exclusions at the END of the
@@ -189,6 +200,14 @@ jobs:
       testkit: ${{ needs.changes.outputs.testkit == 'true' }}
       width: ${{ needs.changes.outputs.width == 'true' }}
 
+  lifetime:
+    name: CodeQL lifetime
+    needs: changes
+    if: ${{ needs.changes.outputs.lifetime == 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/codeql-lifetime.yml  # zizmor: ignore[self-repository] -- actionlint does not accept $/
+
   # --- result gate -----------------------------------------------------------
   # One stable check ("CI / gate") summarising every lane above, so branch
   # protection can require a single name and lanes can be added, merged or
@@ -205,7 +224,7 @@ jobs:
   # asserts it.
   gate:
     name: gate
-    needs: [changes, asan, build-test, static]
+    needs: [changes, asan, build-test, static, lifetime]
     if: ${{ always() }}
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 5
@@ -215,6 +234,15 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+      - name: Check lifetime lane selection
+        env:
+          IMPACT: ${{ needs.changes.outputs.lifetime }}
+          RESULT: ${{ needs.lifetime.result }}
+        run: |
+          case "$IMPACT:$RESULT" in
+            true:success|false:skipped) ;;
+            *) echo "::error::lifetime lane: impact=$IMPACT result=$RESULT"; exit 1 ;;
+          esac
       - name: Evaluate lane results
         env:
           NEEDS: ${{ toJSON(needs) }}

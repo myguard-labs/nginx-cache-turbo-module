@@ -1,0 +1,90 @@
+[
+  {
+    "ruleId": "myguard/nginx-lifetime/park-callback-unchecked",
+    "message": {
+      "text": "'request' of a parked operation is read in ngx_http_cache_turbo_mc_get_finish, reached from read handler [ngx_http_cache_turbo_mc_read_get](1), without a dominating CT_PARK_CHECK."
+    },
+    "locations": [
+      {
+        "physicalLocation": {
+          "artifactLocation": {
+            "uri": "src/ngx_http_cache_turbo_memcached.c",
+            "uriBaseId": "%SRCROOT%",
+            "index": 0
+          },
+          "region": {
+            "startLine": 1336,
+            "startColumn": 42,
+            "endColumn": 49
+          }
+        }
+      }
+    ]
+  },
+  {
+    "ruleId": "myguard/nginx-lifetime/park-callback-unchecked",
+    "message": {
+      "text": "'request' of a parked operation is read in ngx_http_cache_turbo_redis_lock_finish, reached from read handler [ngx_http_cache_turbo_redis_read_lock](1), without a dominating CT_PARK_CHECK."
+    },
+    "locations": [
+      {
+        "physicalLocation": {
+          "artifactLocation": {
+            "uri": "src/ngx_http_cache_turbo_redis.c",
+            "uriBaseId": "%SRCROOT%",
+            "index": 1
+          },
+          "region": {
+            "startLine": 5152,
+            "startColumn": 42,
+            "endColumn": 49
+          }
+        }
+      }
+    ]
+  },
+  {
+    "ruleId": "myguard/nginx-lifetime/park-callback-unchecked",
+    "message": {
+      "text": "'request' of a parked operation is read in ngx_http_cache_turbo_redis_get_finish, reached from read handler [ngx_http_cache_turbo_redis_read_get](1), without a dominating CT_PARK_CHECK."
+    },
+    "locations": [
+      {
+        "physicalLocation": {
+          "artifactLocation": {
+            "uri": "src/ngx_http_cache_turbo_redis.c",
+            "uriBaseId": "%SRCROOT%",
+            "index": 1
+          },
+          "region": {
+            "startLine": 4987,
+            "startColumn": 47,
+            "endColumn": 54
+          }
+        }
+      }
+    ]
+  },
+  {
+    "ruleId": "myguard/nginx-lifetime/park-callback-unchecked",
+    "message": {
+      "text": "'request' of a parked operation is read in ngx_http_cache_turbo_redis_walk_finish, reached from read handler [ngx_http_cache_turbo_redis_read_preamble](1), without a dominating CT_PARK_CHECK."
+    },
+    "locations": [
+      {
+        "physicalLocation": {
+          "artifactLocation": {
+            "uri": "src/ngx_http_cache_turbo_redis.c",
+            "uriBaseId": "%SRCROOT%",
+            "index": 1
+          },
+          "region": {
+            "startLine": 4808,
+            "startColumn": 53,
+            "endColumn": 60
+          }
+        }
+      }
+    ]
+  }
+]

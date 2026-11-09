@@ -1,0 +1,93 @@
+# sync-sha: 7a52fd0c617ec765bedba94977ddfa4f682fecacc9e7234ba81bef3ccd8cee13
+name: CodeQL lifetime
+
+on:
+  workflow_call: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+
+jobs:
+  lifetime:
+    name: Analyze request lifetime
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Load version pins
+        run: bash .github/scripts/load-versions.sh
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl eatmydata libpcre2-dev libssl-dev mold zlib1g-dev
+      - name: Initialize CodeQL
+        id: init
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          languages: c-cpp
+          build-mode: manual
+          queries: ./ci/codeql/nginx-lifetime/lifetime.qls
+          config: |
+            disable-default-queries: true
+      - name: Install query dependencies
+        env:
+          CODEQL: ${{ steps.init.outputs.codeql-path }}
+        run: '"$CODEQL" pack install ci/codeql/nginx-lifetime'
+      - name: Restore build cache
+        uses: ./.github/actions/build-cache  # zizmor: ignore[self-repository] -- $/ not yet accepted by actionlint
+        with:
+          mode: module
+          nginx-version: ${{ env.NGINX_VERSION }}
+          ccache: "false"
+      - name: Build traced module
+        run: bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
+      - name: Analyze module
+        id: analyze
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          upload: never
+          output: ${{ runner.temp }}/lifetime-results
+      - name: Run query fixture tests
+        env:
+          CODEQL: ${{ steps.init.outputs.codeql-path }}
+        run: '"$CODEQL" test run ci/codeql/nginx-lifetime/test'
+      - name: Check gate against the 9c32123 fixture
+        env:
+          CODEQL: ${{ steps.init.outputs.codeql-path }}
+        run: |
+          set -euo pipefail
+          fixture=ci/codeql/nginx-lifetime/test/UseAfterRequestRelease
+          "$CODEQL" database create "$RUNNER_TEMP/lifetime-fixture-db" --language=cpp \
+            --source-root="$GITHUB_WORKSPACE" \
+            --command="gcc -c $fixture/test.c -o $RUNNER_TEMP/lifetime-fixture.o"
+          "$CODEQL" database analyze "$RUNNER_TEMP/lifetime-fixture-db" \
+            ci/codeql/nginx-lifetime/lifetime.qls --format=sarifv2.1.0 \
+            --output="$RUNNER_TEMP/lifetime-fixture.sarif"
+          printf '[]\n' > "$RUNNER_TEMP/lifetime-empty-baseline.json"
+          set +e
+          python3 ci/tools/codeql-lifetime-gate.py "$RUNNER_TEMP/lifetime-fixture.sarif" \
+            "$RUNNER_TEMP/lifetime-empty-baseline.json" \
+            --expect-rule myguard/nginx-lifetime/use-after-request-release \
+            > "$RUNNER_TEMP/lifetime-fixture-gate.txt"
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/lifetime-fixture-gate.txt"
+          test "$status" -eq 1
+          grep -qE '^NEW [1-9][0-9]* myguard/nginx-lifetime/use-after-request-release ' \
+            "$RUNNER_TEMP/lifetime-fixture-gate.txt"
+      - name: Upload lifetime SARIF
+        if: ${{ always() && steps.analyze.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: codeql-lifetime-sarif
+          path: ${{ steps.analyze.outputs.sarif-output }}
+          if-no-files-found: error
+      - name: Gate module findings
+        env:
+          SARIF_DIR: ${{ steps.analyze.outputs.sarif-output }}
+        run: python3 ci/tools/codeql-lifetime-gate.py "$SARIF_DIR/cpp.sarif" ci/codeql/nginx-lifetime/baseline.json
