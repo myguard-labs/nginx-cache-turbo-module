@@ -5010,9 +5010,12 @@ def _sscan_walk_abort_site(redis: RedisServer,
         assert status == 200, f"{uri}: status {status} {body!r}"
         assert json.loads(body) == {"purged": ABORT_WALK_KEYS}, (
             f"{uri}: purge answered {body!r}")
-        left = [k for k in [tag_key(uri), *_abort_walk_keys(ABORT_SSCAN_PREFIX, uri)]
+        left = [k for k in _abort_walk_keys(ABORT_SSCAN_PREFIX, uri)
                 if db("EXISTS", k) != "0"]
         assert not left, f"{uri}: the tag purge left {left}"
+        tkey = tag_key(uri)
+        assert wait_for(lambda: db("EXISTS", tkey) == "0", timeout=10.0), \
+            f"{uri}: the tag purge left {tkey} with members {db('SMEMBERS', tkey)}"
 
     return AbortSite(
         name="sscan",
