@@ -73,3 +73,14 @@ marks each line that must be flagged, and a result on any other line fails the
 test). The fixtures use `//` comments because the expectation parser reads
 only those; the extractor is the only compiler that sees these files. Tested
 with CodeQL CLI 2.26.4 and `codeql/cpp-all` 12.0.3.
+
+## PR gate
+
+The CI lifetime lane builds the module database once, runs both queries, and
+uploads `codeql-lifetime-sarif` even when findings fail the gate. The baseline
+is deliberately empty pending the first current-main SARIF: the known four
+initializer findings therefore keep this draft gate red until each exact result
+is reviewed and recorded. The gate also rejects missing or malformed results,
+a missing query, analysis errors, and any additional finding. The fixture tests
+and a separate fixture database exercise the 9c32123 shape and require the gate
+to reject it. The monthly `codeql.yml` security scan remains separate.
