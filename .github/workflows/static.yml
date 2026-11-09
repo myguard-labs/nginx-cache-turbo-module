@@ -1,4 +1,4 @@
-# sync-sha: 9435cb19e9324950ef6c870e6398422b590eefab127225b816e2a5aaa0313d84
+# sync-sha: 1964ea272e3f3c144a3542d6ae8a9665c8c7606b4a17ad342971cb83928ef876
 name: Static
 
 # Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
@@ -208,30 +208,6 @@ jobs:
           tree="$(BUILD_ROOT="$PWD/.carve-tree" bash ci/tools/ci-build.sh nginx "" configure | sed -n 's/^tree=//p')"
           [ -n "$tree" ] || { echo "ci-build.sh printed no tree= line" >&2; exit 1; }
           echo "NGX_SRC_TREE=$tree" >> "$GITHUB_ENV"
-      - name: Prepare expected-red actionlint proof fixture
-        # CI-L8 regression control: materialize malformed workflow input only
-        # in the runner so the retained tracked-file linter must reject it.
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          invalid = "$" + "{{ totally_invalid }}"
-          Path(".github/workflows/width-proof-invalid.yml").write_text(
-              "name: Width proof invalid\n"
-              "on:\n"
-              "  workflow_dispatch:\n"
-              "jobs:\n"
-              "  width-proof:\n"
-              "    if: " + invalid + "\n"
-              "    runs-on: ubuntu-latest\n"
-              "    steps:\n"
-              "      - run: echo expected-red\n",
-              encoding="utf-8",
-          )
-          PY
-          # The retained YAML linter uses git ls-files; add the runtime-only
-          # fixture to the runner index so that selector includes it.
-          git add -- .github/workflows/width-proof-invalid.yml
       - name: Run linters
         env:
           # Every checker except "c" -- adding a lint-*.sh without adding its
