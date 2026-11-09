@@ -315,39 +315,25 @@ def test_request_cc_serve_verdict_stale(ng: Nginx, origin: Origin) -> None:
     default 4x stale window and beta 1 (dice ~never), so after ~1.3s the entry
     is stale-but-serveable. The client's max-stale decides whether the cache may
     serve that stale copy."""
+    # Prime independent keys together so each crosses its fresh boundary.
+    for suffix in ("a", "c", "cq", "d", "e", "f"):
+        fetch(ng.port, f"/reqccst/{suffix}")
+    time.sleep(1.3)
+
     # default (no request CC): a stale entry is served per cache policy (stale_ok
     # default arm, module.c:1421).
-    fetch(ng.port, "/reqccst/a")
-    time.sleep(1.3)
     _, _, hd = fetch(ng.port, "/reqccst/a")
     assert hd.get("x-ct-status") == "STALE", \
         f"default request must serve STALE, got {hd.get('x-ct-status')}"
 
-    # max-stale=0: no staleness tolerated. staleness>0 -> stale_ok=0; no max-age
-    # so fresh_ok stays 1 but the entry is not fresh -> refused -> refetch.
-    # Sleep 2.3s (not 1.3s) so staleness = now-fresh_until is unambiguously >=1s:
-    # ngx_time() has 1s granularity, and at ~0.3s past a 1s window the rounded
-    # staleness can land on 0, making `staleness <= max_stale(0)` true and the
-    # copy STALE-served (the 1s-granularity SWR flake class). 2.3s clears it.
-    fetch(ng.port, "/reqccst/b")
-    time.sleep(2.3)
-    _, _, hz = fetch(ng.port, "/reqccst/b",
-                     headers={"Cache-Control": "max-stale=0"})
-    assert hz.get("x-ct-status") != "STALE", \
-        f"max-stale=0 must refuse the stale copy, got {hz.get('x-ct-status')}"
-
     # max-stale=100: 100s of staleness tolerated; the ~0.3s-stale entry is well
     # within it -> stale_ok=1 -> STALE served (module.c:1416, valued branch).
-    fetch(ng.port, "/reqccst/c")
-    time.sleep(1.3)
     _, _, hp = fetch(ng.port, "/reqccst/c",
                      headers={"Cache-Control": "max-stale=100"})
     assert hp.get("x-ct-status") == "STALE", \
         f"max-stale=100 must permit the stale copy, got {hp.get('x-ct-status')}"
 
     # The quoted historical form remains a valid delta-seconds value.
-    fetch(ng.port, "/reqccst/cq")
-    time.sleep(1.3)
     _, _, hq = fetch(ng.port, "/reqccst/cq",
                      headers={"Cache-Control": 'max-stale="100"'})
     assert hq.get("x-ct-status") == "STALE", \
@@ -355,8 +341,6 @@ def test_request_cc_serve_verdict_stale(ng: Nginx, origin: Origin) -> None:
 
     # max-stale=abc: a valued directive with an invalid delta does not grant
     # the unlimited stale tolerance reserved for a valid bare max-stale.
-    fetch(ng.port, "/reqccst/d")
-    time.sleep(1.3)
     before = origin.hits_for("/d")
     _, _, hu = fetch(ng.port, "/reqccst/d",
                      headers={"Cache-Control": "max-stale=abc"})
@@ -367,8 +351,6 @@ def test_request_cc_serve_verdict_stale(ng: Nginx, origin: Origin) -> None:
 
     # max-stale= is valued (the '=' is present) but empty. It must not be
     # confused with the valid bare directive merely because both have vlen=0.
-    fetch(ng.port, "/reqccst/e")
-    time.sleep(1.3)
     before = origin.hits_for("/e")
     _, _, he = fetch(ng.port, "/reqccst/e",
                      headers={"Cache-Control": "max-stale="})
@@ -379,8 +361,6 @@ def test_request_cc_serve_verdict_stale(ng: Nginx, origin: Origin) -> None:
 
     # A valid bare max-stale still grants unlimited tolerance within the
     # cache's own serveable stale window.
-    fetch(ng.port, "/reqccst/f")
-    time.sleep(1.3)
     before = origin.hits_for("/f")
     _, _, hb = fetch(ng.port, "/reqccst/f",
                      headers={"Cache-Control": "max-stale"})
@@ -389,12 +369,27 @@ def test_request_cc_serve_verdict_stale(ng: Nginx, origin: Origin) -> None:
     assert origin.hits_for("/f") == before, \
         "bare max-stale stale serve must not reach the origin"
 
+    # These cases require a whole second of staleness, including both orders.
+    fetch(ng.port, "/reqccst/b")
+    for order in ("restrictive-last", "restrictive-first"):
+        fetch(ng.port, f"/reqccst/split-{order}")
+    time.sleep(2.3)
+
+    # max-stale=0: no staleness tolerated. staleness>0 -> stale_ok=0; no max-age
+    # so fresh_ok stays 1 but the entry is not fresh -> refused -> refetch.
+    # Sleep 2.3s (not 1.3s) so staleness = now-fresh_until is unambiguously >=1s:
+    # ngx_time() has 1s granularity, and at ~0.3s past a 1s window the rounded
+    # staleness can land on 0, making `staleness <= max_stale(0)` true and the
+    # copy STALE-served (the 1s-granularity SWR flake class). 2.3s clears it.
+    _, _, hz = fetch(ng.port, "/reqccst/b",
+                     headers={"Cache-Control": "max-stale=0"})
+    assert hz.get("x-ct-status") != "STALE", \
+        f"max-stale=0 must refuse the stale copy, got {hz.get('x-ct-status')}"
+
     # Numeric values across field-lines remain restrictive in either order.
     for order in ("restrictive-last", "restrictive-first"):
         path = f"/reqccst/split-{order}"
         origin_path = f"/split-{order}"
-        fetch(ng.port, path)
-        time.sleep(2.3)
         lines = [("Cache-Control", "max-stale=100"),
                  ("Cache-Control", "max-stale=0")]
         if order == "restrictive-first":
