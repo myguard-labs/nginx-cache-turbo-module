@@ -225,6 +225,8 @@ def parse_args() -> argparse.Namespace:
     # the run when it stresses nginx CORE code (not our module) that trips a known
     # core sanitizer false positive — e.g. the stacked proxy_cache file-write path.
     parser.add_argument("--sanitizer", action="store_true")
+    parser.add_argument("--timings", action="store_true",
+                        help="report elapsed time for each runtime test")
     parser.add_argument("--port", type=int, default=18880)
     parser.add_argument("--redis-server")  # accepted; used by v2 L2 tests
     parser.add_argument("--memcached-server")  # v13: memcached L2 backend tests
@@ -264,7 +266,8 @@ def _conn_cursor() -> int:
     return _origin_module._NGX_CLIENT_CONNS + origin_hits
 
 
-def _instrument(origin: Origin) -> None:
+def _instrument(origin: Origin, timings: list[tuple[str, float]] | None = None,
+                facade: dict | None = None) -> None:
     """Wrap every module-level test_* function so each records the c->number
     cursor before and after it runs. Nested test_* calls just produce nested
     spans; the narrowest span that brackets an alert is the most specific
@@ -277,11 +280,16 @@ def _instrument(origin: Origin) -> None:
         def _runner(*a, **kw):
             before = _conn_cursor()
             _write_breadcrumb(f"{name} {before}")
+            started = time.monotonic() if timings is not None else None
             try:
                 return fn(*a, **kw)
             finally:
                 _SPANS.append((name, before, _conn_cursor()))
                 _write_breadcrumb(f"DONE {name}")
+                if timings is not None and started is not None:
+                    elapsed = max(0.0, time.monotonic() - started)
+                    timings.append((name, elapsed))
+                    print(f"TIMING {name} {elapsed:.6f}s", flush=True)
         _runner._ct_instrumented = True   # type: ignore[attr-defined]
         return _runner
 
@@ -294,8 +302,10 @@ def _instrument(origin: Origin) -> None:
     targets = [m for n, m in sys.modules.items()
                if m is not None and (n == "test_runtime" or n.startswith("areas."))]
     wrapped: dict[str, object] = {}
-    for _mod in targets:
-        _g = vars(_mod)
+    namespaces = [vars(mod) for mod in targets]
+    if facade is not None and all(facade is not ns for ns in namespaces):
+        namespaces.append(facade)
+    for _g in namespaces:
         for _name, _fn in list(_g.items()):
             if not (_name.startswith("test_") and inspect.isfunction(_fn)):
                 continue
