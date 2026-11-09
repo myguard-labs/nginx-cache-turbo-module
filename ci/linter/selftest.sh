@@ -524,6 +524,10 @@ chmod +x "$listroot/bin/yamllint"
 for tool in actionlint zizmor; do
     cat > "$listroot/bin/$tool" <<'WORKFLOWEOF'
 #!/usr/bin/env bash
+if [ "${1:-}" = -version ]; then
+    echo 1.7.7
+    exit 0
+fi
 [ -z "${YAML_REJECT_WORKFLOW_TOOLS:-}" ] || exit 99
 for arg in "$@"; do
     [ "$arg" = "${YAML_EXPECT_WORKFLOW:-}" ] && exit 0

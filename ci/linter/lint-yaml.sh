@@ -46,6 +46,8 @@
 
 # shellcheck source=ci/linter/lib.sh
 . "$(git rev-parse --show-toplevel)/ci/linter/lib.sh"
+# shellcheck source=ci/linter/actionlint-version.sh
+. "$(git rev-parse --show-toplevel)/ci/linter/actionlint-version.sh"
 
 lint_files_into FILES '\.ya?ml$' "$@"
 [ "${#FILES[@]}" -gt 0 ] || { echo "lint-yaml: no YAML files to check"; exit 0; }
@@ -65,6 +67,7 @@ for f in "${FILES[@]}"; do
 done
 if [ "${#WF[@]}" -gt 0 ]; then
     need actionlint "go install github.com/rhysd/actionlint/cmd/actionlint@latest  (see install-linters.sh)"
+    actionlint_version_ok || exit 1
     say "actionlint (${#WF[@]} workflow(s))"
     SHELLCHECK_OPTS=-Swarning \
         actionlint -ignore 'label ".+" is unknown' "${WF[@]}" || rc=1
