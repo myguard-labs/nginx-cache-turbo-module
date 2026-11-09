@@ -1280,12 +1280,58 @@ static void
 ngx_http_cache_turbo_warm_file_test_delay(
     ngx_http_cache_turbo_warm_file_ctx_t *ctx, const char *stage)
 {
-    u_char  marker[32];
+    u_char           marker[32], entered[NGX_MAX_PATH], wait[NGX_MAX_PATH];
+    size_t           len, suffix;
+    ngx_fd_t         fd;
+    ngx_uint_t       i;
+    ngx_file_info_t  fi;
 
     ngx_snprintf(marker, sizeof(marker), ".delay-%s%Z", stage);
     if (ngx_strstr(ctx->nul, marker) != NULL) {
         ngx_msleep(5000);
+        return;
     }
+
+    /* Opt-in handshake, separate from the abort fixtures' fixed delays.
+     * The controller owns .wait: create before POST, unlink to release.
+     * Only an exact .gate-<stage> suffix participates. The worker publishes
+     * .entered exclusively immediately before that syscall, then waits at
+     * most 500 sleeps. Only a normal release writes "1" to that same fd;
+     * escape/error leaves it empty so the controller must fail closed. The
+     * test checks that byte after completion and owns final sidecar cleanup.
+     * Never reuse a path while its request is outstanding. O_EXCL rejects
+     * stale entry files/symlinks without modifying them. A failed controller
+     * can delay a TEST_FAULTS worker for about five seconds, never forever. */
+    ngx_snprintf(marker, sizeof(marker), ".gate-%s%Z", stage);
+    len = ngx_strlen(ctx->nul);
+    suffix = ngx_strlen(marker);
+    if (len < suffix || len > sizeof(entered) - sizeof(".entered")
+        || ngx_strcmp(ctx->nul + len - suffix, marker) != 0)
+    {
+        return;
+    }
+
+    ngx_snprintf(wait, sizeof(wait), "%s.wait%Z", ctx->nul);
+    if (ngx_file_info(wait, &fi) == NGX_FILE_ERROR || !ngx_is_file(&fi)) {
+        return;
+    }
+
+    ngx_snprintf(entered, sizeof(entered), "%s.entered%Z", ctx->nul);
+    fd = ngx_open_file(entered, NGX_FILE_WRONLY,
+                       NGX_FILE_CREATE_OR_OPEN | O_EXCL, 0600);
+    if (fd == NGX_INVALID_FILE) {
+        return;
+    }
+    for (i = 0; i < 500; i++) {
+        if (ngx_file_info(wait, &fi) == NGX_FILE_ERROR) {
+            if (ngx_errno == NGX_ENOENT) {
+                (void) ngx_write_fd(fd, "1", 1);
+            }
+            break;
+        }
+        ngx_msleep(10);
+    }
+    (void) ngx_close_file(fd);
 }
 #else
 #define ngx_http_cache_turbo_warm_file_test_delay(ctx, stage)
