@@ -25,6 +25,9 @@
 
 set -uo pipefail
 
+# shellcheck source=ci/linter/actionlint-version.sh
+. "$(dirname "${BASH_SOURCE[0]}")/actionlint-version.sh"
+
 CHECK=0 FORCE=0
 case "${1:-}" in
     --check) CHECK=1 ;;
@@ -145,6 +148,7 @@ if [ "$CHECK" -eq 1 ]; then
     step "linter status"
     for e in "${APT_TOOLS[@]}" "${PIPX_TOOLS[@]}"; do report "${e%%:*}"; done
     report actionlint
+    actionlint_version_ok || rc=1
     report zizmor
     report ast-grep
     # gitleaks: this repo's secret gate (see install_gitleaks below). A tool
@@ -225,7 +229,7 @@ install_actionlint() {
     # digest sit on adjacent lines for the same reason .github/versions.env
     # does it: a version must not be able to move while its digest stays behind.
     # From the upstream release's actionlint_<ver>_checksums.txt.
-    local ver="1.7.7"
+    local ver="$ACTIONLINT_VERSION"
     local sha="023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
     local tmp
     tmp="$(mktemp -d)"
@@ -249,6 +253,9 @@ if [ "$FORCE" -eq 1 ] || ! have actionlint; then
 else
     echo "present: $(command -v actionlint)"
 fi
+# Validate the executable selected by PATH, including after installation; a
+# shadowing binary must never silently replace the pinned checker.
+actionlint_version_ok || rc=1
 
 install_astgrep() {
     # Rust binary from the upstream release: no apt package on the target
