@@ -1754,36 +1754,60 @@ def test_warm_url_file_fifo_does_not_block_worker(ng: Nginx) -> None:
 
 
 def test_warm_url_file_io_stages_run_off_event_loop(ng: Nginx) -> None:
-    """AUD30-ADMIN-OPEN-BLOCK: TEST_FAULTS delays the wrappers immediately
-    before open, fstat and read independently.  Each admin request must remain
-    pending for the injected delay while an unrelated request is served.  The
-    focused negative control runs this fixture with ``--single-process``: an
-    inline syscall then delays that second request by the full five seconds."""
+    """AUD30-ADMIN-OPEN-BLOCK: TEST_FAULTS gates the wrappers immediately
+    before open, fstat and read independently. Each request must stay pending
+    while an unrelated request is served. Stage entry is signalled explicitly;
+    removing .wait releases it. With ``--single-process``, an inline syscall
+    stalls the control request until the bounded gate escape (and fails)."""
     (ng.root / "warm-lists").mkdir(exist_ok=True)
 
     for stage in ("open", "fstat", "read"):
-        list_path = ng.root / "warm-lists" / f"warm-list.delay-{stage}"
+        list_path = ng.root / "warm-lists" / f"warm-list.gate-{stage}"
         list_path.write_bytes(b"")
+        entered = list_path.with_name(list_path.name + ".entered")
+        wait = list_path.with_name(list_path.name + ".wait")
+        entered.unlink(missing_ok=True)
+        wait.write_bytes(b"")
         completion_timeout = 10.0 * sanitizer_time_scale()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            delayed = pool.submit(
-                fetch, ng.port, f"/_cache_wc?url_file={list_path}",
-                method="POST", timeout=completion_timeout)
-            time.sleep(0.2)
-            assert not delayed.done(), \
-                f"TEST_FAULTS {stage} delay was not reached"
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                try:
+                    delayed = pool.submit(
+                        fetch, ng.port, f"/_cache_wc?url_file={list_path}",
+                        method="POST", timeout=completion_timeout)
+                    deadline = time.monotonic() + completion_timeout
+                    while not entered.is_file() and not delayed.done() \
+                            and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    assert entered.is_file(), \
+                        f"TEST_FAULTS {stage} stage entry was not signalled"
+                    assert not delayed.done(), \
+                        f"TEST_FAULTS {stage} delay was not reached"
 
-            started = time.monotonic()
-            s2, _, _ = fetch(ng.port, "/_cache_wc")
-            elapsed = time.monotonic() - started
-            assert s2 == 200, \
-                f"worker unresponsive during delayed {stage} (status {s2})"
-            assert not delayed.done(), \
-                f"delayed {stage} completed before the control request"
-            assert elapsed < 1.0 * sanitizer_time_scale(), \
-                f"delayed {stage} blocked nginx's event loop for {elapsed:.2f}s"
-            s, b, _ = delayed.result(timeout=completion_timeout)
+                    started = time.monotonic()
+                    try:
+                        s2, _, _ = fetch(ng.port, "/_cache_wc")
+                    except TimeoutError:
+                        # An inline gate can outlast the client's read ceiling.
+                        # Let the existing status oracle name the blocked stage.
+                        s2 = 0
+                    elapsed = time.monotonic() - started
+                    assert s2 == 200, \
+                        f"worker unresponsive during delayed {stage} (status {s2})"
+                    assert not delayed.done(), \
+                        f"delayed {stage} completed before the control request"
+                    assert elapsed < 1.0 * sanitizer_time_scale(), \
+                        f"delayed {stage} blocked nginx's event loop for {elapsed:.2f}s"
+                finally:
+                    # Release before the executor joins, even on an assertion or
+                    # network failure. Keep entry until completion to detect escape.
+                    wait.unlink(missing_ok=True)
+                s, b, _ = delayed.result(timeout=completion_timeout)
+                assert entered.read_bytes() == b"1", \
+                    f"TEST_FAULTS {stage} gate escaped before release"
+        finally:
+            entered.unlink(missing_ok=True)
 
         assert s == 200, f"delayed {stage} url_file returned {s}: {b!r}"
         assert json.loads(b)["warmed"] == 0, \
