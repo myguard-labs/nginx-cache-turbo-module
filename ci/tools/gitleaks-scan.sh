@@ -9,6 +9,7 @@ if [ "${GITHUB_EVENT_NAME:-}" = pull_request ]; then
 		fi
 	done
 	git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA" >/dev/null
-	exec "${GITLEAKS_BIN:-gitleaks}" git --no-banner --redact --log-opts="$PR_BASE_SHA..$PR_HEAD_SHA" .
+	# Include conflict resolutions that exist only in a merge commit's patch.
+	exec "${GITLEAKS_BIN:-gitleaks}" git --no-banner --redact --log-opts="--diff-merges=first-parent $PR_BASE_SHA..$PR_HEAD_SHA" .
 fi
 exec "${GITLEAKS_BIN:-gitleaks}" git --no-banner --redact .
