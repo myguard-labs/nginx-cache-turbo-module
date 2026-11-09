@@ -2109,6 +2109,9 @@ case_ 1 "carve-init: a member vanishing from the struct fails the pin even thoug
 patch_expected_count 2
 case_ 0 "carve-init: count pin restored to the true count is clean again" pin_lint
 
+# Deep lane control flow and retained check inventory are cheap static controls.
+case_ 0 "Deep lanes: inventory and failure continuation" python3 "$ROOT/ci/tools/test_deep_lanes.py"
+
 if [ "$rc" -eq 0 ]; then
     echo "== lint gate selftest: all controls held =="
 else

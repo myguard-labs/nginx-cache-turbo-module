@@ -1,0 +1,442 @@
+{
+  "asan-soak": [
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Install build and runtime dependencies",
+      "sha256": "0f801638f0278437db596e21ca0b825e006f7e4e72565f26921fd7d4ddb7af92"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "8923a14cfc877af8a648138b1fbfb461110395f704e9ede8c69880bee5501996"
+    },
+    {
+      "name": "Build with sanitizers",
+      "sha256": "d4f91ec856389eb8c78b1b3fc73b7600f353f0e5216eb33a4ebfe1b87de8b33d"
+    },
+    {
+      "name": "Sweep stale test listeners",
+      "sha256": "6d94f1d0b0e34b78e4cb9cea3f5961d01528741169501f37233a449274156407"
+    },
+    {
+      "name": "Verify ASan soak port band",
+      "sha256": "2e840e3ddfb0d9fcee6f8f40239ade21c00c986d285db59a3d07d8a16be44b71"
+    },
+    {
+      "name": "Run multi-worker fault-injection suite N times (fail-fast)",
+      "sha256": "8dcba204359f4b731758b4f64e7d9524cdbea385e53490b78d7e0d65507f3722"
+    }
+  ],
+  "fuzz-a": [
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Install clang + libFuzzer",
+      "sha256": "5b52d57ca85d6725586ebede5eba1c72542bc938e90557efb65df33b8b5e3ac7"
+    },
+    {
+      "name": "Select fuzz duration",
+      "sha256": "c6ec94a09a542dd2058e3c773da12b084e3d3fb00472c78f72c624b269cdd66d"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "339abb76aee6bbcf79d6ecd859111fcb7fee680e36b6ef41bc8dd884e2331201"
+    },
+    {
+      "name": "Build fuzz targets",
+      "sha256": "fbe8ff7e0bd2bd89f9c2134d07aab688861d77f06a20759799a61790f66236e8"
+    },
+    {
+      "name": "Fuzz targets concurrently",
+      "sha256": "4f725088dd537e691f841925908a531fc2e3c989e4d8743309d0a9dd4c78b0a1"
+    },
+    {
+      "name": "Upload crash artifacts",
+      "sha256": "069c805ddc1c91951d478b899fd5598453cf9fb96590f4bf41b2f613ef0c6bed"
+    },
+    {
+      "name": "Upload minimized corpus",
+      "sha256": "8a5a15cf0cbd7070d5412c23696857b52eb057b40436ea46bf928ddb07d9fbd8"
+    }
+  ],
+  "coverage": [
+    {
+      "name": "Check out nginx-module-testkit",
+      "sha256": "48a66d34ec49a24e6677dc8ee8f4c47519249c74b3a67f727fb662180fbb575a"
+    },
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Install build and runtime dependencies",
+      "sha256": "a93adedb5bbbeb40feb08af6c3fdda7b936215bee78ab6f046e9b8482942524b"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "27003a76512144facc33455f7055b114f2ab364ede87f7e87fdb4fbe9ed43591"
+    },
+    {
+      "name": "Sweep stale test listeners",
+      "sha256": "6d94f1d0b0e34b78e4cb9cea3f5961d01528741169501f37233a449274156407"
+    },
+    {
+      "name": "Verify coverage port band",
+      "sha256": "2e840e3ddfb0d9fcee6f8f40239ade21c00c986d285db59a3d07d8a16be44b71"
+    },
+    {
+      "name": "Build instrumented, run suite, report",
+      "sha256": "3271ba876bce00747bbadd0aaa3f372c27ed9268710612c811b93d09809fa78d"
+    },
+    {
+      "name": "Coverage summary to job log",
+      "sha256": "4041871d6aa82fe06d6b15ac62e6ea5b26715299729991596785a1a5b428655d"
+    },
+    {
+      "name": "Upload coverage report",
+      "sha256": "51ac0068d6b465f344d8c2ffca0a8059f741af357df6bea7d0be4532c50db722"
+    }
+  ],
+  "fuzz-b": [
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Install clang + libFuzzer",
+      "sha256": "5b52d57ca85d6725586ebede5eba1c72542bc938e90557efb65df33b8b5e3ac7"
+    },
+    {
+      "name": "Select fuzz duration",
+      "sha256": "c6ec94a09a542dd2058e3c773da12b084e3d3fb00472c78f72c624b269cdd66d"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "339abb76aee6bbcf79d6ecd859111fcb7fee680e36b6ef41bc8dd884e2331201"
+    },
+    {
+      "name": "Build fuzz targets",
+      "sha256": "fbe8ff7e0bd2bd89f9c2134d07aab688861d77f06a20759799a61790f66236e8"
+    },
+    {
+      "name": "Fuzz targets concurrently",
+      "sha256": "4f725088dd537e691f841925908a531fc2e3c989e4d8743309d0a9dd4c78b0a1"
+    },
+    {
+      "name": "Upload crash artifacts",
+      "sha256": "069c805ddc1c91951d478b899fd5598453cf9fb96590f4bf41b2f613ef0c6bed"
+    },
+    {
+      "name": "Upload minimized corpus",
+      "sha256": "8a5a15cf0cbd7070d5412c23696857b52eb057b40436ea46bf928ddb07d9fbd8"
+    }
+  ],
+  "scanbench": [
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Install build and benchmark dependencies",
+      "sha256": "324737993d174f72471fd111d8d842d080e72be45686dd94b6813d3207bdd5cb"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "339abb76aee6bbcf79d6ecd859111fcb7fee680e36b6ef41bc8dd884e2331201"
+    },
+    {
+      "name": "Build server and module",
+      "sha256": "89fec3df57927b660e0265700d56161869b08735580c12bec3b2611458eac949"
+    },
+    {
+      "name": "Run Zipf hit-ratio benchmark",
+      "sha256": "8f95dc37a02bfab16426807bea8a81e368c611795b4c6acb086a21c73482045f"
+    }
+  ],
+  "clang-analyze": [
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Install build dependencies",
+      "sha256": "b8f3d9cba698004c9db2be9f20888e204c976a41899456d083e2bdd9db1795d6"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "c04db453fc698de90d13a5faf9da4531bf47071d84284f5eae9b09f813ea4c48"
+    },
+    {
+      "name": "Clang --analyze every source",
+      "sha256": "557bcbb35252ae6192e706b33b53890af262ba8b6ccd6beafd2b0fb67ac84ed8"
+    }
+  ],
+  "compat-mainline": [
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Resolve matrix version",
+      "sha256": "8ca530f0cf53da280c452c67fa1986305c544c84e2140a66f156e96a40b27249"
+    },
+    {
+      "name": "Install build and Test::Nginx dependencies",
+      "sha256": "b31650542564c97e45dfc84def1217f50a59fb315621ffbd0d52ca477ce89d1e"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "5d940cc1d1369656688e57a42728a7bd69ce6ae5cdefec0eefe0e501bafc1b08"
+    },
+    {
+      "name": "Build server and module",
+      "sha256": "238f28dc210f62f355614bea2d06f64c60a13d17c2b11d920d9399a5b1204b69"
+    },
+    {
+      "name": "Verify compatibility port band",
+      "sha256": "2e840e3ddfb0d9fcee6f8f40239ade21c00c986d285db59a3d07d8a16be44b71"
+    },
+    {
+      "name": "Run Test::Nginx compatibility suite",
+      "sha256": "1d348bc84fc9c82cd329e995162491fd97317fe18a6336c216b734a41c1dffb8"
+    }
+  ],
+  "compat-stable": [
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Resolve matrix version",
+      "sha256": "15fb78dd223369e11a68be2340140729402f2bc52ccc4670f67016512bdfaba3"
+    },
+    {
+      "name": "Install build and Test::Nginx dependencies",
+      "sha256": "b31650542564c97e45dfc84def1217f50a59fb315621ffbd0d52ca477ce89d1e"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "5d940cc1d1369656688e57a42728a7bd69ce6ae5cdefec0eefe0e501bafc1b08"
+    },
+    {
+      "name": "Build server and module",
+      "sha256": "238f28dc210f62f355614bea2d06f64c60a13d17c2b11d920d9399a5b1204b69"
+    },
+    {
+      "name": "Verify compatibility port band",
+      "sha256": "2e840e3ddfb0d9fcee6f8f40239ade21c00c986d285db59a3d07d8a16be44b71"
+    },
+    {
+      "name": "Run Test::Nginx compatibility suite",
+      "sha256": "1d348bc84fc9c82cd329e995162491fd97317fe18a6336c216b734a41c1dffb8"
+    }
+  ],
+  "compat-angie": [
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Resolve matrix version",
+      "sha256": "6de8b389b225e287a427b7c900d3891450038caa6ab18a2f61b4b0711ee10ab6"
+    },
+    {
+      "name": "Install build and Test::Nginx dependencies",
+      "sha256": "b31650542564c97e45dfc84def1217f50a59fb315621ffbd0d52ca477ce89d1e"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "3b73d9407abb5b9cc2fd9b88679ea7778983f918cea8da7d9e44b3ca1b5536f7"
+    },
+    {
+      "name": "Build server and module",
+      "sha256": "af5c4081e3179857be1ab0b8edd009851c7b451b19c685f85412bb0d52f6395d"
+    },
+    {
+      "name": "Verify compatibility port band",
+      "sha256": "2e840e3ddfb0d9fcee6f8f40239ade21c00c986d285db59a3d07d8a16be44b71"
+    },
+    {
+      "name": "Run Test::Nginx compatibility suite",
+      "sha256": "1d348bc84fc9c82cd329e995162491fd97317fe18a6336c216b734a41c1dffb8"
+    }
+  ],
+  "legacy-runtime": [
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Install build and runtime dependencies",
+      "sha256": "0f801638f0278437db596e21ca0b825e006f7e4e72565f26921fd7d4ddb7af92"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "f266235a6846cb16c3b107cf5867613ffc5ec56354a16f50e61fc45385489658"
+    },
+    {
+      "name": "Build module against legacy nginx",
+      "sha256": "efbc37fcce80066f09203bd2f916afd3cee5d7afbe951f3517af6df0e1714701"
+    },
+    {
+      "name": "Sweep stale test listeners",
+      "sha256": "6d94f1d0b0e34b78e4cb9cea3f5961d01528741169501f37233a449274156407"
+    },
+    {
+      "name": "Verify legacy runtime port band",
+      "sha256": "2e840e3ddfb0d9fcee6f8f40239ade21c00c986d285db59a3d07d8a16be44b71"
+    },
+    {
+      "name": "Run runtime suite against legacy nginx",
+      "sha256": "ec181125767047b911c30445df4f46feecbd652d0612897e0d2c4ad98cf426f4"
+    }
+  ],
+  "memcheck": [
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Install dependencies",
+      "sha256": "20badf91d55905448cb319c0f2d89ee4f4eedda4dda6fe06b444f10fee05b892"
+    },
+    {
+      "name": "Start L2 backends (redis, memcached)",
+      "sha256": "588e6c2be45c4c4dd35f4c00e55846217db1ff81346738b82fc5761c94bc37d5"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "339abb76aee6bbcf79d6ecd859111fcb7fee680e36b6ef41bc8dd884e2331201"
+    },
+    {
+      "name": "Build debug nginx + cache-turbo module",
+      "sha256": "e13f782799a876aa9a4360270cc878bd0849162a8aed2af9128cad4484bc5243"
+    },
+    {
+      "name": "Memcheck soak (600s @ 4 conc, WITH suppressions, L1+L2)",
+      "sha256": "5460f1d7b8077fa418decda410177f4d8d6c169fbb7fd49672aebf4fd8c73f96"
+    }
+  ],
+  "testkit-sanitizer": [
+    {
+      "name": "Check out nginx-module-testkit",
+      "sha256": "a693475875cd59f989184a3040dee134da327131a2176cd81e9a527f46ab2db1"
+    },
+    {
+      "name": "Install build dependencies",
+      "sha256": "fc43fa581f78090e5929886e20585e325cb58b296c21941b04f88a80d399b233"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "4c7acb0e3f17a643e8e294532dbf7b4b10f52e887c2fc0b7fe72703837c1f7cc"
+    },
+    {
+      "name": "Sweep stale test listeners",
+      "sha256": "b06352de34781adcf4a5f006a18b2f6c54fd5ae34bf0fe463bace6769df66f73"
+    },
+    {
+      "name": "Verify runtime port band",
+      "sha256": "b08baf094c319ce11794dd849ce364801c2c50a01e91bafebe624f098b37cc25"
+    },
+    {
+      "name": "Stage cache-turbo + testkit ref probe under ASan/UBSan",
+      "sha256": "d57d30333d010735013aec4fd3be68742ab0f967b83ed01bf1c20bc4e7facf39"
+    },
+    {
+      "name": "Report compiler-cache effectiveness",
+      "sha256": "4318630c268a73ce6e79dab87e63ccda34d01830ef70a1cff190a519c61655c6"
+    },
+    {
+      "name": "Prober scenarios on the sanitized tree",
+      "sha256": "ecfe85a4069d218563e6971ada98fe6ef5f7736c0aa293f81115d7dab244b23b"
+    }
+  ],
+  "testkit-angie": [
+    {
+      "name": "Check out nginx-module-testkit",
+      "sha256": "48a66d34ec49a24e6677dc8ee8f4c47519249c74b3a67f727fb662180fbb575a"
+    },
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Install build dependencies",
+      "sha256": "42d0018ac0bc0e5856e00f032d4e410c6761e22f45f7a42d905c53d4e0485fe4"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "1d1e498bebd481d20d5763f910592bb60d5b2d832c621d6429f0b5013fa4164e"
+    },
+    {
+      "name": "Sweep stale test listeners",
+      "sha256": "06a44a0e66f4545212382f36a5b1249b7bc32229113a24de2dcc45fa2ea51355"
+    },
+    {
+      "name": "Verify runtime port band",
+      "sha256": "2e840e3ddfb0d9fcee6f8f40239ade21c00c986d285db59a3d07d8a16be44b71"
+    },
+    {
+      "name": "Stage cache-turbo + testkit ref probe for Angie",
+      "sha256": "61505f4b5a512090734b478d0dc8cb1fa029caad81c7ad6f4837825211c5f9d5"
+    },
+    {
+      "name": "Report compiler-cache effectiveness",
+      "sha256": "6ee44868ad6f5ef00a73df06ce1e2765325c6beb3a596ca5f59863898f8c0017"
+    },
+    {
+      "name": "Representative scenario asserts on Angie",
+      "sha256": "aa60fed4a8b6ad2f9b8e010ad01eea326859adff1a15c190278b11818089d4e0"
+    },
+    {
+      "name": "Representative scenario SKIPs on an unstaged Angie tree",
+      "sha256": "22e9702573e665f3e776d886497eb759a1b0ed704195e24ec86ae22958b59a82"
+    }
+  ],
+  "scanners": [
+    {
+      "name": "Load version pins",
+      "sha256": "c914ec450a687f259b06c4bb8c59a2890cb0fe4a181dab68dc5ee4c6bc763cfd"
+    },
+    {
+      "name": "Private cache and tool directories",
+      "sha256": "6a961dc1297aca33d037ccfb7a8a17769d1cd6c790d1a052cfa86dd65f4c496d"
+    },
+    {
+      "name": "Install dependencies",
+      "sha256": "5be395dc28877e0865e2f9f4ab00af800911b491609d50356cb15ff401fe59f2"
+    },
+    {
+      "name": "gitleaks (full history scan)",
+      "sha256": "00c4f4bfd64640cf8aea3ae302e0e3a5e7af971cab6770441ea3df8178b797e2"
+    },
+    {
+      "name": "Restore build caches",
+      "sha256": "c04db453fc698de90d13a5faf9da4531bf47071d84284f5eae9b09f813ea4c48"
+    },
+    {
+      "name": "Configure nginx src tree (clang-tidy headers)",
+      "sha256": "c9c062e53e9f6e63224f05619b301029d98f7cd8c260413dbff9c61963ce6760"
+    },
+    {
+      "name": "flawfinder (gate on >=4)",
+      "sha256": "144d7e7aa4e0ced0aedb2e7085600ff3162e41c83ebb19054ed1c2f713c9e35f"
+    },
+    {
+      "name": "clang-tidy (cert-*, security.*)",
+      "sha256": "f2032f29a66e1131b662ec28820067c443b9b980718654834803e21375bbe34f"
+    },
+    {
+      "name": "semgrep (gate on >=WARNING)",
+      "sha256": "76582e12e2bf724dd730dcb5923dd7765ed013a65c8552e462d5c1a374297d39"
+    },
+    {
+      "name": "Upload reports",
+      "sha256": "dcebeff2e636592951fc8592b168f424d249fabef7d78322eb29a4894424d828"
+    }
+  ]
+}
