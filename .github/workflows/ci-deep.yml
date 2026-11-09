@@ -1,4 +1,4 @@
-# sync-sha: a74e4af9f444504bf093992a436b191f4eac6fc8c39100f8512bfb0aa59842cf
+# sync-sha: 3b127a5b87de0b992517147efa112dacaf5ddd570b4a9ddbd9b4dfcb6338ba5b
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -227,7 +227,7 @@ jobs:
             checkout asan_soak_reset asan_soak_01 asan_soak_02 asan_soak_03 asan_soak_isolate asan_soak_04 asan_soak_05 asan_soak_06
             asan_soak_07
           LANE_OPTIONAL: ''
-        shell: python
+        shell: python3 {0}
         run: |
           import json
           import os
@@ -595,7 +595,7 @@ jobs:
             checkout fuzz_a_reset fuzz_a_01 fuzz_a_02 fuzz_a_03 fuzz_a_04 fuzz_a_05 fuzz_a_06 coverage_reset coverage_01 coverage_02
             coverage_03 coverage_04 coverage_isolate coverage_05 coverage_06 coverage_07 coverage_08 coverage_09
           LANE_OPTIONAL: fuzz_a_07 fuzz_a_08
-        shell: python
+        shell: python3 {0}
         run: |
           import json
           import os
@@ -966,7 +966,7 @@ jobs:
             scanbench_02 scanbench_03 scanbench_isolate scanbench_04 scanbench_05 clang_analyze_reset clang_analyze_01 clang_analyze_02
             clang_analyze_03 clang_analyze_isolate clang_analyze_04
           LANE_OPTIONAL: fuzz_b_07 fuzz_b_08
-        shell: python
+        shell: python3 {0}
         run: |
           import json
           import os
@@ -2080,7 +2080,7 @@ jobs:
             testkit_angie_09 testkit_angie_10 scanners_reset scanners_01 scanners_02 scanners_03 scanners_04 scanners_05 scanners_isolate
             scanners_06 scanners_07 scanners_08 scanners_09 scanners_10
           LANE_OPTIONAL: ''
-        shell: python
+        shell: python3 {0}
         run: |
           import json
           import os

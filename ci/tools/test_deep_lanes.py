@@ -16,6 +16,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -166,11 +168,22 @@ def verdict(job, outcomes):
     with tempfile.TemporaryDirectory() as tmp:
         output = Path(tmp) / "output"
         summary = Path(tmp) / "summary"
+        script = Path(tmp) / "verdict.py"
+        script.write_text(step["run"])
+        python3 = shutil.which("python3")
+        if not python3:
+            raise RuntimeError("python3 is required for the verdict control")
+        (Path(tmp) / "python3").symlink_to(python3)
+        shell = step["shell"]
+        if shell == "python":
+            shell = "python {0}"  # GitHub Actions built-in shell template.
+        command = [part.replace("{0}", str(script)) for part in shlex.split(shell)]
         result = subprocess.run(
-            [sys.executable, "-c", step["run"]],
+            command,
             env={
                 **os.environ,
                 **step["env"],
+                "PATH": tmp,
                 "GITHUB_OUTPUT": str(output),
                 "GITHUB_STEP_SUMMARY": str(summary),
                 "LANE_STEPS": json.dumps(
