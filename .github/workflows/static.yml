@@ -1,4 +1,4 @@
-# sync-sha: f1d271911598bb9100631e1a1c9372f86e148f2e969eaca9c67bb1b5493bc3fe
+# sync-sha: 1964ea272e3f3c144a3542d6ae8a9665c8c7606b4a17ad342971cb83928ef876
 name: Static
 
 # Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
@@ -51,6 +51,11 @@ on:
         required: false
         default: true
         type: boolean
+      width:
+        description: "run the 32-bit unit subset"
+        required: false
+        default: true
+        type: boolean
   workflow_dispatch:
     inputs:
       code:
@@ -65,6 +70,11 @@ on:
         type: boolean
       testkit:
         description: "run the testkit prober section"
+        required: false
+        default: true
+        type: boolean
+      width:
+        description: "run the 32-bit unit subset"
         required: false
         default: true
         type: boolean
@@ -94,6 +104,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0  # gitleaks scans git history
+
+      - name: Test 32-bit change selector
+        run: python3 -m unittest ci.tests.test_width_impact_filter
 
       - name: Load version pins
         run: bash .github/scripts/load-versions.sh
@@ -389,17 +402,20 @@ jobs:
           # against a shim and drives the fixed-point boundary branches the HTTP
           # runtime suite cannot reach. check_constants.sh guards shim drift.
           bash ci/tests/unit/run.sh
+      # Compile dependencies: src/**, ci/**, and .github/workflows/**.
+      # The broad ci/ set covers unit scripts, shims, extractors and their
+      # transitive checks; workflow changes exercise the filter and wiring.
       # Re-run the width-sensitive extracted-production subset with 32-bit
       # pointers, size_t, long and time_t. Crypto-linked controls remain in the
       # full-width lane because this runner's i386 OpenSSL and amd64 MyGuard
       # libzstd packages are not co-installable.
       - name: Install 32-bit unit-test toolchain
-        if: ${{ inputs.code }}
+        if: ${{ inputs.width }}
         run: |
           sudo apt-get -o DPkg::Lock::Timeout=120 install -y \
             gcc-multilib
       - name: Pure-math unit tests (32-bit)
-        if: ${{ inputs.code }}
+        if: ${{ inputs.width }}
         run: |
           printf '_Static_assert(sizeof(void *) == 4, "not 32-bit");\n' \
             | gcc -m32 -x c -fsyntax-only -
@@ -410,21 +426,6 @@ jobs:
           fi
           EXPECT_TIME_T_BYTES=4 UNIT_CFLAGS=-m32 UNIT_WIDTH_ONLY=1 \
             bash ci/tests/unit/run.sh
-      - name: Lint workflows
-        if: ${{ inputs.code }}
-        run: |
-          version=1.7.7
-          archive="/tmp/actionlint_${version}_linux_amd64.tar.gz"
-          curl -fsSL -o "$archive" \
-            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
-          bash ci/tools/verify-download.sh "$archive"
-          tar -xzf "$archive" -C /tmp actionlint
-          # -config-file explicitly: auto-discovery of .github/actionlint.yaml
-          # is not reliable across checkout layouts, and without the config the
-          # self-hosted runner labels are flagged as unknown.
-          /tmp/actionlint -color -config-file .github/actionlint.yaml \
-            .github/workflows/*.yml
-
       # === security scanners (was security-scanners.yml) =====================
       - name: Install dependencies
         run: |

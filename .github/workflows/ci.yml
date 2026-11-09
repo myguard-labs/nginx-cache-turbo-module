@@ -1,4 +1,4 @@
-# sync-sha: b544425fcdde83e6dd3a6609ea9e7de56ba35f467ec99d9b2ef8de3e2df6f875
+# sync-sha: 72ac944d918728728da958b6d98467f650aeeb074682c9ca929c369dcddfd72a
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
@@ -68,6 +68,7 @@ jobs:
       fuzz: ${{ steps.filter.outputs.fuzz }}
       code: ${{ steps.filter.outputs.code }}
       testkit: ${{ steps.filter.outputs.testkit }}
+      width: ${{ steps.filter.outputs.width }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -89,6 +90,7 @@ jobs:
               echo "fuzz=true"
               echo "code=true"
               echo "testkit=true"
+              echo "width=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -127,6 +129,9 @@ jobs:
           else
             echo "testkit=false" >> "$GITHUB_OUTPUT"
           fi
+          # NUL-delimited Git output preserves unusual filenames; diff errors fail the job.
+          width=$(python3 ci/tools/width-impact-filter.py "$BASE_SHA")
+          echo "width=$width" >> "$GITHUB_OUTPUT"
           # code: detect changes to code, CI workflows, or tests (anything that
           # isn't docs-only). gates Build&Test to skip on docs-only PRs.
           # NOTE: this must anchor the DOCS-ONLY exclusions at the END of the
@@ -182,6 +187,7 @@ jobs:
       code: ${{ needs.changes.outputs.code == 'true' }}
       fuzz: ${{ needs.changes.outputs.fuzz == 'true' }}
       testkit: ${{ needs.changes.outputs.testkit == 'true' }}
+      width: ${{ needs.changes.outputs.width == 'true' }}
 
   # --- result gate -----------------------------------------------------------
   # One stable check ("CI / gate") summarising every lane above, so branch
