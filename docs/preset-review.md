@@ -20,8 +20,10 @@ origin:
 - **URI prefix** — protects a stable private route, but not a renamed or
   translated route;
 - **query argument** — protects front-controller and cookieless-token routes;
-- **request header** — protects clients that authenticate with a header alone
-  (`discourse`, `ghost`, `redmine`, `nextjs`); matched on presence, exact name;
+- **request header** — protects clients that authenticate or select a
+  variant with a header alone (`discourse`, `ghost`, `redmine`, `nextjs`,
+  `shopware6`); matched on presence, case-insensitive, with `_` equal to `-`
+  so an `underscores_in_headers on` spelling such as `Api_Key` still matches;
 - **key cookie** — puts a shared presentation or commerce segment in the cache
   key instead of disabling caching for that segment.
 
@@ -54,7 +56,7 @@ deliberately has no rule of that kind; it is not an unchecked blank.
 | `ghost` | 3 | 4 | 4 | — | — | Cookieless member and paid-content token arguments are covered. Plus 1 request-header row (`X-Ghost-Preview`, presence bypass). |
 | `wagtail` | 1 | 3 | — | — | — | Safe while guests remain session-free; anonymous sessions fail safe by reducing hit rate. |
 | `kirby` | 1 | 1 | — | — | — | Safe while guests remain session-free; `csrf()` can make guest pages bypass. |
-| `shopware6` | — | 5 | — | yes | 1 | `sw-cache-hash` is value-keyed, except the `not-cacheable` marker, which bypasses; preserve that contract across Shopware upgrades. |
+| `shopware6` | — | 5 | — | yes | 1 | `sw-cache-hash` is value-keyed, except the `not-cacheable` marker, which bypasses; preserve that contract across Shopware upgrades. Plus 5 request-header rows (the 6.7.15+ `Vary` axes, presence bypass; they also satisfy those `Vary` axes, without which no storefront page is stored). |
 | `typo3` | 3 | 1 | 1 | — | — | Unsafe after an unmirrored `FE/cookieName`, `BE/cookieName` or `BE/entryPoint` change; add local bypass and no-store rules. Workspace-preview key `ADMCMD_prev` is covered as cookie and argument. |
 | `invision` | — | 5 | 5 | yes | 3 | Vendor-attested closed-source rules, unverified 2026-11-07; verify cookies on the deployed release. |
 | `smf` | 1 | — | 16 | — | — | Safe but presence-only session matching can bypass guests. |
@@ -114,7 +116,22 @@ vendor-attested and were not re-verified.
 | `ghost` | v6.75.0 | Added cookie `ghost-admin-toolbar`: the staff toolbar cookie is the only staff signal on site pages, because the admin session cookie is path-scoped to `/ghost`. Added header `X-Ghost-Preview`: `theme-engine/preview.js` renders any page with the design settings carried in it, unauthenticated, so a stored response would serve a draft or attacker-chosen design to guests. |
 | `wagtail` | v8.1 (Django 6.1.3) | No change. |
 | `kirby` | 5.6.3 | No change. |
-| `shopware6` | v6.7.16.0 | Added predicate `sw-cache-hash` equals `not-cacheable` (Shopware's own "bypass the cache" marker); the key cookie stays. Rejected header `sw-access-key`: it names the sales channel, ships in every headless frontend and is read only under `/store-api` and `/api`, which the URI rows already bypass; the per-client `sw-context-token` is overwritten by the session on Storefront routes (`SalesChannelAuthenticationListener.php`, `SessionContextTokenAccessor.php`). |
+| `shopware6` | v6.7.16.0 | Added predicate `sw-cache-hash` equals `not-cacheable` (Shopware's own "bypass the cache" marker); the key cookie stays. Rejected header `sw-access-key`: it names the sales channel, ships in every headless frontend and is read only under `/store-api` and `/api`, which the URI rows already bypass; the per-client `sw-context-token` is overwritten by the session on Storefront routes (`SalesChannelAuthenticationListener.php`, `SessionContextTokenAccessor.php`). Superseded for the `Vary` axes, see below. |
+
+Follow-up the same day: since 6.7.15 every sales-channel response, storefront
+pages included, carries `Vary: sw-access-key, sw-language-id, sw-currency-id,
+sw-include-seo-urls, sw-cache-hash` (`CacheHeadersService.php:42-45`,
+`HttpCacheVariantHeaders.php:25-31`, `CacheResponseSubscriber.php:84-90`). The
+unknown-axis veto refused every such page, so `shopware6` stored nothing on a
+current shop. The five names are now request-header rows. They are not
+identity checks: a browser sends none of them, and a client that sends one
+selects a different variant at the same URL (`RequestTransformer.php:241-243`
+lets a client-sent `sw-language-id` override the domain language,
+`SalesChannelRequestContextResolver.php:60-73` honours `sw-currency-id`,
+`HttpCacheKeyGenerator.php:146-150` prefers an `sw-cache-hash` header over the
+cookie), so bypassing it is correct, and every stored copy then has all five
+absent, which satisfies the `Vary`. `sw-context-token` stays out: a `Vary` on it
+still refuses the store.
 
 The same day the next 12 application presets (mantisbt, plone, umbraco,
 dotclear, wikijs, redmine, flarum, opencart, servarr, calibre, calibreweb,
