@@ -27,7 +27,7 @@ One page per `cache_turbo_backend` preset:
 | `drupal` | [drupal.md](drupal.md) | ✅ yes (`SESS`) — anon users DO get sessions, so the cookie rule is required; it over-matches `PHPSESSID` by design |
 | `mediawiki` | [mediawiki.md](mediawiki.md) | ✅ yes (`*Token`, `*_session`) — **no URI rules: `/index.php` is the article path on a stock wiki** |
 | `magento` | [magento.md](magento.md) | ✅ yes (`X-Magento-Vary`, value-keyed) — and the origin sends `no-store` on cart/checkout |
-| `shopware6` | [shopware6.md](shopware6.md) | ✅ yes (`sw-cache-hash`, value-keyed; `not-cacheable` bypasses) — same engine as `magento` |
+| `shopware6` | [shopware6.md](shopware6.md) | ✅ yes (`sw-cache-hash`, value-keyed; `not-cacheable` bypasses) — same engine as `magento` — **plus the five 6.7.15+ `Vary` request headers (`sw-access-key`, `sw-language-id`, `sw-currency-id`, `sw-include-seo-urls`, `sw-cache-hash`), which bypass on presence and let storefront pages be stored** |
 | `ghost` | [ghost.md](ghost.md) | ✅ yes (`ghost-members-ssr`) — **plus `?uuid=`/`?key=`/`?gift=`, which auth a member or unlock paid content with no cookie**, and the `X-Ghost-Preview` request header (an unauthenticated design override) bypasses |
 | `wagtail` | [wagtail.md](wagtail.md) | ⚠️ yes (`sessionid`) — **but only while nothing writes the session for guests**; fails safe |
 | `kirby` | [kirby.md](kirby.md) | ⚠️ yes (`kirby_session`) — **but a `csrf()` form page cookies guests**; fails safe |

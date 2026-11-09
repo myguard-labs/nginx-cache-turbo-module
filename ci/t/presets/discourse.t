@@ -478,3 +478,56 @@ Api-Key: fixture
 [qq{X-Cache: }, qq{X-Cache: HIT}]
 --- error_code eval
 [200, 200]
+
+
+
+=== TEST 19: underscores_in_headers on -- underscore spellings of the header rows bypass
+# CT-PRESET-HEADER-UNDERSCORE. With `underscores_in_headers on` nginx keeps
+# Api_Key and forwards it; Rack folds '-' and '_' alike into HTTP_API_KEY, so
+# Discourse authenticates it exactly as Api-Key. The header-row compare treats
+# '_' and '-' as the same byte (case-insensitive as before). Same two-path
+# shape as TEST 14 for Api_Key, User_Api_Key and a mixed spelling of
+# X-Shared-Session-Key. Before the fold (exact-name compare) request 3 of
+# each group HITs the header copy and request 5 is served the guest copy (red).
+--- http_config eval: "underscores_in_headers on;\n" . $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /disc/us-a.json", "GET /disc/us-a.json", "GET /disc/us-a.json", "GET /disc/us-a.json", "GET /disc/us-a.json",
+ "GET /disc/us-b.json", "GET /disc/us-b.json", "GET /disc/us-b.json", "GET /disc/us-b.json", "GET /disc/us-b.json",
+ "GET /disc/us-c.json", "GET /disc/us-c.json", "GET /disc/us-c.json", "GET /disc/us-c.json", "GET /disc/us-c.json"]
+--- more_headers eval
+["Api_Key: fixture", "Api_Key: fixture", "", "", "Api_Key: fixture",
+ "USER_API_KEY: fixture", "USER_API_KEY: fixture", "", "", "USER_API_KEY: fixture",
+ "x_shared-SESSION_key: fixture", "x_shared-SESSION_key: fixture", "", "", "x_shared-SESSION_key: fixture"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: }]
+--- error_code eval
+[200, 200, 200, 200, 200,
+ 200, 200, 200, 200, 200,
+ 200, 200, 200, 200, 200]
+
+
+
+=== TEST 20: NEGATIVE -- the fold maps '_' to '-' only; other near-misses still HIT
+# ApiKey (no separator), Api_Keys (longer) and Api0Key (same length, a
+# different byte where the separator sits) are different names: the fold must
+# not strip, skip or wildcard the separator position. The HIT on each URL
+# proves the near-miss request was stored like a guest's.
+--- http_config eval: "underscores_in_headers on;\n" . $::HttpConfig
+--- config eval: $::Config
+--- request eval
+["GET /disc/usn-a.json", "GET /disc/usn-a.json",
+ "GET /disc/usn-b.json", "GET /disc/usn-b.json",
+ "GET /disc/usn-c.json", "GET /disc/usn-c.json"]
+--- more_headers eval
+["ApiKey: fixture", "ApiKey: fixture",
+ "Api_Keys: fixture", "Api_Keys: fixture",
+ "Api0Key: fixture", "Api0Key: fixture"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200, 200, 200, 200]

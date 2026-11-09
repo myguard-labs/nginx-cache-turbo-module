@@ -87,6 +87,42 @@ our $HttpConfigExtra = $HttpConfig . <<"EOC";
             add_header Set-Cookie "sw-cache-hash=established123" always;
             return 200 "origin:\$request_uri:\$connection:\$connection_requests:\$msec\\n";
         }
+
+        # Shopware >= 6.7.15 storefront page: CacheResponseSubscriber.php:84-90
+        # calls CacheHeadersService::applyCacheHeaders() for every response
+        # with a SalesChannelContext, which echoes the context language and
+        # currency (:39-40) and merges HttpCacheVariantHeaders::HEADERS into
+        # Vary (:42-45, HttpCacheVariantHeaders.php:25-31). Symfony's
+        # Response::sendHeaders() emits one `Vary:` line per value, so the five
+        # axes arrive as five header lines. No Set-Cookie: a cookieless guest
+        # page. The body echoes the variant headers so a bypassed request is
+        # visibly answered by the origin for ITS values.
+        location /vary/ {
+            add_header Cache-Control "public, max-age=30" always;
+            add_header sw-language-id "2fbb5fe2e29a4d70aa5854ce7ce3e20b" always;
+            add_header sw-currency-id "b7d2554b0ce847cd82f3ac9bd1c0dfca" always;
+            add_header Vary "sw-access-key" always;
+            add_header Vary "sw-language-id" always;
+            add_header Vary "sw-currency-id" always;
+            add_header Vary "sw-include-seo-urls" always;
+            add_header Vary "sw-cache-hash" always;
+            return 200 "vary:\$request_uri:\$connection:\$connection_requests:\$msec:cur=\$http_sw_currency_id:lang=\$http_sw_language_id\\n";
+        }
+
+        # The same five axes on ONE comma-joined line, plus sw-context-token:
+        # an axis the preset does not own. It must stay uncacheable -- the
+        # rows satisfy only their own names, never the whole Vary line.
+        location /varyx/ {
+            add_header Cache-Control "public, max-age=30" always;
+            add_header Vary "sw-access-key, sw-language-id, sw-currency-id, sw-include-seo-urls, sw-cache-hash, sw-context-token" always;
+            return 200 "varyx:\$request_uri:\$connection:\$connection_requests:\$msec\\n";
+        }
+
+        location /varyc/ {
+            add_header Cache-Control "public, max-age=30" always;
+            add_header Vary "Accept-Encoding, sw-access-key, sw-language-id, sw-currency-id, sw-include-seo-urls, sw-cache-hash" always;
+            return 200 "varyc:\$request_uri:\$connection:\$connection_requests:\$msec\\n";
+        }
     }
 EOC
 
@@ -113,6 +149,34 @@ our $Config = ct_config(
             cache_turbo_key     \$uri;
             cache_turbo_valid   30s;
             proxy_pass http://127.0.0.1:$SwHashOriginPort/;
+        }
+        location /swvary/ {
+            cache_turbo         main;
+            cache_turbo_backend shopware6;
+            cache_turbo_key     \$uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:$SwHashOriginPort/vary/;
+        }
+        location /swvaryx/ {
+            cache_turbo         main;
+            cache_turbo_backend shopware6;
+            cache_turbo_key     \$uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:$SwHashOriginPort/varyx/;
+        }
+        location /swvaryc/ {
+            cache_turbo         main;
+            cache_turbo_backend shopware6;
+            cache_turbo_key     \$uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:$SwHashOriginPort/varyc/;
+        }
+        location /wpvary/ {
+            cache_turbo         main;
+            cache_turbo_backend wordpress;
+            cache_turbo_key     \$uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:$SwHashOriginPort/vary/;
         }
 EOL
 
@@ -392,5 +456,110 @@ Cookie: sw-states=logged-in
 ["GET /gen/product", "GET /gen/product"]
 --- response_headers eval
 [qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200]
+
+
+
+=== TEST 12: a Shopware 6.7.15+ storefront page (five-axis Vary) is cached for a guest
+# CT-PRESET-SHOPWARE-VARY-AXES. Every sales-channel response names
+# sw-access-key, sw-language-id, sw-currency-id, sw-include-seo-urls and
+# sw-cache-hash in Vary. None is a whitelisted axis, so before the shopware6
+# header rows the unknown-axis veto refused every storefront page and this
+# location never HIT (observed red: request 2 had no X-Cache). With the rows,
+# a guest request carries none of the five, so every stored and served
+# representation has all five ABSENT and the Vary is satisfied.
+--- http_config eval: $::HttpConfigExtra
+--- config eval: $::Config
+--- request eval
+["GET /swvary/home", "GET /swvary/home",
+ "GET /swvaryc/home", "GET /swvaryc/home"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: HIT},
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- response_body_like eval
+[qr/^vary:\/vary\/home:.*:cur=:lang=$/, qr/^vary:\/vary\/home:.*:cur=:lang=$/,
+ qr/^varyc:/, qr/^varyc:/]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
+=== TEST 13: each Vary axis header bypasses -- never stored, never served the guest copy
+# A request carrying any of the five selects a different variant at the same
+# URL: RequestTransformer.php:241-243 lets a client-sent sw-language-id (and
+# every other request header) override the domain language on Storefront
+# routes, SalesChannelRequestContextResolver.php:60-73 honours a client-sent
+# sw-currency-id, and HttpCacheKeyGenerator.php:146-150 prefers an
+# sw-cache-hash HEADER over the cookie this preset keys on. Per header, on its
+# own URL: two header requests first (the guest after them is a MISS, so they
+# stored nothing), then a guest HIT, then a header request that must NOT be
+# served the guest copy (its body echoes its own currency/language). Row
+# removed: that header's request 5 HITs (red).
+--- http_config eval: $::HttpConfigExtra
+--- config eval: $::Config
+--- request eval
+["GET /swvary/ak", "GET /swvary/ak", "GET /swvary/ak", "GET /swvary/ak", "GET /swvary/ak",
+ "GET /swvary/li", "GET /swvary/li", "GET /swvary/li", "GET /swvary/li", "GET /swvary/li",
+ "GET /swvary/ci", "GET /swvary/ci", "GET /swvary/ci", "GET /swvary/ci", "GET /swvary/ci",
+ "GET /swvary/su", "GET /swvary/su", "GET /swvary/su", "GET /swvary/su", "GET /swvary/su",
+ "GET /swvary/ch", "GET /swvary/ch", "GET /swvary/ch", "GET /swvary/ch", "GET /swvary/ch"]
+--- more_headers eval
+["sw-access-key: SWSCFIXTURE", "sw-access-key: SWSCFIXTURE", "", "", "sw-access-key: SWSCFIXTURE",
+ "sw-language-id: langfixture", "sw-language-id: langfixture", "", "", "sw-language-id: langfixture",
+ "sw-currency-id: curfixture", "sw-currency-id: curfixture", "", "", "sw-currency-id: curfixture",
+ "sw-include-seo-urls: 1", "sw-include-seo-urls: 1", "", "", "sw-include-seo-urls: 1",
+ "SW-Cache-Hash: hashfixture", "SW-Cache-Hash: hashfixture", "", "", "SW-Cache-Hash: hashfixture"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: }, qq{X-Cache: HIT}, qq{X-Cache: }]
+--- response_body_like eval
+[qr/^vary:/, qr/^vary:/, qr/:cur=:lang=$/, qr/:cur=:lang=$/, qr/^vary:/,
+ qr/:lang=langfixture$/, qr/:lang=langfixture$/, qr/:cur=:lang=$/, qr/:cur=:lang=$/, qr/:lang=langfixture$/,
+ qr/:cur=curfixture:/, qr/:cur=curfixture:/, qr/:cur=:lang=$/, qr/:cur=:lang=$/, qr/:cur=curfixture:/,
+ qr/^vary:/, qr/^vary:/, qr/:cur=:lang=$/, qr/:cur=:lang=$/, qr/^vary:/,
+ qr/^vary:/, qr/^vary:/, qr/:cur=:lang=$/, qr/:cur=:lang=$/, qr/^vary:/]
+--- error_code eval
+[200, 200, 200, 200, 200,
+ 200, 200, 200, 200, 200,
+ 200, 200, 200, 200, 200,
+ 200, 200, 200, 200, 200,
+ 200, 200, 200, 200, 200]
+
+
+
+=== TEST 14: NEGATIVE -- a Vary axis the preset does not own still refuses the store
+# /swvaryx/ sends the five axes plus sw-context-token. The rows satisfy only
+# their own names, so the unknown-axis veto must still hold for the sixth.
+# A sw-cache-hash COOKIE is not the sw-cache-hash HEADER row: the cookie
+# request keys its own bucket on /swvary/ and HITs it.
+--- http_config eval: $::HttpConfigExtra
+--- config eval: $::Config
+--- request eval
+["GET /swvaryx/home", "GET /swvaryx/home",
+ "GET /swvary/ck", "GET /swvary/ck"]
+--- more_headers eval
+["", "",
+ "Cookie: sw-cache-hash=c0ffee", "Cookie: sw-cache-hash=c0ffee"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: },
+ qq{X-Cache: }, qq{X-Cache: HIT}]
+--- error_code eval
+[200, 200, 200, 200]
+
+
+
+=== TEST 15: the shopware6 Vary rows do not leak into another backend's location
+# /wpvary/ runs the wordpress preset against the same five-axis origin. With
+# no header rows of its own, the unknown-axis veto refuses the page there.
+--- http_config eval: $::HttpConfigExtra
+--- config eval: $::Config
+--- request eval
+["GET /wpvary/home", "GET /wpvary/home"]
+--- response_headers eval
+[qq{X-Cache: }, qq{X-Cache: }]
 --- error_code eval
 [200, 200]

@@ -983,15 +983,35 @@ static const char *const  ct_kirby_args[] = { NULL };
  * Administration SPA. /store-api is the headless JSON API: it is context-sensitive
  * per sw-context-token and must never be shared.
  *
- * NO HEADER ROW, by decision (checked against v6.7.16.0). `sw-access-key` is
- * not a client identity: it names the SALES CHANNEL, ships inside every
- * headless frontend, and is read only for Store API routes
- * (SalesChannelAuthenticationListener.php:67-71, StoreApiRouteScope) and the
- * MCP endpoint, all under /store-api or /api, which the URI rows already
- * bypass. The per-client header is `sw-context-token`, and on Storefront
- * routes Shopware overwrites any client-sent value with the session's token
- * (SessionContextTokenAccessor.php:85), so it cannot select a private
- * Storefront page either.
+ * FIVE HEADER ROWS, for the Vary axes (checked against v6.7.16.0). Since
+ * 6.7.15 every response with a SalesChannelContext, Storefront included
+ * (CacheResponseSubscriber.php:84-90), carries
+ *
+ *     Vary: sw-access-key, sw-language-id, sw-currency-id,
+ *           sw-include-seo-urls, sw-cache-hash
+ *
+ * (CacheHeadersService.php:42-45, HttpCacheVariantHeaders.php:25-31). None is
+ * a whitelisted axis, so without these rows the unknown-axis veto refused
+ * every Storefront page and the preset cached nothing. A browser navigation
+ * sends none of the five: the Storefront derives language and currency from
+ * the domain. A client that DOES send one selects a different variant at the
+ * same URL -- RequestTransformer.php:241-243 lets any client-sent header,
+ * sw-language-id included, override the domain language,
+ * SalesChannelRequestContextResolver.php:60-73 honours sw-currency-id, and
+ * HttpCacheKeyGenerator.php:146-150 prefers an sw-cache-hash HEADER over the
+ * cookie keyed above. So the five bypass on presence, and as header rows
+ * they SATISFY the Vary for every header-less request (see `headers` in the
+ * preset struct). The sw-cache-hash header row is the request HEADER only;
+ * the cookie of the same name stays value-keyed.
+ *
+ * These rows are not identity checks. `sw-access-key` names the SALES
+ * CHANNEL, ships inside every headless frontend, and authenticates only Store
+ * API routes (SalesChannelAuthenticationListener.php:67-71, StoreApiRouteScope)
+ * and the MCP endpoint, all under /store-api or /api, which the URI rows
+ * already bypass. The per-client header is `sw-context-token`, and on
+ * Storefront routes Shopware overwrites any client-sent value with the
+ * session's token (SessionContextTokenAccessor.php:85), so it is not a row
+ * and a Vary naming it is still refused.
  *
  * The one EQ predicate: sw-cache-hash == "not-cacheable" (Event/
  * HttpCacheCookieEvent.php:20-25, HttpCacheKeyGenerator.php:158; set for pending
@@ -1011,6 +1031,10 @@ static const ngx_http_cache_turbo_cookie_pred_t  ct_shopware6_preds[] = {
     { "sw-cache-hash", NGX_HTTP_CACHE_TURBO_CVOP_EQ, "not-cacheable" },
     { NULL, 0, NULL }
 };
+/* The 6.7.15+ Vary axes (HttpCacheVariantHeaders::HEADERS); see above. */
+static const char *const  ct_shopware6_headers[] = {
+    "sw-access-key", "sw-language-id", "sw-currency-id",
+    "sw-include-seo-urls", "sw-cache-hash", NULL };
 
 /*
  * TYPO3 (v11..v14, re-checked against v14.3.10). Lazy sessions, confirmed at the strongest possible place: the
@@ -1969,7 +1993,7 @@ const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
       ct_kirby_cookies, ct_kirby_uris, ct_kirby_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_SHOPWARE6,
       ct_shopware6_cookies, ct_shopware6_uris, ct_shopware6_args,
-      ct_shopware6_preds, ct_shopware6_key_cookies, NULL },
+      ct_shopware6_preds, ct_shopware6_key_cookies, ct_shopware6_headers },
     { NGX_HTTP_CACHE_TURBO_BACKEND_TYPO3,
       ct_typo3_cookies, ct_typo3_uris, ct_typo3_args, NULL, NULL, NULL },
     { NGX_HTTP_CACHE_TURBO_BACKEND_INVISION,

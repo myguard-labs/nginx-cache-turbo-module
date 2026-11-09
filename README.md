@@ -951,7 +951,7 @@ storage; the trade is a lost cache hit, never a cacheable private request.
 | `drupal` †    | `/user`, `/admin`, `/node/add`, `/system/`, `/core/install.php`, `/jsonapi`, `/oauth` | — | `SESS` ¥ |
 | `mediawiki` † | — ¶ | `veaction`, `returnto`, mutating `action=` values ‡ | `Token=`, `_session=`, `UserID=` |
 | `magento` † ✦ | `/checkout`, `/customer`, `/graphql`, `/rest`, `/soap`, `/sales`, `/newsletter`, `/wishlist`, `/paypal`, `/review`, `/page_cache/block/esi`, `/health_check.php` | — | *(key)* `X-Magento-Vary` ✦ |
-| `shopware6` † ✦ ∆ | `/account`, `/checkout`, `/admin`, `/api`, `/store-api` | — | *(key)* `sw-cache-hash` ✦; *(value)* `sw-cache-hash` = `not-cacheable` ∆ |
+| `shopware6` † ✦ ∆ ◇ | `/account`, `/checkout`, `/admin`, `/api`, `/store-api` | — | *(key)* `sw-cache-hash` ✦; *(value)* `sw-cache-hash` = `not-cacheable` ∆; **◇ request headers** `sw-access-key`, `sw-language-id`, `sw-currency-id`, `sw-include-seo-urls`, `sw-cache-hash` bypass on presence and satisfy the 6.7.15+ `Vary` |
 | `ghost` † ◇   | `/ghost/`, `/members/`, `/p/`, `/r/` | `uuid`, `key`, `token`, `gift` | `ghost-members-ssr`, `ghost-admin-api-session`, `ghost-admin-toolbar`; **◇ request header** `X-Ghost-Preview` bypasses on presence |
 | `wagtail` † § | `/admin/`, `/django-admin/`, `/documents/` | — | `sessionid` |
 | `kirby` † §   | `/panel` | — | `kirby_session` |
@@ -1145,11 +1145,15 @@ all; `be_typo_user` and the `/typo3` entry point are configurable too
 (`BE/cookieName`, `BE/entryPoint`). `ADMCMD_prev`, the workspace-preview key,
 is matched as a cookie and a query argument. See [typo3.md](docs/typo3.md).
 
-◇ **A request-HEADER tier. Only `nextjs` changes what `Vary` accepts; `redmine`
-(`X-Redmine-API-Key`), `discourse` (`Api-Key`, `User-Api-Key`,
-`X-Shared-Session-Key`) and `ghost` (`X-Ghost-Preview`) use the same tier as a
-plain bypass-on-presence list that satisfies no `Vary` axis.** Next.js serves two different bodies at one URL: the HTML document,
-and — when the client router sends `RSC: 1` — the React Server Component
+◇ **A request-HEADER tier. `nextjs` and `shopware6` change what `Vary`
+accepts; `redmine` (`X-Redmine-API-Key`), `discourse` (`Api-Key`,
+`User-Api-Key`, `X-Shared-Session-Key`) and `ghost` (`X-Ghost-Preview`) use the
+same tier as a plain bypass-on-presence list whose names no stock origin sends
+in `Vary`. Header names match case-insensitively with `_` equal to `-`, so
+under `underscores_in_headers on` a spelling such as `Api_Key`, which Rack and
+PHP read as `Api-Key`, bypasses too.** Next.js serves two different bodies at
+one URL: the HTML document, and — when the client router sends `RSC: 1` —
+the React Server Component
 payload (`text/x-component`). Every App Router response therefore carries
 `Vary: rsc, next-router-state-tree, next-router-prefetch,
 next-router-segment-prefetch`. Default auto-Vary refuses axes it does not know,
@@ -1166,7 +1170,9 @@ ahead of the bypass (`cache_turbo_bypass_stale_uri`) refuses an RSC response.
 Any other unknown `Vary` axis still refuses the store, and no other preset or
 preset-free location accepts these axes. Browsers send none of these headers on
 a document navigation, so the tier costs no HTML hit. See
-[react.md](docs/react.md).
+[react.md](docs/react.md). `shopware6` uses the same mechanism for the five
+axes Shopware 6.7.15+ puts in `Vary` on every storefront page; see
+[shopware6.md](docs/shopware6.md#gotchas).
 
 So a WordPress admin (`wordpress_logged_in_…` cookie), a `?preview=true` draft, a
 `/wp-json/` API call, a WooCommerce cart cookie, a `/checkout` page, a logged-in

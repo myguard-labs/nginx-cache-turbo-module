@@ -37,6 +37,7 @@ handled natively and needs no cookie `map`.
 | Query args | — |
 | Key cookies (value folded into cache key) | `sw-cache-hash` |
 | Cookie value predicates (bypass) | `sw-cache-hash` equals `not-cacheable` |
+| Request headers (bypass on presence; satisfy `Vary`) | `sw-access-key`, `sw-language-id`, `sw-currency-id`, `sw-include-seo-urls`, `sw-cache-hash` |
 
 The one exception to "never bypassed" is the literal value `not-cacheable`: Shopware
 sets it (for example for pending flash messages) to mean "bypass the cache for
@@ -277,6 +278,21 @@ The copy stays fresh for `300s`; if the origin starts failing after that, the ex
   non-default currency, so each of those visitors is in its own key bucket on
   6.4–6.7 too. What you lose on <6.8 is Shopware's state-based *invalidation*
   hint, not segregation — keep `cache_turbo_valid` modest there.
+- **Shopware 6.7.15+ sends a five-axis `Vary` on every storefront page.**
+  `CacheHeadersService::applyCacheHeaders()` adds `Vary: sw-access-key,
+  sw-language-id, sw-currency-id, sw-include-seo-urls, sw-cache-hash` to every
+  sales-channel response (`CacheHeadersService.php:42-45`,
+  `HttpCacheVariantHeaders.php:25-31`, called from
+  `CacheResponseSubscriber.php:84-90`). None of these is an axis the module
+  can key on, so without the preset's header rows the unknown-axis `Vary` veto
+  refused every page. The preset bypasses any request that carries one of
+  those five request headers, so every stored and served copy has all five
+  absent and the `Vary` is satisfied. A browser sends none of them; a client
+  that does gets a different variant at the same URL (a client-sent
+  `sw-language-id` or `sw-currency-id` overrides the domain's, and an
+  `sw-cache-hash` header outranks the cookie), so it goes to the origin. The
+  `sw-cache-hash` _cookie_ is unaffected and stays value-keyed. Any other
+  `Vary` axis, `sw-context-token` included, still refuses the store.
 - **`/admin` here means Shopware's own administration SPA path**, distinct from
   the storefront. Unlike Magento, Shopware does not randomise this path.
 - **Prefer not to set `cache_turbo_cache_control ignore`.** It overrides the

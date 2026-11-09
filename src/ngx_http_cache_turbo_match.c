@@ -2003,6 +2003,37 @@ ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
 
 /* >>> FUZZ-EXTRACT auto-classify END (match.c portion) <<< */
 
+/* Header-name equality for the preset tier: ASCII case-insensitive, and '_'
+ * equal to '-' (see ngx_http_cache_turbo_auto_header_present). The caller
+ * has already matched the lengths. */
+static ngx_uint_t
+ngx_http_cache_turbo_hdr_name_eq(u_char *a, u_char *b, size_t n)
+{
+    u_char  c1, c2;
+
+    while (n--) {
+        c1 = ngx_tolower(*a);
+        c2 = ngx_tolower(*b);
+        a++;
+        b++;
+
+        if (c1 == '_') {
+            c1 = '-';
+        }
+
+        if (c2 == '_') {
+            c2 = '-';
+        }
+
+        if (c1 != c2) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
 /*
  * Preset tier 4: does the request carry ANY header named in `names` (the
  * compiled union of the active presets' headers[] rows)? Presence alone is the
@@ -2014,9 +2045,19 @@ ngx_http_cache_turbo_key_cookie(ngx_http_request_t *r,
  * still leave it on the wire to the upstream, and counting such a field as
  * present can only cost a cache hit, never serve a wrong representation.
  *
+ * Names compare case-insensitively AND with '_' and '-' as the same byte
+ * (ngx_http_cache_turbo_hdr_name_eq). Under `underscores_in_headers on`,
+ * nginx keeps an Api_Key field and forwards it; Rack's HTTP_* env keys and
+ * CGI-style gateways (nginx's own fastcgi param builder feeding PHP's HTTP_*
+ * variables) fold '-' and '_' alike, so the app reads it as Api-Key. An
+ * exact compare would let that spelling reach the origin authenticated while
+ * the cache treats the request as a guest. With the default
+ * `underscores_in_headers off` such fields never reach this list.
+ *
  * One walk of the request header list with the (short, <= a few entries)
- * name list as the inner loop. NULL `names` -- no active preset ships a
- * header row, the common case -- returns before touching the list.
+ * name list as the inner loop, a length test first and no allocation. NULL
+ * `names` -- no active preset ships a header row, the common case -- returns
+ * before touching the list.
  */
 ngx_int_t
 ngx_http_cache_turbo_auto_header_present(ngx_http_request_t *r,
@@ -2047,7 +2088,8 @@ ngx_http_cache_turbo_auto_header_present(ngx_http_request_t *r,
 
         for (j = 0; j < names->nelts; j++) {
             if (h[i].key.len == nm[j].len
-                && ngx_strncasecmp(h[i].key.data, nm[j].data, nm[j].len) == 0)
+                && ngx_http_cache_turbo_hdr_name_eq(h[i].key.data, nm[j].data,
+                                                    nm[j].len))
             {
                 return 1;
             }
