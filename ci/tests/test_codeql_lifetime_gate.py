@@ -35,6 +35,47 @@ def run(document, baseline, *args):
 
 
 class Gate(unittest.TestCase):
+    def test_action_extension_inventory(self):
+        document = json.loads((ROOT / "ci/tests/codeql-lifetime-action.sarif").read_text())
+        baseline = json.loads((ROOT / "ci/codeql/nginx-lifetime/baseline.json").read_text())
+        self.assertEqual(run(document, baseline).returncode, 0)
+        self.assertEqual(run(document, []).returncode, 1)
+        for field in ("path", "line", "column", "message"):
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(document))
+                item = changed["runs"][0]["results"][0]
+                location = item["locations"][0]["physicalLocation"]
+                if field == "path":
+                    location["artifactLocation"]["uri"] += "x"
+                elif field == "message":
+                    item["message"]["text"] += "x"
+                else:
+                    location["region"]["start" + field.title()] += 1
+                self.assertEqual(run(changed, baseline).returncode, 1)
+        document["runs"][0]["results"].append(result())
+        self.assertEqual(run(document, baseline).returncode, 1)
+
+    def test_invalid_rule_references_and_inventories(self):
+        original = json.loads((ROOT / "ci/tests/codeql-lifetime-action.sarif").read_text())
+        for mutation in ("duplicate", "missing", "index", "id", "component", "malformed"):
+            with self.subTest(mutation=mutation):
+                document = json.loads(json.dumps(original))
+                run_data = document["runs"][0]
+                rules = run_data["tool"]["extensions"][1]["rules"]
+                if mutation == "duplicate":
+                    rules.append(rules[0])
+                elif mutation == "missing":
+                    rules.pop()
+                elif mutation == "index":
+                    run_data["results"][0]["rule"]["index"] = 1
+                elif mutation == "id":
+                    run_data["results"][0]["rule"]["id"] = FIRST
+                elif mutation == "component":
+                    run_data["results"][0]["rule"]["toolComponent"]["index"] = 0
+                else:
+                    run_data["tool"]["extensions"] = {}
+                self.assertEqual(run(document, []).returncode, 2)
+
     def test_empty_and_exact_baseline_pass(self):
         self.assertEqual(run(sarif([]), []).returncode, 0)
         self.assertEqual(run(sarif([result()]), [result()]).returncode, 0)

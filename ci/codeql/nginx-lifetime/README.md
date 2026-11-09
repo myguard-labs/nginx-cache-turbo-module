@@ -49,8 +49,7 @@ Request-lifetime detectors for this module (plan row BP-E1). They complement
   read `r->connection` there. Moving those declarations below the check would
   change the release objects, which must stay byte-identical. Only the SSCAN
   page delivery in `redis_read_sscan`, whose check is the first use of
-  `op->request`, is no longer reported. Wire query (a) as a gate now. Query
-  (b) waits for BP-W1, which must clear or accept those four reports first.
+  `op->request`, is no longer reported.
 
 ## Running
 
@@ -78,9 +77,15 @@ with CodeQL CLI 2.26.4 and `codeql/cpp-all` 12.0.3.
 
 The CI lifetime lane builds the module database once, runs both queries, and
 uploads `codeql-lifetime-sarif` even when findings fail the gate. The baseline
-is deliberately empty pending the first current-main SARIF: the known four
-initializer findings therefore keep this draft gate red until each exact result
-is reviewed and recorded. The gate also rejects missing or malformed results,
-a missing query, analysis errors, and any additional finding. The fixture tests
-and a separate fixture database exercise the 9c32123 shape and require the gate
-to reject it. The monthly `codeql.yml` security scan remains separate.
+contains exactly the four reviewed initializer-copy findings from current-main
+SARIF. These reads precede the check and are accepted as existing findings;
+the check does not protect the preceding copies, and three callbacks also read
+`r->connection` before it. The walk callback returns early when detached before
+reaching its check. Keeping these declarations in place preserves release object
+semantics. Each accepted identity includes the rule, path, line, column and
+message; any change produces a new finding for review. The gate accepts query
+inventories in the SARIF driver or extensions and rejects ambiguous references,
+missing or malformed results, a missing query, analysis errors, and any
+additional finding. The fixture tests and a separate fixture database exercise
+the 9c32123 shape and require the gate to reject it. The monthly `codeql.yml`
+security scan remains separate.

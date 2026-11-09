@@ -30,19 +30,81 @@ def finding(result):
     return rule, uri, line, column, message
 
 
+def inventory(tool):
+    driver = tool["driver"]
+    extensions = tool.get("extensions", [])
+    if not isinstance(driver, dict) or not isinstance(extensions, list):
+        raise TypeError("invalid tool components")
+    components = [driver, *extensions]
+    inventories = []
+    for component in components:
+        rules = component.get("rules", [])
+        if not isinstance(rules, list):
+            raise TypeError("invalid rule inventory")
+        ids = [item["id"] for item in rules]
+        if any(not isinstance(rule, str) or not rule for rule in ids):
+            raise ValueError("invalid rule id")
+        inventories.append(ids)
+    all_rules = [rule for rules in inventories for rule in rules]
+    if len(all_rules) != len(set(all_rules)) or set(all_rules) != RULES:
+        raise ValueError("query inventory mismatch: " + repr(sorted(all_rules)))
+    return inventories
+
+
+def valid_index(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def component_index(reference, tool):
+    component = reference.get("toolComponent")
+    if component is None:
+        return 0
+    index = component["index"]
+    if not valid_index(index):
+        raise ValueError("invalid component index")
+    selected = tool["extensions"][index]
+    if any(component[key] != selected.get(key) for key in ("name", "guid")
+           if key in component):
+        raise ValueError("conflicting component reference")
+    return index + 1
+
+
+def validate_reference(result, inventories, tool):
+    rule_id = result["ruleId"]
+    reference = result.get("rule")
+    if reference is None:
+        if rule_id not in RULES:
+            raise ValueError("invalid rule reference")
+        if "ruleIndex" in result:
+            index = result["ruleIndex"]
+            if not valid_index(index) or inventories[0][index] != rule_id:
+                raise ValueError("invalid legacy rule index")
+        return
+    if not isinstance(reference, dict) or reference.get("id", rule_id) != rule_id:
+        raise ValueError("conflicting rule reference")
+    index = reference["index"]
+    if not valid_index(index):
+        raise ValueError("invalid rule index")
+    component_index_value = component_index(reference, tool)
+    if inventories[component_index_value][index] != rule_id:
+        raise ValueError("conflicting rule index")
+    if "ruleIndex" in result and result["ruleIndex"] != index:
+        raise ValueError("conflicting legacy rule index")
+
+
 def evaluate(sarif, baseline, expected=None):
     if (sarif["version"] != "2.1.0" or not isinstance(sarif["runs"], list)
             or len(sarif["runs"]) != 1):
         raise ValueError("expected one SARIF 2.1.0 run")
     run = sarif["runs"][0]
-    rules = {item["id"] for item in run["tool"]["driver"]["rules"]}
-    if rules != RULES:
-        raise ValueError("query inventory mismatch: " + repr(sorted(rules)))
+    inventories = inventory(run["tool"])
     if any(not invocation.get("executionSuccessful", False)
            for invocation in run.get("invocations", [])):
         raise ValueError("analysis invocation failed")
     if not isinstance(run["results"], list) or not isinstance(baseline, list):
         raise TypeError("results and baseline must be lists")
+    for result in run["results"]:
+        validate_reference(result, inventories, run["tool"])
     current = Counter(finding(result) for result in run["results"])
     accepted = Counter(finding(result) for result in baseline)
     if expected and not any(key[0] == expected for key in current):
