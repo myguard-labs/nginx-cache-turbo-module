@@ -20,9 +20,9 @@ USAGE
         --port 18990 \
         test_5xx_never_overwrites_cached_body
 
-    Multiple names are allowed. Every flag that test_runtime.py accepts is
-    passed through unchanged (--redis-server, --memcached-server,
-    --single-process, --sanitizer, ...), so an L2-dependent test still works:
+    Multiple names are allowed. Runtime fixture flags are passed through
+    unchanged (--redis-server, --memcached-server, --single-process,
+    --sanitizer, ...), so an L2-dependent test still works:
 
     python3 ci/tools/run_named.py ... --redis-server /usr/bin/redis-server NAME
 
@@ -30,6 +30,7 @@ INPUTS / OUTPUTS
     Exit 0 = every named test passed. Non-zero = a test raised (traceback on
     stderr, same as the real suite). Prints one "PASS <name>" line per test.
     No files written; the fixture tree lives in a TemporaryDirectory.
+    --timings is unsupported by this named-test runner and is rejected.
 
 SIDE EFFECTS
     Starts nginx (+ optionally redis/memcached) on --port and neighbours
@@ -152,6 +153,9 @@ def main() -> int:
 
     sys.argv = [sys.argv[0]] + passthrough
     args = T.parse_args()
+    if args.timings:
+        print("--timings is not supported by run_named.py", file=sys.stderr)
+        return 2
 
     binary = pathlib.Path(args.nginx_binary).resolve()
     module = pathlib.Path(args.module).resolve() if args.module else None

@@ -722,6 +722,12 @@ def run_all(ng: Nginx, origin: Origin,
     test_admin_purge_all(ng)   # last: it empties the zone
 
 
+def _print_timings(timings: list[tuple[str, float]]) -> None:
+    print("TIMING TOP 20", flush=True)
+    for name, elapsed in sorted(timings, key=lambda item: item[1], reverse=True)[:20]:
+        print(f"TIMING TOP {name} {elapsed:.6f}s", flush=True)
+
+
 def main() -> int:
     args = parse_args()
     binary = pathlib.Path(args.nginx_binary).resolve()
@@ -834,9 +840,14 @@ def main() -> int:
             ng.write_config()
             ng.config_test()
             ng.start()
-            _instrument(origin)   # DIAG: socket-flake attribution
-            run_all(ng, origin, redis, redis_auth, redis_tls, mc,
-                    redis_tls_untrusted, redis_tls_expired)
+            timings: list[tuple[str, float]] | None = [] if args.timings else None
+            _instrument(origin, timings, globals() if args.timings else None)
+            try:
+                run_all(ng, origin, redis, redis_auth, redis_tls, mc,
+                        redis_tls_untrusted, redis_tls_expired)
+            finally:
+                if timings is not None:
+                    _print_timings(timings)
             time.sleep(0.2)
             ng.stop()
             ng.assert_clean_logs()
