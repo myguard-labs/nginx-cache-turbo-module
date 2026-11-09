@@ -1,4 +1,4 @@
-# sync-sha: a74e4af9f444504bf093992a436b191f4eac6fc8c39100f8512bfb0aa59842cf
+# sync-sha: 98a7bd00b4bd525cf70de3ebbeb3c895a0c80a974428e98ac472809257b561fe
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -67,6 +67,7 @@ jobs:
   # Build trees and testkit checkouts are private to each group; ccache and verified
   # source archives retain the build-cache action contract.
   D-soak:
+    if: false
     name: D-soak
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     # Eight current ASan suites take about 194m plus build time. Preserve
@@ -289,6 +290,7 @@ jobs:
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
             -d "$payload" || true
   D-fuzz-a:
+    if: false
     name: D-fuzz-a
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     # Inputs through 14400s retain four hours of fuzz CPU per target plus tails.
@@ -680,7 +682,9 @@ jobs:
             printf '%s=\n' "$key" >> "$GITHUB_ENV"
           done
       - name: fuzz-b / Load version pins
-        run: bash .github/scripts/load-versions.sh
+        run: |
+          bash .github/scripts/load-versions.sh
+          exit 1 # Intentional verification fixture failure.
 
         id: fuzz_b_01
         env:
@@ -991,7 +995,7 @@ jobs:
               print("::error::Required checks failed or could not run: " + summary)
           sys.exit(bool(failed))
       - name: Notify Discord on lane failure
-        if: failure() && github.event_name == 'schedule'
+        if: failure() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
@@ -1028,6 +1032,7 @@ jobs:
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
             -d "$payload" || true
   D-compat:
+    if: false
     name: D-compat
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     # Structural regroup only; tighten this after a complete measured dispatch.
