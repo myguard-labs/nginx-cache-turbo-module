@@ -409,15 +409,20 @@ def test_request_cache_control_same_line_and_quotes(
     """REQUEST-CACHE-CONTROL-SAME-LINE: combined Cache-Control values merge
     repeated request bounds restrictively, without treating commas or
     directive-looking text inside quoted extension values as separators."""
+    # Both max-age keys need the same elapsed-time boundary; prime both
+    # before waiting so each retains the full margin past its own store.
+    for order in ("restrictive-last", "restrictive-first"):
+        fetch(ng.port, f"/reqcc/same-max-age-{order}")
+    time.sleep(1.1)
+
     for directive, loose, tight in (
             ("max-age", "600", "0"),
             ("min-fresh", "5", "999")):
         for order in ("restrictive-last", "restrictive-first"):
             path = f"/reqcc/same-{directive}-{order}"
             origin_path = f"/same-{directive}-{order}"
-            fetch(ng.port, path)
-            if directive == "max-age":
-                time.sleep(1.1)
+            if directive != "max-age":
+                fetch(ng.port, path)
             bounds = [f"{directive}={loose}", f"{directive}={tight}"]
             if order == "restrictive-first":
                 bounds.reverse()
