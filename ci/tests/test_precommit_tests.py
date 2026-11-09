@@ -299,6 +299,22 @@ class AreaL2(unittest.TestCase):
         return sh("--map", str(self.root / "map.tsv"), "--files", "src/x.c",
                   root=self.root, env=e)
 
+    def test_policy_clean_tag_index_precedes_drop_in_area_selection(self):
+        # Exercise the actual selector with the real policy source and a stub
+        # runner; no nginx or Redis state is needed to inspect its arguments.
+        policy = REPO / "ci/tools/areas/policy.py"
+        (self.root / "ci/tools/areas/fx.py").write_text(policy.read_text())
+        ngx = self.root / ".build/nginx-9.9.9/objs/nginx"
+        ngx.write_text("#!/bin/sh\necho NGX_HTTP_CACHE_TURBO_TEST_FAULTS=1\n")
+        r = self.run_sel({"PRECOMMIT_REDIS_SERVER": "fake-redis",
+                          "PRECOMMIT_MEMCACHED_SERVER": "fake-mc"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = next(line for line in r.stdout.splitlines()
+                    if line.startswith("RUN ")).split()
+        clean = "test_tagidx_purge_reports_degraded_after_dropped_index_write"
+        mutator = "test_l9_tag_index_drop_is_observable"
+        self.assertLess(args.index(clean), args.index(mutator))
+
     def test_trailing_comment_after_signature_still_lists_test(self):
         r = self.run_sel({"PRECOMMIT_REDIS_SERVER": "fake-redis",
                           "PRECOMMIT_MEMCACHED_SERVER": "fake-mc"})
