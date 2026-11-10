@@ -1034,36 +1034,51 @@ class RedisMonitor:
         self._lines: list[str] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._pending = b""
 
     def __enter__(self) -> RedisMonitor:
         self._sock = socket.create_connection(("127.0.0.1", self.redis.port), 5)
         self._sock.settimeout(0.2)
         if self.redis.password:
             self._send(b"AUTH", self.redis.password.encode())
-        self._send(b"MONITOR")
+        ready = self._send(b"MONITOR")
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        time.sleep(0.1)  # let MONITOR register before the caller issues traffic
+        # A complete acknowledgement means Redis registered MONITOR already.
+        # Keep the old settling delay if the reply was partial or absent.
+        if not ready:
+            time.sleep(0.1)
         return self
 
-    def _send(self, *args: bytes) -> None:
+    def _send(self, *args: bytes) -> bool:
         cmd = b"*%d\r\n" % len(args)
         for a in args:
             cmd += b"$%d\r\n%s\r\n" % (len(a), a)
         assert self._sock is not None
+        self._pending = b""
         self._sock.sendall(cmd)
         # drain the one-line reply (+OK or the MONITOR banner)
         deadline = time.time() + 2.0
         while time.time() < deadline:
             try:
-                if self._sock.recv(4096):
-                    return
+                reply = self._sock.recv(4096)
+                if reply:
+                    ready = reply.startswith(b"+OK\r\n")
+                    if ready:
+                        self._pending = reply[len(b"+OK\r\n"):]
+                    return ready
             except TimeoutError:
                 continue
+        return False
 
     def _run(self) -> None:
-        buf = b""
+        buf = self._pending
+        self._pending = b""
         assert self._sock is not None
+        while b"\r\n" in buf:
+            line, buf = buf.split(b"\r\n", 1)
+            with self._lock:
+                self._lines.append(line.decode(errors="replace"))
         while not self._stop.is_set():
             try:
                 chunk = self._sock.recv(65536)
