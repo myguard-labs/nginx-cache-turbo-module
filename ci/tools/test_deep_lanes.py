@@ -271,6 +271,8 @@ class DeepLanes(unittest.TestCase):
                         step["env"]["TESTKIT_ROOT"],
                         "${{ github.workspace }}/.testkit-" + group,
                     )
+                if step["name"].endswith("Check out nginx-module-testkit"):
+                    self.assertEqual(step["with"]["path"], ".testkit-" + group)
                 if step["name"].endswith(
                     "Restore build caches"
                 ) and not group.startswith("fuzz-"):
