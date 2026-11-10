@@ -1035,6 +1035,7 @@ class RedisMonitor:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._pending = b""
+        self._pending_replies = 0
 
     def __enter__(self) -> RedisMonitor:
         self._sock = socket.create_connection(("127.0.0.1", self.redis.port), 5)
@@ -1044,6 +1045,9 @@ class RedisMonitor:
         ready = self._send(b"MONITOR")
         while b"\r\n" in self._pending:
             line, self._pending = self._pending.split(b"\r\n", 1)
+            if self._pending_replies:
+                self._pending_replies -= 1
+                continue
             with self._lock:
                 self._lines.append(line.decode(errors="replace"))
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -1059,21 +1063,25 @@ class RedisMonitor:
         for a in args:
             cmd += b"$%d\r\n%s\r\n" % (len(a), a)
         assert self._sock is not None
-        self._pending = b""
         self._sock.sendall(cmd)
-        # drain the one-line reply (+OK or the MONITOR banner)
+        # Redis replies in command order.  Keep timed-out replies in that order
+        # so a late AUTH acknowledgement cannot satisfy the MONITOR command.
+        self._pending_replies += 1
         deadline = time.time() + 2.0
-        while time.time() < deadline:
+        while True:
+            while self._pending_replies and b"\r\n" in self._pending:
+                reply, self._pending = self._pending.split(b"\r\n", 1)
+                self._pending_replies -= 1
+                if not self._pending_replies:
+                    return reply == b"+OK"
+            if time.time() >= deadline:
+                return False
             try:
-                reply = self._sock.recv(4096)
-                if reply:
-                    ready = reply.startswith(b"+OK\r\n")
-                    if ready:
-                        self._pending = reply[len(b"+OK\r\n"):]
-                    return ready
+                chunk = self._sock.recv(4096)
+                if chunk:
+                    self._pending += chunk
             except TimeoutError:
                 continue
-        return False
 
     def _run(self) -> None:
         buf = self._pending
@@ -1091,6 +1099,9 @@ class RedisMonitor:
             buf += chunk
             while b"\r\n" in buf:
                 line, buf = buf.split(b"\r\n", 1)
+                if self._pending_replies:
+                    self._pending_replies -= 1
+                    continue
                 with self._lock:
                     self._lines.append(line.decode(errors="replace"))
 

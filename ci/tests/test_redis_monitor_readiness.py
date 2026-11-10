@@ -29,16 +29,27 @@ class RedisMonitorReadiness(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_partial_or_unexpected_reply_retains_delay(self):
-        for reply in (b"+", b"+OK\r", b"-ERR denied\r\n", b"other"):
+        for reply in (b"+", b"+OK\r", b"other"):
             with self.subTest(reply=reply):
                 mon = self.monitor()
                 sock = mock.Mock()
-                sock.recv.return_value = reply
+                sock.recv.side_effect = [reply, TimeoutError]
                 with mock.patch.object(base.socket, "create_connection", return_value=sock), \
                      mock.patch.object(base.threading, "Thread"), \
+                     mock.patch.object(
+                         base.time, "time", side_effect=[10.0, 10.0, 11.0, 12.0]), \
                      mock.patch.object(base.time, "sleep") as sleep:
                     mon.__enter__()
                 sleep.assert_called_once_with(0.1)
+
+        mon = self.monitor()
+        sock = mock.Mock()
+        sock.recv.return_value = b"-ERR denied\r\n"
+        with mock.patch.object(base.socket, "create_connection", return_value=sock), \
+             mock.patch.object(base.threading, "Thread"), \
+             mock.patch.object(base.time, "sleep") as sleep:
+            mon.__enter__()
+        sleep.assert_called_once_with(0.1)
 
     def test_timeout_retains_deadline_and_delay(self):
         mon = self.monitor()
@@ -75,9 +86,12 @@ class RedisMonitorReadiness(unittest.TestCase):
     def test_auth_precedes_monitor_and_only_monitor_ack_controls_delay(self):
         mon = self.monitor(password="fixture-only")
         sock = mock.Mock()
-        sock.recv.side_effect = [b"+OK\r\n", b"+"]
+        sock.recv.side_effect = [b"+OK\r\n", b"+", TimeoutError]
         with mock.patch.object(base.socket, "create_connection", return_value=sock), \
              mock.patch.object(base.threading, "Thread"), \
+             mock.patch.object(
+                 base.time, "time",
+                 side_effect=[10.0, 10.0, 20.0, 20.0, 21.0, 22.0]), \
              mock.patch.object(base.time, "sleep") as sleep:
             mon.__enter__()
         self.assertEqual(sock.sendall.call_args_list, [
@@ -85,6 +99,46 @@ class RedisMonitorReadiness(unittest.TestCase):
             mock.call(b"*1\r\n$7\r\nMONITOR\r\n"),
         ])
         sleep.assert_called_once_with(0.1)
+
+    def test_fragmented_auth_reply_preserves_monitor_order(self):
+        mon = self.monitor(password="fixture-only")
+        sock = mock.Mock()
+        sock.recv.side_effect = [b"+O", b"K\r\n", b"+OK\r\n"]
+        with mock.patch.object(base.socket, "create_connection", return_value=sock), \
+             mock.patch.object(base.threading, "Thread"), \
+             mock.patch.object(base.time, "sleep") as sleep:
+            mon.__enter__()
+        self.assertEqual(sock.recv.call_count, 3)
+        sleep.assert_not_called()
+
+    def test_late_auth_reply_after_timeout_does_not_mark_monitor_ready(self):
+        mon = self.monitor(password="fixture-only")
+        sock = mock.Mock()
+        sock.recv.return_value = b"+OK\r\n"
+        with mock.patch.object(base.socket, "create_connection", return_value=sock), \
+             mock.patch.object(base.threading, "Thread"), \
+             mock.patch.object(
+                 base.time, "time", side_effect=[10.0, 12.0, 20.0, 20.0, 22.0]), \
+             mock.patch.object(base.time, "sleep") as sleep:
+            mon.__enter__()
+        self.assertEqual(sock.recv.call_count, 1)
+        sleep.assert_called_once_with(0.1)
+        self.assertEqual(mon._pending_replies, 1)
+
+    def test_late_auth_and_monitor_ack_preserve_coalesced_traffic(self):
+        mon = self.monitor(password="fixture-only")
+        sock = mock.Mock()
+        sock.recv.return_value = (
+            b'+OK\r\n+OK\r\n123 [0 client] "GET" "key"\r\n')
+        with mock.patch.object(base.socket, "create_connection", return_value=sock), \
+             mock.patch.object(base.threading, "Thread"), \
+             mock.patch.object(
+                 base.time, "time", side_effect=[10.0, 12.0, 20.0, 20.0]), \
+             mock.patch.object(base.time, "sleep") as sleep:
+            mon.__enter__()
+        self.assertEqual(mon.commands_seen(), ["GET"])
+        self.assertEqual(mon._pending_replies, 0)
+        sleep.assert_not_called()
 
     def test_ack_prefix_with_trailing_data_is_ready(self):
         mon = self.monitor()
