@@ -2839,14 +2839,15 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # S7.2: $cache_turbo_serve_reason coverage, FRESH/STALE arms. Same
-        # shape as /ctstale/ (1s fresh -> x4=4s stale, beta 1 so the refresh
-        # dice never fires) but on the private sr72z zone. Drives
-        # test_serve_reason_variable.
+        # S7.2: $cache_turbo_serve_reason coverage, FRESH/STALE arms.
+        # A 2s fresh window gives the strict FRESH probe one full native
+        # integer-second clock tick of guard; x4 keeps an 8s stale window for
+        # the strict STALE probe. Beta 1 keeps the refresh dice from firing.
+        # Drives test_serve_reason_variable.
         location /sr72/ {{
             cache_turbo        sr72z;
             cache_turbo_key    $uri;
-            cache_turbo_valid  1s;
+            cache_turbo_valid  2s;
             cache_turbo_beta   1;
             # S231-DEFAULTS: pinned off explicitly. This location does not
             # exercise the breaker; left at the (now shipped-on) default it

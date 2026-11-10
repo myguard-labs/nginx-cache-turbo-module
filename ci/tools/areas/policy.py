@@ -3326,8 +3326,8 @@ def test_serve_reason_variable(ng: Nginx, origin: Origin) -> None:
     priming (expects CLOSED, then trips it itself) is not polluted by another
     test's already-tripped breaker.
 
-    FRESH  : /sr72/ second fetch, within the 1s fresh window.
-    STALE  : /sr72/ third fetch, past fresh (1s) but within the x4=4s stale
+    FRESH  : /sr72/ second fetch, within the 2s fresh window.
+    STALE  : /sr72/ third fetch, past fresh (2s) but within the x4=8s stale
              window (beta 1 keeps the refresh dice from firing, same
              discipline as test_status_stale).
     STALE-IF-ERROR : /sr72sie/ fully expired (past the stale_mult-1 1s stale window) with
@@ -3349,24 +3349,23 @@ def test_serve_reason_variable(ng: Nginx, origin: Origin) -> None:
     fetch(ng.port, "/sr72/k1")                    # prime: MISS (SR_NONE, no
                                                     # unfolded reason for a cold
                                                     # miss -- not asserted here)
-    t_store = time.monotonic()                    # 1s fresh clock starts here
+    t_store = time.monotonic()                    # 2s fresh clock starts here
     _, _, h_fresh = fetch(ng.port, "/sr72/k1")
-    # TTL-FRESH-RACE (2026-08-24, asan-soak iteration 2/8): /sr72/ has a 1s
-    # fresh window and this read must land INSIDE it. Under ASan +
-    # fault-injection the prime and this re-read together can exceed 1s, and
-    # the entry is then legitimately STALE -- a slow box, not a broken
-    # $cache_turbo_serve_reason. Same near-edge class as the TTL-REVAL-RACE
-    # note on test_rfc1_request_max_stale, but this arm cannot be fixed by
-    # sleeping longer (it needs to be EARLY, not late), so the elapsed time is
-    # asserted as an explicit timing precondition instead. NOT scaled through
-    # sanitizer_time_scale(): that helper stretches how long the TEST waits,
-    # but this budget is a deadline the SERVER enforces -- cache_turbo_valid
-    # 1s is real wall-clock under every build, so widening it here would just
-    # let a genuinely-stale read through to fail the assertion below instead.
+    # TTL-FRESH-RACE (2026-08-24 and 2026-11-10, asan-soak): the native cache
+    # clock stores integer-second deadlines. With a 1s TTL, an immediate read
+    # that crosses the next integer-second boundary is legitimately STALE even
+    # when the measured request elapsed time is well below 1s. The dedicated
+    # 2s fixture window leaves one whole clock tick of guard while the strict
+    # elapsed < 1s precondition still proves the read must be FRESH. This arm
+    # cannot be fixed by sleeping longer (it needs to be EARLY, not late), so
+    # the elapsed time remains an explicit timing precondition. It is NOT
+    # scaled through sanitizer_time_scale(): that helper stretches test waits,
+    # while this budget is the real wall-clock deadline enforced by the server.
     elapsed = time.monotonic() - t_store
     assert elapsed < 1.0, \
-        ("TIMING PRECONDITION violated: box too slow to read back inside the "
-         f"1s fresh window -- elapsed={elapsed:.3f}s since store. This is an "
+        ("TIMING PRECONDITION violated: box exceeded the 1s read-back budget "
+         f"inside the 2s fresh window -- elapsed={elapsed:.3f}s since store. "
+         "This is an "
          "environment speed problem, not a "
          "module-behaviour failure; do not read the assertion below as "
          "evidence $cache_turbo_serve_reason mis-reports FRESH.")
@@ -3374,7 +3373,7 @@ def test_serve_reason_variable(ng: Nginx, origin: Origin) -> None:
         f"fresh serve should report FRESH, got {h_fresh.get('x-ct-reason')}"
 
     # STALE
-    time.sleep(1.3)                                # past fresh, within 4s stale
+    time.sleep(2.3)                                # past fresh, within 8s stale
     _, _, h_stale = fetch(ng.port, "/sr72/k1")
     assert h_stale.get("x-ct-reason") == "STALE", \
         f"stale serve should report STALE, got {h_stale.get('x-ct-reason')}"
