@@ -93,6 +93,22 @@ class RedisMonitorReadiness(unittest.TestCase):
         self.assertTrue(mon._send(b"MONITOR"))
         self.assertEqual(mon._pending, b'123 [0 client] "PING"\r\n')
 
+    def test_checkpoint_excludes_complete_coalesced_lines(self):
+        mon = self.monitor()
+        sock = mock.Mock()
+        sock.recv.side_effect = [
+            b'+OK\r\n123 [0 client] "AUTH"\r\n124 [0 client] "GE',
+            b'T" "key"\r\n',
+            b'',
+        ]
+        with mock.patch.object(base.socket, "create_connection", return_value=sock), \
+             mock.patch.object(base.threading, "Thread"):
+            mon.__enter__()
+            self.assertEqual(mon.commands_seen(), ["AUTH"])
+            mon.checkpoint()
+            mon._run()
+        self.assertEqual(mon.commands_seen(), ["GET"])
+
     def test_socket_reader_captures_coalesced_traffic_and_closes(self):
         client, server = socket.socketpair()
         captured = threading.Event()

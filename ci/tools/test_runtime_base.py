@@ -1042,6 +1042,10 @@ class RedisMonitor:
         if self.redis.password:
             self._send(b"AUTH", self.redis.password.encode())
         ready = self._send(b"MONITOR")
+        while b"\r\n" in self._pending:
+            line, self._pending = self._pending.split(b"\r\n", 1)
+            with self._lock:
+                self._lines.append(line.decode(errors="replace"))
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         # A complete acknowledgement means Redis registered MONITOR already.
@@ -1075,10 +1079,6 @@ class RedisMonitor:
         buf = self._pending
         self._pending = b""
         assert self._sock is not None
-        while b"\r\n" in buf:
-            line, buf = buf.split(b"\r\n", 1)
-            with self._lock:
-                self._lines.append(line.decode(errors="replace"))
         while not self._stop.is_set():
             try:
                 chunk = self._sock.recv(65536)
