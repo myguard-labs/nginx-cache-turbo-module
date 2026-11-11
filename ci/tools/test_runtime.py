@@ -17,6 +17,8 @@ Both properties come from the star-imports below; keep them.
 
 from __future__ import annotations
 
+import traceback
+
 from areas.admin import *
 from areas.breaker import *
 from areas.core import *
@@ -824,6 +826,7 @@ def main() -> int:
                        redis_tls_expired_port if redis_tls_expired else None))
         ng.sanitizer = args.sanitizer
 
+        body_failed = False
         try:
             origin.start()
             if redis is not None:
@@ -851,21 +854,23 @@ def main() -> int:
             time.sleep(0.2)
             ng.stop()
             ng.assert_clean_logs()
+        except BaseException:
+            body_failed = True
+            raise
         finally:
-            ng.stop()
-            if redis is not None:
-                redis.stop()
-            if redis_auth is not None:
-                redis_auth.stop()
-            if redis_tls is not None:
-                redis_tls.stop()
-            if redis_tls_untrusted is not None:
-                redis_tls_untrusted.stop()
-            if redis_tls_expired is not None:
-                redis_tls_expired.stop()
-            if mc is not None:
-                mc.stop()
-            origin.stop()
+            cleanup_error = None
+            for fixture in (ng, redis, redis_auth, redis_tls,
+                            redis_tls_untrusted, redis_tls_expired, mc, origin):
+                if fixture is None:
+                    continue
+                try:
+                    fixture.stop()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    traceback.print_exception(type(error), error, error.__traceback__)
+            if cleanup_error is not None and not body_failed:
+                raise cleanup_error
 
         if fixture_skips:
             print(f"FIXTURE SUMMARY: {len(fixture_skips)} skipped: "
