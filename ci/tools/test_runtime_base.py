@@ -666,6 +666,53 @@ class Nginx:
             f"reload: workers did not turn over within {timeout}s "
             f"(before={sorted(before)}, now={sorted(self.worker_pids())})")
 
+    def _capture_shutdown(self) -> None:
+        """Save bounded, allowlisted evidence while the timed-out process lives."""
+        if not _BREADCRUMB or self.process is None:
+            return
+        proc = pathlib.Path("/proc") / str(self.process.pid)
+        lines = [f"pid={self.process.pid}"]
+        try:
+            tasks = []
+            for entry in (proc / "task").iterdir():
+                if entry.name.isdecimal():
+                    tasks.append(int(entry.name))
+                    if len(tasks) == 64:
+                        break
+        except OSError:
+            tasks = []
+        for tid in tasks:
+            task = proc / "task" / str(tid)
+            for name in ("status", "wchan"):
+                try:
+                    with (task / name).open(encoding="ascii", errors="replace") as fh:
+                        value = fh.read(4096)
+                    if name == "status":
+                        match = re.search(r"^State:\s*([A-Z])", value, re.MULTILINE)
+                    else:
+                        match = re.fullmatch(r"([a-zA-Z0-9_]{1,64})\s*", value)
+                    if match:
+                        lines.append(f"tid={tid} {name}={match.group(1)}")
+                except OSError:
+                    pass
+        # Emit only fixed nginx shutdown markers, never arbitrary log text.
+        for path in (self.output_path, self.root / "logs" / "error.log"):
+            try:
+                with path.open("rb") as fh:
+                    fh.seek(0, 2)
+                    fh.seek(max(0, fh.tell() - 16384))
+                    tail = fh.read(16384)
+                for marker in (b"signal 15 (SIGTERM) received", b"exiting",
+                               b"exit process", b"worker process is shutting down"):
+                    count = tail.count(marker)
+                    if count:
+                        lines.append(f"{path.name}: {marker.decode('ascii')} count={count}")
+            except OSError:
+                pass
+        dest = pathlib.Path(_BREADCRUMB).parent / f"shutdown-{self.process.pid}.txt"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("\n".join(lines) + "\n", encoding="ascii")
+
     def stop(self) -> None:
         if self.process is None:
             return
@@ -674,6 +721,10 @@ class Nginx:
             try:
                 self.process.wait(timeout=15)
             except subprocess.TimeoutExpired:
+                try:
+                    self._capture_shutdown()
+                except Exception:  # noqa: BLE001, S110 -- cleanup must proceed
+                    pass
                 self.process.kill()
                 self.process.wait(timeout=5)
         rc = self.process.returncode
