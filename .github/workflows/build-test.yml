@@ -1,4 +1,4 @@
-# sync-sha: 5f0aa9155fea5008f71cdbf9752c73870deea03160cfd8bcf2ecd0b0272f3fa9
+# sync-sha: 1bafac74601533b60a3c5551ddc5e8aa52e685df9c8c1f38df43edb2ee4ade21
 name: Build & Test
 
 # Lane L-build (CI-L3). One job, sequential, no artifact hop: build, unit
@@ -232,7 +232,7 @@ jobs:
                 --module "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/ngx_http_cache_turbo_module.so" \
                 --redis-server /usr/bin/redis-server \
                 --memcached-server /usr/bin/memcached \
-                | tee runtime-suite.log
+                2>&1 | tee runtime-suite.log
             '
 
       - name: Assert the requested fixture set actually came up (AUD-TESTFIX1)

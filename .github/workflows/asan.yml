@@ -1,4 +1,4 @@
-# sync-sha: 59a75aa04f5c2e0175c3ca96722ddb4105a7f11bf0bc5f14b2b838986179c349
+# sync-sha: 08d0b0b38e33d82f317089de650b04271388b7d1690650754c4f344d7bd1afcd
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -169,7 +169,7 @@ jobs:
                 --redis-server /usr/bin/redis-server \
                 --memcached-server /usr/bin/memcached \
                 --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx" \
-                | tee runtime-suite-single.log
+                2>&1 | tee runtime-suite-single.log
             '
 
       - name: Assert the requested fixture set actually came up (AUD-TESTFIX1)
@@ -313,7 +313,7 @@ jobs:
                 --redis-server /usr/bin/redis-server \
                 --memcached-server /usr/bin/memcached \
                 --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx" \
-                | tee runtime-suite-multiworker.log
+                2>&1 | tee runtime-suite-multiworker.log
             '
 
       - name: Assert the requested fixture set actually came up (AUD-TESTFIX1)
