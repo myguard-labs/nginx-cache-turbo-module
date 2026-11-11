@@ -71,7 +71,7 @@ class ShutdownCapture(unittest.TestCase):
             server.output_path.write_bytes(b"secret " + b"x" * 16384 + b" exiting secret")
             (root / "logs").mkdir()
             (root / "logs" / "error.log").write_text("signal 15 (SIGTERM) received private")
-            original_path = pathlib.Path
+            original_path = type(root)
             def path(value):
                 return root / "proc" if value == "/proc" else original_path(value)
             with mock.patch.object(base, "_BREADCRUMB", str(root / "artifacts" / "current")), \
@@ -93,7 +93,7 @@ class ShutdownCapture(unittest.TestCase):
             with mock.patch.object(base, "_BREADCRUMB", None):
                 server._capture_shutdown()
             self.assertEqual(list(root.iterdir()), [])
-            original_path = pathlib.Path
+            original_path = type(root)
             def path(value):
                 return root / "missing-proc" if value == "/proc" else original_path(value)
             with mock.patch.object(base, "_BREADCRUMB", str(root / "out" / "current")), \
