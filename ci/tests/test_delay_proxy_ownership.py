@@ -578,8 +578,15 @@ class StopDrainTests(unittest.TestCase):
         async def shield(future):
             return future.result()
 
-        namespace["asyncio"] = types.SimpleNamespace(ensure_future=immediate_task,
-                                                      shield=shield)
+        async def wait(tasks, **_kwargs):
+            return set(tasks), set()
+
+        async def pause(_delay):
+            return None
+
+        namespace["asyncio"] = types.SimpleNamespace(
+            ensure_future=immediate_task, shield=shield, wait=wait,
+            sleep=pause, get_running_loop=lambda: loop)
         # Seed the same resource for both pinned and repaired source so the
         # negative control reaches stop's writer-drain assertion.
         proxy._writers = {Writer()}
@@ -592,7 +599,7 @@ class StopDrainTests(unittest.TestCase):
             events.append("stop")
 
         loop = types.SimpleNamespace(call_soon_threadsafe=queued.append,
-                                     create_task=create_task, stop=stop_loop)
+                                     create_task=create_task, stop=stop_loop, time=lambda: 0)
 
         def join(timeout):
             self.assertEqual(timeout, 10)
@@ -607,6 +614,7 @@ class StopDrainTests(unittest.TestCase):
             else:
                 self.fail("inert writer drainage unexpectedly suspended")
             self.assertEqual(events, ["stop"])
+            proxy._loop_closed = True
 
         proxy._loop = loop
         proxy._thread = types.SimpleNamespace(join=join, is_alive=lambda: False)
@@ -679,7 +687,8 @@ class StopDrainTests(unittest.TestCase):
             raise AssertionError("inert start unexpectedly suspended")
 
         loop = types.SimpleNamespace(run_until_complete=run_until_complete,
-                                     run_forever=lambda: events.append("run-forever"))
+                                     run_forever=lambda: events.append("run-forever"),
+                                     close=lambda: events.append("close"))
 
         def thread(**kwargs):
             self.assertEqual(kwargs["name"], "abort-delay-proxy")
@@ -692,7 +701,7 @@ class StopDrainTests(unittest.TestCase):
               patch.object(asyncio, "start_server", start_server)):
             proxy.start()
         set_loop.assert_called_once_with(loop)
-        self.assertEqual(events, ["accept-installed", "run-forever"])
+        self.assertEqual(events, ["accept-installed", "run-forever", "close"])
         self.assertIs(proxy._server, server)
 
     def test_drain_creation_failure_is_ferried_without_unawaited_coroutine(self):
@@ -708,7 +717,8 @@ class StopDrainTests(unittest.TestCase):
                                      create_task=create_task, stop=lambda: events.append("stop"))
         proxy._loop = loop
         proxy._thread = types.SimpleNamespace(
-            join=lambda **_kw: [callback() for callback in queued], is_alive=lambda: False)
+            join=lambda **_kw: ([callback() for callback in queued],
+                                setattr(proxy, "_loop_closed", True)), is_alive=lambda: False)
         with self.assertRaises(ValueError) as caught:
             proxy.stop()
         self.assertIs(caught.exception, failure)

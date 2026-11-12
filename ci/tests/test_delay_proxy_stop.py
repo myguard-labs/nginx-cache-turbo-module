@@ -69,6 +69,8 @@ class DelayProxyStopTests(unittest.TestCase):
                 for callback in queued:
                     callback()
                 queued.clear()
+            if not alive:
+                proxy._loop_closed = True
 
         thread_owner = types.SimpleNamespace(
             join=join, is_alive=action("is-alive", alive))
@@ -77,10 +79,11 @@ class DelayProxyStopTests(unittest.TestCase):
             _thread=thread_owner if thread else None,
             _server=server_owner if server else None,
             _timers=set(), _tasks=set(), _writers=set(),
+            _loop_closed=False, _server_closed=False, _run_error=None,
         )
 
         async def drain():
-            return None
+            proxy._server_closed = True
 
         proxy._drain = drain
         return proxy, calls, ownership
@@ -97,10 +100,11 @@ class DelayProxyStopTests(unittest.TestCase):
         proxy, calls, ownership = self.rig()
         initial = proxy._loop, proxy._thread
         stop = stop_method()
+        server_close = proxy._server.close
         stop(proxy)
         self.assertEqual(self.names(calls),
                          ["schedule-close", "schedule-timers", "schedule-stop", "join", "is-alive"])
-        self.assertEqual(calls[0][1], (proxy._server.close,))
+        self.assertEqual(calls[0][1], (server_close,))
         self.assertEqual(calls[2][1][0].__name__, "stop_when_drained")
         self.assertEqual(calls[3], ("join", (), {"timeout": 10}))
         self.assertTrue(all(pair == initial for pair in ownership))
@@ -136,15 +140,15 @@ class DelayProxyStopTests(unittest.TestCase):
         # queued cancellation cannot run, and no handler has registered a timer.
         proxy, calls, ownership = self.rig(server=False, execute=False)
         initial = proxy._loop, proxy._thread
+        proxy._loop_closed = True
         stop = stop_method()
         stop(proxy)
-        self.assertEqual(self.names(calls),
-                         ["schedule-timers", "schedule-stop", "join", "is-alive"])
+        self.assertEqual(self.names(calls), ["join", "is-alive"])
         self.assertTrue(all(pair == initial for pair in ownership))
         self.assertEqual(proxy._timers, set())
         self.assertEqual((proxy._loop, proxy._thread), (None, None))
         stop(proxy)
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 2)
 
     def test_unobserved_cancellation_empty_timers_and_live_thread_is_failure(self):
         proxy, calls, ownership = self.rig(alive=True, execute=False)
@@ -153,6 +157,7 @@ class DelayProxyStopTests(unittest.TestCase):
             stop_method()(proxy)
         self.assertEqual(caught.exception.__notes__, [
             "Cleanup failure: RuntimeError('DelayProxy timer cancellation did not complete')",
+            "Cleanup failure: RuntimeError('DelayProxy server closure did not complete')",
         ])
         self.assertEqual(self.names(calls).count("is-alive"), 1)
         self.assert_retained(proxy, initial, ownership)
@@ -166,6 +171,7 @@ class DelayProxyStopTests(unittest.TestCase):
         self.assertIs(caught.exception, failure)
         self.assertEqual(failure.__notes__, [
             "Cleanup failure: RuntimeError('DelayProxy timer cancellation did not complete')",
+            "Cleanup failure: RuntimeError('DelayProxy server closure did not complete')",
         ])
         self.assertEqual(self.names(calls).count("is-alive"), 1)
         self.assert_retained(proxy, initial, ownership)
@@ -192,6 +198,7 @@ class DelayProxyStopTests(unittest.TestCase):
                          ["schedule-close", "schedule-timers", "schedule-stop", "join", "is-alive"])
         self.assert_retained(proxy, initial, ownership)
         proxy._thread.is_alive = lambda: False
+        proxy._loop_closed = True
         stop_method()(proxy)
         self.assertEqual((proxy._loop, proxy._thread), (None, None))
 
@@ -221,6 +228,7 @@ class DelayProxyStopTests(unittest.TestCase):
             f"Cleanup failure: {second!r}", f"Cleanup failure: {third!r}",
             "Cleanup failure: RuntimeError('DelayProxy thread did not terminate')",
             "Cleanup failure: RuntimeError('DelayProxy timer cancellation did not complete')",
+            "Cleanup failure: RuntimeError('DelayProxy server closure did not complete')",
         ])
         self.assertEqual(self.names(calls),
                          ["schedule-close", "schedule-timers", "schedule-stop", "join", "is-alive"])

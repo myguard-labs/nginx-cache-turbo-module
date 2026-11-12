@@ -278,23 +278,48 @@ class DelayProxy:
         self._writer_waits: dict[asyncio.StreamWriter, asyncio.Future] = {}
         self._task_errors: list[BaseException] = []
         self._stopping = False
+        self._server_wait: asyncio.Future | None = None
+        self._server_closed = False
+        self._loop_closed = False
+        self._run_error: BaseException | None = None
 
     def start(self) -> None:
         loop = asyncio.new_event_loop()
         self._loop = loop
+        self._loop_closed = self._server_closed = False
+        self._server_wait = self._run_error = None
         ready: concurrent.futures.Future[None] = concurrent.futures.Future()
 
         def run() -> None:
-            asyncio.set_event_loop(loop)
-            self._stopping = False
+            startup_error = None
             try:
+                asyncio.set_event_loop(loop)
+                self._stopping = False
                 self._server = loop.run_until_complete(asyncio.start_server(
                     self._accept, "127.0.0.1", self.port))
-            except Exception as exc:
-                ready.set_exception(exc)
-                return
-            ready.set_result(None)
-            loop.run_forever()
+                ready.set_result(None)
+                # A callback queued behind stop can still register ownership.
+                # Keep its loop alive until a later stop confirms drainage.
+                while True:
+                    loop.run_forever()
+                    if not (self._timers or self._tasks or self._writers):
+                        break
+            except BaseException as error:
+                if ready.done():
+                    self._run_error = error
+                else:
+                    startup_error = error
+            finally:
+                try:
+                    loop.close()
+                except BaseException as error:
+                    if self._run_error is not None:
+                        error.add_note(f"Loop failure: {self._run_error!r}")
+                    self._run_error = error
+                else:
+                    self._loop_closed = True
+                if not ready.done():
+                    ready.set_exception(startup_error)
 
         self._thread = threading.Thread(target=run, daemon=True,
                                         name="abort-delay-proxy")
@@ -335,10 +360,16 @@ class DelayProxy:
 
         def stop_when_drained() -> None:
             assert loop is not None  # Only scheduled with a retained loop owner.
+
+            def stop_if_confirmed(_done=None) -> None:
+                if (not (self._timers or self._tasks or self._writers)
+                        and (self._server is None or self._server_closed)):
+                    loop.stop()
+
             if cancelled.done() or not cleanup_scheduled:
-                loop.stop()
+                stop_if_confirmed()
             else:
-                cancelled.add_done_callback(lambda _done: loop.stop())
+                cancelled.add_done_callback(stop_if_confirmed)
 
         def attempt(action: Callable[..., object], *args: object) -> bool:
             try:
@@ -351,7 +382,7 @@ class DelayProxy:
         cleanup_scheduled = False
         if loop is None or thread is None:
             failures.append(RuntimeError("DelayProxy has partial loop/thread ownership"))
-        if loop is not None:
+        if loop is not None and not self._loop_closed:
             if self._server is not None:
                 attempt(loop.call_soon_threadsafe, self._server.close)
             cleanup_scheduled = attempt(loop.call_soon_threadsafe, cancel_timers)
@@ -366,6 +397,10 @@ class DelayProxy:
             except Exception as error:
                 failures.append(error)
 
+        if self._run_error is not None:
+            if not isinstance(self._run_error, Exception):
+                raise self._run_error
+            failures.append(self._run_error)
         if loop is not None:
             if cancelled.done():
                 attempt(cancelled.result)
@@ -376,12 +411,17 @@ class DelayProxy:
             elif self._timers or self._tasks or self._writers or not thread_terminated:
                 failures.append(RuntimeError("DelayProxy timer cancellation did not complete"))
 
+        if self._server is not None and not self._server_closed:
+            failures.append(RuntimeError("DelayProxy server closure did not complete"))
+        if thread_terminated and loop is not None and not self._loop_closed:
+            failures.append(RuntimeError("DelayProxy loop closure did not complete"))
         if failures:
             primary = failures.pop(0)
             for failure in failures:
                 primary.add_note(f"Cleanup failure: {failure!r}")
             raise primary
         self._loop = self._thread = None
+        self._server = None
 
     def _spawn(self, coroutine) -> None:
         """Retain owned work and its failures until completion or stop."""
@@ -409,7 +449,7 @@ class DelayProxy:
         else:
             self._spawn(self._handle(reader, writer))
 
-    async def _close_writer(self, writer) -> None:
+    async def _close_writer(self, writer, deadline: float | None = None) -> None:
         writer.close()
         waiter = self._writer_waits.get(writer)
         if waiter is None:
@@ -421,6 +461,11 @@ class DelayProxy:
                 raise
             self._writer_waits[writer] = waiter
         try:
+            if deadline is not None:
+                _, pending = await asyncio.wait(
+                    {waiter}, timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
+                if pending:
+                    raise TimeoutError("DelayProxy writer drainage timed out")
             # Handler cancellation must not cancel the protocol's shared close
             # future. Retain this wait separately until a later close confirms it.
             await asyncio.shield(waiter)
@@ -438,10 +483,17 @@ class DelayProxy:
     def _close_client(self, writer) -> None:
         self._spawn(self._close_writer(writer))
 
-    async def _drain(self) -> None:
-        """Drain only this fixture's work, on its owning event loop."""
+    async def _drain(self, timeout: float = 5.0) -> None:
+        """Bound owned drainage without cancelling shared protocol waiters."""
         self._stopping = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         errors: list[Exception] = []
+        if self._server is not None:
+            try:
+                self._server.close()
+            except Exception as error:
+                errors.append(error)
         for timer in tuple(self._timers):
             try:
                 timer.cancel()
@@ -449,19 +501,61 @@ class DelayProxy:
                 errors.append(error)
             else:
                 self._timers.discard(timer)
-        # Handler finalizers cancel and await their own pumps. Work scheduled by
-        # a finalizer or an already queued accept is included on the next pass.
-        while self._tasks:
-            tasks = tuple(self._tasks)
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self._tasks.difference_update(tasks)
-        for writer in tuple(self._writers):
-            try:
-                await self._close_writer(writer)
-            except Exception as error:
-                errors.append(error)
+        # Give callbacks queued before listener close a turn to register their
+        # ownership. Recheck after every pass; this is no promise about future
+        # accepts, whose synchronous callback still retains task and writer.
+        while True:
+            await asyncio.sleep(0)
+            while self._tasks:
+                tasks = tuple(self._tasks)
+                for task in tasks:
+                    task.cancel()
+                _, pending = await asyncio.wait(
+                    tasks, timeout=max(0.0, deadline - loop.time()))
+                if pending:
+                    errors.append(TimeoutError("DelayProxy task drainage timed out"))
+                    break
+                self._tasks.difference_update(tasks)
+                if self._tasks and loop.time() >= deadline:
+                    errors.append(TimeoutError("DelayProxy task drainage timed out"))
+                    break
+            for writer in tuple(self._writers):
+                try:
+                    await self._close_writer(writer, deadline)
+                except Exception as error:
+                    errors.append(error)
+            if self._server is not None and not self._server_closed:
+                try:
+                    if self._server_wait is None:
+                        closing = self._server.wait_closed()
+                        try:
+                            self._server_wait = asyncio.ensure_future(closing)
+                        except BaseException:
+                            closing.close()
+                            raise
+                    _server_done, server_pending = await asyncio.wait(
+                        {self._server_wait}, timeout=max(0.0, deadline - loop.time()))
+                    if server_pending:
+                        raise TimeoutError("DelayProxy server drainage timed out")
+                    await asyncio.shield(self._server_wait)
+                except BaseException as error:
+                    # A completed exceptional wait cannot confirm a later close.
+                    # Keep pending and successful waits intact on cancellation.
+                    waiter = self._server_wait
+                    if (waiter is not None and waiter.done()
+                            and (waiter.cancelled() or waiter.exception() is not None)):
+                        self._server_wait = None
+                    if not isinstance(error, Exception):
+                        raise
+                    errors.append(error)
+                else:
+                    self._server_closed = True
+            await asyncio.sleep(0)
+            if errors or not (self._tasks or self._writers):
+                break
+            if loop.time() >= deadline:
+                errors.append(TimeoutError("DelayProxy drainage timed out"))
+                break
         task_errors, self._task_errors = self._task_errors, []
         for task_error in task_errors:
             if not isinstance(task_error, Exception):
