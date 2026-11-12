@@ -4,6 +4,7 @@ No event loop, server, thread or socket is started by these controls.
 """
 
 import ast
+import concurrent.futures
 import pathlib
 import types
 import unittest
@@ -19,7 +20,7 @@ def stop_method():
     method = next(node for node in proxy.body
                   if isinstance(node, ast.FunctionDef) and node.name == "stop")
     module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
-    namespace = {"Callable": Callable}
+    namespace = {"Callable": Callable, "concurrent": concurrent}
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace["stop"]
 
@@ -28,6 +29,7 @@ class DelayProxyStopTests(unittest.TestCase):
     def rig(self, failures=None, alive=False, loop=True, thread=True, server=True):
         calls = []
         ownership = []
+        queued = []
         failures = failures or {}
 
         def action(name, result=None):
@@ -43,16 +45,26 @@ class DelayProxyStopTests(unittest.TestCase):
         loop_owner = types.SimpleNamespace(stop=action("stop"))
 
         def schedule(callback):
-            name = "schedule-close" if callback is server_owner.close else "schedule-stop"
+            name = ("schedule-close" if callback is server_owner.close else
+                    "schedule-stop" if callback is loop_owner.stop else "schedule-timers")
             action(name)(callback)
+            if name == "schedule-timers":
+                queued.append(callback)
 
         loop_owner.call_soon_threadsafe = schedule
+        def join(*args, **kwargs):
+            action("join")(*args, **kwargs)
+            for callback in queued:
+                callback()
+            queued.clear()
+
         thread_owner = types.SimpleNamespace(
-            join=action("join"), is_alive=action("is-alive", alive))
+            join=join, is_alive=action("is-alive", alive))
         proxy = types.SimpleNamespace(
             _loop=loop_owner if loop else None,
             _thread=thread_owner if thread else None,
             _server=server_owner if server else None,
+            _timers=set(),
         )
         return proxy, calls, ownership
 
@@ -70,14 +82,14 @@ class DelayProxyStopTests(unittest.TestCase):
         stop = stop_method()
         stop(proxy)
         self.assertEqual(self.names(calls),
-                         ["schedule-close", "schedule-stop", "join", "is-alive"])
+                         ["schedule-close", "schedule-timers", "schedule-stop", "join", "is-alive"])
         self.assertEqual(calls[0][1], (proxy._server.close,))
-        self.assertEqual(calls[1][1], (initial[0].stop,))
-        self.assertEqual(calls[2], ("join", (), {"timeout": 10}))
+        self.assertEqual(calls[2][1], (initial[0].stop,))
+        self.assertEqual(calls[3], ("join", (), {"timeout": 10}))
         self.assertTrue(all(pair == initial for pair in ownership))
         self.assertEqual((proxy._loop, proxy._thread), (None, None))
         stop(proxy)
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 5)
 
     def test_empty_and_repeated_stop(self):
         proxy, calls, _ = self.rig(loop=False, thread=False, server=False)
@@ -98,12 +110,13 @@ class DelayProxyStopTests(unittest.TestCase):
     def test_no_server_still_stops_and_confirms_thread(self):
         proxy, calls, _ = self.rig(server=False)
         stop_method()(proxy)
-        self.assertEqual(self.names(calls), ["schedule-stop", "join", "is-alive"])
+        self.assertEqual(self.names(calls),
+                         ["schedule-timers", "schedule-stop", "join", "is-alive"])
         self.assertEqual((proxy._loop, proxy._thread), (None, None))
 
     def test_partial_ownership_attempts_available_cleanup_and_retains_handles(self):
         for loop, thread, expected in (
-            (True, False, ["schedule-close", "schedule-stop"]),
+            (True, False, ["schedule-close", "schedule-timers", "schedule-stop"]),
             (False, True, ["join", "is-alive"]),
         ):
             with self.subTest(loop=loop, thread=thread):
@@ -120,14 +133,14 @@ class DelayProxyStopTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "thread did not terminate"):
             stop_method()(proxy)
         self.assertEqual(self.names(calls),
-                         ["schedule-close", "schedule-stop", "join", "is-alive"])
+                         ["schedule-close", "schedule-timers", "schedule-stop", "join", "is-alive"])
         self.assert_retained(proxy, initial, ownership)
         proxy._thread.is_alive = lambda: False
         stop_method()(proxy)
         self.assertEqual((proxy._loop, proxy._thread), (None, None))
 
     def test_each_ordinary_failure_attempts_remaining_cleanup_and_retains_handles(self):
-        for name in ("schedule-close", "schedule-stop", "join", "is-alive"):
+        for name in ("schedule-close", "schedule-timers", "schedule-stop", "join", "is-alive"):
             with self.subTest(action=name):
                 failure = ValueError(name)
                 proxy, calls, ownership = self.rig({name: failure})
@@ -136,7 +149,8 @@ class DelayProxyStopTests(unittest.TestCase):
                     stop_method()(proxy)
                 self.assertIs(caught.exception, failure)
                 self.assertEqual(self.names(calls),
-                                 ["schedule-close", "schedule-stop", "join", "is-alive"])
+                                 ["schedule-close", "schedule-timers", "schedule-stop",
+                                  "join", "is-alive"])
                 self.assert_retained(proxy, initial, ownership)
 
     def test_multiple_ordinary_errors_preserve_first_and_note_later(self):
@@ -150,13 +164,14 @@ class DelayProxyStopTests(unittest.TestCase):
         self.assertEqual(first.__notes__, [
             f"Cleanup failure: {second!r}", f"Cleanup failure: {third!r}",
             "Cleanup failure: RuntimeError('DelayProxy thread did not terminate')",
+            "Cleanup failure: RuntimeError('DelayProxy timer cancellation did not complete')",
         ])
         self.assertEqual(self.names(calls),
-                         ["schedule-close", "schedule-stop", "join", "is-alive"])
+                         ["schedule-close", "schedule-timers", "schedule-stop", "join", "is-alive"])
         self.assert_retained(proxy, initial, ownership)
 
     def test_base_exception_propagates_without_clearing_ownership(self):
-        names = ["schedule-close", "schedule-stop", "join", "is-alive"]
+        names = ["schedule-close", "schedule-timers", "schedule-stop", "join", "is-alive"]
         for index, name in enumerate(names):
             with self.subTest(action=name):
                 interrupt = KeyboardInterrupt(name)

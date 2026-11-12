@@ -268,6 +268,7 @@ class DelayProxy:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._server: asyncio.base_events.Server | None = None
         self._thread: threading.Thread | None = None
+        self._timers: set[asyncio.TimerHandle] = set()
 
     def start(self) -> None:
         loop = asyncio.new_event_loop()
@@ -301,6 +302,28 @@ class DelayProxy:
         if loop is None and thread is None:
             return
         failures: list[Exception] = []
+        cancelled: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+        def cancel_timers() -> None:
+            try:
+                errors: list[Exception] = []
+                for timer in tuple(self._timers):
+                    try:
+                        timer.cancel()
+                    except Exception as error:
+                        errors.append(error)
+                    else:
+                        self._timers.discard(timer)
+                if errors:
+                    primary = errors.pop(0)
+                    for failure in errors:
+                        primary.add_note(f"Cleanup failure: {failure!r}")
+                    raise primary
+            except BaseException as error:
+                # Ferry even process-control errors back to the calling owner.
+                cancelled.set_exception(error)
+            else:
+                cancelled.set_result(None)
 
         def attempt(action: Callable[..., object], *args: object) -> None:
             try:
@@ -313,6 +336,7 @@ class DelayProxy:
         if loop is not None:
             if self._server is not None:
                 attempt(loop.call_soon_threadsafe, self._server.close)
+            attempt(loop.call_soon_threadsafe, cancel_timers)
             attempt(loop.call_soon_threadsafe, loop.stop)
         if thread is not None:
             attempt(lambda: thread.join(timeout=10))
@@ -321,6 +345,14 @@ class DelayProxy:
                     failures.append(RuntimeError("DelayProxy thread did not terminate"))
             except Exception as error:
                 failures.append(error)
+
+        if loop is not None:
+            if cancelled.done():
+                attempt(cancelled.result)
+                if self._timers:
+                    failures.append(RuntimeError("DelayProxy timers remain pending"))
+            else:
+                failures.append(RuntimeError("DelayProxy timer cancellation did not complete"))
 
         if failures:
             primary = failures.pop(0)
@@ -457,6 +489,19 @@ class DelayProxy:
 
         splitter = CommandSplitter()
 
+        def schedule(due: float, callback: Callable[..., object],
+                     *args: object) -> None:
+            timer: asyncio.TimerHandle | None = None
+
+            def fire() -> None:
+                nonlocal timer
+                self._timers.discard(timer)
+                timer = None
+                callback(*args)
+
+            timer = loop.call_at(due, fire)
+            self._timers.add(timer)
+
         def deliver(data: bytes) -> None:
             if not cw.is_closing():
                 cw.write(data)
@@ -523,9 +568,9 @@ class DelayProxy:
                         s.reply_at = due
                         s.reply_head = head
                         s.replied.set()
-                loop.call_at(due, deliver, data)
-            loop.call_at(max(loop.time() + self.delay,
-                                 last_due + REPLY_ORDER_EPS), cw.close)
+                schedule(due, deliver, data)
+            schedule(max(loop.time() + self.delay,
+                         last_due + REPLY_ORDER_EPS), cw.close)
 
         tasks = [asyncio.ensure_future(client_to_server()),
                  asyncio.ensure_future(server_to_client())]
