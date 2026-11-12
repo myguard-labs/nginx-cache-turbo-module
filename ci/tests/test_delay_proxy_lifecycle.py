@@ -230,6 +230,78 @@ class DrainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await proxy._drain()
         self.assertTrue(proxy._server_closed)
 
+    async def test_completed_listener_wait_failure_is_reported_then_retried(self):
+        proxy, server = self.rig()
+        failure = ValueError("transient listener wait")
+        server.wait_error = failure
+        with self.assertRaises(ValueError) as caught:
+            await proxy._drain()
+        self.assertIs(caught.exception, failure)
+        self.assertFalse(proxy._server_closed)
+        self.assertIs(proxy._server, server)
+        self.assertIsNone(proxy._server_wait, "completed failed listener wait blocked retry")
+        server.wait_error = None
+        await proxy._drain()
+        self.assertTrue(proxy._server_closed, "retry did not confirm listener closure")
+        self.assertTrue(proxy._server_wait.done())
+
+    async def test_completed_listener_wait_cancellation_or_base_exception_allows_retry(self):
+        for failure in (asyncio.CancelledError("wait cancelled"),
+                        KeyboardInterrupt("wait interrupted")):
+            with self.subTest(error=type(failure).__name__):
+                proxy, server = self.rig()
+                waiter = asyncio.get_running_loop().create_future()
+                if isinstance(failure, asyncio.CancelledError):
+                    waiter.cancel()
+                else:
+                    waiter.set_exception(failure)
+                proxy._server_wait = waiter
+                with self.assertRaises(type(failure)):
+                    await proxy._drain()
+                self.assertFalse(proxy._server_closed)
+                self.assertIs(proxy._server, server)
+                self.assertIsNone(proxy._server_wait,
+                                  "completed exceptional listener wait blocked retry")
+                await proxy._drain()
+                self.assertTrue(proxy._server_closed)
+                self.assertIsNot(proxy._server_wait, waiter)
+
+    async def test_drain_cancellation_preserves_pending_listener_wait_for_retry(self):
+        proxy, server = self.rig()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def wait_closed():
+            entered.set()
+            await release.wait()
+
+        server.wait_closed = wait_closed
+        draining = asyncio.create_task(proxy._drain())
+        await entered.wait()
+        waiter = proxy._server_wait
+        draining.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await draining
+        self.assertIs(proxy._server_wait, waiter)
+        self.assertFalse(waiter.done(), "drain cancellation cancelled shared listener wait")
+        self.assertFalse(proxy._server_closed)
+        release.set()
+        await proxy._drain()
+        self.assertIs(proxy._server_wait, waiter)
+        self.assertTrue(proxy._server_closed)
+
+    async def test_drain_cancellation_does_not_discard_completed_successful_wait(self):
+        proxy, _ = self.rig()
+        waiter = asyncio.get_running_loop().create_future()
+        waiter.set_result(None)
+        proxy._server_wait = waiter
+        with patch.object(asyncio, "shield", side_effect=asyncio.CancelledError("owner cancelled")):
+            with self.assertRaises(asyncio.CancelledError):
+                await proxy._drain()
+        self.assertIs(proxy._server_wait, waiter)
+        self.assertFalse(proxy._server_closed)
+        await proxy._drain()
+        self.assertTrue(proxy._server_closed)
+
     async def test_listener_wait_error_and_base_exception_remain_visible(self):
         proxy, server = self.rig()
         failure = ValueError("listener wait")
@@ -238,7 +310,7 @@ class DrainLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await proxy._drain()
         self.assertIs(caught.exception, failure)
         self.assertFalse(proxy._server_closed)
-        self.assertIs(proxy._server_wait.exception(), failure)
+        self.assertIsNone(proxy._server_wait)
         server.close_error = KeyboardInterrupt("listener close")
         with self.assertRaisesRegex(KeyboardInterrupt, "listener close"):
             await proxy._drain()

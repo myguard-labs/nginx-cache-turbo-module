@@ -538,7 +538,15 @@ class DelayProxy:
                     if server_pending:
                         raise TimeoutError("DelayProxy server drainage timed out")
                     await asyncio.shield(self._server_wait)
-                except Exception as error:
+                except BaseException as error:
+                    # A completed exceptional wait cannot confirm a later close.
+                    # Keep pending and successful waits intact on cancellation.
+                    waiter = self._server_wait
+                    if (waiter is not None and waiter.done()
+                            and (waiter.cancelled() or waiter.exception() is not None)):
+                        self._server_wait = None
+                    if not isinstance(error, Exception):
+                        raise
                     errors.append(error)
                 else:
                     self._server_closed = True
