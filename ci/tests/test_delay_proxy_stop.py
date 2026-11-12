@@ -44,11 +44,22 @@ class DelayProxyStopTests(unittest.TestCase):
         server_owner = types.SimpleNamespace(close=action("close"))
         loop_owner = types.SimpleNamespace(stop=action("stop"))
 
+        def create_task(coroutine):
+            action("create-drain")()
+            try:
+                coroutine.send(None)
+            except StopIteration:
+                return
+            raise AssertionError("inert drainage unexpectedly suspended")
+
+        loop_owner.create_task = create_task
+
         def schedule(callback):
             name = ("schedule-close" if callback is server_owner.close else
-                    "schedule-stop" if callback is loop_owner.stop else "schedule-timers")
+                    "schedule-stop" if callback.__name__ == "stop_when_drained"
+                    else "schedule-timers")
             action(name)(callback)
-            if name == "schedule-timers":
+            if name != "schedule-close":
                 queued.append(callback)
 
         loop_owner.call_soon_threadsafe = schedule
@@ -65,8 +76,13 @@ class DelayProxyStopTests(unittest.TestCase):
             _loop=loop_owner if loop else None,
             _thread=thread_owner if thread else None,
             _server=server_owner if server else None,
-            _timers=set(),
+            _timers=set(), _tasks=set(), _writers=set(),
         )
+
+        async def drain():
+            return None
+
+        proxy._drain = drain
         return proxy, calls, ownership
 
     def assert_retained(self, proxy, initial, ownership):
@@ -75,7 +91,7 @@ class DelayProxyStopTests(unittest.TestCase):
                         "ownership was cleared before termination was confirmed")
 
     def names(self, calls):
-        return [name for name, _, _ in calls]
+        return [name for name, _, _ in calls if name not in ("create-drain", "stop")]
 
     def test_success_keeps_ownership_through_join_and_liveness_check(self):
         proxy, calls, ownership = self.rig()
@@ -85,12 +101,12 @@ class DelayProxyStopTests(unittest.TestCase):
         self.assertEqual(self.names(calls),
                          ["schedule-close", "schedule-timers", "schedule-stop", "join", "is-alive"])
         self.assertEqual(calls[0][1], (proxy._server.close,))
-        self.assertEqual(calls[2][1], (initial[0].stop,))
+        self.assertEqual(calls[2][1][0].__name__, "stop_when_drained")
         self.assertEqual(calls[3], ("join", (), {"timeout": 10}))
         self.assertTrue(all(pair == initial for pair in ownership))
         self.assertEqual((proxy._loop, proxy._thread), (None, None))
         stop(proxy)
-        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(calls), 7)
 
     def test_empty_and_repeated_stop(self):
         proxy, calls, _ = self.rig(loop=False, thread=False, server=False)
