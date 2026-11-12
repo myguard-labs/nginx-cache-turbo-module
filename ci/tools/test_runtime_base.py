@@ -74,15 +74,33 @@ def _track(proc: subprocess.Popen) -> subprocess.Popen:
 
 def _reap_spawned() -> None:
     for proc in _SPAWNED:
-        if proc.poll() is None:
-            proc.terminate()
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception as exc:  # noqa: BLE001 - continue reaping other children
+            print(f"child cleanup: terminate/poll failed: {exc}", file=sys.stderr)
     deadline = time.monotonic() + 5
     for proc in _SPAWNED:
-        if proc.poll() is None:
-            try:
-                proc.wait(timeout=max(0.1, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        try:
+            if proc.poll() is not None:
+                continue
+        except Exception as exc:  # noqa: BLE001 - retain uncertain children
+            print(f"child cleanup: poll failed: {exc}", file=sys.stderr)
+        try:
+            proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            continue
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception as exc:  # noqa: BLE001 - still attempt forced cleanup
+            print(f"child cleanup: wait failed: {exc}", file=sys.stderr)
+        try:
+            proc.kill()
+        except Exception as exc:  # noqa: BLE001 - still attempt to reap
+            print(f"child cleanup: kill failed: {exc}", file=sys.stderr)
+        try:
+            proc.wait(timeout=0.1)
+        except Exception as exc:  # noqa: BLE001 - report unresolved cleanup
+            print(f"child cleanup: post-kill wait failed: {exc}", file=sys.stderr)
 
 
 
