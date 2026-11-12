@@ -1364,6 +1364,6 @@ class Origin:
                 self._thread = None
 
         if errors:
-            for error in errors[1:]:
-                errors[0].add_note(f"Additional origin cleanup error: {error!r}")
+            for additional_error in errors[1:]:
+                errors[0].add_note(f"Additional origin cleanup error: {additional_error!r}")
             raise errors[0]
