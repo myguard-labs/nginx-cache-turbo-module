@@ -31,14 +31,20 @@ def proxy_class(loop, upstream):
                  if isinstance(node, ast.ClassDef) and node.name == "DelayProxy")
     proxy.body = [node for node in proxy.body
                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                  and node.name in ("__init__", "_handle", "stop")]
+                  and node.name in ("__init__", "_handle", "_relay", "stop", "_drain",
+                                    "_close_writer", "_spawn", "_close_client")]
 
     async def connect(*_args):
         return upstream
 
     def task(coroutine):
         complete(coroutine)
-        return types.SimpleNamespace(cancel=lambda: None)
+        result = type("Done", (), {})()
+        result.cancel = lambda: None
+        result.cancelled = lambda: False
+        result.exception = lambda: None
+        result.add_done_callback = lambda callback: callback(result)
+        return result
 
     async def wait(*_args, **_kwargs):
         return None
@@ -80,6 +86,9 @@ class Writer:
         self.data = []
         self.failure = None
 
+    async def wait_closed(self):
+        assert self.closed
+
     def is_closing(self):
         return self.closed
 
@@ -101,6 +110,9 @@ class Loop:
         self.execute = True
         self.executing = False
         self.cancelled = []
+
+    def create_task(self, coroutine):
+        complete(coroutine)
 
     def time(self):
         return 100
@@ -221,7 +233,8 @@ class DelayProxyTimerTests(unittest.TestCase):
         self.assertTrue(all(timer._callback is None for timer in timers))
         self.assertEqual(proxy._timers, set())
         self.assertEqual(writer.data, [])
-        self.assertFalse(writer.closed)
+        self.assertTrue(writer.closed)
+        self.assertEqual(proxy._writers, set())
         proxy.stop()
         self.assertEqual(loop.events, ["stop"])
 
