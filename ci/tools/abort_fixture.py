@@ -410,7 +410,12 @@ class DelayProxy:
 
     async def _close_writer(self, writer) -> None:
         writer.close()
-        await writer.wait_closed()
+        try:
+            await writer.wait_closed()
+        except (ConnectionResetError, BrokenPipeError):
+            # The close waiter completes in connection_lost(), carrying the
+            # peer's earlier reset/write error even though closure is complete.
+            pass
         self._writers.discard(writer)
 
     def _close_client(self, writer) -> None:

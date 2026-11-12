@@ -8,6 +8,7 @@ import ast
 import asyncio
 import collections
 import concurrent.futures
+import errno
 import pathlib
 import time
 import types
@@ -109,6 +110,41 @@ class Writer:
             except asyncio.CancelledError:
                 self.drain_cancelled = True
                 raise
+
+
+class MemoryTransport(asyncio.Transport):
+    """Supply connection_lost to the real stream protocol without a socket."""
+
+    def __init__(self, protocol, error):
+        super().__init__()
+        self.protocol = protocol
+        self.error = error
+        self.closed = False
+        self.lost = False
+
+    def is_closing(self):
+        return self.closed
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            asyncio.get_running_loop().call_soon(self.lose)
+
+    def lose(self):
+        if not self.lost:
+            self.closed = self.lost = True
+            self.protocol.connection_lost(self.error)
+
+
+def memory_stream(error):
+    # Real stdlib waiter behavior, including the error recorded by
+    # connection_lost; only the actual I/O transport is replaced.
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader(loop=loop)
+    protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
+    transport = MemoryTransport(protocol, error)
+    protocol.connection_made(transport)
+    return asyncio.StreamWriter(transport, protocol, reader, loop), transport
 
 
 class OwnershipTests(unittest.IsolatedAsyncioTestCase):
@@ -290,6 +326,63 @@ class OwnershipTests(unittest.IsolatedAsyncioTestCase):
         await proxy._drain()
         self.assertEqual(proxy._writers, set())
         self.assertEqual(failed.waited, 1)
+
+    async def test_peer_close_waiter_errors_confirm_closure_and_release_writer(self):
+        for error in (ConnectionResetError(errno.ECONNRESET, "peer reset"),
+                      BrokenPipeError(errno.EPIPE, "peer closed")):
+            for already_lost in (False, True):
+                with self.subTest(error=type(error).__name__, already_lost=already_lost):
+                    proxy, _ = self.rig()
+                    writer, transport = memory_stream(error)
+                    if already_lost:
+                        transport.lose()
+                    proxy._writers.add(writer)
+                    outcome, = await asyncio.gather(proxy._drain(), return_exceptions=True)
+                    self.assertTrue(transport.lost, "close waiter returned before connection_lost")
+                    self.assertTrue(writer.is_closing())
+                    self.assertIsNone(outcome, "closed peer was reported as failed writer drainage")
+                    self.assertEqual(proxy._writers, set())
+                    await proxy._drain()
+
+    async def test_peer_reset_delayed_close_task_releases_writer_without_task_failure(self):
+        proxy, _ = self.rig()
+        writer, transport = memory_stream(ConnectionResetError(errno.ECONNRESET, "peer reset"))
+        proxy._writers.add(writer)
+        proxy._close_client(writer)
+        await asyncio.gather(*tuple(proxy._tasks), return_exceptions=True)
+        self.assertTrue(transport.lost)
+        self.assertEqual(proxy._tasks, set())
+        self.assertEqual(proxy._task_errors, [], "expected peer reset became a task failure")
+        self.assertEqual(proxy._writers, set())
+        await proxy._drain()
+
+    async def test_other_close_waiter_errors_remain_visible_and_owned(self):
+        for error in (OSError(errno.EIO, "unexpected I/O error"),
+                      ConnectionAbortedError(errno.ECONNABORTED, "unexpected abort")):
+            with self.subTest(error=type(error).__name__):
+                proxy, _ = self.rig()
+                writer, transport = memory_stream(error)
+                proxy._writers.add(writer)
+                with self.assertRaises(type(error)) as caught:
+                    await proxy._drain()
+                self.assertIs(caught.exception, error)
+                self.assertTrue(transport.lost)
+                self.assertIn(writer, proxy._writers)
+
+    async def test_peer_error_from_close_call_remains_visible_and_owned(self):
+        for error in (ConnectionResetError(errno.ECONNRESET, "close failed"),
+                      BrokenPipeError(errno.EPIPE, "close failed")):
+            with self.subTest(error=type(error).__name__):
+                proxy, _ = self.rig()
+                writer, other = Writer(), Writer()
+                writer.close_error = error
+                proxy._writers.update((writer, other))
+                with self.assertRaises(type(error)) as caught:
+                    await proxy._drain()
+                self.assertIs(caught.exception, error)
+                self.assertEqual(writer.waited, 0)
+                self.assertEqual(other.waited, 1)
+                self.assertEqual(proxy._writers, {writer})
 
     async def test_close_failure_retains_writer_and_process_control_propagates(self):
         proxy, _ = self.rig()
