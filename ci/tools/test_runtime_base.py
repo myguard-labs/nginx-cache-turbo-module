@@ -284,8 +284,65 @@ def _conn_cursor() -> int:
     return _origin_module._NGX_CLIENT_CONNS + origin_hits
 
 
+class _OutcomeJournal:
+    """Optional serial observations; no journal alone proves suite success.
+
+    The caller supplies a private fresh path and unpredictable run ID, and
+    closes the journal after use. Concurrent invocations are unsupported.
+    """
+
+    def __init__(self, path: str, run_id: str):
+        self.run_id = run_id
+        self.failed = False
+        self._file = None
+        self._next_id = 0
+        self._stack: list[int] = []
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                self._file = os.fdopen(fd, "w", encoding="utf-8")
+            except BaseException:
+                os.close(fd)
+                raise
+        except OSError:
+            self.failed = True
+
+    def _write(self, invocation: int, parent: int | None, name: str, event: str) -> None:
+        if self.failed or self._file is None:
+            return
+        try:
+            record = json.dumps([1, self.run_id, invocation, parent, name, event]) + "\n"
+            if self._file.write(record) != len(record):
+                self.failed = True
+                return
+            self._file.flush()
+        except OSError:
+            self.failed = True
+
+    def enter(self, name: str) -> tuple[int, int | None]:
+        self._next_id += 1
+        invocation = self._next_id
+        parent = self._stack[-1] if self._stack else None
+        self._stack.append(invocation)
+        self._write(invocation, parent, name, "entry")
+        return invocation, parent
+
+    def finish(self, token: tuple[int, int | None], name: str, event: str) -> None:
+        self._stack.pop()
+        self._write(*token, name, event)
+
+    def close(self) -> None:
+        if self._file is not None:
+            try:
+                self._file.close()
+            except OSError:
+                self.failed = True
+            finally:
+                self._file = None
+
+
 def _instrument(origin: Origin, timings: list[tuple[str, float]] | None = None,
-                facade: dict | None = None) -> None:
+                facade: dict | None = None, journal: _OutcomeJournal | None = None) -> None:
     """Wrap every module-level test_* function so each records the c->number
     cursor before and after it runs. Nested test_* calls just produce nested
     spans; the narrowest span that brackets an alert is the most specific
@@ -299,8 +356,21 @@ def _instrument(origin: Origin, timings: list[tuple[str, float]] | None = None,
             before = _conn_cursor()
             _write_breadcrumb(f"{name} {before}")
             started = time.monotonic() if timings is not None else None
+            token = journal.enter(name) if journal is not None else None
             try:
-                return fn(*a, **kw)
+                try:
+                    result = fn(*a, **kw)
+                except Exception:
+                    if journal is not None and token is not None:
+                        journal.finish(token, name, "exception")
+                    raise
+                except BaseException:
+                    if journal is not None and token is not None:
+                        journal.finish(token, name, "base_exception")
+                    raise
+                if journal is not None and token is not None:
+                    journal.finish(token, name, "return")
+                return result
             finally:
                 _SPANS.append((name, before, _conn_cursor()))
                 _write_breadcrumb(f"DONE {name}")
