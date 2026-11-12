@@ -914,15 +914,20 @@ class RedisServer:
 
     def cli(self, *args: str) -> str:
         """Run a redis-cli command against this server; return stdout."""
-        base = ["redis-cli", "-h", "127.0.0.1", "-p", str(self.port)]
+        base = ["redis-cli", "-e", "-h", "127.0.0.1", "-p", str(self.port)]
         if self.tls_certs:
             base += ["--tls", "--cacert", self.tls_certs["ca"]]
         if self.password:
             base += ["-a", self.password, "--no-auth-warning"]
-        r = subprocess.run(
-            [*base, *args],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=10)
+        try:
+            r = subprocess.run(
+                [*base, *args],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=10)
+        except subprocess.TimeoutExpired as exc:
+            raise subprocess.TimeoutExpired("redis-cli", exc.timeout) from None
+        if r.returncode:
+            raise RuntimeError(f"redis-cli failed with exit status {r.returncode}")
         return r.stdout.strip()
 
     def set_raw(self, key: str, value: bytes, px_ms: int) -> None:
