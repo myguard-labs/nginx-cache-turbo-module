@@ -275,6 +275,7 @@ class DelayProxy:
         # Only confirmed drainage and thread termination release loop ownership.
         self._tasks: set[asyncio.Task[None]] = set()
         self._writers: set[asyncio.StreamWriter] = set()
+        self._writer_waits: dict[asyncio.StreamWriter, asyncio.Future] = {}
         self._task_errors: list[BaseException] = []
         self._stopping = False
 
@@ -410,12 +411,28 @@ class DelayProxy:
 
     async def _close_writer(self, writer) -> None:
         writer.close()
+        waiter = self._writer_waits.get(writer)
+        if waiter is None:
+            closing = writer.wait_closed()
+            try:
+                waiter = asyncio.ensure_future(closing)
+            except BaseException:
+                closing.close()
+                raise
+            self._writer_waits[writer] = waiter
         try:
-            await writer.wait_closed()
+            # Handler cancellation must not cancel the protocol's shared close
+            # future. Retain this wait separately until a later close confirms it.
+            await asyncio.shield(waiter)
         except (ConnectionResetError, BrokenPipeError):
             # The close waiter completes in connection_lost(), carrying the
             # peer's earlier reset/write error even though closure is complete.
             pass
+        except BaseException:
+            if waiter.done():
+                self._writer_waits.pop(writer, None)
+            raise
+        self._writer_waits.pop(writer, None)
         self._writers.discard(writer)
 
     def _close_client(self, writer) -> None:
@@ -423,6 +440,7 @@ class DelayProxy:
 
     async def _drain(self) -> None:
         """Drain only this fixture's work, on its owning event loop."""
+        self._stopping = True
         errors: list[Exception] = []
         for timer in tuple(self._timers):
             try:
@@ -597,6 +615,8 @@ class DelayProxy:
         pending: collections.deque[_Sighting | None] = collections.deque()
 
         splitter = CommandSplitter()
+        last_due = 0.0
+        close_scheduled = False
 
         def schedule(due: float, callback: Callable[..., object],
                      *args: object) -> None:
@@ -646,8 +666,8 @@ class DelayProxy:
                     s.closed.set()
 
         async def server_to_client() -> None:
+            nonlocal last_due, close_scheduled
             counter = ReplyCounter()
-            last_due = 0.0
             while data := await ur.read(65536):
                 # One sighting per complete reply, not per read: two replies
                 # coalesced in one read each take their own, and a reply split
@@ -680,6 +700,7 @@ class DelayProxy:
                 schedule(due, deliver, data)
             schedule(max(loop.time() + self.delay,
                          last_due + REPLY_ORDER_EPS), self._close_client, cw)
+            close_scheduled = True
 
         tasks = [asyncio.ensure_future(client_to_server()),
                  asyncio.ensure_future(server_to_client())]
@@ -691,6 +712,11 @@ class DelayProxy:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if not close_scheduled and not self._stopping and not cr.at_eof():
+                # An early pump failure can precede upstream EOF. Preserve all
+                # queued replies and close strictly after the final delivery.
+                schedule(max(loop.time(), last_due + REPLY_ORDER_EPS),
+                         self._close_client, cw)
 
 
 # --------------------------------------------------------------------------- #

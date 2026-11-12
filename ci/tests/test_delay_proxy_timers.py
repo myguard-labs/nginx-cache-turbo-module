@@ -41,6 +41,7 @@ def proxy_class(loop, upstream):
         complete(coroutine)
         result = type("Done", (), {})()
         result.cancel = lambda: None
+        result.done = lambda: True
         result.cancelled = lambda: False
         result.exception = lambda: None
         result.add_done_callback = lambda callback: callback(result)
@@ -53,7 +54,7 @@ def proxy_class(loop, upstream):
         "asyncio": types.SimpleNamespace(get_running_loop=lambda: loop,
                                           open_connection=connect,
                                           ensure_future=task, wait=wait,
-                                          gather=wait, FIRST_COMPLETED=object()),
+                                          gather=wait, shield=wait, FIRST_COMPLETED=object()),
         "collections": collections, "concurrent": concurrent,
         "Callable": Callable, "time": types.SimpleNamespace(monotonic=lambda: 100),
         "CommandSplitter": lambda: None,

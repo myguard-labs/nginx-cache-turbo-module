@@ -115,8 +115,9 @@ class Writer:
 class MemoryTransport(asyncio.Transport):
     """Supply connection_lost to the real stream protocol without a socket."""
 
-    def __init__(self, protocol, error):
+    def __init__(self, protocol, error, defer_loss=False):
         super().__init__()
+        self.defer_loss = defer_loss
         self.protocol = protocol
         self.error = error
         self.closed = False
@@ -128,7 +129,8 @@ class MemoryTransport(asyncio.Transport):
     def close(self):
         if not self.closed:
             self.closed = True
-            asyncio.get_running_loop().call_soon(self.lose)
+            if not self.defer_loss:
+                asyncio.get_running_loop().call_soon(self.lose)
 
     def lose(self):
         if not self.lost:
@@ -136,15 +138,23 @@ class MemoryTransport(asyncio.Transport):
             self.protocol.connection_lost(self.error)
 
 
-def memory_stream(error):
+class ObservedStreamWriter(asyncio.StreamWriter):
+    async def wait_closed(self):
+        self.wait_started.set()
+        await super().wait_closed()
+
+
+def memory_stream(error, *, defer_loss=False):
     # Real stdlib waiter behavior, including the error recorded by
     # connection_lost; only the actual I/O transport is replaced.
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader(loop=loop)
     protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
-    transport = MemoryTransport(protocol, error)
+    transport = MemoryTransport(protocol, error, defer_loss)
     protocol.connection_made(transport)
-    return asyncio.StreamWriter(transport, protocol, reader, loop), transport
+    writer = ObservedStreamWriter(transport, protocol, reader, loop)
+    writer.wait_started = asyncio.Event()
+    return writer, transport
 
 
 class OwnershipTests(unittest.IsolatedAsyncioTestCase):
@@ -327,6 +337,98 @@ class OwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proxy._writers, set())
         self.assertEqual(failed.waited, 1)
 
+    async def test_cancelled_delayed_close_keeps_real_shared_waiter_intact(self):
+        for error in (None, ConnectionResetError(errno.ECONNRESET, "peer reset"),
+                      OSError(errno.EIO, "unexpected wait error")):
+            with self.subTest(error=type(error).__name__):
+                proxy, _ = self.rig()
+                writer, transport = memory_stream(error, defer_loss=True)
+                proxy._writers.add(writer)
+                proxy._close_client(writer)
+                await writer.wait_started.wait()
+                closing = tuple(proxy._tasks)
+                draining = asyncio.create_task(proxy._drain())
+                await asyncio.gather(*closing, return_exceptions=True)
+                shared_cancelled = transport.protocol._closed.cancelled()
+                transport.lose()
+                outcome, = await asyncio.gather(draining, return_exceptions=True)
+                self.assertFalse(shared_cancelled, "cancellation poisoned shared close waiter")
+                self.assertEqual(proxy._writer_waits, {})
+                if isinstance(error, OSError) and not isinstance(error, ConnectionResetError):
+                    self.assertIs(outcome, error)
+                    self.assertIn(writer, proxy._writers)
+                else:
+                    self.assertIsNone(outcome)
+                    self.assertEqual(proxy._writers, set())
+
+    async def test_close_wait_task_scheduling_failure_closes_coroutine_and_retains_writer(self):
+        proxy, _ = self.rig()
+        writer = Writer()
+        proxy._writers.add(writer)
+        coroutines = []
+
+        def fail(coroutine):
+            coroutines.append(coroutine)
+            raise ValueError("schedule close waiter")
+
+        with patch.object(asyncio, "ensure_future", fail):
+            with self.assertRaisesRegex(ValueError, "schedule close waiter"):
+                await proxy._close_writer(writer)
+        self.assertIsNone(coroutines[0].cr_frame, "failed scheduling leaked close coroutine")
+        self.assertEqual(proxy._writer_waits, {})
+        self.assertIn(writer, proxy._writers)
+        await proxy._drain()
+
+    async def test_early_client_pump_failure_closes_after_all_pending_replies(self):
+        for replies in ((), (b"first", b"second")):
+            with self.subTest(replies=replies):
+                proxy, _ = self.rig()
+                proxy.delay = 3600
+                cw, uw = Writer(), Writer()
+                upstream = Reader(replies, blocked=True)
+
+                class FailedClient:
+                    async def read(self, _size):
+                        await self.upstream.entered.wait()
+                        raise OSError("client read failed")
+
+                    def at_eof(self):
+                        return False
+
+                client = FailedClient()
+                client.upstream = upstream
+
+                async def connect(*_args, upstream=upstream, uw=uw):
+                    return upstream, uw
+
+                loop = asyncio.get_running_loop()
+
+                def timer(due, callback, *args, loop=loop):
+                    return asyncio.TimerHandle(due, callback, args, loop)
+
+                with (patch.object(asyncio, "open_connection", connect),
+                      patch.object(loop, "call_at", timer)):
+                    proxy._accept(client, cw)
+                    await asyncio.gather(*tuple(proxy._tasks))
+                timers = sorted(proxy._timers, key=lambda timer: timer.when())
+                self.assertEqual(len(timers), len(replies) + 1,
+                                 "early pump exit left no client-close timer")
+                self.assertFalse(cw.closed)
+                for timer in timers[:-1]:
+                    timer._run()
+                    self.assertFalse(cw.closed, "client closed before queued reply")
+                self.assertEqual(cw.data, list(replies))
+                if replies:
+                    self.assertGreater(timers[-1].when(), timers[-2].when())
+                timers[-1]._run()
+                await asyncio.gather(*tuple(proxy._tasks))
+                self.assertTrue(cw.closed)
+                self.assertEqual(cw.waited, 1)
+                self.assertEqual(proxy._writers, set())
+                for timer in timers:
+                    timer.cancel()
+                await proxy._drain()
+
     async def test_peer_close_waiter_errors_confirm_closure_and_release_writer(self):
         for error in (ConnectionResetError(errno.ECONNRESET, "peer reset"),
                       BrokenPipeError(errno.EPIPE, "peer closed")):
@@ -460,9 +562,24 @@ class OwnershipTests(unittest.IsolatedAsyncioTestCase):
 
 class StopDrainTests(unittest.TestCase):
     def test_stop_waits_for_drain_future_before_stopping_owner(self):
-        cls, _ = proxy_class()
+        cls, namespace = proxy_class()
         proxy = cls(1, 2)
         queued, coroutines, events = [], [], []
+
+        def immediate_task(coroutine):
+            try:
+                coroutine.send(None)
+            except StopIteration as done:
+                future = concurrent.futures.Future()
+                future.set_result(done.value)
+                return future
+            raise AssertionError("inert close unexpectedly suspended")
+
+        async def shield(future):
+            return future.result()
+
+        namespace["asyncio"] = types.SimpleNamespace(ensure_future=immediate_task,
+                                                      shield=shield)
         # Seed the same resource for both pinned and repaired source so the
         # negative control reaches stop's writer-drain assertion.
         proxy._writers = {Writer()}
