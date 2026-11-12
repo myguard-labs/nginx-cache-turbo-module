@@ -868,7 +868,8 @@ def gen_tls_expired_cert(dirpath: pathlib.Path, ca_key: str, ca: str) -> dict:
         "-in", str(csr), "-out", str(crt), "-notext",
         "-extfile", str(ext),
         "-startdate", "20200101000000Z", "-enddate", "20200102000000Z")
-    return {"ca": ca, "cert": str(crt), "key": str(key)}
+    return {"ca": ca, "cert": str(crt), "key": str(key),
+            "cli_insecure": True}
 
 
 class RedisServer:
@@ -917,6 +918,10 @@ class RedisServer:
         base = ["redis-cli", "-e", "-h", "127.0.0.1", "-p", str(self.port)]
         if self.tls_certs:
             base += ["--tls", "--cacert", self.tls_certs["ca"]]
+            # Only the expired-cert fixture needs an unverified admin client;
+            # nginx still verifies the certificate in the negative test.
+            if self.tls_certs.get("cli_insecure"):
+                base.append("--insecure")
         if self.password:
             base += ["-a", self.password, "--no-auth-warning"]
         try:
