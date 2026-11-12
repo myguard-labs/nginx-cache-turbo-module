@@ -291,14 +291,43 @@ class DelayProxy:
         ready.result(timeout=10)
 
     def stop(self) -> None:
+        """Release ownership only after confirmed termination and no errors.
+
+        Empty ownership is repeatable. Partial ownership or any cleanup failure
+        keeps the handles for diagnosis/recovery; ordinary failures do not skip
+        later cleanup. The calling owner serializes start/stop operations.
+        """
         loop, thread = self._loop, self._thread
-        self._loop = self._thread = None
-        if loop is None or thread is None:
+        if loop is None and thread is None:
             return
-        if self._server is not None:
-            loop.call_soon_threadsafe(self._server.close)
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=10)
+        failures: list[Exception] = []
+
+        def attempt(action: Callable[..., object], *args: object) -> None:
+            try:
+                action(*args)
+            except Exception as error:
+                failures.append(error)
+
+        if loop is None or thread is None:
+            failures.append(RuntimeError("DelayProxy has partial loop/thread ownership"))
+        if loop is not None:
+            if self._server is not None:
+                attempt(loop.call_soon_threadsafe, self._server.close)
+            attempt(loop.call_soon_threadsafe, loop.stop)
+        if thread is not None:
+            attempt(lambda: thread.join(timeout=10))
+            try:
+                if thread.is_alive():
+                    failures.append(RuntimeError("DelayProxy thread did not terminate"))
+            except Exception as error:
+                failures.append(error)
+
+        if failures:
+            primary = failures.pop(0)
+            for failure in failures:
+                primary.add_note(f"Cleanup failure: {failure!r}")
+            raise primary
+        self._loop = self._thread = None
 
     def watch(self, markers: list[bytes]) -> None:
         """Start watching for these markers, forgetting any earlier set."""
