@@ -47,14 +47,20 @@ def proxy_class(loop, upstream):
         result.add_done_callback = lambda callback: callback(result)
         return result
 
-    async def wait(*_args, **_kwargs):
+    async def wait(tasks, **_kwargs):
+        return set(tasks), set()
+
+    async def pause(_delay):
+        return None
+
+    async def ignore(*_args, **_kwargs):
         return None
 
     namespace = {
         "asyncio": types.SimpleNamespace(get_running_loop=lambda: loop,
                                           open_connection=connect,
                                           ensure_future=task, wait=wait,
-                                          gather=wait, shield=wait, FIRST_COMPLETED=object()),
+                                          gather=ignore, shield=ignore, sleep=pause, FIRST_COMPLETED=object()),
         "collections": collections, "concurrent": concurrent,
         "Callable": Callable, "time": types.SimpleNamespace(monotonic=lambda: 100),
         "CommandSplitter": lambda: None,
@@ -153,6 +159,8 @@ class Loop:
                     callback()
             finally:
                 self.executing = False
+        if hasattr(self, "owner"):
+            self.owner._loop_closed = True
 
     def fire(self, timer):
         self.timers.remove(timer)
@@ -167,6 +175,7 @@ class DelayProxyTimerTests(unittest.TestCase):
         writer = Writer()
         complete(proxy._handle(Reader(eof=eof), writer))
         proxy._loop = loop
+        loop.owner = proxy
         proxy._thread = types.SimpleNamespace(join=loop.join, is_alive=lambda: False)
         return proxy, loop, writer
 
@@ -259,7 +268,7 @@ class DelayProxyTimerTests(unittest.TestCase):
         self.assertEqual((proxy._loop, proxy._thread), initial)
         self.assertEqual(proxy._timers, timers)
         self.assertTrue(all(not timer.cancelled() for timer in timers))
-        self.assertEqual(loop.events, ["stop"])
+        self.assertEqual(loop.events, [])
 
     def test_unobserved_cancellation_cannot_report_success(self):
         proxy, loop, _ = self.rig()
@@ -343,7 +352,7 @@ class DelayProxyTimerTests(unittest.TestCase):
                 self.assertIs(caught.exception, error)
                 self.assertEqual(proxy._timers, {timer})
                 self.assertEqual((proxy._loop, proxy._thread), initial)
-                self.assertEqual(loop.events, ["stop"])
+                self.assertEqual(loop.events, [])
 
 
 if __name__ == "__main__":
