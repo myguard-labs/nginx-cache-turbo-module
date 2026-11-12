@@ -1482,8 +1482,8 @@ class AbortRig:
         assert not missing, f"never reached the backend: {missing}"
 
     def __enter__(self) -> AbortRig:
-        self.proxy.start()
         try:
+            self.proxy.start()
             self.node.write_config()
             self.node.config_test()
             self.node.start()
@@ -1491,8 +1491,8 @@ class AbortRig:
                 self._prime()
             self.proxy.delay = self.proxy_delay
             self.site.arrange(self)
-        except BaseException:
-            self.__exit__(None, None, None)
+        except BaseException as error:
+            self.__exit__(type(error), error, error.__traceback__)
             raise
         return self
 
