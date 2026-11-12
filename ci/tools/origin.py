@@ -1342,7 +1342,28 @@ class Origin:
         wait_port(self.port)
 
     def stop(self) -> None:
-        if self._server:
-            self._server.shutdown()
-            self._server.server_close()
-            self._server = None
+        errors = []
+        if self._server is not None:
+            server = self._server
+            for cleanup in (server.shutdown, server.server_close):
+                try:
+                    cleanup()
+                except Exception as error:
+                    errors.append(error)
+            if not errors:
+                self._server = None
+
+        if self._thread is not None:
+            try:
+                self._thread.join(timeout=5)
+                if self._thread.is_alive():
+                    raise RuntimeError("origin serving thread did not terminate")
+            except Exception as error:
+                errors.append(error)
+            else:
+                self._thread = None
+
+        if errors:
+            for error in errors[1:]:
+                errors[0].add_note(f"Additional origin cleanup error: {error!r}")
+            raise errors[0]
