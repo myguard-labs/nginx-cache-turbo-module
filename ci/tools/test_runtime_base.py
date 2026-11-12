@@ -968,7 +968,11 @@ class RedisServer:
             return
         if self.process.poll() is None:
             self.process.terminate()
-            self.process.wait(timeout=10)
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=10)
         self.process = None
 
     def start_monitor(self) -> RedisMonitor:
@@ -1272,7 +1276,11 @@ class MemcachedServer:
             return
         if self.process.poll() is None:
             self.process.terminate()
-            self.process.wait(timeout=10)
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=10)
         self.process = None
 
 
