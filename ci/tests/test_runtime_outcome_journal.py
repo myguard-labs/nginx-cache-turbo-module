@@ -104,6 +104,32 @@ class OutcomeJournalTests(unittest.TestCase):
         self.assertEqual([json.loads(line)[-1] for line in moved.read_text().splitlines()],
                          ["entry", "return"])
 
+    def test_fdopen_failure_closes_descriptor(self):
+        descriptors = []
+        real_open = base.os.open
+        def capture_open(*args):
+            descriptor = real_open(*args)
+            descriptors.append(descriptor)
+            return descriptor
+        with mock.patch.object(base.os, "open", side_effect=capture_open), \
+             mock.patch.object(base.os, "fdopen", side_effect=OSError("fdopen")):
+            failed = base._OutcomeJournal(str(self.path.parent / "fdopen"), "id")
+        self.assertTrue(failed.failed)
+        self.assertEqual(len(descriptors), 1)
+        with self.assertRaises(OSError):
+            base.os.fstat(descriptors[0])
+        failed.close()
+
+    def test_disabled_preserves_exception_identity(self):
+        for error in (ValueError(), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                def fail(error=error):
+                    raise error
+                wrapped = self.wrap({"fail": fail})["test_fail"]
+                with self.assertRaises(type(error)) as caught:
+                    wrapped()
+                self.assertIs(caught.exception, error)
+
     def test_io_failures_are_sticky_and_do_not_mask_outcomes(self):
         for stage in ("write", "flush", "close", "short_write"):
             for raises in (False, True):
