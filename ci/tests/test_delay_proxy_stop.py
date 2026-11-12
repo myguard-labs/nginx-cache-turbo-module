@@ -26,7 +26,7 @@ def stop_method():
 
 
 class DelayProxyStopTests(unittest.TestCase):
-    def rig(self, failures=None, alive=False, loop=True, thread=True, server=True):
+    def rig(self, failures=None, alive=False, loop=True, thread=True, server=True, execute=True):
         calls = []
         ownership = []
         queued = []
@@ -54,9 +54,10 @@ class DelayProxyStopTests(unittest.TestCase):
         loop_owner.call_soon_threadsafe = schedule
         def join(*args, **kwargs):
             action("join")(*args, **kwargs)
-            for callback in queued:
-                callback()
-            queued.clear()
+            if execute:
+                for callback in queued:
+                    callback()
+                queued.clear()
 
         thread_owner = types.SimpleNamespace(
             join=join, is_alive=action("is-alive", alive))
@@ -113,6 +114,45 @@ class DelayProxyStopTests(unittest.TestCase):
         self.assertEqual(self.names(calls),
                          ["schedule-timers", "schedule-stop", "join", "is-alive"])
         self.assertEqual((proxy._loop, proxy._thread), (None, None))
+
+    def test_failed_start_empty_timers_and_terminated_thread_clear_ownership(self):
+        # start_server failure returns from the thread before run_forever; the
+        # queued cancellation cannot run, and no handler has registered a timer.
+        proxy, calls, ownership = self.rig(server=False, execute=False)
+        initial = proxy._loop, proxy._thread
+        stop = stop_method()
+        stop(proxy)
+        self.assertEqual(self.names(calls),
+                         ["schedule-timers", "schedule-stop", "join", "is-alive"])
+        self.assertTrue(all(pair == initial for pair in ownership))
+        self.assertEqual(proxy._timers, set())
+        self.assertEqual((proxy._loop, proxy._thread), (None, None))
+        stop(proxy)
+        self.assertEqual(len(calls), 4)
+
+    def test_unobserved_cancellation_empty_timers_and_live_thread_is_failure(self):
+        proxy, calls, ownership = self.rig(alive=True, execute=False)
+        initial = proxy._loop, proxy._thread
+        with self.assertRaisesRegex(RuntimeError, "thread did not terminate") as caught:
+            stop_method()(proxy)
+        self.assertEqual(caught.exception.__notes__, [
+            "Cleanup failure: RuntimeError('DelayProxy timer cancellation did not complete')",
+        ])
+        self.assertEqual(self.names(calls).count("is-alive"), 1)
+        self.assert_retained(proxy, initial, ownership)
+
+    def test_unobserved_cancellation_needs_confirmed_termination(self):
+        failure = ValueError("unknown liveness")
+        proxy, calls, ownership = self.rig({"is-alive": failure}, execute=False)
+        initial = proxy._loop, proxy._thread
+        with self.assertRaises(ValueError) as caught:
+            stop_method()(proxy)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(failure.__notes__, [
+            "Cleanup failure: RuntimeError('DelayProxy timer cancellation did not complete')",
+        ])
+        self.assertEqual(self.names(calls).count("is-alive"), 1)
+        self.assert_retained(proxy, initial, ownership)
 
     def test_partial_ownership_attempts_available_cleanup_and_retains_handles(self):
         for loop, thread, expected in (

@@ -338,10 +338,12 @@ class DelayProxy:
                 attempt(loop.call_soon_threadsafe, self._server.close)
             attempt(loop.call_soon_threadsafe, cancel_timers)
             attempt(loop.call_soon_threadsafe, loop.stop)
+        thread_terminated = False
         if thread is not None:
             attempt(lambda: thread.join(timeout=10))
             try:
-                if thread.is_alive():
+                thread_terminated = not thread.is_alive()
+                if not thread_terminated:
                     failures.append(RuntimeError("DelayProxy thread did not terminate"))
             except Exception as error:
                 failures.append(error)
@@ -351,7 +353,7 @@ class DelayProxy:
                 attempt(cancelled.result)
                 if self._timers:
                     failures.append(RuntimeError("DelayProxy timers remain pending"))
-            else:
+            elif self._timers or not thread_terminated:
                 failures.append(RuntimeError("DelayProxy timer cancellation did not complete"))
 
         if failures:
