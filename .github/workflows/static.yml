@@ -1,4 +1,4 @@
-# sync-sha: ddf32ea78957b45ba01bb2869b6924fe72b00ffa7e4af9c222dedaab9d821953
+# sync-sha: b3e82d9ab08a2550cf229972a575da8895d8173a5d60a7ef0450cda944d49b2f
 name: Static
 
 # Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
@@ -430,7 +430,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bear build-essential ccache curl eatmydata flawfinder clang-tidy \
+          sudo apt-get install -y build-essential ccache curl eatmydata flawfinder clang-tidy \
             libpcre2-dev libssl-dev mold python3 python3-pip pipx zlib1g-dev
           # semgrep: isolate via pipx (PEP 668 blocks a bare pip3 install into the
           # system Python on the Ubuntu 24.04 self-hosted runner). Fall back to a
@@ -446,7 +446,9 @@ jobs:
           fi
           test "$(semgrep --version)" = 1.169.0
       - name: Static-analysis negative controls
-        run: bash ci/tools/test-analysis-controls.sh
+        run: |
+          bash ci/tools/test-analysis-controls.sh
+          python3 ci/tests/unit/test_compile_capture.py
       - name: gitleaks
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -470,11 +472,14 @@ jobs:
         run: |
           set -euo pipefail
           tree="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}"
-          # bear only records compiles that execute. Force just this module's
-          # objects cold so a warm build cache cannot yield a valid empty db.
+          # Force make to submit every module compile, even with cached objects.
+          # The recorder preserves the submitted argv on ccache hits as well.
           rm -rf "$tree/objs/addon" "$tree"/objs/*.so
-          bear --output compile_commands.json -- \
-            bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
+          capture="$(mktemp -d)"
+          trap 'rm -rf "$capture"' EXIT
+          export CT_COMPILE_COMMANDS_DIR="$capture"
+          bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
+          python3 ci/tools/record_compile.py --merge "$capture" compile_commands.json
       - name: Verify compilation database covers src/
         env:
           WS: ${{ github.workspace }}

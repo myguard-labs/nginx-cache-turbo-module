@@ -278,15 +278,26 @@ if [ -n "$MODULE_SAN" ]; then
     bash "$MODULE_DIR/ci/tools/asan-module-reinstrument.sh" objs/Makefile "$MODULE_SAN"
 fi
 
+# Compilation database capture: configure still probes the normal compiler.
+# Wrap only make's CC, outside ccache, so cache selection and compiler hashing
+# stay unchanged. Each invocation writes its own file; no interception server
+# or concurrent append is involved. The caller merges only after build success.
+CAPTURE_MAKE_ARGS=()
+if [ -n "${CT_COMPILE_COMMANDS_DIR:-}" ]; then
+    printf -v capture_cc 'python3 %q' "$MODULE_DIR/ci/tools/record_compile.py"
+    CAPTURE_MAKE_ARGS=("CC=$capture_cc $WITH_CC")
+fi
+# End compilation database capture.
+
 if [ "$MODE" != "asan" ]; then
     # MAKE may be "eatmydata make" — must word-split.
     # shellcheck disable=SC2086
-    $MAKE -j"$(nproc)" modules
+    $MAKE -j"$(nproc)" "${CAPTURE_MAKE_ARGS[@]}" modules
 fi
 
 if [ "$MODE" != "module" ]; then
     # shellcheck disable=SC2086
-    $MAKE -j"$(nproc)"
+    $MAKE -j"$(nproc)" "${CAPTURE_MAKE_ARGS[@]}"
     printf 'binary=%s\n' "$ROOT/$DIR/objs/$BINARY"
 fi
 
