@@ -1496,18 +1496,28 @@ class AbortRig:
             raise
         return self
 
-    def __exit__(self, exc_type: object, *exc: object) -> None:
-        try:
-            self.node.stop()
-        except RuntimeError:
-            # A single-process nginx that crashed fails stop() too. Let the
-            # failure already on its way out, which names the cause, win.
-            if exc_type is None:
-                raise
-        finally:
-            self.proxy.stop()
-            for uri in self.uris + self.retired:
-                self.site.forget(uri)
+    def __exit__(self, exc_type: object, exc_value: BaseException | None,
+                 traceback: object) -> None:
+        failures: list[Exception] = []
+
+        def attempt(action: Callable[..., object], *args: object) -> None:
+            try:
+                action(*args)
+            except Exception as error:
+                failures.append(error)
+
+        attempt(self.node.stop)
+        attempt(self.proxy.stop)
+        for uri in self.uris + self.retired:
+            attempt(self.site.forget, uri)
+
+        if failures:
+            body_error = exc_value if exc_type is not None else None
+            primary = body_error if body_error is not None else failures.pop(0)
+            for failure in failures:
+                primary.add_note(f"Cleanup failure: {failure!r}")
+            if body_error is None:
+                raise primary
 
     def anchor(self, uri: str) -> ParkAnchor:
         return self.site.anchor(self, uri)
