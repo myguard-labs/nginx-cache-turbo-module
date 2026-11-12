@@ -55,6 +55,18 @@ class RedisTlsCliFixture(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 server.cli("FLUSHALL")
 
+    def test_other_tls_failures_are_not_bypassed(self):
+        for certs in ({"ca": "valid-ca", "cert": "cert", "key": "key"},
+                      {"ca": "wrong-ca", "cert": "cert", "key": "key"}):
+            server = base.RedisServer(pathlib.Path("redis-server"), pathlib.Path("."),
+                                      12345, tls_certs=certs)
+            with self.subTest(ca=certs["ca"]), mock.patch.object(
+                    base.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [], 1, stdout="certificate or configuration error")) as run:
+                with self.assertRaises(RuntimeError):
+                    server.cli("PING")
+                self.assertNotIn("--insecure", run.call_args.args[0])
+
 
 if __name__ == "__main__":
     unittest.main()
