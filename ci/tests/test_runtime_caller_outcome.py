@@ -182,6 +182,23 @@ class CallerOutcomeTests(unittest.TestCase):
         report.assert_called_once()
         self.assertEqual(report.call_args.args[0], "UNKNOWN")
 
+    def test_empty_outcome_dir_rejected_before_setup(self):
+        import test_runtime_base as base
+
+        with mock.patch.object(sys, "argv", ["runtime", "--nginx-binary", "/bin/true"]):
+            self.assertIsNone(base.parse_args().outcome_dir)
+        with (
+            mock.patch.object(sys, "argv", ["runtime", "--nginx-binary", "/bin/true",
+                                            "--outcome-dir", ""]),
+            mock.patch.object(runtime, "_main") as setup,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit) as error,
+        ):
+            runtime.main()
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("--outcome-dir", stderr.getvalue())
+        setup.assert_not_called()
+
     def test_cli_option_and_actual_post_setup_fixtures(self):
         import test_runtime_base as base
 

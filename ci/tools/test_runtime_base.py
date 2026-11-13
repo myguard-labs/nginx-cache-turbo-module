@@ -249,7 +249,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=18880)
     parser.add_argument("--redis-server")  # accepted; used by v2 L2 tests
     parser.add_argument("--memcached-server")  # v13: memcached L2 backend tests
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.outcome_dir == "":
+        parser.error("--outcome-dir must not be empty")
+    return args
 
 
 
