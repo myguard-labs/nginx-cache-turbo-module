@@ -7,7 +7,10 @@ CLOEXEC socket for guard death and a pidfd for caller death; neither is a PID
 rediscovery. A nondefault SIGCHLD reaper is refused before launching anything.
 Command/session leaders remain unreaped until the final group
 signal, preventing PGID reuse. Adopted children are signalled through pidfds.
-Diagnostics never become command descendants. Cleanup is bounded, including
+Diagnostics never become command descendants. On ordinary command exit, an
+active capture may finish only until the reserved cleanup window; the command's
+status remains authoritative. Signals/parent death abort that wait immediately.
+Cleanup is bounded, including
 stubborn/escaped descendants; inability to establish ownership fails closed.
 
 SIGKILL of the guard is handled by the independent owner. SIGKILL of that owner,
@@ -172,14 +175,19 @@ def _owner(wire, caller_fd, command, env, soft, hard, capture):
                     number = json.loads(data)["signal"]
                     result.update(status=128 + number, reason="guard signal")
                 break
-            if command_process.exited():
+            command_exited = command_process.exited()
+            # An already-started capture has a post-signal snapshot tail. Keep
+            # its session owned until it finishes or cleanup must start; an
+            # ordinary command exit must not truncate that evidence.
+            cleanup_due = now >= deadline - 2 * grace
+            if command_exited and (len(processes) == 1 or processes[-1].exited() or cleanup_due):
                 result.update(reason="command exit")
                 break
             # Reserve both escalation/reaping phases INSIDE the hard bound.
-            if now >= deadline - 2 * grace:
+            if cleanup_due:
                 result.update(status=124, reason="hard deadline")
                 break
-            if soft is not None and not captured and now >= start + soft:
+            if not command_exited and soft is not None and not captured and now >= start + soft:
                 captured = True
                 if capture is not None:
                     processes.append(OwnedProcess(capture(command_process.pid)))

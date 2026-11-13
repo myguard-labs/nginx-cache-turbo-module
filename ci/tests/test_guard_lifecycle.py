@@ -200,6 +200,43 @@ class GuardLifecycleTests(unittest.TestCase):
         _, status = os.waitpid(guard_pid, 0)
         self.assertEqual(os.waitstatus_to_exitcode(status), 125)
 
+    def test_normal_exit_allows_capture_tail_and_preserves_status(self):
+        command_script = ("import pathlib,sys,time\n"
+                          "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.005)\n"
+                          "raise SystemExit(int(sys.argv[2]))")
+        capture_script = ("import pathlib,sys,time; pathlib.Path(sys.argv[1]).touch(); "
+                          "time.sleep(.15); pathlib.Path(sys.argv[2]).write_text('complete')")
+        for status in (0, 23):
+            with self.subTest(status=status):
+                ready = self.directory / ('tail-ready-' + str(status))
+                snapshot = self.directory / ('tail-snapshot-' + str(status))
+                result = lifecycle.run_owned(
+                    [sys.executable, '-c', command_script, str(ready), str(status)],
+                    None, self.pin, soft=0, hard=2,
+                    capture=lambda pid, ready=ready, snapshot=snapshot: [
+                        sys.executable, '-c', capture_script, str(ready), str(snapshot)])
+                self.assertTrue(snapshot.exists(), 'normal command exit truncated diagnostic tail')
+                self.assertEqual(snapshot.read_text(), 'complete')
+                self.assertEqual(result['status'], status)
+                self.assertEqual(result['code'], status)
+
+    def test_stubborn_tail_is_bounded_and_preserves_exited_command_status(self):
+        ready = self.directory / 'stubborn-tail-ready'
+        command_script = ("import pathlib,sys,time\n"
+                          "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.005)\n"
+                          "raise SystemExit(23)")
+        capture_script = ("import pathlib,signal,sys,time; "
+                          "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                          "pathlib.Path(sys.argv[1]).touch(); time.sleep(60)")
+        result = lifecycle.run_owned(
+            [sys.executable, '-c', command_script, str(ready)], None, self.pin,
+            soft=0, hard=1,
+            capture=lambda pid: [sys.executable, '-c', capture_script, str(ready)])
+        self.assertTrue(ready.exists(), 'capture never started')
+        self.assertEqual(result['reason'], 'command exit')
+        self.assertEqual(result['status'], 23)
+        self.assertEqual(result['code'], 23)
+
     def test_blocked_capture_is_isolated_and_cannot_extend_deadline(self):
         identity = self.directory / 'capture-command.json'
         capture_file = self.directory / 'capture.json'
