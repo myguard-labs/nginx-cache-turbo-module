@@ -1,4 +1,4 @@
-# sync-sha: 6ad7bc6769dc5afbcde55aa563cf3ca03c6e45d7b5e8675e19a106a67611075f
+# sync-sha: 0554cb90ba4c4954d79acfa1b3ff0de22593fc57d84de024d33dbc5dc9a1b18b
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -2038,11 +2038,14 @@ jobs:
         continue-on-error: true
         if: always() && steps.scanners_06.outcome == 'success'
       - name: scanners / gcc -fanalyzer (advisory)
+        id: scanners_analyzer
         if: always() && steps.scanners_06.outcome == 'success'
         continue-on-error: true
         env:
           BUILD_ROOT: ${{ github.workspace }}/.build/deep/scanners
-        run: bash ci/tools/fanalyzer.sh "$GITHUB_WORKSPACE"
+        run: |
+          bash ci/tools/fanalyzer.sh "$GITHUB_WORKSPACE" || \
+            echo "::warning::gcc analyzer reported findings or replay failure; see fanalyzer.log"
       - name: scanners / semgrep (gate on >=WARNING)
         run: |
           set -euo pipefail
@@ -2092,7 +2095,7 @@ jobs:
             testkit_sanitizer_06 testkit_sanitizer_07 testkit_sanitizer_08 testkit_angie_reset testkit_angie_01 testkit_angie_02
             testkit_angie_03 testkit_angie_04 testkit_angie_isolate testkit_angie_05 testkit_angie_06 testkit_angie_07 testkit_angie_08
             testkit_angie_09 testkit_angie_10 scanners_reset scanners_01 scanners_02 scanners_03 scanners_04 scanners_05 scanners_isolate
-            scanners_06 scanners_07 scanners_08 scanners_09 scanners_10
+            scanners_06 scanners_07 scanners_08 scanners_analyzer scanners_09 scanners_10
           LANE_OPTIONAL: ''
         shell: python3 {0}
         run: |

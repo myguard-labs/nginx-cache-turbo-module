@@ -420,7 +420,7 @@
     },
     {
       "name": "Configure nginx src tree (clang-tidy headers)",
-      "sha256": "c9c062e53e9f6e63224f05619b301029d98f7cd8c260413dbff9c61963ce6760"
+      "sha256": "cee525f5648114903827f7a1e92a5b68462e139f8379d4241436c9f1aef60149"
     },
     {
       "name": "flawfinder (gate on >=4)",
@@ -431,12 +431,16 @@
       "sha256": "f2032f29a66e1131b662ec28820067c443b9b980718654834803e21375bbe34f"
     },
     {
+      "name": "gcc -fanalyzer (advisory)",
+      "sha256": "94511ba4bfc2bc65b8d4eb423e863e68c70c435c8bc20d59c0ad91df64ef68bb"
+    },
+    {
       "name": "semgrep (gate on >=WARNING)",
       "sha256": "76582e12e2bf724dd730dcb5923dd7765ed013a65c8552e462d5c1a374297d39"
     },
     {
       "name": "Upload reports",
-      "sha256": "dcebeff2e636592951fc8592b168f424d249fabef7d78322eb29a4894424d828"
+      "sha256": "830e8245e4016627c3e20ac08ec4f5bc04596e23bcbd0f33bd6da100888cec76"
     }
   ]
 }

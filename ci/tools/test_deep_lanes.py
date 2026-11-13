@@ -527,6 +527,51 @@ class DeepLanes(unittest.TestCase):
                 )
                 self.assertEqual(len(capture.read_text().splitlines()), 2)
 
+    def test_analyzer_advisory_is_accounted_and_independent(self):
+        job = WORKFLOW["jobs"]["D-compat"]
+        step = next(
+            s
+            for s in job["steps"]
+            if s["name"] == "scanners / gcc -fanalyzer (advisory)"
+        )
+        self.assertEqual(step["id"], "scanners_analyzer")
+        self.assertEqual(
+            step["if"], "always() && steps.scanners_06.outcome == 'success'"
+        )
+        final = next(s for s in job["steps"] if s.get("id") == "verdict")
+        self.assertIn(step["id"], final["env"]["LANE_REQUIRED"].split())
+        good = simulate(job)
+        self.assertEqual(good[step["id"]], "success")
+        self.assertEqual(verdict(job, good)[0], 0)
+        failed = simulate(job, step["id"])
+        self.assertEqual(failed["scanners_09"], "success")
+        self.assertEqual(failed["scanners_10"], "success")
+        self.assertEqual(verdict(job, failed)[0], 1)
+        self.assertEqual(simulate(job, "scanners_06")[step["id"]], "skipped")
+        missing = dict(good)
+        del missing[step["id"]]
+        self.assertEqual(verdict(job, missing)[0], 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "bash"
+            stub.write_text('#!/bin/sh\necho analyzer-ran\nexit "$STUB_EXIT"\n')
+            stub.chmod(0o755)
+            for exit_code in ("0", "1"):
+                result = subprocess.run(
+                    ["/bin/bash", "-euo", "pipefail", "-c", step["run"]],
+                    env={
+                        **os.environ,
+                        "PATH": tmp,
+                        "GITHUB_WORKSPACE": tmp,
+                        "STUB_EXIT": exit_code,
+                    },
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("analyzer-ran", result.stdout)
+                self.assertEqual("::warning::" in result.stdout, exit_code == "1")
+
     def test_scanners_and_angie_controls_are_independent(self):
         job = WORKFLOW["jobs"]["D-compat"]
         siblings = [
