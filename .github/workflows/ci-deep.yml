@@ -1,4 +1,4 @@
-# sync-sha: 3b127a5b87de0b992517147efa112dacaf5ddd570b4a9ddbd9b4dfcb6338ba5b
+# sync-sha: 645776a15e78bfa520a40e913914f8bdc66913e563ce06f63b3512248f483a5f
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -191,6 +191,7 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           TEST_CT_TIMEOUT: "30"
+          CT_ALLOC_SWEEP: full
           SOAK_ITERATIONS: ${{ github.event.inputs.soak_iterations || 8 }}
         run: |
           B="${BUILD_ROOT}/nginx-${NGINX_VERSION}/objs/nginx"
