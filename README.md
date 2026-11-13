@@ -36,6 +36,13 @@ them live in `ci.yml`'s header comment.
 | [Testkit Valgrind](.github/workflows/testkit-valgrind.yml) | weekly: the same prober scenarios as the Static testkit leg, staged as a plain DEBUG build and run under valgrind memcheck instead of the probe's own fd/pool-delta accounting, asserted in both directions the same way |
 | [Bump versions](.github/workflows/bump.yml) | weekly refresh of the pinned nginx/angie versions and verified archive digests |
 
+The runtime driver `ci/tools/test_runtime.py` accepts `--outcome-dir DIR` to
+record an optional outcome journal. `DIR` must exist; each run creates a fresh
+private subdirectory for the journal and status files. The driver prints the
+outcome and artifact paths, and exits nonzero for `UNKNOWN` or `FAILURE`.
+The decision is evaluated in-process; the files do not authenticate a
+cross-process result. Without the option, runtime behavior is unchanged.
+
 ### The testkit prober leg
 
 [nginx-module-testkit](https://github.com/myguard-labs/nginx-module-testkit) is
