@@ -776,7 +776,7 @@ def _run_with_outcome(directory, ng, origin, refs, timings, report=None):
     journal = None
     path = status = None
     roots = None
-    run_id = secrets.token_hex(16)
+    run_id = os.environ.get("CT_OUTCOME_RUN_ID") or secrets.token_hex(16)
     source_id = ""
     try:
         source = pathlib.Path(__file__).read_bytes()

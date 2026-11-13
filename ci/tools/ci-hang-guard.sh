@@ -84,7 +84,12 @@ nginx_role() {
 }
 
 # Run the real command in the background; watch its wall time.
-"$@" &
+# Observation is opt-in; the original command path remains unchanged otherwise.
+if [ "${CT_OUTCOME_OBSERVE:-}" = "1" ]; then
+    python3 "$(dirname "$0")/ci_child_observer.py" "$ARTDIR" -- "$@" &
+else
+    "$@" &
+fi
 CMD_PID=$!
 
 captured=0

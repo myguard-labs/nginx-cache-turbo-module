@@ -1,4 +1,4 @@
-# sync-sha: de11d2aa2af6b4a43a91b6e9e1c990c208f0228b43d894553d98b087815a5742
+# sync-sha: 2468e419cd5ba4d0c906d5bbe40a3d5d6120187969c35f2c94ae955884051e1d
 name: Build & Test
 
 # Lane L-build (CI-L3). One job, sequential, no artifact hop: build, unit
@@ -210,6 +210,7 @@ jobs:
           # test_runtime.py _write_breadcrumb). On an R6b hang the guard copies
           # it to hanging-test.txt so the backtrace is labelled with the culprit.
           CT_TEST_BREADCRUMB: ${{ github.workspace }}/ci-hang-artifacts/current-test.txt
+          CT_OUTCOME_OBSERVE: "1"
         run: |
           # Guard bound: measured 15 runs of THIS step on main
           # (2026-08-08, gh api .../jobs, "Run runtime suite" step
