@@ -245,6 +245,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sanitizer", action="store_true")
     parser.add_argument("--timings", action="store_true",
                         help="report elapsed time for each runtime test")
+    parser.add_argument("--outcome-dir", help="write a private outcome journal under this directory")
     parser.add_argument("--port", type=int, default=18880)
     parser.add_argument("--redis-server")  # accepted; used by v2 L2 tests
     parser.add_argument("--memcached-server")  # v13: memcached L2 backend tests
