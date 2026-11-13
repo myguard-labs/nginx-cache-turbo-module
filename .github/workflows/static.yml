@@ -1,4 +1,4 @@
-# sync-sha: b3e82d9ab08a2550cf229972a575da8895d8173a5d60a7ef0450cda944d49b2f
+# sync-sha: 3909c04e0793de75862dbc3a19734bda6354aa2b939b74d32e0f068895b45f66
 name: Static
 
 # Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
@@ -449,6 +449,7 @@ jobs:
         run: |
           bash ci/tools/test-analysis-controls.sh
           python3 ci/tests/unit/test_compile_capture.py
+          python3 ci/tests/unit/test_fanalyzer_gate.py
       - name: gitleaks
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -528,9 +529,11 @@ jobs:
               2>&1 | tee -a clang-tidy.log || status=1
           done
           exit "$status"
-      - name: gcc -fanalyzer (advisory)
-        continue-on-error: true
-        run: bash ci/tools/fanalyzer.sh "$GITHUB_WORKSPACE"
+      - name: gcc -fanalyzer selected diagnostics
+        run: |
+          set -o pipefail
+          python3 ci/tools/fanalyzer_gate.py "$GITHUB_WORKSPACE" compile_commands.json \
+            ci/tools/fanalyzer-baseline.json 2>&1 | tee fanalyzer.log
       - name: semgrep (gate on >=WARNING)
         run: |
           set -euo pipefail
