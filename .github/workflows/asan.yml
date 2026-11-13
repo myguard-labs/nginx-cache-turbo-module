@@ -1,4 +1,4 @@
-# sync-sha: 08d0b0b38e33d82f317089de650b04271388b7d1690650754c4f344d7bd1afcd
+# sync-sha: 0ffe018e84edd4e284f3e3b9ed494e3368a5bff4eabed6082cd1804fad0cd4de
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -237,6 +237,14 @@ jobs:
 
       - name: Verify multi-worker port band
         run: ci/tools/max-port.sh "$TEST_BASE_PORT"
+
+      - name: Run ASan abort soak
+        env:
+          ABORT: "1"
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          ABORT_PORT_BASE="$TEST_BASE_PORT" bash ci/tools/soak.sh "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx" 90
 
       - name: Run runtime suite multi-worker under ASan and UBSan (CI-3)
         # CI-3: the single-process job covers our allocations; this run exercises
