@@ -1,4 +1,4 @@
-# sync-sha: 2468e419cd5ba4d0c906d5bbe40a3d5d6120187969c35f2c94ae955884051e1d
+# sync-sha: 16058fbacfaac716404c92d53c4df5c848ce3a006f74acf828b8f8d417491496
 name: Build & Test
 
 # Lane L-build (CI-L3). One job, sequential, no artifact hop: build, unit
@@ -189,18 +189,17 @@ jobs:
         run: ci/tools/max-port.sh "$TEST_BASE_PORT"
 
       - name: Run runtime suite
-        # Wrapped in ci-hang-guard.sh, same pattern as asan.yml: 749s worst-observed
-        # on a runner shared with 4 sibling jobs leaves too little headroom to trust
-        # a bare job timeout, and this job is not the critical path (A/UBSan is), so
-        # a soft-timeout guard that captures evidence costs nothing on the happy path.
+        # CI-L10d runtime budget: capture at 540s and stop/reap by 600s.
+        # The hard bound includes TERM/KILL/reaping; capture runs separately so
+        # a blocked debugger cannot extend it. Runtime budget failures stay red.
         #
-        # AUD-TESTFIX1 log capture: ci-hang-guard.sh does `"$@" &` and tracks nginx as
-        # a descendant of $! (see descendants()/nginx_pids_under() there). Piping
+        # AUD-TESTFIX1 log capture: the guard owns a private command session.
+        # nginx stays under its retained command leader. Piping
         # test_runtime.py directly (`cmd | tee log -- ...`) would make tee, not
         # python3, the backgrounded process, and nginx would come up as a SIBLING of
         # tee rather than a descendant -- the guard would report "no nginx under pid"
         # and never capture a hang again. Wrapping the whole pipeline in one
-        # `bash -c '...'` keeps a single process ($!) that is the ancestor of both
+        # `bash -c '...'` keeps a single process that is the ancestor of both
         # python3 and tee, so nginx (python3's descendant) stays inside the tracked
         # tree. `set -o pipefail` inside that inner bash makes the wrapper's exit
         # status the suite's, not tee's, so a failing suite still fails this step.
@@ -212,17 +211,8 @@ jobs:
           CT_TEST_BREADCRUMB: ${{ github.workspace }}/ci-hang-artifacts/current-test.txt
           CT_OUTCOME_OBSERVE: "1"
         run: |
-          # Guard bound: measured 15 runs of THIS step on main
-          # (2026-08-08, gh api .../jobs, "Run runtime suite" step
-          # started_at/completed_at) gave min=709s median=724s max=749s.
-          # That left only 151s of margin against the old 900s bound
-          # (max within ~1.2x) -- a slower/contended runner risks the
-          # guard firing mid-test and reading as an R6b hang (SUITE-
-          # TIMEOUT-MARGIN, memory/labs/nginx-cache-turbo-module/TODO.md).
-          # Raised to 1200s then (900s -> 1200s, +451s over observed max).
-          # PR #503's abort/re-entry arms took this step to 1156s, so it is
-          # now 2100s (~1.8x) with the job at 40 minutes.
-          bash ci/tools/ci-hang-guard.sh 2100 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+          # Enforce the existing CI-L10d runtime budget without extending the job.
+          CT_HANG_HARD_SECONDS=600 bash ci/tools/ci-hang-guard.sh 540 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
               python3 ci/tools/test_runtime.py \

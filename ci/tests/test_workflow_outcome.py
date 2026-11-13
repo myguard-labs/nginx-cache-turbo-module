@@ -14,6 +14,20 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class WorkflowOutcomeTest(unittest.TestCase):
+    def test_asan_preserves_capture_with_finite_existing_job_bound(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/asan.yml').read_text())
+        checked = 0
+        for job in workflow['jobs'].values():
+            for step in job.get('steps', []):
+                command = step.get('run', '')
+                if 'ci-hang-guard.sh 2700' in command:
+                    checked += 1
+                    args = shlex.split(command, comments=True)
+                    self.assertEqual(args[:4], ['CT_HANG_HARD_SECONDS=3000', 'bash',
+                                                'ci/tools/ci-hang-guard.sh', '2700'])
+                    self.assertEqual(job['timeout-minutes'], 60)
+        self.assertEqual(checked, 2)
+
     def test_build_runtime_outcome_and_status(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/build-test.yml').read_text())
         steps = workflow['jobs']['build']['steps']
@@ -23,7 +37,8 @@ class WorkflowOutcomeTest(unittest.TestCase):
         self.assertIn('set -o pipefail', command)
         self.assertIn('--outcome-dir "$GITHUB_WORKSPACE/ci-hang-artifacts"', command)
         args = shlex.split(command, comments=True)
-        self.assertEqual(args[:3], ['bash', 'ci/tools/ci-hang-guard.sh', '2100'])
+        self.assertEqual(args[:4], ['CT_HANG_HARD_SECONDS=600', 'bash',
+                                    'ci/tools/ci-hang-guard.sh', '540'])
         with tempfile.TemporaryDirectory(prefix='workflow outcome ') as tmp:
             workspace = Path(tmp)
             tools_dir = workspace / 'ci/tools'
@@ -35,6 +50,8 @@ class WorkflowOutcomeTest(unittest.TestCase):
             producer.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
+if pathlib.Path(args[0]).name == 'ci_child_observer.py':
+    os.execv(sys.executable, [sys.executable, *args])
 assert args[0] == 'ci/tools/test_runtime.py'
 assert args.count('--outcome-dir') == 1
 parent = args[args.index('--outcome-dir') + 1]
