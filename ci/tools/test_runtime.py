@@ -17,6 +17,9 @@ Both properties come from the star-imports below; keep them.
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import secrets
 import traceback
 
 from areas.admin import *
@@ -37,7 +40,9 @@ from test_runtime_base import (
     Origin,
     RedisServer,
     _check_port_registry,
+    _consume_outcome,
     _instrument,
+    _OutcomeJournal,
     _start_tls_fixtures,
 )
 
@@ -724,14 +729,123 @@ def run_all(ng: Nginx, origin: Origin,
     test_admin_purge_all(ng)   # last: it empties the zone
 
 
+def _expected_roots(source: bytes, config: dict[str, bool]) -> list[str]:
+    """Interpret only the supported, declarative run_all call sequence."""
+    keys = {"fault_injection", "redis", "redis_auth", "redis_tls",
+            "redis_tls_untrusted", "redis_tls_expired", "mc"}
+    if set(config) != keys or any(type(v) is not bool for v in config.values()):
+        raise ValueError("invalid fixture configuration")
+    funcs = [n for n in ast.parse(source).body
+             if isinstance(n, ast.FunctionDef) and n.name == "run_all"]
+    if len(funcs) != 1:
+        raise ValueError("missing or ambiguous run_all")
+    roots = []
+
+    def walk(statements, enabled):
+        for stmt in statements:
+            if isinstance(stmt, ast.If) and not stmt.orelse:
+                test = stmt.test
+                if (isinstance(test, ast.Attribute) and isinstance(test.value, ast.Name)
+                        and test.value.id == "ng" and test.attr == "fault_injection"):
+                    flag = "fault_injection"
+                elif (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                      and test.left.id in keys - {"fault_injection"}
+                      and len(test.ops) == 1 and isinstance(test.ops[0], ast.IsNot)
+                      and len(test.comparators) == 1
+                      and isinstance(test.comparators[0], ast.Constant)
+                      and test.comparators[0].value is None):
+                    flag = test.left.id
+                else:
+                    raise ValueError("unsupported fixture condition")
+                walk(stmt.body, enabled and config[flag])
+            elif (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                  and isinstance(stmt.value.func, ast.Name)
+                  and stmt.value.func.id.startswith("test_")
+                  and all(isinstance(a, ast.Name) for a in stmt.value.args)
+                  and not stmt.value.keywords):
+                if enabled:
+                    roots.append(stmt.value.func.id)
+            else:
+                raise ValueError("unsupported run_all statement")
+    walk(funcs[0].body, True)
+    return roots
+
+
+def _run_with_outcome(directory, ng, origin, refs, timings, report=None):
+    """Record and consume one optional process-local outcome without masking errors."""
+    journal = None
+    path = status = None
+    roots = None
+    run_id = secrets.token_hex(16)
+    source_id = ""
+    try:
+        source = pathlib.Path(__file__).read_bytes()
+        source_id = hashlib.sha256(source).hexdigest()
+        config = dict(zip(("redis", "redis_auth", "redis_tls", "mc",
+                           "redis_tls_untrusted", "redis_tls_expired"),
+                          [ref is not None for ref in refs], strict=True))
+        config["fault_injection"] = ng.fault_injection
+        roots = _expected_roots(source, config)
+        run_dir = pathlib.Path(tempfile.mkdtemp(prefix="outcome-", dir=directory))
+        path, status = run_dir / "journal", run_dir / "status"
+        journal = _OutcomeJournal(str(path), run_id, source_id)
+    except (OSError, ValueError, SyntaxError):
+        roots = None  # Missing evidence is consumed as UNKNOWN.
+    completed = False
+    try:
+        _instrument(origin, timings, globals(), journal)
+        run_all(ng, origin, *refs)
+        completed = True
+    finally:
+        decision = "UNKNOWN"
+        if journal is not None:
+            journal.close()
+            receipt = journal.publish(str(status))
+            try:
+                data = path.read_bytes()
+            except OSError:
+                data = None
+            decision = _consume_outcome(data, receipt, expected_run=run_id,
+                                        expected_source=source_id, expected_roots=roots)
+        if not completed and decision == "SUCCESS":
+            decision = "UNKNOWN"
+        if not completed:
+            if report is None:
+                _print_outcome(decision, path, status)
+            else:
+                report(decision, path, status)
+    return decision, path, status
+
+
 def _print_timings(timings: list[tuple[str, float]]) -> None:
     print("TIMING TOP 20", flush=True)
     for name, elapsed in sorted(timings, key=lambda item: item[1], reverse=True)[:20]:
         print(f"TIMING TOP {name} {elapsed:.6f}s", flush=True)
 
 
+def _print_outcome(decision, path, status):
+    print(f"OUTCOME {decision} journal={path} status={status}", flush=True)
+
+
 def main() -> int:
     args = parse_args()
+    reported = False
+
+    def report(decision, path, status):
+        nonlocal reported
+        if not reported:
+            reported = True
+            _print_outcome(decision, path, status)
+
+    try:
+        return _main(args, report)
+    except BaseException:
+        if args.outcome_dir:
+            report("UNKNOWN", None, None)
+        raise
+
+
+def _main(args, report) -> int:
     binary = pathlib.Path(args.nginx_binary).resolve()
     module = pathlib.Path(args.module).resolve() if args.module else None
     if not binary.exists():
@@ -844,10 +958,17 @@ def main() -> int:
             ng.config_test()
             ng.start()
             timings: list[tuple[str, float]] | None = [] if args.timings else None
-            _instrument(origin, timings, globals() if args.timings else None)
             try:
-                run_all(ng, origin, redis, redis_auth, redis_tls, mc,
-                        redis_tls_untrusted, redis_tls_expired)
+                if args.outcome_dir:
+                    decision, outcome_path, outcome_status = _run_with_outcome(
+                        args.outcome_dir, ng, origin,
+                        (redis, redis_auth, redis_tls, mc,
+                         redis_tls_untrusted, redis_tls_expired), timings, report)
+                else:
+                    _instrument(origin, timings, globals() if args.timings else None)
+                    run_all(ng, origin, redis, redis_auth, redis_tls, mc,
+                            redis_tls_untrusted, redis_tls_expired)
+                    decision = "SUCCESS"
             finally:
                 if timings is not None:
                     _print_timings(timings)
@@ -871,6 +992,11 @@ def main() -> int:
                     traceback.print_exception(type(error), error, error.__traceback__)
             if cleanup_error is not None and not body_failed:
                 raise cleanup_error
+
+        if args.outcome_dir:
+            report(decision, outcome_path, outcome_status)
+            if decision != "SUCCESS":
+                raise RuntimeError(f"runtime outcome: {decision}")
 
         if fixture_skips:
             print(f"FIXTURE SUMMARY: {len(fixture_skips)} skipped: "
