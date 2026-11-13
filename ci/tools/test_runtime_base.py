@@ -399,6 +399,72 @@ class _OutcomeReceipt:
         return None if self._journal.failed else self._status.copy()
 
 
+UNKNOWN, FAILURE, SUCCESS = "UNKNOWN", "FAILURE", "SUCCESS"
+
+
+def _consume_outcome(data, receipt, *, expected_run, expected_source, expected_roots):
+    """Evaluate trusted inputs only; UNKNOWN covers any missing or invalid evidence."""
+    if type(receipt) is not _OutcomeReceipt:
+        return UNKNOWN
+    status = receipt.status()
+    if type(expected_run) is not str or not expected_run:
+        return UNKNOWN
+    if type(expected_source) is not str or not expected_source:
+        return UNKNOWN
+    if type(expected_roots) is not list or not expected_roots or any(type(x) is not str or not x for x in expected_roots):
+        return UNKNOWN
+    if type(data) is not bytes or not data or type(status) is not dict:
+        return UNKNOWN
+    if set(status) != {'version', 'run_id', 'source_id', 'complete', 'io_ok', 'length', 'sha256'}:
+        return UNKNOWN
+    if (type(status['version']) is not int or status['version'] != 1 or
+        type(status['run_id']) is not str or status['run_id'] != expected_run or
+        type(status['source_id']) is not str or status['source_id'] != expected_source or
+        status['complete'] is not True or status['io_ok'] is not True or
+        type(status['length']) is not int or status['length'] < 1 or
+        type(status['sha256']) is not str):
+        return UNKNOWN
+    # MUTATION_TARGET: complete byte binding must precede event interpretation.
+    if status['length'] != len(data) or status['sha256'] != hashlib.sha256(data).hexdigest():
+        return UNKNOWN
+    try:
+        if not data.endswith(b'\n'):
+            return UNKNOWN
+        lines = data.decode('utf-8').splitlines()
+        records = [json.loads(line) for line in lines]
+    except (UnicodeDecodeError, ValueError):
+        return UNKNOWN
+    stack, roots = [], []
+    next_id, failed = 1, False
+    for record in records:
+        if type(record) is not list or len(record) != 6:
+            return UNKNOWN
+        version, run_id, ident, parent, name, event = record
+        if (type(version) is not int or version != 1 or type(run_id) is not str or run_id != expected_run or
+            type(ident) is not int or ident < 1 or
+            (parent is not None and (type(parent) is not int or parent < 1)) or
+            type(name) is not str or not name or type(event) is not str):
+            return UNKNOWN
+        if event == 'entry':
+            if ident != next_id or parent != (stack[-1][0] if stack else None):
+                return UNKNOWN
+            next_id += 1
+            if not stack:
+                roots.append(name)
+            stack.append((ident, parent, name))
+        elif event in ('return', 'exception', 'base_exception'):
+            if not stack or stack[-1] != (ident, parent, name):
+                return UNKNOWN
+            stack.pop()
+            failed |= event != 'return'
+        else:
+            return UNKNOWN
+    if stack or roots != expected_roots:
+        return UNKNOWN
+    return FAILURE if failed else SUCCESS
+
+
+
 def _instrument(origin: Origin, timings: list[tuple[str, float]] | None = None,
                 facade: dict | None = None, journal: _OutcomeJournal | None = None) -> None:
     """Wrap every module-level test_* function so each records the c->number
