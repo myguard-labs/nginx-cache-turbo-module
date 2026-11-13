@@ -218,6 +218,52 @@ class DeepLanes(unittest.TestCase):
                 inventory(yaml.safe_load(ARGS.baseline.read_text()), True), expected
             )
 
+    def test_soak_uses_full_allocation_sweep(self):
+        step = next(
+            s
+            for s in WORKFLOW["jobs"]["D-soak"]["steps"]
+            if s["name"].endswith(
+                "Run multi-worker fault-injection suite N times (fail-fast)"
+            )
+        )
+        self.assertEqual(step["env"].get("CT_ALLOC_SWEEP"), "full")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            record = root / "invocation.json"
+            stub = root / "python3"
+            stub.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ['RECORD'], 'w') as output:\n"
+                "    json.dump([os.environ.get('CT_ALLOC_SWEEP'), sys.argv[1:]], output)\n"
+            )
+            stub.chmod(0o755)
+            fuser = root / "fuser"
+            fuser.write_text("#!/bin/sh\nexit 0\n")
+            fuser.chmod(0o755)
+            env = {
+                **os.environ,
+                **step["env"],
+                "PATH": tmp + os.pathsep + os.environ["PATH"],
+                "BUILD_ROOT": tmp,
+                "NGINX_VERSION": "test",
+                "SOAK_ITERATIONS": "1",
+                "TEST_BASE_PORT": "10000",
+                "RECORD": str(record),
+            }
+            result = subprocess.run(
+                ["bash", "-e", "-c", step["run"]],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            sweep, arguments = json.loads(record.read_text())
+            self.assertEqual(sweep, "full")
+            self.assertEqual(arguments[0], "ci/tools/test_runtime.py")
+            self.assertIn("--fault-injection", arguments)
+
     def test_four_lanes_and_budgets(self):
         self.assertEqual(list(WORKFLOW["jobs"]), list(LANES))
         dispatch = WORKFLOW[True]["workflow_dispatch"]["inputs"]

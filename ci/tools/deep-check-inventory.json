@@ -26,7 +26,7 @@
     },
     {
       "name": "Run multi-worker fault-injection suite N times (fail-fast)",
-      "sha256": "8dcba204359f4b731758b4f64e7d9524cdbea385e53490b78d7e0d65507f3722"
+      "sha256": "f2c44bec1dadbf15760b214d23c771ac701b73eb86b53363f3360791036fa1d8"
     }
   ],
   "fuzz-a": [
