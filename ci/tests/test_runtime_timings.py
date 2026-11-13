@@ -2,10 +2,13 @@
 import contextlib
 import io
 import pathlib
+import shlex
 import sys
 import types
 import unittest
 from unittest import mock
+
+import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
 import test_runtime
@@ -65,7 +68,16 @@ class RuntimeTimings(unittest.TestCase):
         with mock.patch.object(sys, "argv", [*argv, "--timings"]):
             self.assertTrue(base.parse_args().timings)
         workflow = pathlib.Path(__file__).resolve().parents[2] / ".github/workflows/build-test.yml"
-        self.assertIn("python3 ci/tools/test_runtime.py \\\n                --timings", workflow.read_text())
+        data = yaml.safe_load(workflow.read_text())
+        commands = [step["run"] for step in data["jobs"]["build"]["steps"]
+                    if "test_runtime.py" in step.get("run", "")]
+        self.assertEqual(len(commands), 1)
+        outer = shlex.split(commands[0], comments=True)
+        script = outer[outer.index("-c") + 1]
+        args = shlex.split(script, comments=True)
+        runtime = args.index("ci/tools/test_runtime.py")
+        self.assertEqual(args[runtime - 1], "python3")
+        self.assertIn("--timings", args[runtime + 1:args.index("|", runtime)])
 
     def test_clock_regression_is_nonnegative(self):
         timings = []
