@@ -285,22 +285,27 @@ def _conn_cursor() -> int:
 
 
 class _OutcomeJournal:
-    """Optional serial observations; no journal alone proves suite success.
+    """Serial recorder. Trusted IDs and private fresh paths belong to the caller.
 
-    The caller supplies a private fresh path and unpredictable run ID, and
-    closes the journal after use. Concurrent invocations are unsupported.
+    Publication receipts are valid only while this recorder remains unmisused;
+    they are process-local and do not authenticate a cross-process transport.
     """
 
-    def __init__(self, path: str, run_id: str):
+    def __init__(self, path: str, run_id: str, source_id: str = ""):
         self.run_id = run_id
+        self.source_id = source_id
         self.failed = False
+        self._closed = False
+        self._published = False
         self._file = None
         self._next_id = 0
         self._stack: list[int] = []
+        self._length = 0
+        self._digest = hashlib.sha256()
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
-                self._file = os.fdopen(fd, "w", encoding="utf-8")
+                self._file = os.fdopen(fd, "wb")
             except BaseException:
                 os.close(fd)
                 raise
@@ -308,10 +313,13 @@ class _OutcomeJournal:
             self.failed = True
 
     def _write(self, invocation: int, parent: int | None, name: str, event: str) -> None:
+        record = (json.dumps([1, self.run_id, invocation, parent, name, event])
+                  + "\n").encode("utf-8")
+        self._length += len(record)
+        self._digest.update(record)
         if self.failed or self._file is None:
             return
         try:
-            record = json.dumps([1, self.run_id, invocation, parent, name, event]) + "\n"
             if self._file.write(record) != len(record):
                 self.failed = True
                 return
@@ -319,7 +327,10 @@ class _OutcomeJournal:
         except OSError:
             self.failed = True
 
-    def enter(self, name: str) -> tuple[int, int | None]:
+    def enter(self, name: str) -> tuple[int, int | None] | None:
+        if self._closed:
+            self.failed = True
+            return None
         self._next_id += 1
         invocation = self._next_id
         parent = self._stack[-1] if self._stack else None
@@ -328,10 +339,17 @@ class _OutcomeJournal:
         return invocation, parent
 
     def finish(self, token: tuple[int, int | None], name: str, event: str) -> None:
+        if self._closed or not self._stack or self._stack[-1] != token[0]:
+            self.failed = True
+            return
         self._stack.pop()
         self._write(*token, name, event)
 
     def close(self) -> None:
+        if self._closed:
+            self.failed = True
+            return
+        self._closed = True
         if self._file is not None:
             try:
                 self._file.close()
@@ -339,6 +357,46 @@ class _OutcomeJournal:
                 self.failed = True
             finally:
                 self._file = None
+
+    def publish(self, path: str):
+        """Publish once; return a live receipt only after every I/O step succeeds."""
+        incomplete = not self._next_id or bool(self._stack)
+        missing_identity = not self.run_id or not self.source_id
+        if self._published or not self._closed or self.failed or incomplete or missing_identity:
+            self.failed = True
+            return None
+        self._published = True
+        status = {"version": 1, "run_id": self.run_id, "source_id": self.source_id,
+                  "complete": True, "io_ok": True, "length": self._length,
+                  "sha256": self._digest.hexdigest()}
+        data = json.dumps(status, sort_keys=True).encode("utf-8")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                stream = os.fdopen(fd, "wb")
+            except BaseException:
+                os.close(fd)
+                raise
+            with stream:
+                if stream.write(data) != len(data):
+                    self.failed = True
+                    return None
+                stream.flush()
+        except OSError:
+            self.failed = True
+            return None
+        return _OutcomeReceipt(self, status)
+
+
+class _OutcomeReceipt:
+    """A process-local success observation, invalidated by later recorder misuse."""
+
+    def __init__(self, journal, status):
+        self._journal = journal
+        self._status = status
+
+    def status(self):
+        return None if self._journal.failed else self._status.copy()
 
 
 def _instrument(origin: Origin, timings: list[tuple[str, float]] | None = None,
