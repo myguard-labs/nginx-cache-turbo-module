@@ -1,4 +1,4 @@
-# sync-sha: 1bafac74601533b60a3c5551ddc5e8aa52e685df9c8c1f38df43edb2ee4ade21
+# sync-sha: de11d2aa2af6b4a43a91b6e9e1c990c208f0228b43d894553d98b087815a5742
 name: Build & Test
 
 # Lane L-build (CI-L3). One job, sequential, no artifact hop: build, unit
@@ -225,6 +225,7 @@ jobs:
             bash -c '
               set -o pipefail
               python3 ci/tools/test_runtime.py \
+                --outcome-dir "$GITHUB_WORKSPACE/ci-hang-artifacts" \
                 --timings \
                 --fault-injection \
                 --port "$TEST_BASE_PORT" \
