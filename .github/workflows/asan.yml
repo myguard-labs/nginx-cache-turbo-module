@@ -1,4 +1,4 @@
-# sync-sha: 08d0b0b38e33d82f317089de650b04271388b7d1690650754c4f344d7bd1afcd
+# sync-sha: b26c9ca38656a2223956f534032fbfb04304191fabeb7ac7b2401d3a5940afc3
 name: ASan and UBSan
 
 # Dedicated ASan+UBSan workflow, PATH-GATED: only runs when a PR/push touches
@@ -145,21 +145,22 @@ jobs:
         # reproduces locally too, not CI-only; see memory issues.md, 2026-08-21).
         # If the suite runs past the soft timeout the guard captures a gdb all-thread
         # backtrace + SIGQUIT debug dump into ci-hang-artifacts/ (uploaded below) so the
-        # next occurrence yields evidence instead of a mute job timeout. 1200s soft <
-        # the 30-min job timeout, well above the ~7-min healthy run.
+        # next occurrence yields evidence before the finite 3000s hard bound.
+        # Keep the existing 2700s soft capture within the 60-minute job.
         #
-        # AUD-TESTFIX1 log capture: ci-hang-guard.sh does `"$@" &` and tracks nginx as
-        # a descendant of $! (see descendants()/nginx_pids_under() there). Piping
+        # AUD-TESTFIX1 log capture: the guard owns a private command session.
+        # nginx stays under its retained command leader. Piping
         # test_runtime.py directly (`cmd | tee log -- ...`) would make tee, not
         # python3, the backgrounded process, and nginx would come up as a SIBLING of
         # tee rather than a descendant — the guard would report "no nginx under pid"
         # and never capture a hang again. Wrapping the whole pipeline in one
-        # `bash -c '...'` keeps a single process ($!) that is the ancestor of both
+        # `bash -c '...'` keeps a single process that is the ancestor of both
         # python3 and tee, so nginx (python3's descendant) stays inside the tracked
         # tree. `set -o pipefail` inside that inner bash makes the wrapper's exit
         # status the suite's, not tee's, so a failing suite still fails this step.
         run: |
-          bash ci/tools/ci-hang-guard.sh 2700 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+          # Leave ten minutes of the existing 60m job for teardown/artifacts.
+          CT_HANG_HARD_SECONDS=3000 bash ci/tools/ci-hang-guard.sh 2700 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
               python3 ci/tools/test_runtime.py \
@@ -303,7 +304,8 @@ jobs:
           # it to hanging-test.txt so the backtrace is labelled with the culprit.
           CT_TEST_BREADCRUMB: ${{ github.workspace }}/ci-hang-artifacts/current-test.txt
         run: |
-          bash ci/tools/ci-hang-guard.sh 2700 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+          # Leave ten minutes of the existing 60m job for teardown/artifacts.
+          CT_HANG_HARD_SECONDS=3000 bash ci/tools/ci-hang-guard.sh 2700 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
               python3 ci/tools/test_runtime.py \
