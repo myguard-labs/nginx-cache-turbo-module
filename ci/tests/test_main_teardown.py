@@ -23,9 +23,9 @@ def teardown(body, owners):
                        and isinstance(child.value.func, ast.Attribute)
                        and child.value.func.attr == "stop"
                        for child in ast.walk(ast.Module(body=node.finalbody, type_ignores=[])))]
-    # The main teardown owns origin and nginx; identify it from its enclosing function.
+    # The runtime teardown owns origin and nginx in the _main implementation.
     main = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                and node.name == "main")
+                and node.name == "_main")
     matches = [node for node in matches if node in list(ast.walk(main))
                and any(isinstance(child, ast.Name) and child.id == "origin"
                        for stmt in node.finalbody for child in ast.walk(stmt))]
