@@ -1,4 +1,4 @@
-# sync-sha: 645776a15e78bfa520a40e913914f8bdc66913e563ce06f63b3512248f483a5f
+# sync-sha: 6ad7bc6769dc5afbcde55aa563cf3ca03c6e45d7b5e8675e19a106a67611075f
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -1983,7 +1983,13 @@ jobs:
       - name: scanners / Configure nginx src tree (clang-tidy headers)
         run: |
           set -euo pipefail
+          tree="${BUILD_ROOT}/nginx-${NGINX_VERSION}"
+          rm -rf "$tree/objs/addon" "$tree"/objs/*.so
+          capture="$(mktemp -d)"
+          trap 'rm -rf "$capture"' EXIT
+          export CT_COMPILE_COMMANDS_DIR="$capture"
           bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" module
+          python3 ci/tools/record_compile.py --merge "$capture" compile_commands.json
           echo "NGINX_SRC_TREE=${BUILD_ROOT}/nginx-${NGINX_VERSION}" \
             >> "$GITHUB_ENV"
         id: scanners_06
@@ -2031,6 +2037,12 @@ jobs:
           BUILD_ROOT: ${{ github.workspace }}/.build/deep/scanners
         continue-on-error: true
         if: always() && steps.scanners_06.outcome == 'success'
+      - name: scanners / gcc -fanalyzer (advisory)
+        if: always() && steps.scanners_06.outcome == 'success'
+        continue-on-error: true
+        env:
+          BUILD_ROOT: ${{ github.workspace }}/.build/deep/scanners
+        run: bash ci/tools/fanalyzer.sh "$GITHUB_WORKSPACE"
       - name: scanners / semgrep (gate on >=WARNING)
         run: |
           set -euo pipefail
@@ -2054,6 +2066,7 @@ jobs:
           path: |
             ${{ github.workspace }}/flawfinder.log
             ${{ github.workspace }}/clang-tidy.log
+            ${{ github.workspace }}/fanalyzer.log
             ${{ github.workspace }}/semgrep.log
           retention-days: 14
 
