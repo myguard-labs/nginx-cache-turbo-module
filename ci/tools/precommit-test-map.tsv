@@ -66,6 +66,7 @@ ci/tests/unit/check_versions_env.sh	none	bash ci/tests/unit/check_versions_env.s
 ci/tests/unit/check_ci_build_ccache.sh	none	bash ci/tests/unit/check_ci_build_ccache.sh
 ci/tests/unit/check_purge_snapshot_control.sh	build	bash ci/tests/unit/check_purge_snapshot_control.sh
 ci/tests/unit/check_purge_zero_skew_control.sh	build	bash ci/tests/unit/check_purge_zero_skew_control.sh
+ci/tests/unit/check_hash_diagnostic_pipefail.sh	none	bash ci/tests/unit/check_hash_diagnostic_pipefail.sh
 ci/tests/unit/check_hash_diagnostic_controls.sh	build	bash ci/tests/unit/check_hash_diagnostic_controls.sh
 ci/tests/unit/check_varidx_accounting.sh	build	bash ci/tests/unit/check_varidx_accounting.sh
 ci/tests/unit/check_preset_mirrors.py	none	bash ci/tests/unit/check_constants.sh

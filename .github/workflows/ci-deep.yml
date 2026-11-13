@@ -1,4 +1,4 @@
-# sync-sha: 0554cb90ba4c4954d79acfa1b3ff0de22593fc57d84de024d33dbc5dc9a1b18b
+# sync-sha: 38bbb80554585240ef66b9f5a7fd259074ffa0f9abd7151ead43f2f44d98e411
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -218,6 +218,18 @@ jobs:
         id: asan_soak_07
         continue-on-error: true
         if: always() && steps.asan_soak_06.outcome == 'success'
+      - name: Run ASan abort soak
+        id: asan_soak_abort
+        if: always() && steps.asan_soak_06.outcome == 'success'
+        continue-on-error: true
+        env:
+          BUILD_ROOT: ${{ github.workspace }}/.build/deep/asan-soak
+          ABORT: "1"
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          ABORT_PORT_BASE="$TEST_BASE_PORT" bash ci/tools/soak.sh "${BUILD_ROOT}/nginx-${NGINX_VERSION}/objs/nginx" 90
+
       - name: Lane verdict
         id: verdict
         if: always()
@@ -226,7 +238,7 @@ jobs:
           LANE_STEPS: ${{ toJSON(steps) }}
           LANE_REQUIRED: >-
             checkout asan_soak_reset asan_soak_01 asan_soak_02 asan_soak_03 asan_soak_isolate asan_soak_04 asan_soak_05 asan_soak_06
-            asan_soak_07
+            asan_soak_07 asan_soak_abort
           LANE_OPTIONAL: ''
         shell: python3 {0}
         run: |

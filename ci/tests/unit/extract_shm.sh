@@ -643,7 +643,7 @@ for fn in ngx_http_cache_turbo_shm_store_locked ngx_http_cache_turbo_shm_claim_l
           ngx_http_cache_turbo_shm_count_miss_locked ngx_http_cache_turbo_shm_l2_neg_set
 do
     body="$(sed -n "/^${fn}(/,/^}/p" "$SRC")"
-    if ! printf '%s\n' "$body" | grep -q 'test_hash_crc32_mismatch'; then
+    if ! grep -q 'test_hash_crc32_mismatch' <<< "$body"; then
         echo "✗ PERF-AUD2-10: $fn lost its hash mismatch diagnostic" >&2
         rm -f "$OUT"
         exit 1

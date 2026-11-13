@@ -2111,6 +2111,7 @@ case_ 0 "carve-init: count pin restored to the true count is clean again" pin_li
 
 # Deep lane control flow and retained check inventory are cheap static controls.
 case_ 0 "Deep lanes: inventory and failure continuation" env PYTHONUTF8=1 python3 "$ROOT/ci/tools/test_deep_lanes.py"
+case_ 0 "Abort soak workflow commands" env PYTHONUTF8=1 python3 "$ROOT/ci/tools/test_abort_ci.py"
 
 if [ "$rc" -eq 0 ]; then
     echo "== lint gate selftest: all controls held =="
