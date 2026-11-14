@@ -2113,6 +2113,9 @@ case_ 0 "carve-init: count pin restored to the true count is clean again" pin_li
 case_ 0 "Deep lanes: inventory and failure continuation" env PYTHONUTF8=1 python3 "$ROOT/ci/tools/test_deep_lanes.py"
 case_ 0 "Abort soak workflow commands" env PYTHONUTF8=1 python3 "$ROOT/ci/tools/test_abort_ci.py"
 
+# The sizeof-pointer policy is mandatory even when its structural matches are advisory.
+case_ 0 "sizeof-pointer canonical type and mandatory wrapper controls" python3 "$ROOT/ci/tests/test_sizeof_pointer.py"
+
 if [ "$rc" -eq 0 ]; then
     echo "== lint gate selftest: all controls held =="
 else

@@ -146,6 +146,14 @@ bash "$DIR/extract_digest.sh"
 "$CC" $CFLAGS "$DIR/test_digest.c" -o "$DIR/test_digest" -lssl -lcrypto
 "$DIR/test_digest"
 
+# --- typed admin schema: frozen bytes, maxima, escaping and bounds --------
+if [ "${COVERAGE:-0}" = 1 ]; then
+    STATS_TEST_OUT="${STATS_TEST_OUT:-$DIR/stats-schema-coverage}" \
+        python3 "$DIR/test_stats_schema.py"
+else
+    python3 "$DIR/test_stats_schema.py"
+fi
+
 # --- admin ?key= digest failure propagation (DIGEST-ERRORS-IGNORED) -------
 # Compile the real helper with a deterministic failing digest.  A mutation
 # that ignores digest()'s return reaches either cache tier and turns this red.

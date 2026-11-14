@@ -4,9 +4,9 @@
 # Structural, not textual. The other C checkers here read the file as tokens
 # (flawfinder's risky-API list) or as a whole translation unit (cppcheck,
 # clang-tidy); ast-grep reads it as a PARSE TREE, so a rule can say "memcpy
-# whose third argument is a sizeof of a pointer" and mean it -- a shape grep
-# cannot express and a TU-level analyzer will not report unless it can also
-# prove the overflow. That is the gap this fills: cheap, shape-level sinks,
+# whose third argument is a sizeof of an identifier". Pointer type is
+# decided by the mandatory libclang check below; shape alone also matches
+# safe scalar and whole-object widths. That is the gap this fills: cheap, shape-level sinks,
 # checked on every commit rather than in the nightly deep lane.
 #
 # Ruleset is ci/ast-grep/: rules/own/ (this superrepo's C and nginx rules) plus
@@ -36,7 +36,7 @@
 # describes. A rule joins PROMOTED only after its findings are measured on real
 # trees and confirmed real.
 #
-# PROMOTED is the only list of rules that block, and ci/linter/run-all.sh is the
+# PROMOTED is the list of rules that block, and ci/linter/run-all.sh is the
 # only gate that runs it (the commit hook and CI both call run-all), so there is
 # no second copy to keep in step.
 #
@@ -85,7 +85,8 @@
 #
 # The other five stay promoted: each is defined by the ruleset (the check below
 # proves that) and each currently has zero findings here, so promoting them
-# gates future regressions at no cost today.
+# gates future regressions. c-memcpy-sizeof-pointer is resolved semantically
+# by libclang, rather than promoting its identifier-only structural matches.
 PROMOTED=(
     c-memcpy-sizeof-pointer
     c-sizeof-wrong-operand
@@ -156,16 +157,39 @@ done
        | ast-grep ignores an unknown --error= silently, so these gate NOTHING.
        | Fix the spelling or drop them."
 
+# Keep the pointer rule in the mandatory policy. Its structural candidates
+# remain advisory in ast-grep; the compiler-backed decision below owns its
+# blocking verdict. All other promoted rules retain ast-grep enforcement.
+SEMANTIC_RULE=c-memcpy-sizeof-pointer
+SEMANTIC_IMPL=ci/tools/sizeof_pointer.py
+[ -f "$SEMANTIC_IMPL" ] || die "$SEMANTIC_IMPL missing -- mandatory pointer-size gate unavailable"
+need python3 "install python3 for the mandatory sizeof-pointer check"
+
 ERRFLAGS=()
-for r in "${PROMOTED[@]}"; do ERRFLAGS+=("--error=$r"); done
+for r in "${PROMOTED[@]}"; do
+    [ "$r" = "$SEMANTIC_RULE" ] || ERRFLAGS+=("--error=$r")
+done
 
-say "ast-grep (${#PROMOTED[@]} promoted rule(s) block; rest advisory)"
-ast-grep scan -c "$CONFIG" "${ERRFLAGS[@]}" "${FILES[@]}"
-rc=$?
+say "ast-grep (${#PROMOTED[@]} mandatory rule(s); $SEMANTIC_RULE uses canonical C types)"
+if ast-grep scan -c "$CONFIG" "${ERRFLAGS[@]}" "${FILES[@]}"; then
+    rc=0
+else
+    rc=$?
+fi
 
-# 0 clean, 1 a promoted rule fired. Anything else is ast-grep failing to run
-# (6 = config error, verified 2026-08-10), which is "could not run", not clean.
+# 0 clean, 1 a promoted rule fired. Anything else means no reliable verdict.
 case "$rc" in
-    0|1) exit "$rc" ;;
-    *)   die "ast-grep exited $rc -- could not run (config error?), not a verdict" ;;
+    0|1) ;;
+    *) die "ast-grep exited $rc -- could not run (config error?), not a verdict" ;;
 esac
+if python3 "$SEMANTIC_IMPL" "${FILES[@]}"; then
+    semantic_rc=0
+else
+    semantic_rc=$?
+fi
+case "$semantic_rc" in
+    0) ;;
+    1) rc=1 ;;
+    *) die "mandatory $SEMANTIC_RULE semantic check unavailable (exit $semantic_rc)" ;;
+esac
+exit "$rc"

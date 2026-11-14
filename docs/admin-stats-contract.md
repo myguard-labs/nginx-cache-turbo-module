@@ -15,12 +15,22 @@ reads the breaker's stored state; it does not advance an expired OPEN breaker.
 
 The zone directive accepts a nonempty nginx configuration token. The nginx
 configuration parser determines which bytes can be represented. Quoted tokens
-can represent a quote, a backslash, and a newline. The Prometheus renderer
-inserts the resulting bytes literally in its `zone` label, without escaping;
-these cases can produce invalid exposition. Changing this behavior requires a
-compatibility decision. The focused test exercises these cases, punctuation,
-and an ordinary name; it does not claim to enumerate nginx's entire token
-language.
+can represent a quote, a backslash, and a newline. The schema renderer now
+escapes these as `\"`, `\\` and `\n` in Prometheus label values. This intentionally
+repairs the historical literal insertion of these bytes, which could produce
+invalid exposition. Labels needing no escaping retain their exact historical
+bytes. JSON keys and string values use JSON escaping, including control bytes;
+the zone name is not a JSON field. The focused test covers these label cases,
+punctuation and an ordinary name, plus empty-name rejection.
+
+A private typed descriptor table supplies names, historical HELP/TYPE, source
+member offsets and per-format order. One bounded snapshot contains the backend
+stats and the admin location's effective `lock_ttl`; it adds no shared state.
+The renderer first measures descriptor prose, escaped labels and full atomic or
+signed time widths, then allocates once and bounds every append. Overflow or a
+short buffer fails closed without sending partial JSON or exposition. This
+admin-only work introduces no request-path allocation or lock, and the snapshot
+does not strengthen the sampling consistency described above.
 
 The table maps each field to every production writer function and its relevant
 conditional classes. Function names omit the common `ngx_http_cache_turbo_`

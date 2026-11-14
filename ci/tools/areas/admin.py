@@ -2369,11 +2369,12 @@ def test_admin_expired_breaker_scrape(ng: Nginx, origin: Origin) -> None:
 
 
 def test_admin_raw_zone_labels(ng: Nginx) -> None:
-    """Configuration token bytes pass through to the legacy label unescaped."""
+    """Ordinary label bytes stay stable; configuration metacharacters escape."""
     import pathlib
     import subprocess
     import tempfile
 
+    load = f"load_module {ng.module};\n" if ng.module else ""
     cases = (("", None), ("normal", "normal"), ("a-b.c_1", "a-b.c_1"),
              ('a\\"b', 'a"b'), (r"a\\b", "a\\b"), (r"a\nb", "a\nb"))
     for token, name in cases:
@@ -2383,12 +2384,13 @@ def test_admin_raw_zone_labels(ng: Nginx) -> None:
             config = root / "nginx.conf"
             port = ng.port + 55
             config.write_text(
-                f"load_module {ng.module};\npid {root}/nginx.pid;\ndaemon off;\n"
+                f"{load}pid {root}/nginx.pid;\ndaemon off;\n"
                 f'events {{}}\nhttp {{ cache_turbo_zone "name={token}" 1m; '
                 f'server {{ listen 127.0.0.1:{port}; location /stats '
                 f'{{ cache_turbo_admin "{token}"; }} }} }}\n')
             command = ng.runner + [str(ng.binary), "-p", directory, "-c", str(config)]
-            checked = subprocess.run(command + ["-t"], capture_output=True, text=True, check=False)
+            checked = subprocess.run(command + ["-t"], capture_output=True, text=True,
+                                     check=False, env=config_check_env())
             if name is None:
                 assert checked.returncode != 0, "empty zone name accepted"
                 continue
@@ -2405,7 +2407,9 @@ def test_admin_raw_zone_labels(ng: Nginx) -> None:
                 else:
                     raise AssertionError(f"nginx did not start for {token!r}")
                 assert status == 200
-                assert f'cache_turbo_hits_total{{zone="{name}"}} 0\n' in body
+                escaped = name.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                assert f'cache_turbo_hits_total{{zone="{escaped}"}} 0\n' in body
+                assert len(body.splitlines()) == 36 * 3, "label broke exposition framing"
             finally:
                 process.terminate()
                 process.wait(timeout=10)
@@ -2419,13 +2423,14 @@ def test_admin_stats_reload_restart(ng: Nginx) -> None:
     import subprocess
     import tempfile
 
+    load = f"load_module {ng.module};\n" if ng.module else ""
     with tempfile.TemporaryDirectory(prefix="c239-reload-") as directory:
         root = pathlib.Path(directory)
         (root / "logs").mkdir()
         config = root / "nginx.conf"
         port = ng.port + 56
         config.write_text(
-            f"load_module {ng.module};\npid {root}/nginx.pid;\ndaemon off;\n"
+            f"{load}pid {root}/nginx.pid;\ndaemon off;\n"
             "events {}\nhttp { cache_turbo_zone name=contract 1m; "
             f"server {{ listen 127.0.0.1:{port}; location /stats "
             "{ cache_turbo_admin contract; } location /c/ { "
