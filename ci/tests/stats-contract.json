@@ -1,0 +1,262 @@
+{
+  "json_keys": [
+    "hits",
+    "misses",
+    "stale_serves",
+    "refreshes",
+    "evictions",
+    "l2_hits",
+    "l2_misses",
+    "lock_waits",
+    "min_uses_skips",
+    "l2_neg_skips",
+    "bypasses",
+    "refuse_set_cookie",
+    "refuse_encoded",
+    "refuse_vary_unsafe",
+    "refuse_authorization",
+    "refuse_cache_control",
+    "refuse_require_header",
+    "refuse_partial",
+    "refuse_head",
+    "cost_ms",
+    "autotuned_beta",
+    "autotuned_load",
+    "breaker_state",
+    "breaker_opens",
+    "sie_serves",
+    "breaker_serves",
+    "origin_failures",
+    "varidx_drops",
+    "tag_index_drops",
+    "tag_cap_drops",
+    "bg_inflight",
+    "sketch_gen",
+    "sketch_bumps",
+    "admission_refused",
+    "used_bytes",
+    "markers",
+    "lock_ttl"
+  ],
+  "prometheus_families": [
+    {
+      "name": "cache_turbo_hits_total",
+      "help": "Fresh L1 cache hits served.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_misses_total",
+      "help": "Misses that went to the origin.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_stale_serves_total",
+      "help": "Stale copies served while a refresh ran.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_refreshes_total",
+      "help": "Background single-flight refreshes started.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_evictions_total",
+      "help": "Entries evicted under memory pressure (LRU).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_l2_hits_total",
+      "help": "L1 misses satisfied by the L2 tier (Redis or memcached).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_l2_misses_total",
+      "help": "L1 misses that L2 could not satisfy (went to origin).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_lock_waits_total",
+      "help": "Cold-miss requests that waited for a single-flight fill (v10).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_min_uses_skips_total",
+      "help": "Cold misses sent to origin without storing because the key is below cache_turbo_min_uses (v15).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_l2_neg_skips_total",
+      "help": "L2 GETs skipped because a negative memo already recorded a miss for the key (L13).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_bypasses_total",
+      "help": "Requests skipped straight to origin by a cache_turbo_bypass predicate or a CMS backend preset (subset of misses).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_refuse_set_cookie_total",
+      "help": "Store refused because the response carried a Set-Cookie header.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_refuse_encoded_total",
+      "help": "Store refused because the response was already Content-Encoding'd (origin pre-compression or filter mis-order).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_refuse_vary_unsafe_total",
+      "help": "Store refused: Vary named an axis outside the whitelist or \"*\".",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_refuse_authorization_total",
+      "help": "Store refused because the request carried Authorization.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_refuse_cache_control_total",
+      "help": "Store refused by a Cache-Control (or CDN-/Surrogate-) no-store/no-cache/private/max-age=0 directive.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_refuse_require_header_total",
+      "help": "Store refused because cache_turbo_require_header was unmet (absent or not affirmative).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_refuse_partial_total",
+      "help": "Store refused because the response was 206 Partial Content.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_refuse_head_total",
+      "help": "Store refused because the request was HEAD.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_regen_cost_ms",
+      "help": "Average origin regeneration cost in milliseconds.",
+      "type": "gauge"
+    },
+    {
+      "name": "cache_turbo_autotuned_beta",
+      "help": "Live autotuned SWR beta (x1000; 0 = none).",
+      "type": "gauge"
+    },
+    {
+      "name": "cache_turbo_autotuned_load",
+      "help": "Live load factor widening stale window + lock_ttl under load (x1000; 1000 = none).",
+      "type": "gauge"
+    },
+    {
+      "name": "cache_turbo_sie_serves_total",
+      "help": "Responses served from a stale-if-error snapshot.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_breaker_serves_total",
+      "help": "Responses served from the circuit breaker's armed fallback while OPEN.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_origin_failures_total",
+      "help": "Origin responses recorded as a failure by the circuit breaker.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_varidx_drops_total",
+      "help": "Auto-Vary variant-index writes dropped before reaching the transport at store time (self-heals on the next hit).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_tag_index_drops_total",
+      "help": "Purge-by-tag index writes dropped before reaching the transport at store time (no self-heal; a later purge of the tag will not invalidate the affected object until its own TTL).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_tag_cap_drops_total",
+      "help": "Tags silently dropped from the purge-by-tag index because a response named more than NGX_HTTP_CACHE_TURBO_MAX_TAGS distinct tags (no self-heal; a later purge of a dropped tag will not invalidate the affected object until its own TTL).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_breaker_opens_total",
+      "help": "Lifetime count of CLOSED->OPEN circuit breaker trips.",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_breaker_state",
+      "help": "Circuit breaker state (0=closed, 1=open, 2=half-open).",
+      "type": "gauge"
+    },
+    {
+      "name": "cache_turbo_bg_inflight",
+      "help": "Background-refresh subrequests currently in flight for this zone (cache_turbo_background_update_max cap).",
+      "type": "gauge"
+    },
+    {
+      "name": "cache_turbo_sketch_gen",
+      "help": "W-TinyLFU sketch aging generation (full incremental halving laps completed so far; 0 = never aged or no sketch).",
+      "type": "gauge"
+    },
+    {
+      "name": "cache_turbo_sketch_bumps_total",
+      "help": "Lifetime W-TinyLFU sketch increments (0 on a live zone means the sketch was never allocated).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_admission_refused_total",
+      "help": "New entries refused by W-TinyLFU admission control (cache_turbo_zone ... admission=on).",
+      "type": "counter"
+    },
+    {
+      "name": "cache_turbo_used_bytes",
+      "help": "Slab bytes currently charged for cached payload and metadata in this zone (excludes fixed per-zone init overhead).",
+      "type": "gauge"
+    },
+    {
+      "name": "cache_turbo_markers",
+      "help": "Live count of L1 auto-Vary marker nodes resident in this zone (0 gates the vary-marker probe off, C3).",
+      "type": "gauge"
+    }
+  ],
+  "json_types": {
+    "hits": "integer",
+    "misses": "integer",
+    "stale_serves": "integer",
+    "refreshes": "integer",
+    "evictions": "integer",
+    "l2_hits": "integer",
+    "l2_misses": "integer",
+    "lock_waits": "integer",
+    "min_uses_skips": "integer",
+    "l2_neg_skips": "integer",
+    "bypasses": "integer",
+    "refuse_set_cookie": "integer",
+    "refuse_encoded": "integer",
+    "refuse_vary_unsafe": "integer",
+    "refuse_authorization": "integer",
+    "refuse_cache_control": "integer",
+    "refuse_require_header": "integer",
+    "refuse_partial": "integer",
+    "refuse_head": "integer",
+    "cost_ms": "integer",
+    "autotuned_beta": "integer",
+    "autotuned_load": "integer",
+    "breaker_state": "string",
+    "breaker_opens": "integer",
+    "sie_serves": "integer",
+    "breaker_serves": "integer",
+    "origin_failures": "integer",
+    "varidx_drops": "integer",
+    "tag_index_drops": "integer",
+    "tag_cap_drops": "integer",
+    "bg_inflight": "integer",
+    "sketch_gen": "integer",
+    "sketch_bumps": "integer",
+    "admission_refused": "integer",
+    "used_bytes": "integer",
+    "markers": "integer",
+    "lock_ttl": "integer"
+  }
+}
