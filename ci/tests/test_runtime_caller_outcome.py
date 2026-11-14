@@ -37,7 +37,17 @@ class CallerOutcomeTests(unittest.TestCase):
             with mock.patch.multiple(runtime, **stubs):
                 runtime.run_all(types.SimpleNamespace(fault_injection=bits[-1]), object(), *refs)
             self.assertEqual(runtime._expected_roots(source, config), seen)
-        self.assertEqual(len(full), 588)
+        # These additions extend the current roster; the historical 588-call
+        # qualification remains evidence for its original caller only.
+        stats_roots = (
+            "test_admin_wire_contract",
+            "test_admin_raw_zone_labels",
+            "test_admin_stats_reload_restart",
+            "test_admin_expired_breaker_scrape",
+        )
+        for name in stats_roots:
+            self.assertEqual(full.count(name), 1, name)
+        self.assertEqual(len([name for name in full if name not in stats_roots]), 588)
 
     def test_manifest_rejects_unsupported_inactive_branch(self):
         source = b"def run_all():\n    if redis is not None:\n        arbitrary()\n"
