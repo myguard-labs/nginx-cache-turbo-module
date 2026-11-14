@@ -9,7 +9,14 @@ or 2 in Prometheus. Other Prometheus names use the JSON key with the
 `cache_turbo_` prefix and, for counters, `_total` suffix. This describes the
 current output, including the historical TYPE choices.
 
-A scrape reads fields separately, not as a globally atomic snapshot. GET and
+A scrape reads counters separately, not as a globally atomic snapshot.
+The capacity scalars `used_bytes`, `zone_reserved_bytes` and `zone_size_bytes`
+are sampled together under the slab mutex in O(1) time, then rendered after
+unlock. `zone_size_bytes` is the full configured mapping; reserved bytes are
+that size minus wholly free slab pages. Reserved bytes include allocator
+metadata, fixed zone allocations and bin slack, while the existing used gauge
+keeps its payload/metadata charge semantics. Empty, full and reloaded zones
+satisfy `used_bytes <= zone_reserved_bytes <= zone_size_bytes`. GET and
 HEAD, including the legacy `autotune=1` query, do not force autotuning. A scrape
 reads the breaker's stored state; it does not advance an expired OPEN breaker.
 
@@ -29,8 +36,8 @@ stats and the admin location's effective `lock_ttl`; it adds no shared state.
 The renderer first measures descriptor prose, escaped labels and full atomic or
 signed time widths, then allocates once and bounds every append. Overflow or a
 short buffer fails closed without sending partial JSON or exposition. This
-admin-only work introduces no request-path allocation or lock, and the snapshot
-does not strengthen the sampling consistency described above.
+admin-only work introduces no cache request-path allocation or lock. The
+capacity sample adds one bounded admin-only mutex hold.
 
 The table maps each field to every production writer function and its relevant
 conditional classes. Function names omit the common `ngx_http_cache_turbo_`

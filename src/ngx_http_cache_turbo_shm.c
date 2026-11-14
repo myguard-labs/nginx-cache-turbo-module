@@ -2153,10 +2153,19 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->sketch_bumps      = (ngx_atomic_uint_t) ngx_http_cache_turbo_zone_sh(z)->sketch_bumps;
     out->admission_refused = (ngx_atomic_uint_t) ngx_http_cache_turbo_zone_sh(z)->admission_refused;
 
-    /* P4-2-s3a: live used-bytes gauge (cached payload+metadata charged by
-     * shm_alloc_evict / discharged by shm_free_locked). Plain read like the
-     * sketch fields above -- diagnostics, not a decision input. */
+    /* One O(1) capacity sample. pfree counts wholly free slab pages;
+     * reserved includes pool metadata, fixed zone allocations and bin slack.
+     * used_bytes is charged/discharged under this same mutex, so the three
+     * scalars describe one allocator instant even across worker reloads.
+     * Nothing shared escapes the lock; the admin renders this copy later. */
+    ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
+    out->zone_size_bytes = (ngx_atomic_uint_t)
+        (ngx_http_cache_turbo_zone_pool(z)->end
+         - (u_char *) ngx_http_cache_turbo_zone_pool(z));
+    out->zone_reserved_bytes = out->zone_size_bytes
+        - ngx_http_cache_turbo_zone_pool(z)->pfree * ngx_pagesize;
     out->used_bytes = (ngx_atomic_uint_t) ngx_http_cache_turbo_zone_sh(z)->used_bytes;
+    ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
     out->markers    = ngx_http_cache_turbo_zone_sh(z)->markers;
 }
 

@@ -36,6 +36,8 @@
     "admission_refused",
     "used_bytes",
     "markers",
+    "zone_size_bytes",
+    "zone_reserved_bytes",
     "lock_ttl"
   ],
   "prometheus_families": [
@@ -218,6 +220,16 @@
       "name": "cache_turbo_markers",
       "help": "Live count of L1 auto-Vary marker nodes resident in this zone (0 gates the vary-marker probe off, C3).",
       "type": "gauge"
+    },
+    {
+      "name": "cache_turbo_zone_size_bytes",
+      "help": "Configured shared-memory zone size in bytes.",
+      "type": "gauge"
+    },
+    {
+      "name": "cache_turbo_zone_reserved_bytes",
+      "help": "Zone bytes reserved by slab pages and allocator metadata (includes fixed zone overhead and bin slack).",
+      "type": "gauge"
     }
   ],
   "json_types": {
@@ -257,6 +269,8 @@
     "admission_refused": "integer",
     "used_bytes": "integer",
     "markers": "integer",
+    "zone_size_bytes": "integer",
+    "zone_reserved_bytes": "integer",
     "lock_ttl": "integer"
   }
 }

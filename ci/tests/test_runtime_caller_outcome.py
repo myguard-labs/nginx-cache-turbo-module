@@ -41,6 +41,7 @@ class CallerOutcomeTests(unittest.TestCase):
         # qualification remains evidence for its original caller only.
         stats_roots = (
             "test_admin_wire_contract",
+            "test_admin_stats_capacity",
             "test_admin_raw_zone_labels",
             "test_admin_stats_reload_restart",
             "test_admin_expired_breaker_scrape",

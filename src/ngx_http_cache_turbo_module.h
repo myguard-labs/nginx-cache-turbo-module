@@ -1630,6 +1630,9 @@ typedef struct {
     ngx_atomic_uint_t   admission_refused;
     /* P4-2-s3a: live used-bytes gauge, see the shctx_t field. */
     ngx_atomic_uint_t   used_bytes;
+    /* Capacity scalars sampled with used_bytes under the slab mutex. */
+    ngx_atomic_uint_t   zone_size_bytes;
+    ngx_atomic_uint_t   zone_reserved_bytes;
     /* C3: live L1 auto-Vary marker presence gauge, see the shctx_t field. */
     ngx_atomic_uint_t   markers;
     /* P0-1: per-reason store-refusal counters, mirrors shctx_t. */

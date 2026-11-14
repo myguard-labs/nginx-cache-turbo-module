@@ -7,7 +7,7 @@
 
 /* Private admin schema. Order is JSON order; prom_order preserves the legacy
  * Prometheus order. No shared-memory layout or request-path state changes.
- * The backend fills stats once; these separately sampled values are not a
+ * The backend fills stats once; counters sampled separately are not a
  * globally atomic snapshot. lock_ttl belongs to the admin location. */
 typedef struct {
     ngx_http_cache_turbo_stats_t  stats;
@@ -176,6 +176,14 @@ ngx_http_cache_turbo_stats_descriptors[] = {
       ngx_string("cache_turbo_markers"),
       ngx_string("Live count of L1 auto-Vary marker nodes resident in this zone (0 gates the vary-marker probe off, C3)."),
       CT_STATS_GAUGE, offsetof(ngx_http_cache_turbo_stats_t, markers), 35 },
+    { ngx_string("zone_size_bytes"),
+      ngx_string("cache_turbo_zone_size_bytes"),
+      ngx_string("Configured shared-memory zone size in bytes."),
+      CT_STATS_GAUGE, offsetof(ngx_http_cache_turbo_stats_t, zone_size_bytes), 36 },
+    { ngx_string("zone_reserved_bytes"),
+      ngx_string("cache_turbo_zone_reserved_bytes"),
+      ngx_string("Zone bytes reserved by slab pages and allocator metadata (includes fixed zone overhead and bin slack)."),
+      CT_STATS_GAUGE, offsetof(ngx_http_cache_turbo_stats_t, zone_reserved_bytes), 37 },
     { ngx_string("lock_ttl"), ngx_null_string, ngx_null_string,
       CT_STATS_TIME, 0, 0 }
 };

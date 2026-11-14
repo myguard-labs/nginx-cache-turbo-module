@@ -2483,3 +2483,100 @@ def test_admin_stats_reload_restart(ng: Nginx) -> None:
         finally:
             process.terminate()
             process.wait(timeout=10)
+
+def test_admin_stats_capacity(ng: Nginx) -> None:
+    """Real slab capacity stays bounded through eviction, exhaustion and reload."""
+    import json
+    import pathlib
+    import signal
+    import subprocess
+    import tempfile
+
+    load = f"load_module {ng.module};\n" if ng.module else ""
+    with tempfile.TemporaryDirectory(prefix="stats-capacity-") as directory:
+        root = pathlib.Path(directory)
+        (root / "logs").mkdir()
+        (root / "body").write_bytes(b"c" * 65536)
+        (root / "big").write_bytes(b"x" * (2 * 1024 * 1024))
+        config = root / "nginx.conf"
+        port = ng.port + 58
+        config.write_text(
+            f"{load}pid {root}/nginx.pid; daemon off; worker_processes 2;\n"
+            f"error_log {root}/error.log notice;\nevents {{}}\nhttp {{ "
+            f"access_log off; cache_turbo_zone name=capacity 1m; "
+            f"server {{ listen 127.0.0.1:{port + 1}; root {root}; "
+            "location / { try_files /body =404; } location = /big {} } "
+            f"server {{ listen 127.0.0.1:{port}; location /stats "
+            "{ cache_turbo_admin capacity; } location /c/ { "
+            "cache_turbo capacity; cache_turbo_key $request_uri; "
+            "cache_turbo_valid 1h; cache_turbo_max_size 4m; "
+            f"proxy_pass http://127.0.0.1:{port + 1}/; }} }} }}\n")
+        command = ng.runner + [str(ng.binary), "-p", directory, "-c", str(config)]
+        with (root / "stderr.log").open("w") as stderr:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr)
+
+        def stats():
+            status, body, _ = fetch(port, "/stats")
+            assert status == 200
+            values = json.loads(body)
+            assert values["zone_size_bytes"] == 1024 * 1024
+            assert 0 <= values["used_bytes"] <= values["zone_reserved_bytes"] \
+                <= values["zone_size_bytes"], f"invalid allocator sample: {values}"
+            return values
+
+        try:
+            for _ in range(100):
+                try:
+                    empty = stats()
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                raise AssertionError("isolated capacity server did not start")
+            assert empty["used_bytes"] == 0 and empty["zone_reserved_bytes"] > 0
+            status, body, _ = fetch(port, "/c/first")
+            assert status == 200 and len(body) == 65536
+            populated = stats()
+            assert populated["used_bytes"] > 0
+            assert populated["zone_reserved_bytes"] > empty["zone_reserved_bytes"]
+            # A distinct-key working set exceeds the entire zone, forcing eviction.
+            for index in range(24):
+                assert fetch(port, f"/c/key-{index}")[0] == 200
+                stats()
+            evicted = stats()
+            assert evicted["evictions"] > populated["evictions"]
+            # The object fits max_size but cannot fit the zone even after eviction.
+            status, body, _ = fetch(port, "/c/big")
+            assert status == 200 and len(body) == 2 * 1024 * 1024
+            exhausted = stats()
+            assert exhausted["evictions"] > evicted["evictions"]
+            assert exhausted["used_bytes"] < evicted["used_bytes"]
+            # Refill before reload; a new cycle must retain the same slab mapping.
+            assert fetch(port, "/c/reload")[0] == 200
+            before = stats()
+            children = pathlib.Path(f"/proc/{process.pid}/task/{process.pid}/children")
+            old_workers = set(children.read_text(encoding="ascii").split())
+            assert old_workers
+            process.send_signal(signal.SIGHUP)
+            for _ in range(100):
+                workers = set(children.read_text(encoding="ascii").split())
+                if workers and workers.isdisjoint(old_workers):
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("capacity reload did not replace workers")
+            after = stats()
+            for key in ("used_bytes", "zone_reserved_bytes", "zone_size_bytes"):
+                assert after[key] == before[key], f"reload changed {key}"
+            status, exposition, _ = fetch(port, "/stats?format=prometheus")
+            assert status == 200
+            for key in ("used_bytes", "zone_reserved_bytes", "zone_size_bytes"):
+                assert f'cache_turbo_{key}{{zone="capacity"}} {after[key]}\n' in exposition
+            print("capacity live: empty/populated/evicted/exhausted/reload passed")
+        finally:
+            process.send_signal(signal.SIGQUIT)
+            returncode = process.wait(timeout=10)
+            log = (root / "error.log").read_text() + (root / "stderr.log").read_text()
+            assert returncode == 0, f"capacity server exit {returncode}: {log}"
+            assert "AddressSanitizer" not in log and "runtime error:" not in log, log
+            assert "used_bytes underflow" not in log, log
