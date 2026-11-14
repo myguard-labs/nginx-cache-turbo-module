@@ -171,8 +171,13 @@ class RealMap(unittest.TestCase):
 
     def test_area_edit_selects_that_area_only(self):
         plan = self.plan("ci/tools/areas/admin.py")
-        self.assertEqual(len(plan), 1)
-        self.assertIn("areas/admin.py", plan[0])
+        self.assertEqual(len(plan), 2, plan)
+        self.assertRegex(
+            plan[0],
+            r"^PLAN \[build\] run_named\.py ci/tools/areas/admin\.py "
+            r"\(\d+ tests, fault-only=\d+ gated on build capability\)$",
+        )
+        self.assertEqual(plan[1], "PLAN [none] python3 ci/tests/test_admin_stats_config.py")
 
     def test_linter_edit_selects_selftest(self):
         self.assertEqual(self.plan("ci/linter/lint-c.sh"),
