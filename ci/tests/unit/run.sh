@@ -56,7 +56,12 @@ bash "$DIR/extract_cc_delta.sh"
 "$DIR/test_cc_delta_narrow_time"
 
 # --- capacity sampling: one bounded slab-locked snapshot -----------------
-python3 "$DIR/test_stats_capacity.py"
+if [ "${COVERAGE:-0}" = 1 ]; then
+    CAPACITY_TEST_OUT="${CAPACITY_TEST_OUT:-$DIR/stats-capacity-coverage}" \
+        python3 "$DIR/test_stats_capacity.py"
+else
+    python3 "$DIR/test_stats_capacity.py"
+fi
 
 # --- auto-Vary purge generation wrap (AUD-GEN1) ----------------------------
 # Pure-math mirror of marker_store/variant_hash's gen write/truncate/fold --

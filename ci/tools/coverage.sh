@@ -94,6 +94,7 @@ UNIT_DIR="$MODULE_DIR/ci/tests/unit"
 find "$UNIT_DIR" -name '*.gcda' -delete 2>/dev/null || true
 STATS_TEST_OUT="$UNIT_DIR/stats-schema-coverage" COVERAGE=1 bash "$UNIT_DIR/run.sh"
 python3 "$UNIT_DIR/test_stats_coverage.py"
+python3 "$UNIT_DIR/test_capacity_coverage.py"
 
 # 3. report. Filter to the module's own sources; branch coverage included.
 #
