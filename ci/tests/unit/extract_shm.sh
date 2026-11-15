@@ -349,7 +349,7 @@ awk -v source_name="$SRC_CANON" '
     /^static ngx_inline (uint32_t|uint64_t|ngx_uint_t|void)$/ {
         pending = 1; start = NR; buf = $0 ORS; next
     }
-    pending && /^ngx_http_cache_turbo_(shm_(key64|sketch_bump|sketch_estimate|admit|lookup|evict_one|alloc_evict|free_locked|drop_locked|purge_all|store_locked|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|rows|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
+    pending && /^ngx_http_cache_turbo_(shm_(key64|sketch_bump|sketch_estimate|admit|lookup|entry_removed|evict_one|alloc_evict|free_locked|drop_locked|purge_all|store_locked|claim_locked|claim|resolve_miss|unstub|owns|count_miss_locked|count_miss|l2_neg_check|l2_neg_set|touch_lru|brk_probe_age|breaker_state|breaker_record|breaker_state_str|get_u32|get_u64|node_sie_live)|lru_(link_head|unlink|insert_new|enforce_cap)|sketch_(row_hash|rows|get|inc|halve)|blob_(alloc|node_release|acquire|release))\(/ {
         capture = 1
         pending = 0
         printf "#line %d \"%s\"\n", start, source_name
@@ -408,8 +408,9 @@ if [ -n "${CTRL_HASH_DIAG_MUTATION:-}" ]; then
         ngx_http_cache_turbo_shm_count_miss_locked|ngx_http_cache_turbo_shm_l2_neg_set) ;;
         *) echo "✗ unknown hash diagnostic owner: $owner" >&2; exit 1 ;;
     esac
-    case "$kind" in guard|increment) ;; *)
-        echo "✗ unknown hash diagnostic mutation: $kind" >&2; exit 1 ;;
+    case "$kind" in
+        guard|increment) ;;
+        *) echo "✗ unknown hash diagnostic mutation: $kind" >&2; exit 1 ;;
     esac
     if [ "$kind" = guard ]; then
         sed -i "/^${owner}(/,/^}/s/if (ngx_crc32_short(key_hash, 32) != hash)/if (0)/" "$OUT"
@@ -468,7 +469,7 @@ for fn in 'ngx_http_cache_turbo_breaker_is_origin_failure(' \
           'ngx_http_cache_turbo_breaker_should_consult(' \
           'ngx_http_cache_turbo_breaker_action('; do
     if ! grep -qF "$fn" "$OUT"; then
-        echo "✗ failed to extract ${fn%(} from $MODSRC" >&2
+        echo "✗ failed to extract ${fn%'('} from $MODSRC" >&2
         echo "  (UNIT-EXTRACT breaker-failure markers moved or vanished?)" >&2
         rm -f "$OUT"
         exit 1
@@ -606,6 +607,7 @@ for fn in \
     'ngx_http_cache_turbo_shm_sketch_estimate(' \
     'ngx_http_cache_turbo_shm_lookup(' \
     'ngx_http_cache_turbo_shm_admit(' \
+    'ngx_http_cache_turbo_shm_entry_removed(' \
     'ngx_http_cache_turbo_shm_evict_one(' \
     'ngx_http_cache_turbo_shm_alloc_evict(' \
     'ngx_http_cache_turbo_shm_free_locked(' \

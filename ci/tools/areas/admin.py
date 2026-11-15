@@ -2368,6 +2368,28 @@ def test_admin_expired_breaker_scrape(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)
 
 
+def _assert_admin_stats_framing(body: str, zone: str) -> None:
+    """Require each frozen family once, in order, with one escaped sample."""
+    import json
+    import re
+    from pathlib import Path
+
+    contract = json.loads((Path(__file__).resolve().parents[2] / "tests" /
+                           "stats-contract.json").read_text())
+    families = contract["prometheus_families"]
+    lines = body.splitlines(keepends=True)
+    assert len(lines) == len(families) * 3, "label broke exposition framing"
+    escaped = zone.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    for index, family in enumerate(families):
+        name = family["name"]
+        help_line, type_line, sample = lines[index * 3:index * 3 + 3]
+        assert help_line == f"# HELP {name} {family['help']}\n", "HELP framing changed"
+        assert type_line == f"# TYPE {name} {family['type']}\n", "TYPE framing changed"
+        prefix = f'{name}{{zone="{escaped}"}} '
+        assert re.fullmatch(re.escape(prefix) + r"[0-9]+\n", sample), \
+            "sample name, escaped label or framing changed"
+
+
 def test_admin_raw_zone_labels(ng: Nginx) -> None:
     """Ordinary label bytes stay stable; configuration metacharacters escape."""
     import pathlib
@@ -2409,7 +2431,7 @@ def test_admin_raw_zone_labels(ng: Nginx) -> None:
                 assert status == 200
                 escaped = name.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
                 assert f'cache_turbo_hits_total{{zone="{escaped}"}} 0\n' in body
-                assert len(body.splitlines()) == 36 * 3, "label broke exposition framing"
+                _assert_admin_stats_framing(body, name)
             finally:
                 process.terminate()
                 process.wait(timeout=10)
@@ -2522,6 +2544,7 @@ def test_admin_stats_capacity(ng: Nginx) -> None:
             assert values["zone_size_bytes"] == 1024 * 1024
             assert 0 <= values["used_bytes"] <= values["zone_reserved_bytes"] \
                 <= values["zone_size_bytes"], f"invalid allocator sample: {values}"
+            assert type(values["entries"]) is int and 0 <= values["entries"] <= values["used_bytes"]
             return values
 
         try:
@@ -2534,10 +2557,12 @@ def test_admin_stats_capacity(ng: Nginx) -> None:
             else:
                 raise AssertionError("isolated capacity server did not start")
             assert empty["used_bytes"] == 0 and empty["zone_reserved_bytes"] > 0
+            assert empty["entries"] == 0
             status, body, _ = fetch(port, "/c/first")
             assert status == 200 and len(body) == 65536
             populated = stats()
             assert populated["used_bytes"] > 0
+            assert populated["entries"] == 1
             assert populated["zone_reserved_bytes"] > empty["zone_reserved_bytes"]
             # A distinct-key working set exceeds the entire zone, forcing eviction.
             for index in range(24):
@@ -2548,7 +2573,17 @@ def test_admin_stats_capacity(ng: Nginx) -> None:
             # The object fits max_size but cannot fit the zone even after eviction.
             status, body, _ = fetch(port, "/c/big")
             assert status == 200 and len(body) == 2 * 1024 * 1024
-            exhausted = stats()
+            # Wait for both original allocator observations to become visible.
+            # A response can arrive before the other worker's stats scrape sees
+            # the terminal store state; polling here sends no cache traffic.
+            for _ in range(100):
+                exhausted = stats()
+                if (exhausted["evictions"] > evicted["evictions"]
+                        and exhausted["used_bytes"] < evicted["used_bytes"]):
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("capacity exhaustion did not evict and release bytes")
             assert exhausted["evictions"] > evicted["evictions"]
             assert exhausted["used_bytes"] < evicted["used_bytes"]
             # Refill before reload; a new cycle must retain the same slab mapping.
@@ -2566,11 +2601,11 @@ def test_admin_stats_capacity(ng: Nginx) -> None:
             else:
                 raise AssertionError("capacity reload did not replace workers")
             after = stats()
-            for key in ("used_bytes", "zone_reserved_bytes", "zone_size_bytes"):
+            for key in ("used_bytes", "zone_reserved_bytes", "zone_size_bytes", "entries"):
                 assert after[key] == before[key], f"reload changed {key}"
             status, exposition, _ = fetch(port, "/stats?format=prometheus")
             assert status == 200
-            for key in ("used_bytes", "zone_reserved_bytes", "zone_size_bytes"):
+            for key in ("used_bytes", "zone_reserved_bytes", "zone_size_bytes", "entries"):
                 assert f'cache_turbo_{key}{{zone="capacity"}} {after[key]}\n' in exposition
             print("capacity live: empty/populated/evicted/exhausted/reload passed")
         finally:
@@ -2580,3 +2615,4 @@ def test_admin_stats_capacity(ng: Nginx) -> None:
             assert returncode == 0, f"capacity server exit {returncode}: {log}"
             assert "AddressSanitizer" not in log and "runtime error:" not in log, log
             assert "used_bytes underflow" not in log, log
+            assert "entries underflow" not in log, log

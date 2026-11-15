@@ -184,6 +184,10 @@ ngx_http_cache_turbo_stats_descriptors[] = {
       ngx_string("cache_turbo_zone_reserved_bytes"),
       ngx_string("Zone bytes reserved by slab pages and allocator metadata (includes fixed zone overhead and bin slack)."),
       CT_STATS_GAUGE, offsetof(ngx_http_cache_turbo_stats_t, zone_reserved_bytes), 37 },
+    { ngx_string("entries"),
+      ngx_string("cache_turbo_entries"),
+      ngx_string("Resident L1 nodes in this zone, including entries, counters and Vary markers."),
+      CT_STATS_GAUGE, offsetof(ngx_http_cache_turbo_stats_t, entries), 38 },
     { ngx_string("lock_ttl"), ngx_null_string, ngx_null_string,
       CT_STATS_TIME, 0, 0 }
 };

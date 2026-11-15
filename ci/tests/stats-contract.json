@@ -38,6 +38,7 @@
     "markers",
     "zone_size_bytes",
     "zone_reserved_bytes",
+    "entries",
     "lock_ttl"
   ],
   "prometheus_families": [
@@ -230,6 +231,11 @@
       "name": "cache_turbo_zone_reserved_bytes",
       "help": "Zone bytes reserved by slab pages and allocator metadata (includes fixed zone overhead and bin slack).",
       "type": "gauge"
+    },
+    {
+      "name": "cache_turbo_entries",
+      "help": "Resident L1 nodes in this zone, including entries, counters and Vary markers.",
+      "type": "gauge"
     }
   ],
   "json_types": {
@@ -271,6 +277,7 @@
     "markers": "integer",
     "zone_size_bytes": "integer",
     "zone_reserved_bytes": "integer",
+    "entries": "integer",
     "lock_ttl": "integer"
   }
 }

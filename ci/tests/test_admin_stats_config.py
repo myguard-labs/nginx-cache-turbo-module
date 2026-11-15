@@ -1,4 +1,5 @@
 """Isolated stats configs support static/dynamic nginx without starting servers."""
+import json
 import os
 import pathlib
 import sys
@@ -64,6 +65,41 @@ class StatsConfigTests(unittest.TestCase):
 
     def test_dynamic_configs(self):
         self.check_mode(pathlib.Path("/fixture/cache_turbo.so"))
+
+
+class StatsFramingTests(unittest.TestCase):
+    @staticmethod
+    def exposition(zone):
+        contract = json.loads((pathlib.Path(__file__).resolve().parent /
+                               "stats-contract.json").read_text())
+        escaped = zone.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        blocks = []
+        for family in contract["prometheus_families"]:
+            name = family["name"]
+            blocks.append(f"# HELP {name} {family['help']}\n"
+                          f"# TYPE {name} {family['type']}\n"
+                          f'{name}{{zone="{escaped}"}} 0\n')
+        return blocks
+
+    def test_current_families_and_escaped_labels(self):
+        for zone in ("normal", "a-b.c_1", 'a"b', "a\\b", "a\nb"):
+            with self.subTest(zone=zone):
+                admin._assert_admin_stats_framing("".join(self.exposition(zone)), zone)
+
+    def test_omitted_duplicate_and_broken_framing_rejected(self):
+        blocks = self.exposition("main")
+        malformed = {
+            "omitted": "".join(blocks[:-1]),
+            "extra duplicate": "".join(blocks + blocks[-1:]),
+            "same count duplicate": "".join(blocks[:-1] + blocks[:1]),
+            "newline in label": "".join(blocks).replace('zone="main"', 'zone="ma\nin"', 1),
+            "missing final newline": "".join(blocks).rstrip("\n"),
+            "wrong type": "".join(blocks).replace(" counter\n", " gauge\n", 1),
+        }
+        for name, body in malformed.items():
+            with self.subTest(control=name):
+                with self.assertRaisesRegex(AssertionError, "framing|label"):
+                    admin._assert_admin_stats_framing(body, "main")
 
 
 if __name__ == "__main__":

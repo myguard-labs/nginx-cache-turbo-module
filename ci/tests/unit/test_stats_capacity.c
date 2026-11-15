@@ -13,7 +13,7 @@ static union {
     u_char mapping[65536];
 } memory;
 static shctx_t shared;
-static ngx_uint_t current_used, current_free;
+static ngx_uint_t current_used, current_free, current_entries;
 static unsigned locks, unlocks;
 
 void
@@ -24,6 +24,7 @@ ngx_shmtx_lock(ngx_shmtx_t *mutex)
     locks++;
     memory.pool.pfree = current_free;
     shared.used_bytes = current_used;
+    shared.n_entries = current_entries;
 }
 
 void
@@ -34,17 +35,19 @@ ngx_shmtx_unlock(ngx_shmtx_t *mutex)
     unlocks++;
     memory.pool.pfree = 0;
     shared.used_bytes = sizeof(memory.mapping);
+    shared.n_entries = (ngx_uint_t) -1;
 }
 
 static void
 sample(ngx_http_cache_turbo_zone_t *zone, const char *name,
-    ngx_uint_t used, ngx_uint_t free_pages)
+    ngx_uint_t used, ngx_uint_t free_pages, ngx_uint_t entries)
 {
     ngx_http_cache_turbo_stats_t snapshot;
     unsigned before = locks;
 
     memset(&snapshot, 0xa5, sizeof(snapshot));
     current_used = used;
+    current_entries = entries;
     current_free = free_pages;
     shared.hits = 17;
     shared.markers = 3;
@@ -55,6 +58,7 @@ sample(ngx_http_cache_turbo_zone_t *zone, const char *name,
     assert(snapshot.zone_reserved_bytes == sizeof(memory.mapping) - free_pages * ngx_pagesize);
     assert(snapshot.used_bytes <= snapshot.zone_reserved_bytes);
     assert(snapshot.used_bytes == used);
+    assert(snapshot.entries == entries);
     assert(snapshot.zone_reserved_bytes <= snapshot.zone_size_bytes);
     assert(snapshot.hits == 17 && snapshot.markers == 3);
     printf("capacity: %s used=%lu reserved=%lu size=%lu; locked scalar snapshot\n",
@@ -69,12 +73,12 @@ main(void)
     ngx_http_cache_turbo_zone_t zone = {&shared, &memory.pool}, reloaded;
 
     memory.pool.end = memory.mapping + sizeof(memory.mapping);
-    sample(&zone, "empty (fixed overhead)", 0, 12);
-    sample(&zone, "populated (bin slack)", 5000, 10);
-    sample(&zone, "evicted", 0, 12);
-    sample(&zone, "exhausted", 40000, 0);
+    sample(&zone, "empty (fixed overhead)", 0, 12, 0);
+    sample(&zone, "populated (bin slack)", 5000, 10, 4);
+    sample(&zone, "evicted", 0, 12, 0);
+    sample(&zone, "exhausted", 40000, 0, 20);
     /* A new config context points to the retained shared mapping. */
     reloaded = zone;
-    sample(&reloaded, "reload retained mapping", 5000, 10);
+    sample(&reloaded, "reload retained mapping", 5000, 10, 4);
     return 0;
 }

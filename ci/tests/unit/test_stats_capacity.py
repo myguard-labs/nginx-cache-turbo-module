@@ -32,7 +32,7 @@ typedef struct { int depth; } ngx_shmtx_t;
 typedef struct { ngx_shmtx_t mutex; u_char *end; ngx_uint_t pfree; } ngx_slab_pool_t;
 """
     types += "typedef struct {" + fields + "} ngx_http_cache_turbo_stats_t;\n"
-    types += "typedef struct {" + fields + "\nngx_uint_t cost_sum_ms, cost_count; } shctx_t;\n"
+    types += "typedef struct {" + fields + "\nngx_uint_t cost_sum_ms, cost_count, n_entries; } shctx_t;\n"
     types += """typedef struct { shctx_t *sh; ngx_slab_pool_t *pool; } ngx_http_cache_turbo_zone_t;
 #define ngx_http_cache_turbo_zone_sh(z) ((z)->sh)
 #define ngx_http_cache_turbo_zone_pool(z) ((z)->pool)

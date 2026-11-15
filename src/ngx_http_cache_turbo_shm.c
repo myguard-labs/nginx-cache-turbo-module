@@ -872,6 +872,22 @@ ngx_http_cache_turbo_lru_insert_new(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+/* Remove one resident node from the occupancy tally. Every final node removal
+ * calls this while holding the slab mutex; temporary LRU moves do not. A broken
+ * insert/remove pair is logged instead of wrapping the exported gauge. */
+static void
+ngx_http_cache_turbo_shm_entry_removed(ngx_http_cache_turbo_zone_t *z)
+{
+    if (ngx_http_cache_turbo_zone_sh(z)->n_entries != 0) {
+        ngx_http_cache_turbo_zone_sh(z)->n_entries--;
+
+    } else {
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                      "cache_turbo: entries underflow -- insert/remove pairing bug");
+    }
+}
+
+
 /* Cap on demotions performed by ONE call to lru_enforce_cap().
  *
  * This runs on the hot touch_lru() path while holding the shpool mutex, so an
@@ -1305,7 +1321,7 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
             /* Evictable: not SIE-live, breaker CLOSED/HALF_OPEN, or already
              * spared once before. */
             ngx_http_cache_turbo_lru_unlink(z, ctn);
-            ngx_http_cache_turbo_zone_sh(z)->n_entries--;
+            ngx_http_cache_turbo_shm_entry_removed(z);
             ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
 
             /* C3: this generic LRU walk evicts ANY kind, markers included --
@@ -1331,7 +1347,7 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
         ctn = ngx_queue_data(fallback, ngx_http_cache_turbo_node_t, lru);
 
         ngx_http_cache_turbo_lru_unlink(z, ctn);
-        ngx_http_cache_turbo_zone_sh(z)->n_entries--;
+        ngx_http_cache_turbo_shm_entry_removed(z);
         ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
 
         /* C3: fallback-take arm of the same generic walk -- see the sibling
@@ -1473,7 +1489,7 @@ ngx_http_cache_turbo_shm_drop_locked(ngx_http_cache_turbo_zone_t *z,
     ngx_http_cache_turbo_node_t *ctn)
 {
     ngx_http_cache_turbo_lru_unlink(z, ctn);
-    ngx_http_cache_turbo_zone_sh(z)->n_entries--;
+    ngx_http_cache_turbo_shm_entry_removed(z);
     ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
     /* C3: the shared drop path for purge_key() (a single explicit key,
      * including the vary-marker purge at access.c's PURGE self-heal site) and
@@ -2155,7 +2171,7 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
 
     /* One O(1) capacity sample. pfree counts wholly free slab pages;
      * reserved includes pool metadata, fixed zone allocations and bin slack.
-     * used_bytes is charged/discharged under this same mutex, so the three
+     * used_bytes and n_entries change under this same mutex, so these
      * scalars describe one allocator instant even across worker reloads.
      * Nothing shared escapes the lock; the admin renders this copy later. */
     ngx_shmtx_lock(ngx_http_cache_turbo_zone_mutex(z));
@@ -2165,6 +2181,7 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->zone_reserved_bytes = out->zone_size_bytes
         - ngx_http_cache_turbo_zone_pool(z)->pfree * ngx_pagesize;
     out->used_bytes = (ngx_atomic_uint_t) ngx_http_cache_turbo_zone_sh(z)->used_bytes;
+    out->entries = (ngx_atomic_uint_t) ngx_http_cache_turbo_zone_sh(z)->n_entries;
     ngx_shmtx_unlock(ngx_http_cache_turbo_zone_mutex(z));
     out->markers    = ngx_http_cache_turbo_zone_sh(z)->markers;
 }
@@ -2589,7 +2606,7 @@ ngx_http_cache_turbo_shm_unstub(ngx_http_cache_turbo_zone_t *z,
             && ctn->miss_count == 0 && ctn->l2_neg_until <= ngx_time())
         {
             ngx_http_cache_turbo_lru_unlink(z, ctn);
-            ngx_http_cache_turbo_zone_sh(z)->n_entries--;
+            ngx_http_cache_turbo_shm_entry_removed(z);
             ngx_rbtree_delete(&ngx_http_cache_turbo_zone_sh(z)->rbtree, &ctn->node);
             ngx_http_cache_turbo_shm_free_locked(z, ctn,
                 sizeof(ngx_http_cache_turbo_node_t));

@@ -10,12 +10,17 @@ or 2 in Prometheus. Other Prometheus names use the JSON key with the
 current output, including the historical TYPE choices.
 
 A scrape reads counters separately, not as a globally atomic snapshot.
-The capacity scalars `used_bytes`, `zone_reserved_bytes` and `zone_size_bytes`
+The capacity scalars `used_bytes`, `zone_reserved_bytes`, `zone_size_bytes` and `entries`
 are sampled together under the slab mutex in O(1) time, then rendered after
 unlock. `zone_size_bytes` is the full configured mapping; reserved bytes are
 that size minus wholly free slab pages. Reserved bytes include allocator
 metadata, fixed zone allocations and bin slack, while the existing used gauge
-keeps its payload/metadata charge semantics. Empty, full and reloaded zones
+keeps its payload/metadata charge semantics. `entries` counts resident L1 nodes,
+including cached entries, miss counters/single-flight stubs and Vary markers.
+It changes only when a new node is linked or a resident node is finally removed;
+body allocations, replacements and temporary LRU moves do not add entries.
+Failed allocations add no entries; eviction on the allocation path can reduce
+occupancy. Reloads retain the shared tally. Empty, full and reloaded zones
 satisfy `used_bytes <= zone_reserved_bytes <= zone_size_bytes`. GET and
 HEAD, including the legacy `autotune=1` query, do not force autotuning. A scrape
 reads the breaker's stored state; it does not advance an expired OPEN breaker.
