@@ -69,6 +69,26 @@ class SizeofPointerTests(unittest.TestCase):
                 with self.subTest(fn=fn, size=size):
                     self.run_check(f"void f(void *d, void *s, char *p) {{ {fn}(d,s,{size}); }}", 1)
 
+    def test_public_named_suppression(self):
+        output = self.run_check("""void f(void *d, void *s, char *p) {
+            // ast-grep-ignore: c-memcpy-sizeof-pointer
+            memcpy(d,s,sizeof(p));
+        }""")
+        self.assertIn("no sizeof-identifier copy lengths", output)
+
+    def test_unrelated_named_suppression_does_not_hide_pointer(self):
+        self.run_check("""void f(void *d, void *s, char *p) {
+            // ast-grep-ignore: unrelated-rule
+            memcpy(d,s,sizeof(p));
+        }""", 1)
+
+    def test_public_suppression_is_local_to_one_copy(self):
+        self.run_check("""void f(void *d, void *s, char *p) {
+            // ast-grep-ignore: c-memcpy-sizeof-pointer
+            memcpy(d,s,sizeof(p));
+            memmove(d,s,sizeof(p));
+        }""", 1)
+
     def test_pointer_typedef_and_chain(self):
         self.run_check("""typedef pointer_t chained_t;
             void f(void *d, void *s) { chained_t p = 0; memcpy(d,s,sizeof(p)); }""", 1)

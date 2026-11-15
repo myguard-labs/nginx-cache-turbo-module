@@ -29,13 +29,15 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/actionlint-version.sh"
 
 CHECK=0 FORCE=0
-case "${1:-}" in
-    --check) CHECK=1 ;;
-    --force) FORCE=1 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
-    "") ;;
-    *) echo "unknown argument: $1" >&2; exit 2 ;;
-esac
+if [ "${1:-}" = --check ]; then
+    CHECK=1
+elif [ "${1:-}" = --force ]; then
+    FORCE=1
+elif [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then
+    sed -n '2,25p' "$0"; exit 0
+elif [ -n "${1:-}" ]; then
+    echo "unknown argument: $1" >&2; exit 2
+fi
 
 SUDO=""
 [ "$(id -u)" -eq 0 ] || SUDO="sudo"
@@ -144,9 +146,23 @@ report() {
 
 have_mod() { python3 -c "import $1" >/dev/null 2>&1; }
 
+# Use the semantic gate itself, including its library selection, symbol setup
+# and index creation, so an executable alone cannot conceal a broken runtime.
+have_libclang() {
+    python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from sizeof_pointer import Clang; c = Clang("clang"); c.close()' \
+        "$(dirname "${BASH_SOURCE[0]}")/../tools" >/dev/null 2>&1
+}
+
+
 if [ "$CHECK" -eq 1 ]; then
     step "linter status"
     for e in "${APT_TOOLS[@]}" "${PIPX_TOOLS[@]}"; do report "${e%%:*}"; done
+    if have_libclang; then
+        printf '%-14s ok\n' libclang
+    else
+        printf '%-14s MISSING or unusable\n' libclang
+        rc=1
+    fi
     report actionlint
     actionlint_version_ok || rc=1
     report zizmor
@@ -196,6 +212,23 @@ if [ "${#NEED[@]}" -gt 0 ]; then
     $SUDO apt-get install -y --no-install-recommends "${NEED[@]}" || rc=1
 else
     echo "nothing to do"
+fi
+
+# The selected clang can differ from the distro default. Install its matching
+# runtime and verify the same predicate again; apt success alone is insufficient.
+if [ "$FORCE" -eq 1 ] || ! have_libclang; then
+    clang_major="$(clang -dumpversion 2>/dev/null)"
+    clang_major="${clang_major%%.*}"
+    if [[ "$clang_major" =~ ^[0-9]+$ ]]; then
+        $SUDO apt-get install -y --no-install-recommends "libclang1-${clang_major}" || rc=1
+    else
+        echo "cannot determine clang major for libclang installation" >&2
+        rc=1
+    fi
+fi
+if ! have_libclang; then
+    echo "matching libclang runtime is missing or unusable" >&2
+    rc=1
 fi
 
 step "pipx"

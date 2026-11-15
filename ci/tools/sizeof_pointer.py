@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 RULE = "c-memcpy-sizeof-pointer"
-CANDIDATES = """id: sizeof-pointer-candidate
+CANDIDATES = f"""id: {RULE}
 language: c
 severity: warning
 rule:

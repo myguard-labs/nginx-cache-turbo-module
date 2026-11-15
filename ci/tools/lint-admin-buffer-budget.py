@@ -37,8 +37,8 @@ def main() -> int:
     for key, name, help_text, kind, member, _order in sorted(rows, key=lambda row: int(row[5])):
         if member != key:
             failures.append(f"{key}: snapshot member mismatch: {member}")
-        expected_kind = "STATE" if key == "breaker_state" else None
-        if kind not in (expected_kind, "COUNTER", "GAUGE"):
+        allowed_kinds = ("STATE",) if key == "breaker_state" else ("COUNTER", "GAUGE")
+        if kind not in allowed_kinds:
             failures.append(f"{key}: unrecognized descriptor type {kind}")
         families.append({"name": name, "help": help_text,
                          "type": "counter" if kind == "COUNTER" else "gauge"})
