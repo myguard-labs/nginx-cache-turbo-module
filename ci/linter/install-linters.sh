@@ -149,7 +149,7 @@ have_mod() { python3 -c "import $1" >/dev/null 2>&1; }
 # Use the semantic gate itself, including its library selection, symbol setup
 # and index creation, so an executable alone cannot conceal a broken runtime.
 have_libclang() {
-    python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from sizeof_pointer import Clang; c = Clang("clang"); c.close()' \
+    python3 -c 'import os, sys; sys.path.insert(0, sys.argv[1]); from sizeof_pointer import Clang; c = Clang(os.environ.get("SIZEOF_POINTER_CLANG", "clang")); c.close()' \
         "$(dirname "${BASH_SOURCE[0]}")/../tools" >/dev/null 2>&1
 }
 
@@ -217,7 +217,7 @@ fi
 # The selected clang can differ from the distro default. Install its matching
 # runtime and verify the same predicate again; apt success alone is insufficient.
 if [ "$FORCE" -eq 1 ] || ! have_libclang; then
-    clang_major="$(clang -dumpversion 2>/dev/null)"
+    clang_major="$("${SIZEOF_POINTER_CLANG-clang}" -dumpversion 2>/dev/null)"
     clang_major="${clang_major%%.*}"
     if [[ "$clang_major" =~ ^[0-9]+$ ]]; then
         $SUDO apt-get install -y --no-install-recommends "libclang1-${clang_major}" || rc=1

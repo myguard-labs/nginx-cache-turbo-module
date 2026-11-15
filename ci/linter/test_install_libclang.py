@@ -28,7 +28,8 @@ class Function:
 class Library:
     def __getattr__(self, name): return Function()
 def find(name):
-    return None if open(os.environ["LIBCLANG_STATE"]).read() == "missing" else "fake-libclang"
+    state = open(os.environ["LIBCLANG_STATE"]).read()
+    return None if state == "missing" or name in state.split(",") else "fake-libclang"
 def load(name):
     if open(os.environ["LIBCLANG_STATE"]).read() == "unusable": raise OSError("broken runtime")
     return Library()
@@ -64,9 +65,13 @@ ctypes.CDLL = load
             'case "$1" in -dumpversion) echo 91.2.3;; *) echo libclang.so.1;; esac',
         )
         self.stub(
+            "alternate-clang",
+            'case "$1" in -dumpversion) echo 92.4.0;; *) echo libclang.so.1;; esac',
+        )
+        self.stub(
             "apt-get",
             """echo "$*" >> "$APT_LOG"
-case "$*" in *libclang1-91*) [ "${APT_REPAIR:-yes}" = no ] || echo usable > "$LIBCLANG_STATE";; esac
+case "$*" in *libclang1-91*|*libclang1-92*) [ "${APT_REPAIR:-yes}" = no ] || echo usable > "$LIBCLANG_STATE";; esac
 exit 0""",
         )
         self.env = dict(
@@ -78,15 +83,19 @@ exit 0""",
             APT_LOG=str(self.log),
         )
 
+        self.env.pop("SIZEOF_POINTER_CLANG", None)
+
     def stub(self, name, body):
         path = self.bin / name
         path.write_text(f"#!/bin/sh\n{body}\n")
         path.chmod(0o755)
 
-    def run_installer(self, state, *args, repair="yes"):
+    def run_installer(self, state, *args, repair="yes", compiler=None):
         self.state.write_text(state)
         self.log.unlink(missing_ok=True)
         env = dict(self.env, APT_REPAIR=repair)
+        if compiler is not None:
+            env["SIZEOF_POINTER_CLANG"] = compiler
         return subprocess.run(
             ["bash", str(INSTALLER), *args],
             env=env,
@@ -108,6 +117,25 @@ exit 0""",
                     self.assertIn("libclang       MISSING or unusable", result.stdout)
                     self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.log.exists())
+
+    def test_selected_compiler_rejects_hardcoded_default(self):
+        result = self.run_installer("clang-91", "--check", compiler="alternate-clang")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("libclang       ok", result.stdout)
+
+        result = self.run_installer("clang-92", "--check", compiler="alternate-clang")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("libclang       MISSING or unusable", result.stdout)
+
+        result = self.run_installer("clang-92", "--check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("libclang       ok", result.stdout)
+
+    def test_selected_compiler_package_major(self):
+        result = self.run_installer("clang-92", compiler="alternate-clang")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("libclang1-92", self.log.read_text())
+        self.assertNotIn("libclang1-91", self.log.read_text())
 
     def test_provision_and_recheck(self):
         for state in ("missing", "unusable"):
