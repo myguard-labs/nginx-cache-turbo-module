@@ -178,7 +178,11 @@ class OutcomeJournalTests(unittest.TestCase):
         self.assertEqual(events, ["test_target 7", "call", "DONE test_target"])
         self.assertEqual(base._SPANS[-1], ("test_target", 7, 7))
         self.assertEqual(timings, [("test_target", 2.0)])
-        self.assertEqual(output.getvalue(), "TIMING test_target 2.000000s\n")
+        self.assertEqual(
+            output.getvalue(),
+            "TIMING test_target 2.000000s\n"
+            "PHASE test_target origin_delay=0.000000s gets=0 sleeps=0.000000s "
+            "lifecycle=0.000000s\n")
 
 
 if __name__ == "__main__":
