@@ -1,4 +1,4 @@
-# sync-sha: bb3251b3f03b76101cc2aab861618e3d5618098d7f2c9e27f409138dd4806037
+# sync-sha: 4f45eb2c7a0dc9c3b225df31ef995adde2ab6ab3b6c07957ba9a2be080868b7e
 name: Static
 
 # Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
@@ -599,8 +599,12 @@ jobs:
           cd ci/fuzz
           total=0
           failed=0
-          for dir in regressions/*/; do
-            bin="$(basename "$dir")"
+          # Explicit target list, kept in sync with the "Run each target 60s"
+          # step below. Iterating regressions/*/ instead would silently skip a
+          # deleted target directory.
+          for bin in fuzz_resp_parser fuzz_norm_args fuzz_mc_parser fuzz_auto_classify fuzz_blob; do
+            dir="regressions/$bin/"
+            [ -d "$dir" ] || { echo "❌ $bin: regressions directory $dir is missing"; failed=$((failed + 1)); continue; }
             [ -x "./$bin" ] || { echo "❌ no such fuzz target: $bin"; exit 1; }
             # Real units only: README.md is not one. An empty target fails
             # below, so this gate cannot go vacuous again.
@@ -632,7 +636,10 @@ jobs:
               echo "✓ $bin: all $n replayed clean"
             fi
           done
-          [ "$failed" -eq 0 ] || { echo "❌ $failed regression target failure(s) (reproducing or empty)"; exit 1; }
+          [ "$failed" -eq 0 ] || {
+            echo "❌ $failed regression target failure(s) (reproducing, missing or empty)"
+            exit 1
+          }
           echo "replayed $total recorded regression(s) across all targets, all clean"
       # Name carries the literal, not ${{ env.FUZZ_SECONDS }}: the run: block
       # below is the single consumer of that value, and a step name is not
