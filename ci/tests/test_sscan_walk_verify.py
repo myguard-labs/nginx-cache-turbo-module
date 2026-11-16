@@ -2,10 +2,32 @@
 
 import pathlib
 import sys
+import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
+import test_runtime_base
 from areas import l2
+
+
+class FakeClock:
+    """Virtual clock for test_runtime_base.wait_for: sleep() advances time
+    instantly, so a bounded wait that times out costs no real seconds."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def patched(self):
+        return mock.patch.object(
+            test_runtime_base, "time",
+            types.SimpleNamespace(time=self.time, sleep=self.sleep))
 
 
 class FakeRedis:
@@ -44,8 +66,10 @@ class SscanWalkVerify(unittest.TestCase):
 
     def test_retained_tag_times_out_with_members(self):
         redis = FakeRedis(retained=True)
-        with self.assertRaises(AssertionError) as caught:
+        clock = FakeClock()
+        with clock.patched(), self.assertRaises(AssertionError) as caught:
             self.verify(redis)
+        self.assertGreaterEqual(clock.now - 1000.0, 10.0)
         self.assertIn("ctabtag:tag:sscan-walk-reply-1", str(caught.exception))
         self.assertIn("member-a", str(caught.exception))
         self.assertGreater(redis.tag_reads, 1)
