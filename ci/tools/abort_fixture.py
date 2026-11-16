@@ -928,8 +928,12 @@ class WalkAnchor(ProxyAnchor):
 IN_OPEN = 0x20
 IN_CLOSE_NOWRITE = 0x10
 # TEST_FAULTS: a ".delay-<stage>" url_file sleeps this long before that stage
-# (ngx_http_cache_turbo_warm_file_test_delay, admin.c).
-WARM_FILE_TEST_DELAY = 5.0
+# (ngx_http_cache_turbo_warm_file_test_delay, admin.c). The native value is
+# NGX_HTTP_CACHE_TURBO_WARM_FILE_TEST_DELAY_MS (testalloc.h); the boundary arm
+# predicts the reply from this copy, so ci/tests/test_warm_window.py fails when
+# the two differ. One second keeps the earliest abort (0.03s, scaled) and the
+# poke far inside the park on an ASan build; the six warm tests pay it 21 times.
+WARM_FILE_TEST_DELAY = 1.0
 
 
 class FileAnchor:

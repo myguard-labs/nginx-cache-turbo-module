@@ -368,6 +368,15 @@ ngx_int_t ngx_http_cache_turbo_test_park_check_slot(ngx_http_request_t *r,
 void ngx_http_cache_turbo_test_park_stale_cold_wait(ngx_http_request_t *r,
     ngx_event_t *ev);
 
+/* The admin warm ?url_file= fault window: a list whose name holds
+ * ".delay-<stage>" sleeps this long in the thread task before that stage
+ * (ngx_http_cache_turbo_warm_file_test_delay, admin.c). The abort fixture
+ * predicts the reply from it, so ci/tools/abort_fixture.py
+ * WARM_FILE_TEST_DELAY must hold the same value in seconds;
+ * ci/tests/test_warm_window.py fails when they differ. Defined here, not in
+ * admin.c, so a release translation unit sees no line shift. */
+#define NGX_HTTP_CACHE_TURBO_WARM_FILE_TEST_DELAY_MS  1000
+
 
 #endif /* NGX_HTTP_CACHE_TURBO_TEST_FAULTS */
 
