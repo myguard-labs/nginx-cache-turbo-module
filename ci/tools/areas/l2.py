@@ -3465,7 +3465,7 @@ def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
     (2) the background refresh still lands and a later read sees the NEW
     generation, i.e. the entry is still evictable/replaceable afterward --
     a leaked reference from this arm would pin the OLD generation forever."""
-    uri = "/lock/won"
+    uri = "/lock1/won"
     redis.cli("DEL", l2_key(uri), lock_key(uri))
 
     # nginx strips the /lock/ prefix before proxying, so the origin logs
@@ -3488,7 +3488,7 @@ def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
     assert wait_for(lambda: origin.hits_for(slug) >= 1, timeout=2.0), \
         "prime phase never registered its own origin contact"
 
-    time.sleep(2.5)                     # stale (fresh=2s), still < 8s window
+    time.sleep(1.5)                     # stale (fresh=1s), still < 8s window
     drain_origin(origin)                # absorb any stray async bg before counting
     base = origin.hits_for(slug)
 
@@ -3569,16 +3569,16 @@ def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
     assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
         "prime never wrote L2"
 
-    time.sleep(2.4)                                # now stale (fresh=2s)
+    time.sleep(1.4)                                # now stale (fresh=1s)
 
-    # A peer node 'holds' the regen lock (set now that the key is stale, PX 2500
-    # > lock_ttl 2000), then crashes — the lock is freed only by PX expiry.
-    redis.cli("SET", lock_key(uri), "peer-node", "PX", "2500")
+    # A peer node 'holds' the regen lock (set now that the key is stale, PX 2000
+    # > lock_ttl 1000), then crashes — the lock is freed only by PX expiry.
+    redis.cli("SET", lock_key(uri), "peer-node", "PX", "2000")
     drain_origin(origin)           # absorb any stray async bg before counting
     base = origin.hits
 
     # Phase 1 — lock held by the peer: refresh attempts lose the NX, so reads
-    # serve stale and origin is NOT hit. Short, well inside the 2.5s PX.
+    # serve stale and origin is NOT hit. Short, well inside the 2s PX.
     for _ in range(6):
         s, _, _ = fetch(ng.port, uri)
         assert s == 200, f"stale read status {s}"
@@ -3587,7 +3587,7 @@ def test_lock_self_heal(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
         f"origin was hit while the lock was held by a peer ({origin.hits - base})"
 
     # Phase 2 — let the peer's lock PX-expire (and with it, past this node's own
-    # 2s local lock), then read: a node self-heals by acquiring the freed NX and
+    # 1s local lock), then read: a node self-heals by acquiring the freed NX and
     # regenerating exactly once. Still inside the 8s stale window.
     assert wait_for(lambda: redis.cli("EXISTS", lock_key(uri)) == "0",
                     timeout=4.0), "foreign lock never PX-expired"
@@ -3624,7 +3624,7 @@ def test_lock_redis_outage_fallback(ng: Nginx, origin: Origin,
     Here the lock channel never even completes: Redis is stopped between the
     prime and the stale read, so the NX attempt itself gets ECONNREFUSED
     (immediate, deterministic — no timeout hang, since this is a plain TCP
-    connect failure, not a slow-loris). Uses /lock/ (cache_turbo_lock off
+    connect failure, not a slow-loris). Uses /lock1/ (cache_turbo_lock off
     isolates the stale-path NX under test, same as test_multinode_lock).
 
     Readers are BARRIER-SYNCHRONISED and concurrent, which is what makes the
@@ -3652,14 +3652,14 @@ def test_lock_redis_outage_fallback(ng: Nginx, origin: Origin,
     2. The refresh dice is driven by ngx_time(), which has ONE-SECOND
        granularity (swr.c: `elapsed = now - fresh_until`, threshold =
        elapsed/window * beta). At elapsed == 0 the threshold is 0 and the dice
-       CANNOT fire, whatever beta is. sleep(2.4) puts the first read ~0.4s past
+       CANNOT fire, whatever beta is. sleep(1.4) (fresh=1s) puts the first read ~0.4s past
        fresh_until, i.e. still elapsed == 0 for up to ~0.6s more; the barrier
        burst then rides the wait_for below rather than assuming an instant regen.
        Do not "optimise" the wait_for into a fixed short sleep -- a burst that
        lands entirely inside elapsed == 0 legitimately produces zero regens until
        the clock ticks."""
     slug = f"redis-outage-{time.time_ns()}"
-    uri = f"/lock/{slug}"
+    uri = f"/lock1/{slug}"
     redis.cli("DEL", l2_key(uri), lock_key(uri))
 
     s, _body_a, h = fetch(ng.port, uri)             # prime -> origin -> L1 + L2
@@ -3667,7 +3667,7 @@ def test_lock_redis_outage_fallback(ng: Nginx, origin: Origin,
     assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
         "prime never wrote L2"
 
-    time.sleep(2.4)                                # now stale (fresh=2s)
+    time.sleep(1.4)                                # now stale (fresh=1s)
 
     # Simulate the outage: Redis goes away mid-flight, AFTER the prime succeeded
     # and BEFORE any refresh's lock NX is attempted. Every subsequent lock
