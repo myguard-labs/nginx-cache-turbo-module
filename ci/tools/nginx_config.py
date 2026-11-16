@@ -3249,6 +3249,18 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # CI-L10d-T3b: /keepstalewins/ with stale_mult 2 (ordinary stale window
+        # 2s instead of 4s) so test_keep_stale_loses_to_response_sie crosses it
+        # at 2.3s; the response SIE window (fresh 1s + 5s) is origin-fixed.
+        location /keepstalewins2/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;
+            cache_turbo_stale_mult 2;
+            cache_turbo_keep_stale 1h;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # S3.1: a negative-cached 5xx must never overwrite a still-serveable
         # body (cache_turbo_valid 503 1m legitimately negative-caches errors,
         # but that must not let an error blob clobber a good 200 -- the
