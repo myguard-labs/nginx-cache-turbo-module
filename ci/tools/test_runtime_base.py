@@ -469,6 +469,34 @@ def _consume_outcome(data, receipt, *, expected_run, expected_source, expected_r
 
 
 
+_LIFECYCLE_DEPTH = threading.local()
+
+
+def _enable_lifecycle_accounting(acct) -> None:
+    """Time Nginx.start/reload/stop into `acct.lifecycle` (idempotent). A
+    thread-local depth guard keeps a start() that calls stop() from counting
+    the inner span twice."""
+    for meth in ("start", "reload", "stop"):
+        fn = getattr(Nginx, meth)
+        if getattr(fn, "_ct_phase_wrapped", False):
+            continue
+
+        def _make(fn):
+            def _timed(*a, **kw):
+                depth = getattr(_LIFECYCLE_DEPTH, "n", 0)
+                _LIFECYCLE_DEPTH.n = depth + 1
+                started = time.monotonic()
+                try:
+                    return fn(*a, **kw)
+                finally:
+                    _LIFECYCLE_DEPTH.n = depth
+                    if depth == 0:
+                        acct.add(lifecycle=max(0.0, time.monotonic() - started))
+            _timed._ct_phase_wrapped = True   # type: ignore[attr-defined]
+            return _timed
+        setattr(Nginx, meth, _make(fn))
+
+
 def _instrument(origin: Origin, timings: list[tuple[str, float]] | None = None,
                 facade: dict | None = None, journal: _OutcomeJournal | None = None) -> None:
     """Wrap every module-level test_* function so each records the c->number
@@ -479,11 +507,19 @@ def _instrument(origin: Origin, timings: list[tuple[str, float]] | None = None,
     _ORIGIN_REF = origin
     import inspect
 
+    # CI-L10d-T0: PHASE lines ride on the existing --timings flag; with it off
+    # nothing below is created or patched.
+    phases = None
+    if timings is not None:
+        phases = _origin_module.enable_phase_accounting()
+        _enable_lifecycle_accounting(phases)
+
     def _wrap(name, fn):
         def _runner(*a, **kw):
             before = _conn_cursor()
             _write_breadcrumb(f"{name} {before}")
             started = time.monotonic() if timings is not None else None
+            phase_before = phases.snapshot() if phases is not None else None
             token = journal.enter(name) if journal is not None else None
             try:
                 try:
@@ -506,6 +542,9 @@ def _instrument(origin: Origin, timings: list[tuple[str, float]] | None = None,
                     elapsed = max(0.0, time.monotonic() - started)
                     timings.append((name, elapsed))
                     print(f"TIMING {name} {elapsed:.6f}s", flush=True)
+                    if phases is not None and phase_before is not None:
+                        print(phases.format_line(name, phase_before, phases.snapshot()),
+                              flush=True)
         _runner._ct_instrumented = True   # type: ignore[attr-defined]
         return _runner
 
