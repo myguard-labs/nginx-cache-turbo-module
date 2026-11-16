@@ -47,7 +47,7 @@ from test_runtime_base import (
     _redis_conns_received,
 )
 
-from areas.core import _fault_alloc_config, _FaultAlloc
+from areas.core import _fault_alloc_config, _FaultAlloc, _no_origin_delay
 
 
 def test_redis_param_reject_keeps_own_diagnostic(ng: Nginx) -> None:
@@ -2003,9 +2003,12 @@ def test_l2_tag_purge_large(ng: Nginx, origin: Origin,
          f"(SCARD={redis.cli('SCARD', tag_key('news'))})")
 
     n = 350                                        # ~25 KiB of members
-    for i in range(n):
-        s, _, _ = fetch(ng.port, f"/l2t/big-{i}")  # miss -> store + tag
-        assert s == 200, f"prime /l2t/big-{i} status {s}"
+    # Serial prime loop: no single-flight/lock/burst/TTL oracle, so run it
+    # against a zero-delay origin (suite baseline restored after the loop).
+    with _no_origin_delay(origin):
+        for i in range(n):
+            s, _, _ = fetch(ng.port, f"/l2t/big-{i}")  # miss -> store + tag
+            assert s == 200, f"prime /l2t/big-{i} status {s}"
     assert wait_for(lambda: redis.cli("SCARD", tag_key("news")) == str(n),
                     timeout=10.0), \
         f"expected {n} members in 'news', got {redis.cli('SCARD', tag_key('news'))}"
