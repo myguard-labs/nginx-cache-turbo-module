@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections.abc
 import contextlib
+from typing import TYPE_CHECKING
 
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
@@ -24,6 +25,12 @@ from test_runtime_base import (
     _config_rejects,
     _fetch_keepalive,
 )
+
+if TYPE_CHECKING:
+    # Star imports do not re-export names test_runtime_base merely imported
+    # (no __all__), so the Origin annotation needs its defining module for
+    # mypy. Type-only: no runtime import, no change to the module load path.
+    from origin import Origin
 
 
 @contextlib.contextmanager
