@@ -71,6 +71,8 @@ class _Base(unittest.TestCase):
         finally:
             time.sleep = self._saved_sleep
             origin_mod.PHASES = self._saved_phases
+            # Drop the sleeping Nginx fakes: a reload rebuilds the real class.
+            importlib.reload(self.trb)
 
     def run_instrumented(self, timings, *tests):
         for fn in tests:
