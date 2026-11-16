@@ -49,7 +49,7 @@ PARSER.add_argument(
 PARSER.add_argument("--baseline", type=Path)
 PARSER.add_argument("--write-inventory", type=Path)
 ARGS, REST = PARSER.parse_known_args()
-WORKFLOW = yaml.safe_load(ARGS.workflow.read_text())
+WORKFLOW = yaml.safe_load(ARGS.workflow.read_text(encoding="utf-8"))
 MANIFEST = ROOT / "ci/tools/deep-check-inventory.json"
 
 
@@ -169,7 +169,7 @@ def verdict(job, outcomes):
         output = Path(tmp) / "output"
         summary = Path(tmp) / "summary"
         script = Path(tmp) / "verdict.py"
-        script.write_text(step["run"])
+        script.write_text(step["run"], encoding="utf-8")
         python3 = shutil.which("python3")
         if not python3:
             raise RuntimeError("python3 is required for the verdict control")
@@ -194,10 +194,67 @@ def verdict(job, outcomes):
             capture_output=True,
             check=False,
         )
-        return result.returncode, output.read_text(), summary.read_text(), result.stdout
+        return (
+            result.returncode,
+            output.read_text(encoding="utf-8"),
+            summary.read_text(encoding="utf-8"),
+            result.stdout,
+        )
+
+
+def failed_checks(output):
+    """Return the verdict's failed= value; a missing key is a contract break."""
+    if not output.startswith("failed="):
+        raise AssertionError("verdict output lacks failed= prefix: " + repr(output))
+    return output.removeprefix("failed=").strip()
+
+
+def notify_step(job):
+    """Find the Discord notification step by name, not by position."""
+    return next(s for s in job["steps"] if s["name"].startswith("Notify Discord"))
 
 
 class DeepLanes(unittest.TestCase):
+    def test_workflow_loaded(self):
+        # Probe selected by test_reads_are_utf8 under a non-UTF-8 locale.
+        self.assertIn("jobs", WORKFLOW)
+
+    def test_reads_are_utf8(self):
+        # Without explicit encodings the C locale decodes the workflow as ASCII.
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow = Path(tmp) / "wf.yml"
+            workflow.write_text("jobs:\n  x: sch\u00f6n\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-X",
+                    "utf8=0",
+                    str(Path(__file__).resolve()),
+                    "--workflow",
+                    str(workflow),
+                    "DeepLanes.test_workflow_loaded",
+                ],
+                env={
+                    **os.environ,
+                    "LC_ALL": "C",
+                    "PYTHONCOERCECLOCALE": "0",
+                    "PYTHONUTF8": "0",
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_verdict_prefix_and_notify_lookup_controls(self):
+        self.assertEqual(failed_checks("failed=a (failure)\n"), "a (failure)")
+        with self.assertRaises(AssertionError):
+            failed_checks("fail=a (failure)\n")
+        job = {"steps": [{"name": "Notify Discord on lane failure"}, {"name": "x"}]}
+        self.assertEqual(notify_step(job)["name"], "Notify Discord on lane failure")
+        with self.assertRaises(StopIteration):
+            notify_step({"steps": [{"name": "x"}]})
+
     def test_workflow_sync_stamps(self):
         # Use the shipped predicate (ci/tools/sync-stamp.sh:151-157), so the
         # focused pre-review controls catch generated metadata drift too.
@@ -211,11 +268,14 @@ class DeepLanes(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_original_inventory(self):
-        expected = json.loads(MANIFEST.read_text())
+        expected = json.loads(MANIFEST.read_text(encoding="utf-8"))
         self.assertEqual(inventory(WORKFLOW), expected)
         if ARGS.baseline:
             self.assertEqual(
-                inventory(yaml.safe_load(ARGS.baseline.read_text()), True), expected
+                inventory(
+                    yaml.safe_load(ARGS.baseline.read_text(encoding="utf-8")), True
+                ),
+                expected,
             )
 
     def test_soak_uses_full_allocation_sweep(self):
@@ -235,11 +295,12 @@ class DeepLanes(unittest.TestCase):
                 "#!/usr/bin/python3\n"
                 "import json, os, sys\n"
                 "with open(os.environ['RECORD'], 'w') as output:\n"
-                "    json.dump([os.environ.get('CT_ALLOC_SWEEP'), sys.argv[1:]], output)\n"
+                "    json.dump([os.environ.get('CT_ALLOC_SWEEP'), sys.argv[1:]], output)\n",
+                encoding="utf-8",
             )
             stub.chmod(0o755)
             fuser = root / "fuser"
-            fuser.write_text("#!/bin/sh\nexit 0\n")
+            fuser.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             fuser.chmod(0o755)
             env = {
                 **os.environ,
@@ -259,7 +320,7 @@ class DeepLanes(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            sweep, arguments = json.loads(record.read_text())
+            sweep, arguments = json.loads(record.read_text(encoding="utf-8"))
             self.assertEqual(sweep, "full")
             self.assertEqual(arguments[0], "ci/tools/test_runtime.py")
             self.assertIn("--fault-injection", arguments)
@@ -424,9 +485,11 @@ class DeepLanes(unittest.TestCase):
                         )
                         archive = build / "nginx-1.31.3.tar.gz"
                         self.assertTrue(archive.is_symlink())
-                        archive.write_text("verified source fixture")
+                        archive.write_text("verified source fixture", encoding="utf-8")
                         self.assertEqual(
-                            (workspace / ".build/nginx-1.31.3.tar.gz").read_text(),
+                            (workspace / ".build/nginx-1.31.3.tar.gz").read_text(
+                                encoding="utf-8"
+                            ),
                             "verified source fixture",
                         )
                 if step["name"].endswith("Reset previous check environment"):
@@ -441,7 +504,9 @@ class DeepLanes(unittest.TestCase):
                         self.assertEqual(
                             dict(
                                 line.split("=", 1)
-                                for line in output.read_text().splitlines()
+                                for line in output.read_text(
+                                    encoding="utf-8"
+                                ).splitlines()
                             ),
                             dict.fromkeys(
                                 (
@@ -458,7 +523,7 @@ class DeepLanes(unittest.TestCase):
 
     def test_one_notification_names_checks_and_escapes_payload(self):
         for lane, job in WORKFLOW["jobs"].items():
-            step = job["steps"][-1]
+            step = notify_step(job)
             with tempfile.TemporaryDirectory() as tmp:
                 bindir = Path(tmp)
                 curl = bindir / "curl"
@@ -466,7 +531,8 @@ class DeepLanes(unittest.TestCase):
                 curl.write_text(
                     "#!/usr/bin/env python3\nimport json, os, sys\n"
                     "with open(os.environ['CAPTURE'], 'a') as out:\n"
-                    "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                    "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+                    encoding="utf-8",
                 )
                 curl.chmod(0o755)
                 env = {
@@ -487,7 +553,7 @@ class DeepLanes(unittest.TestCase):
                     check=True,
                     capture_output=True,
                 )
-                calls = capture.read_text().splitlines()
+                calls = capture.read_text(encoding="utf-8").splitlines()
                 self.assertEqual(len(calls), 1)
                 args = json.loads(calls[0])
                 content = json.loads(args[args.index("-d") + 1])["content"]
@@ -496,14 +562,14 @@ class DeepLanes(unittest.TestCase):
                 # Checkout failure produces the largest prerequisite-skip list.
                 rc, output, summary, _ = verdict(job, simulate(job, "checkout"))
                 self.assertEqual(rc, 1)
-                env["FAILED_CHECKS"] = output.removeprefix("failed=").strip()
+                env["FAILED_CHECKS"] = failed_checks(output)
                 subprocess.run(
                     ["bash", "-euo", "pipefail", "-c", step["run"]],
                     env=env,
                     check=True,
                     capture_output=True,
                 )
-                calls = capture.read_text().splitlines()
+                calls = capture.read_text(encoding="utf-8").splitlines()
                 self.assertEqual(len(calls), 2)
                 args = json.loads(calls[-1])
                 content = json.loads(args[args.index("-d") + 1])["content"]
@@ -525,7 +591,9 @@ class DeepLanes(unittest.TestCase):
                     check=True,
                     capture_output=True,
                 )
-                self.assertEqual(len(capture.read_text().splitlines()), 2)
+                self.assertEqual(
+                    len(capture.read_text(encoding="utf-8").splitlines()), 2
+                )
 
     def test_analyzer_advisory_is_accounted_and_independent(self):
         job = WORKFLOW["jobs"]["D-compat"]
@@ -553,7 +621,9 @@ class DeepLanes(unittest.TestCase):
         self.assertEqual(verdict(job, missing)[0], 1)
         with tempfile.TemporaryDirectory() as tmp:
             stub = Path(tmp) / "bash"
-            stub.write_text('#!/bin/sh\necho analyzer-ran\nexit "$STUB_EXIT"\n')
+            stub.write_text(
+                '#!/bin/sh\necho analyzer-ran\nexit "$STUB_EXIT"\n', encoding="utf-8"
+            )
             stub.chmod(0o755)
             for exit_code in ("0", "1"):
                 result = subprocess.run(
@@ -609,9 +679,13 @@ if __name__ == "__main__":
             PARSER.error("--write-inventory needs --baseline")
         ARGS.write_inventory.write_text(
             json.dumps(
-                inventory(yaml.safe_load(ARGS.baseline.read_text()), True), indent=2
+                inventory(
+                    yaml.safe_load(ARGS.baseline.read_text(encoding="utf-8")), True
+                ),
+                indent=2,
             )
-            + "\n"
+            + "\n",
+            encoding="utf-8",
         )
     else:
         unittest.main(argv=[sys.argv[0], *REST])
