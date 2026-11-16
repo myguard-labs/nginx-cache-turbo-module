@@ -75,7 +75,13 @@ ABORT_REPLY_DELAY = 0.1
 # Once the backend has gone quiet for this long the parked request has finished
 # or crashed. It must exceed the gap between a reply landing and nginx sending
 # its next command, so it is a real margin on a loaded host, not a tight fit.
-ABORT_SETTLE_MARGIN = 0.1
+# The abort-arm and clean-arm lines print that gap (reply-to-next-max) against
+# half this margin, scaled, so a lane that drifts toward it shows up there.
+ABORT_SETTLE_MARGIN = 0.05
+# How long the walk's UNLINK connection may trail the page connection's close:
+# both normally close in one proxy loop pass. A wait that returns on the close,
+# kept at its own value so the settle margin above does not narrow it.
+WALK_CLOSE_PAIR_WAIT = 0.1
 # Gap between two scheduled proxy deliveries (see the reply ordering below).
 REPLY_ORDER_EPS = 1e-6
 
@@ -264,6 +270,11 @@ class DelayProxy:
         self._watch: dict[bytes, _Sighting] = {}
         self._tail_len = 0
         self._busy_until = 0.0    # last request seen or reply release scheduled
+        # Release time of the last reply delivered since the last request read,
+        # and each gap from such a release to the next request read: how long
+        # nginx took to act on a reply, which the settle margin must cover.
+        self._landed_at: float | None = None
+        self._reply_gaps: list[float] = []
         self.request_bytes = 0    # everything nginx ever sent to the backend
         self._loop: asyncio.AbstractEventLoop | None = None
         self._server: asyncio.base_events.Server | None = None
@@ -606,6 +617,14 @@ class DelayProxy:
             raise AssertionError(f"the backend never answered {marker!r}")
         return s.reply_at
 
+    def take_reply_gaps(self) -> list[float]:
+        """Return the reply-to-next-request gaps seen since the last call and
+        start over, forgetting the last release too, so the next request read
+        is not timed from a reply that came before this call."""
+        gaps, self._reply_gaps = self._reply_gaps, []
+        self._landed_at = None
+        return gaps
+
     def wait_quiet(self, margin: float, timeout: float = 5.0) -> None:
         """Block until every scheduled reply has been released and no request
         has crossed for `margin` seconds. A reply being merely scheduled is not
@@ -725,8 +744,10 @@ class DelayProxy:
             timer = loop.call_at(due, fire)
             self._timers.add(timer)
 
-        def deliver(data: bytes) -> None:
+        def deliver(data: bytes, due: float) -> None:
             if not cw.is_closing():
+                # Before the write: a reader that has the reply already sees it.
+                self._landed_at = due
                 cw.write(data)
 
         # Ids of the sightings whose first crossing was on this connection:
@@ -741,6 +762,12 @@ class DelayProxy:
                 while data := await cr.read(65536):
                     self.request_bytes += len(data)
                     now = time.monotonic()
+                    # Timed from the release wait_quiet() counts from, so the
+                    # gap includes any lateness of the delivery itself.
+                    landed = self._landed_at
+                    if landed is not None:
+                        self._landed_at = None
+                        self._reply_gaps.append(now - landed)
                     cmds, rest = splitter.feed(data)
                     for cmd in cmds:
                         self._note_command(cmd, now, pending, here)
@@ -791,7 +818,7 @@ class DelayProxy:
                         s.reply_at = due
                         s.reply_head = head
                         s.replied.set()
-                schedule(due, deliver, data)
+                schedule(due, deliver, data, due)
             schedule(max(loop.time() + self.delay,
                          last_due + REPLY_ORDER_EPS), self._close_client, cw)
             close_scheduled = True
@@ -1602,18 +1629,35 @@ class Landing:
     minus_reply: float   # abort time minus the last reply seen, seconds
 
 
+def describe_reply_gaps(gaps: Sequence[float]) -> str:
+    """The settle margin's evidence: the longest a reply's release was
+    followed by nginx's next backend request, against half the scaled margin.
+    "over" marks a run where that gap reached it."""
+    if not gaps:
+        return "reply-to-next-max=n/a"
+    worst = max(gaps)
+    limit = ABORT_SETTLE_MARGIN * sanitizer_time_scale() / 2
+    over = " over" if worst > limit else ""
+    return (f"reply-to-next-max={worst * 1000:.1f}ms/{limit * 1000:.1f}ms "
+            f"n={len(gaps)}{over}")
+
+
 @dataclasses.dataclass
 class ArmResult:
     arm: str
     landings: list[Landing]
     fatal: list[str]
+    # Reply-to-next-request gaps of the judged keys; None: not collected.
+    gaps: list[float] | None = None
 
     def describe(self) -> str:
         deltas = [x.minus_reply * 1000 for x in self.landings]
         spread = f"{min(deltas):+.1f}..{max(deltas):+.1f}ms" if deltas else "n/a"
         hit = sum(x.in_phase for x in self.landings)
+        gaps = "" if self.gaps is None else f" {describe_reply_gaps(self.gaps)}"
         return (f"{self.arm}: aborts={len(self.landings)} in-phase={hit} "
-                f"abort-minus-last-reply={spread} fatal={len(self.fatal)}")
+                f"abort-minus-last-reply={spread} fatal={len(self.fatal)}"
+                f"{gaps}")
 
 
 class ParkWindowClosed(Exception):
@@ -1877,6 +1921,7 @@ def run_abort_arm(ng: Nginx, origin: Origin, site: AbortSite, kind: str,
     arm = f"{site.name} {kind} {timing}"
     keys = ABORT_BOUNDARY_KEYS if timing == "boundary" else ABORT_KEYS
     landings: list[Landing] = []
+    gaps: list[float] = []
     held: list[str] = []
     with AbortRig(ng, site, f"{kind}-{timing}", keys) as rig:
         if kind in HTTP2_KINDS:
@@ -1885,6 +1930,8 @@ def run_abort_arm(ng: Nginx, origin: Origin, site: AbortSite, kind: str,
         for i, key in enumerate(rig.uris):
             uri, attempt = key, 0
             while True:
+                # Priming, an earlier key or a retried one: not this key's.
+                rig.proxy.take_reply_gaps()
                 anchor = rig.anchor(uri)
                 try:
                     aborted_at = _abort_one(
@@ -1904,6 +1951,7 @@ def run_abort_arm(ng: Nginx, origin: Origin, site: AbortSite, kind: str,
                 except (AssertionError, OSError) as exc:
                     raise _arm_failure(arm, rig, i, keys, exc) from exc
                 break
+            gaps.extend(rig.proxy.take_reply_gaps())
             landings.append(_landing(timing, aborted_at, anchor.times()))
             # A request nothing finalizes logs nothing and does not crash: it
             # keeps its connection. That is how the walks fail on the old
@@ -1911,7 +1959,7 @@ def run_abort_arm(ng: Nginx, origin: Origin, site: AbortSite, kind: str,
             held.extend(f"key {i}: client connection never closed: {h}"
                         for h in rig.node.wait_released())
         rig.node.stop()
-        result = ArmResult(arm, landings, rig.node.fatal_lines() + held)
+        result = ArmResult(arm, landings, rig.node.fatal_lines() + held, gaps)
         print(f"abort-arm {result.describe()}", flush=True)
         if not result.fatal:
             rig.assert_no_origin_traffic(origin, base)
@@ -1938,7 +1986,9 @@ def run_clean_test(ng: Nginx, origin: Origin, site: AbortSite,
         if protocol == "http2":
             rig.node.require_http2()
         base = origin.hits_for(f"{site.name}-")
+        gaps: list[float] = []
         for uri in rig.uris:
+            rig.proxy.take_reply_gaps()
             anchor = rig.anchor(uri)
             path = site.request_target(uri)
             if protocol == "http2":
@@ -1954,6 +2004,7 @@ def run_clean_test(ng: Nginx, origin: Origin, site: AbortSite,
             # A site with nothing primed learns the expected body from its
             # anchor, which has it once the request is over.
             anchor.settle()
+            gaps.extend(rig.proxy.take_reply_gaps())
             if site.verify is not None:
                 site.verify(rig, uri, status, body)
             else:
@@ -1963,6 +2014,8 @@ def run_clean_test(ng: Nginx, origin: Origin, site: AbortSite,
             anchor.assert_each_step_once()
             held = rig.node.wait_released()
             assert not held, f"{uri}: connection still held after the answer: {held}"
+        print(f"clean-arm {site.name} {protocol}: keys={len(rig.uris)} "
+              f"{describe_reply_gaps(gaps)}", flush=True)
         rig.assert_no_origin_traffic(origin, base)
         rig.node.stop()
         fatal = rig.node.fatal_lines()
@@ -2695,7 +2748,7 @@ def _walk_timeout_arm(ng: Nginx, site: AbortSite, arm: str) -> None:
                 f"wanted on the reply at {replied_at - sent_at:.3f}s, before "
                 f"the {timeout:.3f}s timer")
         # Both closes can land in one proxy loop pass in either order.
-        unlink_closed = rig.proxy.wait_closed(unlink, ABORT_SETTLE_MARGIN * scale)
+        unlink_closed = rig.proxy.wait_closed(unlink, WALK_CLOSE_PAIR_WAIT * scale)
         if own and (unlink_closed is None or unlink_closed >= replied_at):
             problems.append("the UNLINK connection outlived the UNLINK's own "
                             "timeout")
