@@ -919,7 +919,7 @@ def test_honor_cache_control(ng: Nginx) -> None:
     _, _, h1 = fetch(ng.port, "/cc7/ttl1")
     assert h1.get("x-cache") in ("HIT", "STALE"), \
         f"second should be served from cache (HIT or a raced STALE), got {h1.get('x-cache')}"
-    time.sleep(2.0)                               # past max-age=1, within stale
+    time.sleep(1.3)                               # past max-age=1 (TTL+0.3), within stale
     _, _, h2 = fetch(ng.port, "/cc7/ttl1")
     assert h2.get("x-cache") == "STALE", \
         ("honor_cache_control: entry should be STALE at 2s (max-age=1 < 60s), "
@@ -931,8 +931,8 @@ def test_honor_expires_absolute_ttl(ng: Nginx) -> None:
     Cache-Control/CDN-CC/Surrogate-Control, only an absolute Expires ~2s out,
     must derive its fresh TTL from Expires-minus-now — NOT from the configured
     cache_turbo_valid 60s (which would keep it fresh). STALE at ~3.5s (past the
-    2s Expires window, staleness >=1s so the 1s-granularity check is unambiguous)
-    proves the Expires arm set the window."""
+    2s Expires window; wait = TTL + 0.3, T3a) proves the Expires arm set the
+    window. The "~3.5s" in the failure text below predates the T3a shortening."""
     _, _, h0 = fetch(ng.port, "/cc7/expabs")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/cc7/expabs")
@@ -940,7 +940,7 @@ def test_honor_expires_absolute_ttl(ng: Nginx) -> None:
     # test_honor_cache_control.
     assert h1.get("x-cache") in ("HIT", "STALE"), \
         f"second should be served from cache, got {h1.get('x-cache')}"
-    time.sleep(3.5)                               # past the 2s Expires, staleness >=1s
+    time.sleep(2.3)                               # past the 2s Expires (TTL+0.3)
     _, _, h2 = fetch(ng.port, "/cc7/expabs")
     assert h2.get("x-cache") == "STALE", \
         ("Expires-derived TTL (~2s) must win over cache_turbo_valid 60s: "
@@ -959,7 +959,7 @@ def test_cdn_cache_control_ttl_outranks_cache_control(ng: Nginx) -> None:
     # test_honor_cache_control.
     assert h1.get("x-cache") in ("HIT", "STALE"), \
         f"second should be served from cache, got {h1.get('x-cache')}"
-    time.sleep(2.0)                               # past CDN max-age=1, within stale
+    time.sleep(1.3)                               # past CDN max-age=1 (TTL+0.3), within stale
     _, _, h2 = fetch(ng.port, "/cc7/cdnttl")
     assert h2.get("x-cache") == "STALE", \
         ("CDN-Cache-Control max-age=1 must outrank Cache-Control max-age=60: "
@@ -977,7 +977,7 @@ def test_surrogate_control_ttl_outranks_cdn_and_cache_control(ng: Nginx) -> None
     # test_honor_cache_control.
     assert h1.get("x-cache") in ("HIT", "STALE"), \
         f"second should be served from cache, got {h1.get('x-cache')}"
-    time.sleep(2.0)
+    time.sleep(1.3)                               # past SC max-age=1 (TTL+0.3)
     _, _, h2 = fetch(ng.port, "/cc7/scttl")
     assert h2.get("x-cache") == "STALE", \
         ("Surrogate-Control max-age=1 must outrank CDN-CC=60 and CC=60: entry "
@@ -998,7 +998,7 @@ def test_surrogate_control_split_header_ttl(ng: Nginx) -> None:
     # test_honor_cache_control.
     assert h1.get("x-cache") in ("HIT", "STALE"), \
         f"second should be served from cache, got {h1.get('x-cache')}"
-    time.sleep(2.0)                               # past SC max-age=1 (2nd line)
+    time.sleep(1.3)                               # past SC max-age=1 (2nd line, TTL+0.3)
     _, _, h2 = fetch(ng.port, "/cc7/scsplit")
     assert h2.get("x-cache") == "STALE", \
         ("Surrogate-Control max-age on a later field-line must not be ignored: "
@@ -1018,7 +1018,7 @@ def test_cdn_cache_control_split_header_ttl(ng: Nginx) -> None:
     # test_honor_cache_control.
     assert h1.get("x-cache") in ("HIT", "STALE"), \
         f"second should be served from cache, got {h1.get('x-cache')}"
-    time.sleep(2.0)                               # past CDN-CC max-age=1 (2nd line)
+    time.sleep(1.3)                               # past CDN-CC max-age=1 (2nd line, TTL+0.3)
     _, _, h2 = fetch(ng.port, "/cc7/cdnsplit")
     assert h2.get("x-cache") == "STALE", \
         ("CDN-Cache-Control max-age on a later field-line must not be ignored: "
@@ -1087,7 +1087,7 @@ def test_must_revalidate_split_header(ng: Nginx) -> None:
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/ccsplit/splitmrev")
     assert h1.get("x-cache") == "HIT", f"second should be a fresh HIT, got {h1}"
-    time.sleep(6.0)                               # past max-age=4, generous margin
+    time.sleep(4.3)                               # past max-age=4 (TTL+0.3)
     _, _, h2 = fetch(ng.port, "/ccsplit/splitmrev")
     assert h2.get("x-cache") != "STALE", \
         ("must-revalidate on a later Cache-Control field-line must NOT be "
@@ -1131,14 +1131,15 @@ def test_must_revalidate(ng: Nginx) -> None:
     sibling test_honor_cache_control), giving two quick HTTP round trips ample
     slack to complete before the deadline even under a slow sanitizer build.
     The post-deadline sleep below is widened to match (was 2.0 past max-age=1,
-    now 6.0 past max-age=4 -- 2s of margin, and there is no upper-bound risk to
-    overshoot since must-revalidate has no stale window to fall out of the far
-    side of)."""
+    now 4.3 past max-age=4 per CI-L10d-T3a -- TTL+0.3, enough because staleness
+    is `now >= fresh_until` at 1s clock granularity; there is no upper-bound
+    risk to overshoot since must-revalidate has no stale window to fall out of
+    the far side of)."""
     _, _, h0 = fetch(ng.port, "/mrev/mustrev")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/mrev/mustrev")
     assert h1.get("x-cache") == "HIT", f"second should be a fresh HIT, got {h1}"
-    time.sleep(6.0)                               # past max-age=4, generous margin
+    time.sleep(4.3)                               # past max-age=4 (TTL+0.3)
     _, _, h2 = fetch(ng.port, "/mrev/mustrev")
     assert h2.get("x-cache") != "STALE", \
         f"must-revalidate must NOT stale-serve past freshness, got {h2.get('x-cache')}"
@@ -1158,7 +1159,7 @@ def test_proxy_revalidate(ng: Nginx) -> None:
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/mrev/proxyrev")
     assert h1.get("x-cache") == "HIT", f"second should be a fresh HIT, got {h1}"
-    time.sleep(6.0)                               # past max-age=4, generous margin
+    time.sleep(4.3)                               # past max-age=4 (TTL+0.3)
     _, _, h2 = fetch(ng.port, "/mrev/proxyrev")
     assert h2.get("x-cache") != "STALE", \
         f"proxy-revalidate must NOT stale-serve past freshness, got {h2.get('x-cache')}"
@@ -1326,7 +1327,7 @@ def test_valid_zero_is_forever(ng: Nginx, origin: Origin) -> None:
     assert h1.get("x-cache") == "HIT", \
         f"valid 0 must serve a FRESH HIT, got X-Cache={h1.get('x-cache')}"
     assert b1 == b0, "HIT served a different body"
-    time.sleep(2.0)
+    time.sleep(1.3)                               # crosses a 1s tick: a 1s-wrapped TTL would be STALE
     _, b2, h2 = fetch(ng.port, "/forever/forever-f")
     assert h2.get("x-cache") == "HIT", \
         f"valid 0 must still be fresh after a delay, got X-Cache={h2.get('x-cache')}"
@@ -1348,7 +1349,7 @@ def test_honor_ttl_clamped_to_max(ng: Nginx, origin: Origin) -> None:
     _, _b1, h1 = fetch(ng.port, "/cc7/ttlclamp")
     assert h1.get("x-cache") == "HIT", \
         f"clamped huge max-age must serve a FRESH HIT, got {h1.get('x-cache')}"
-    time.sleep(2.0)
+    time.sleep(1.3)                               # crosses a 1s tick: a wrapped TTL would be STALE
     _, _b2, h2 = fetch(ng.port, "/cc7/ttlclamp")
     assert h2.get("x-cache") == "HIT", \
         ("clamped max-age must still be fresh after a delay (no overflow-to-stale), "
@@ -1471,9 +1472,9 @@ def test_auto_vary_stale_marker_reachable(ng: Nginx, origin: Origin) -> None:
     stale marker and serve it from cache — not fall back to the base key and miss
     to origin (codex follow-up)."""
     ae = {"Accept-Encoding": "gzip"}
-    _, _, h0 = fetch(ng.port, "/avs/m?v=ae", headers=ae)
+    _, _, h0 = fetch(ng.port, "/avs1/m?v=ae", headers=ae)
     assert "x-cache" not in h0, "first should miss"
-    _, _, h1 = fetch(ng.port, "/avs/m?v=ae", headers=ae)
+    _, _, h1 = fetch(ng.port, "/avs1/m?v=ae", headers=ae)
     # TEST-MICROTTL-ORACLE (2026-08-23): HIT or a raced STALE both prove the
     # variant was stored, without racing the 2s fresh window over two live
     # HTTP round trips under a slow sanitizer build; see test_honor_cache_control
@@ -1481,8 +1482,8 @@ def test_auto_vary_stale_marker_reachable(ng: Nginx, origin: Origin) -> None:
     # this test exists to prove is the deterministic post-sleep check below.
     assert h1.get("x-cache") in ("HIT", "STALE"), \
         f"second should be served from cache, got {h1.get('x-cache')}"
-    time.sleep(2.5)                          # past the 2s fresh TTL, inside stale
-    _, _, h2 = fetch(ng.port, "/avs/m?v=ae", headers=ae)
+    time.sleep(1.3)                          # past the 1s fresh TTL (TTL+0.3), inside stale
+    _, _, h2 = fetch(ng.port, "/avs1/m?v=ae", headers=ae)
     assert "x-cache" in h2, \
         ("a stale-but-serveable variant must stay reachable via its stale marker, "
          f"got X-Cache={h2.get('x-cache')} (base-key fallback missed to origin)")
@@ -2014,7 +2015,7 @@ def test_rfc6_stale_conditional_full(ng: Nginx, origin: Origin) -> None:
             f"before the fresh conditional leg could run (last: {last_fresh_state})"
         )
 
-    time.sleep(1.4)                                                # now stale
+    time.sleep(1.3)                                                # now stale
     s1, b1, h1 = fetch_raw(ng.port, key,
                            headers={"If-None-Match": '"v11etag"'})
     assert s1 == 200, f"stale conditional must serve full body, not 304: {s1}"
@@ -2032,7 +2033,7 @@ def test_rfc3_date_stable_across_hits(ng: Nginx) -> None:
     assert ha.get("x-cache") == "HIT", f"second read should be a HIT: {ha}"
     assert ha.get("date"), "a cached HIT must carry a Date"
     age_a = int(ha.get("age", "0"))
-    time.sleep(1.4)
+    time.sleep(1.3)
     _, _, hb = fetch_raw(ng.port, "/cond/date")                    # HIT B (later)
     assert hb.get("x-cache") == "HIT", f"third read should be a HIT: {hb}"
     assert hb.get("date") == ha.get("date"), \
@@ -2312,7 +2313,7 @@ def test_p4_multi_directive_single_resolve(ng: Nginx, origin: Origin) -> None:
 
     # (b) max-stale half of a combined directive on a stale entry.
     fetch_raw(ng.port, "/condst/p4-multi")                         # prime, fresh 1s
-    time.sleep(1.5)                                                # now stale
+    time.sleep(1.3)                                                # now stale
     before = origin.hits_for("/p4-multi")
     s2, b2, h2 = fetch_raw(ng.port, "/condst/p4-multi",
                            headers={"Cache-Control": "no-store, max-stale=30"})
@@ -2324,12 +2325,13 @@ def test_p4_multi_directive_single_resolve(ng: Nginx, origin: Origin) -> None:
 
 def test_rfc2_swr_duration_extends_stale(ng: Nginx, origin: Origin) -> None:
     """RFC-2: a response stale-while-revalidate=10 extends the stale window past
-    the cache_turbo_stale_mult default (which would expire the 1s entry at ~4s),
-    so the copy is still STALE-serveable at ~5s."""
-    fetch_raw(ng.port, "/swrdur/swrdur-x")                         # prime, fresh 1s
-    time.sleep(5)                                                  # > default 4s window
+    the cache_turbo_stale_mult default (which would expire the 1s entry at ~2s
+    on /swrdur2/, stale_mult 2; T3a), so the copy is still STALE-serveable at
+    ~2.3s."""
+    fetch_raw(ng.port, "/swrdur2/swrdur-x")                         # prime, fresh 1s
+    time.sleep(2.3)                                                # > default 2s window (stale_mult 2)
     before = origin.hits_for("/swrdur-x")
-    s, b, h = fetch_raw(ng.port, "/swrdur/swrdur-x")
+    s, b, h = fetch_raw(ng.port, "/swrdur2/swrdur-x")
     assert s == 200 and b, f"SWR-extended entry should still serve: {s}"
     assert h.get("x-cache") == "STALE", \
         f"stale-while-revalidate must keep it serveable past the default: {h}"
@@ -3310,10 +3312,11 @@ def test_status_expired(ng: Nginx, origin: Origin) -> None:
     """$cache_turbo_status = EXPIRED when a cached entry is found past its whole
     serveable window and refetched from origin — distinct from a cold MISS
     (which test_status_variable covers). Locks the ST_EXPIRED arm + the
-    nginx-aligned semantics (EXPIRED != only-if-cached-504)."""
-    fetch(ng.port, "/ctstale/e")                  # prime: MISS, fresh 1s, stale to 4s
-    time.sleep(4.5)                               # past the entire 4s window
-    _, _, h = fetch(ng.port, "/ctstale/e")
+    nginx-aligned semantics (EXPIRED != only-if-cached-504). Runs on /ctexp/
+    (fresh 1s, stale_mult 2: whole window 2s) so the wait is window + 0.3."""
+    fetch(ng.port, "/ctexp/e")                  # prime: MISS, fresh 1s, stale to 2s
+    time.sleep(2.3)                               # past the entire 2s window (TTL+0.3)
+    _, _, h = fetch(ng.port, "/ctexp/e")
     assert h.get("x-ct-status") == "EXPIRED", \
         f"expired-refetch should report EXPIRED, got {h.get('x-ct-status')}"
     drain_origin(origin)

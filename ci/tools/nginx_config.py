@@ -2130,6 +2130,18 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # CI-L10d-T3a: /swrdur/ with stale_mult 2 (default stale window 2s
+        # instead of 4s) so test_rfc2_swr_duration_extends_stale waits 2.3s,
+        # past that default window but far inside the origin's SWR=10 extension.
+        location /swrdur2/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 1s;
+            cache_turbo_stale_mult 2;
+            cache_turbo_beta  1;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # per-status caching (v6): cache redirects + negative responses too
         location /st/ {{
             cache_turbo       main;
@@ -2347,6 +2359,20 @@ http {{
             cache_turbo        main;
             cache_turbo_key    $uri;
             cache_turbo_valid  1s;
+            cache_turbo_beta   1;
+            add_header         X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # CI-L10d-T3a: /ctstale/ with stale_mult 2 (whole serveable window 2s
+        # instead of 4s) so test_status_expired waits window+0.3 = 2.3s, not
+        # 4.5s. Same fresh 1s, beta 1 and X-CT-Status as /ctstale/, which stays
+        # unchanged for test_status_stale.
+        location /ctexp/ {{
+            cache_turbo        main;
+            cache_turbo_key    $uri;
+            cache_turbo_valid  1s;
+            cache_turbo_stale_mult 2;
             cache_turbo_beta   1;
             add_header         X-CT-Status $cache_turbo_status always;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -4468,6 +4494,18 @@ http {{
             cache_turbo          main;
             cache_turbo_key      $request_uri;
             cache_turbo_valid    2s;
+            cache_turbo_auto_vary on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # CI-L10d-T3a: /avs1/ is /avs/ with a 1s fresh TTL (instead of 2s) so
+        # test_auto_vary_stale_marker_reachable waits TTL+0.3 = 1.3s, not 2.5s.
+        # stale_mult 8 keeps the original 8s total serve window (2s * 4).
+        location /avs1/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    1s;
+            cache_turbo_stale_mult 8;
             cache_turbo_auto_vary on;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
