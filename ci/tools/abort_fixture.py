@@ -2432,11 +2432,15 @@ def run_reentry_test(ng: Nginx, origin: Origin, site: AbortSite,
 
 SHUTDOWN_TIMEOUT_MS = 100
 # Long enough that the shutdown timer always fires inside the park, even on a
-# loaded host where the reload takes a while to reach the old worker. Short
-# enough that, scaled for a sanitizer (x2), it stays under the sites' 2s L2
-# timeout: at 1.0s the ASan reply landed on the timeout and the graceful
-# control got no cache answer.
-SHUTDOWN_REPLY_DELAY = 0.75
+# loaded host where the reload takes a while to reach the old worker: the
+# SIGHUP-to-close latency measured about 0.2s plain and ASan, which the
+# shutdown-arm line reports per key (close-minus-reload) against the scaled
+# delay minus 0.1s. Short enough that, scaled for a sanitizer (x2), it stays
+# under the sites' 2s L2 timeout: at 1.0s unscaled the ASan reply landed on
+# the timeout and the graceful control got no cache answer.
+SHUTDOWN_REPLY_DELAY = 0.5
+# The close must land this far ahead of the scaled reply delay.
+SHUTDOWN_CLOSE_MARGIN = 0.1
 # http1, http2  a reload with worker_shutdown_timeout while parked
 # graceful      the same reload with no shutdown timeout, HTTP/1: the old worker
 #               waits for the request, which gets its answer. It must pass on
@@ -2477,6 +2481,29 @@ def memcached_hit_reply(head: bytes) -> bool:
     return head.startswith(b"VALUE ")
 
 
+def _peer_closed(sock: socket.socket) -> bool:
+    """True once the peer closed or reset `sock`. POLLRDHUP reports the FIN
+    even behind queued response bytes, which stay unread."""
+    poller = select.poll()
+    poller.register(sock, select.POLLRDHUP)
+    return any(events & (select.POLLRDHUP | select.POLLHUP | select.POLLERR)
+               for _, events in poller.poll(0))
+
+
+def describe_close_latency(closes: Sequence[float | None],
+                           limit: float) -> str:
+    """The shutdown timer's evidence: per key, when the old worker closed the
+    idle client connection, seconds after the reload, against `limit` (the
+    scaled reply delay minus SHUTDOWN_CLOSE_MARGIN). "over" marks a run where
+    a close was not seen or came at or past it."""
+    if not closes:
+        return "close-minus-reload=n/a"
+    keys = ",".join(f"k{i}:" + ("none" if c is None else f"{c * 1000:+.1f}ms")
+                    for i, c in enumerate(closes))
+    over = " over" if any(c is None or c >= limit for c in closes) else ""
+    return f"close-minus-reload={keys}/{limit * 1000:.1f}ms{over}"
+
+
 def shutdown_site(site: AbortSite, timeout: bool,
                   delay: float = SHUTDOWN_REPLY_DELAY) -> AbortSite:
     """`site` with a reply delay longer than the shutdown timeout, and that
@@ -2515,6 +2542,10 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
     scale = sanitizer_time_scale()
     problems: list[str] = []
     landings: list[Landing] = []
+    # Per key, the idle HTTP/1 client's close seen after the reload, on the
+    # arms with a shutdown timer.
+    closes: list[float | None] = []
+    track_close = protocol == "http1" and arm != "graceful"
     # The op timeout lines are logged at info.
     with AbortRig(ng, site, f"shutdown-{arm}", ABORT_KEYS,
                   "info" if own else None) as rig:
@@ -2547,13 +2578,26 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
             reloaded_at = time.monotonic()
             os.kill(rig.node.process.pid, signal.SIGHUP)
             exited_at: float | None = None
-            if wait_for(lambda old=old: not (rig.node.worker_pids() & old),
-                        timeout=(max(SHUTDOWN_REPLY_DELAY,
+            closed_at: float | None = None
+
+            def gone(old: set[int] = old, h1: Http1Client | None = h1) -> bool:
+                nonlocal closed_at
+                if (track_close and closed_at is None and h1 is not None
+                        and _peer_closed(h1.sock)):
+                    closed_at = time.monotonic()
+                return rig.node.worker_pids().isdisjoint(old)
+
+            if wait_for(gone, timeout=(max(SHUTDOWN_REPLY_DELAY,
                                      OWN_TIMEOUT_REPLY_DELAY) + 5.0) * scale,
                         interval=0.02):
                 exited_at = time.monotonic()
             else:
                 problems.append(f"key {i}: old worker never exited")
+            if track_close:
+                if closed_at is None and h1 is not None and _peer_closed(h1.sock):
+                    closed_at = time.monotonic()
+                closes.append(None if closed_at is None
+                              else closed_at - reloaded_at)
             anchor.settle()
             if arm == "graceful" and h1 is not None:
                 try:
@@ -2622,8 +2666,10 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
                             for ln in late)
         fatal = rig.node.fatal_lines()
         result = ArmResult(name, landings, fatal + problems)
-        print(f"shutdown-arm {result.describe()} problems={len(problems)}",
-              flush=True)
+        close = ("" if not track_close else " " + describe_close_latency(
+            closes, (site.proxy_delay or 0.0) * scale - SHUTDOWN_CLOSE_MARGIN))
+        print(f"shutdown-arm {result.describe()}{close} "
+              f"problems={len(problems)}", flush=True)
         assert not result.fatal, (
             f"{result.describe()}\nfirst: {result.fatal[0]}")
         rig.assert_no_origin_traffic(origin, base)
