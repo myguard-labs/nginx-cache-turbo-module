@@ -1288,7 +1288,7 @@ ngx_http_cache_turbo_warm_file_test_delay(
 
     ngx_snprintf(marker, sizeof(marker), ".delay-%s%Z", stage);
     if (ngx_strstr(ctx->nul, marker) != NULL) {
-        ngx_msleep(5000);
+        ngx_msleep(NGX_HTTP_CACHE_TURBO_WARM_FILE_TEST_DELAY_MS);
         return;
     }
 
