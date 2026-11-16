@@ -3,4 +3,4 @@
 One file per past crash in this target; see [../README.md](../README.md)
 for the contract and how to add one.
 
-Empty is normal: this target has never crashed.
+Holds the recorded signed-overflow crash unit; no other crash has been recorded.
