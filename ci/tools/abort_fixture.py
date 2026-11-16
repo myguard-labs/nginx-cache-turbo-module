@@ -2482,16 +2482,12 @@ def memcached_hit_reply(head: bytes) -> bool:
 
 
 def _peer_closed(sock: socket.socket) -> bool:
-    """True once the peer closed or reset `sock`; any data stays queued."""
-    try:
-        readable, _, _ = select.select([sock], [], [], 0)
-        if not readable:
-            return False
-        return sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
-    except (BlockingIOError, InterruptedError):
-        return False
-    except OSError:
-        return True
+    """True once the peer closed or reset `sock`. POLLRDHUP reports the FIN
+    even behind queued response bytes, which stay unread."""
+    poller = select.poll()
+    poller.register(sock, select.POLLRDHUP)
+    return any(events & (select.POLLRDHUP | select.POLLHUP | select.POLLERR)
+               for _, events in poller.poll(0))
 
 
 def describe_close_latency(closes: Sequence[float | None],
