@@ -22,8 +22,17 @@ regressions/
   fuzz_blob/
 ```
 
-An empty subdirectory is the normal state for a target that has never crashed.
-The replay step skips it.
+Every target must hold at least one unit; the replay step FAILS on an empty
+target so the gate cannot silently replay nothing. No target has ever produced
+a libFuzzer crash artifact (bounded discovery runs found none), so units are of
+two kinds:
+
+- **crash**: a minimised input that actually crashed (`fuzz_resp_parser/
+  scan_cursor_len_signed_overflow`).
+- **pin**: a hand-built boundary input for a bug class fixed earlier (empty
+  Cookie header, over-bound arg sort, forged `BLOBF_HDRS_VETTED`, u32-max
+  lengths, truncated payloads). Pins are not crash artifacts; they replay clean
+  today and guard the fix. Say which in the file name or here.
 
 ## Adding a crash
 

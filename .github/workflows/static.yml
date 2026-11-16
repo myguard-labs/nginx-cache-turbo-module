@@ -1,4 +1,4 @@
-# sync-sha: 3909c04e0793de75862dbc3a19734bda6354aa2b939b74d32e0f068895b45f66
+# sync-sha: bb3251b3f03b76101cc2aab861618e3d5618098d7f2c9e27f409138dd4806037
 name: Static
 
 # Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
@@ -602,7 +602,8 @@ jobs:
           for dir in regressions/*/; do
             bin="$(basename "$dir")"
             [ -x "./$bin" ] || { echo "❌ no such fuzz target: $bin"; exit 1; }
-            # Real units only; README.md and an empty dir are both fine.
+            # Real units only: README.md is not one. An empty target fails
+            # below, so this gate cannot go vacuous again.
             n=0
             bad=0
             for unit in $(find "$dir" -type f ! -name 'README.md' | sort); do
@@ -623,23 +624,16 @@ jobs:
               fi
             done
             if [ "$n" -eq 0 ]; then
-              echo "— $bin: no recorded regressions"
+              # Fail closed: every target keeps at least one pinned unit
+              # (regressions/README.md). A deleted unit must not read as a pass.
+              failed=$((failed + 1))
+              echo "❌ $bin: no recorded regressions (every target needs >= 1 unit)"
             elif [ "$bad" -eq 0 ]; then
               echo "✓ $bin: all $n replayed clean"
             fi
           done
-          [ "$failed" -eq 0 ] || { echo "❌ $failed recorded regression(s) reproduce"; exit 1; }
-          if [ "$total" -eq 0 ]; then
-            # Loud, not a failure: an empty regressions/ tree is the documented
-            # normal state for targets that have never crashed (see
-            # regressions/README.md). But a step that silently replays nothing
-            # reads exactly like a step that replayed something and passed —
-            # make the no-op explicit so this gate cannot go vacuous unnoticed.
-            echo "⚠ replayed 0 recorded regression(s) across all targets — this step is"
-            echo "  currently a no-op (no crash has ever been recorded; see regressions/README.md)"
-          else
-            echo "replayed $total recorded regression(s) across all targets, all clean"
-          fi
+          [ "$failed" -eq 0 ] || { echo "❌ $failed regression target failure(s) (reproducing or empty)"; exit 1; }
+          echo "replayed $total recorded regression(s) across all targets, all clean"
       # Name carries the literal, not ${{ env.FUZZ_SECONDS }}: the run: block
       # below is the single consumer of that value, and a step name is not
       # worth an expression. Update both together if the budget changes.
