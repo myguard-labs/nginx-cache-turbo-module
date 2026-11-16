@@ -9,6 +9,9 @@ star-imports this module, so every test stays reachable as
 
 from __future__ import annotations
 
+import collections.abc
+import contextlib
+
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
 from test_runtime_base import *
@@ -21,6 +24,19 @@ from test_runtime_base import (
     _config_rejects,
     _fetch_keepalive,
 )
+
+
+@contextlib.contextmanager
+def _no_origin_delay(origin: Origin) -> collections.abc.Iterator[None]:
+    """Serial pair-per-key classification loops (bypass/HIT per request) have
+    no single-flight / lock_waits / burst / TTL oracle, so run them against a
+    zero-delay origin and ALWAYS restore the suite baseline via reset_delay()
+    (never a hardcoded 0.0: a leaked 0.0 voids every later burst test)."""
+    origin.delay = 0.0
+    try:
+        yield
+    finally:
+        origin.reset_delay()
 
 
 def test_sanitizer_time_scale() -> None:
@@ -871,42 +887,43 @@ def test_header_auth_rest_surfaces(ng: Nginx, origin: Origin) -> None:
     ^wp-json/(.*) -> index.php?rest_route=/$1, and rest_api_loaded() dispatches
     only when that query var is set. With plain permalinks the request never has
     a /wp-json/ path at all, so the URI rule saw nothing."""
-    # Magento Web API front names: rest + soap.
-    for uri in ("/rest/V1/customers/me", "/rest/V1/orders", "/soap/default"):
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, \
-            (f"magento {uri} is header-authenticated and invisible to the cookie "
-             f"tier -- it must bypass on the URI rule, got {h.get('x-cache')}")
+    with _no_origin_delay(origin):
+        # Magento Web API front names: rest + soap.
+        for uri in ("/rest/V1/customers/me", "/rest/V1/orders", "/soap/default"):
+            fetch(ng.port, uri)
+            _, _, h = fetch(ng.port, uri)
+            assert "x-cache" not in h, \
+                (f"magento {uri} is header-authenticated and invisible to the cookie "
+                 f"tier -- it must bypass on the URI rule, got {h.get('x-cache')}")
 
-    # ...but a catalog URL that merely shares the letters must still cache. The
-    # prefix requires a '/' or '.' boundary, so /restaurant-supplies is not /rest.
-    fetch(ng.port, "/restaurant-supplies")
-    _, _, hr = fetch(ng.port, "/restaurant-supplies")
-    assert hr.get("x-cache") == "HIT", \
-        ("/restaurant-supplies merely shares letters with /rest and must stay "
-         f"cacheable (prefix needs a '/' or '.' boundary), got {hr.get('x-cache')}")
+        # ...but a catalog URL that merely shares the letters must still cache. The
+        # prefix requires a '/' or '.' boundary, so /restaurant-supplies is not /rest.
+        fetch(ng.port, "/restaurant-supplies")
+        _, _, hr = fetch(ng.port, "/restaurant-supplies")
+        assert hr.get("x-cache") == "HIT", \
+            ("/restaurant-supplies merely shares letters with /rest and must stay "
+             f"cacheable (prefix needs a '/' or '.' boundary), got {hr.get('x-cache')}")
 
-    # Drupal JSON:API (core, jsonapi.base_path) and simple_oauth.
-    # /oauth/userinfo is the leak that justifies the prefix: a GET, authenticated
-    # purely by bearer token, returning the token holder's profile.
-    for uri in ("/jsonapi/node/article", "/oauth/userinfo", "/oauth/debug"):
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, \
-            (f"drupal {uri} is header-authenticated -- it must bypass on the URI "
-             f"rule, got {h.get('x-cache')}")
+        # Drupal JSON:API (core, jsonapi.base_path) and simple_oauth.
+        # /oauth/userinfo is the leak that justifies the prefix: a GET, authenticated
+        # purely by bearer token, returning the token holder's profile.
+        for uri in ("/jsonapi/node/article", "/oauth/userinfo", "/oauth/debug"):
+            fetch(ng.port, uri)
+            _, _, h = fetch(ng.port, uri)
+            assert "x-cache" not in h, \
+                (f"drupal {uri} is header-authenticated -- it must bypass on the URI "
+                 f"rule, got {h.get('x-cache')}")
 
-    # WordPress ?rest_route= -- the same API as /wp-json/, addressed the other
-    # way. This is the arm that fails if only the URI half is covered.
-    for uri in ("/wpq/?rest_route=/wp/v2/users/me",
-                "/wpq/index.php?rest_route=/wp/v2/posts",
-                "/wpq/?p=1&rest_route=/wp/v2/settings"):
-        fetch(ng.port, uri)
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, \
-            (f"{uri} IS the REST API -- /wp-json/ is a rewrite to this form, so "
-             f"guarding only the path leaves it open, got {h.get('x-cache')}")
+        # WordPress ?rest_route= -- the same API as /wp-json/, addressed the other
+        # way. This is the arm that fails if only the URI half is covered.
+        for uri in ("/wpq/?rest_route=/wp/v2/users/me",
+                    "/wpq/index.php?rest_route=/wp/v2/posts",
+                    "/wpq/?p=1&rest_route=/wp/v2/settings"):
+            fetch(ng.port, uri)
+            _, _, h = fetch(ng.port, uri)
+            assert "x-cache" not in h, \
+                (f"{uri} IS the REST API -- /wp-json/ is a rewrite to this form, so "
+                 f"guarding only the path leaves it open, got {h.get('x-cache')}")
     drain_origin(origin)
 
 
@@ -926,88 +943,89 @@ def test_phpbb_preset(ng: Nginx, origin: Origin) -> None:
     rule stops firing on a renamed board, and a bypass that stops firing leaks.
     Verified against phpbb/phpbb: includes/constants.php (ANONYMOUS=1),
     phpbb/session.php session_create()/set_cookie()."""
-    for uri in ("/ucp.php", "/ucp.php?mode=login"):
-        _, _, h = fetch(ng.port, uri)
-        assert "x-cache" not in h, f"{uri} must bypass on the phpbb preset"
+    with _no_origin_delay(origin):
+        for uri in ("/ucp.php", "/ucp.php?mode=login"):
+            _, _, h = fetch(ng.port, uri)
+            assert "x-cache" not in h, f"{uri} must bypass on the phpbb preset"
 
-    # ?sid= marks a session-propagated URL: bypass (also a key-poisoning vector).
-    _, _, hs = fetch(ng.port, "/phpbb/viewtopic?sid=deadbeef")
-    assert "x-cache" not in hs, "?sid= must bypass"
+        # ?sid= marks a session-propagated URL: bypass (also a key-poisoning vector).
+        _, _, hs = fetch(ng.port, "/phpbb/viewtopic?sid=deadbeef")
+        assert "x-cache" not in hs, "?sid= must bypass"
 
-    # Guest cookies must NOT bypass — every anonymous phpBB visitor carries them.
-    guest = {"Cookie": "phpbb3_sid=abc; phpbb3_u=1; phpbb3_k="}
-    fetch(ng.port, "/phpbb/viewtopic-a", headers=guest)
-    _, _, hg = fetch(ng.port, "/phpbb/viewtopic-a", headers=guest)
-    assert hg.get("x-cache") == "HIT", \
-        f"guest phpbb cookies must stay cacheable, got {hg.get('x-cache')}"
+        # Guest cookies must NOT bypass — every anonymous phpBB visitor carries them.
+        guest = {"Cookie": "phpbb3_sid=abc; phpbb3_u=1; phpbb3_k="}
+        fetch(ng.port, "/phpbb/viewtopic-a", headers=guest)
+        _, _, hg = fetch(ng.port, "/phpbb/viewtopic-a", headers=guest)
+        assert hg.get("x-cache") == "HIT", \
+            f"guest phpbb cookies must stay cacheable, got {hg.get('x-cache')}"
 
-    # THE FIX (was the documented gap): a logged-in user carries <prefix>_u with
-    # their user_id, never ANONYMOUS(=1). The value predicate reads it and
-    # bypasses. Before this rule the member's page was cached and served to
-    # strangers — a cross-user leak the docs told the operator to patch by hand.
-    authed = {"Cookie": "phpbb3_sid=abc; phpbb3_u=42; phpbb3_k=beef"}
-    fetch(ng.port, "/phpbb/viewtopic-b", headers=authed)
-    _, _, ha = fetch(ng.port, "/phpbb/viewtopic-b", headers=authed)
-    assert "x-cache" not in ha, \
-        (f"logged-in phpbb user (_u=42 != ANONYMOUS 1) MUST bypass, got "
-         f"{ha.get('x-cache')} — this is the cross-user leak the value "
-         "predicate exists to close")
+        # THE FIX (was the documented gap): a logged-in user carries <prefix>_u with
+        # their user_id, never ANONYMOUS(=1). The value predicate reads it and
+        # bypasses. Before this rule the member's page was cached and served to
+        # strangers — a cross-user leak the docs told the operator to patch by hand.
+        authed = {"Cookie": "phpbb3_sid=abc; phpbb3_u=42; phpbb3_k=beef"}
+        fetch(ng.port, "/phpbb/viewtopic-b", headers=authed)
+        _, _, ha = fetch(ng.port, "/phpbb/viewtopic-b", headers=authed)
+        assert "x-cache" not in ha, \
+            (f"logged-in phpbb user (_u=42 != ANONYMOUS 1) MUST bypass, got "
+             f"{ha.get('x-cache')} — this is the cross-user leak the value "
+             "predicate exists to close")
 
-    # The cookie NAME PREFIX is an ACP setting (config 'cookie_name', default
-    # "phpbb"), and installers randomise it. The predicate matches the name by
-    # SUFFIX for exactly this reason: a literal-name rule silently stops firing
-    # on a renamed board, and a bypass rule that stops firing LEAKS. Prove the
-    # suffix match holds under an arbitrary prefix.
-    for prefix in ("phpbb", "phpbb3", "myboard_xyz", "zz"):
-        m = {"Cookie": f"{prefix}_sid=abc; {prefix}_u=7"}
-        fetch(ng.port, f"/phpbb/vt-{prefix}", headers=m)
-        _, _, hm = fetch(ng.port, f"/phpbb/vt-{prefix}", headers=m)
-        assert "x-cache" not in hm, \
-            (f"member with cookie prefix '{prefix}' must bypass — the name is "
-             "matched by SUFFIX because the prefix is admin-configurable")
+        # The cookie NAME PREFIX is an ACP setting (config 'cookie_name', default
+        # "phpbb"), and installers randomise it. The predicate matches the name by
+        # SUFFIX for exactly this reason: a literal-name rule silently stops firing
+        # on a renamed board, and a bypass rule that stops firing LEAKS. Prove the
+        # suffix match holds under an arbitrary prefix.
+        for prefix in ("phpbb", "phpbb3", "myboard_xyz", "zz"):
+            m = {"Cookie": f"{prefix}_sid=abc; {prefix}_u=7"}
+            fetch(ng.port, f"/phpbb/vt-{prefix}", headers=m)
+            _, _, hm = fetch(ng.port, f"/phpbb/vt-{prefix}", headers=m)
+            assert "x-cache" not in hm, \
+                (f"member with cookie prefix '{prefix}' must bypass — the name is "
+                 "matched by SUFFIX because the prefix is admin-configurable")
 
-        g = {"Cookie": f"{prefix}_sid=abc; {prefix}_u=1"}
-        fetch(ng.port, f"/phpbb/vg-{prefix}", headers=g)
-        _, _, hgp = fetch(ng.port, f"/phpbb/vg-{prefix}", headers=g)
-        assert hgp.get("x-cache") == "HIT", \
-            f"guest (_u=1) with prefix '{prefix}' must stay cacheable"
+            g = {"Cookie": f"{prefix}_sid=abc; {prefix}_u=1"}
+            fetch(ng.port, f"/phpbb/vg-{prefix}", headers=g)
+            _, _, hgp = fetch(ng.port, f"/phpbb/vg-{prefix}", headers=g)
+            assert hgp.get("x-cache") == "HIT", \
+                f"guest (_u=1) with prefix '{prefix}' must stay cacheable"
 
-    # Absent _u => no session => guest => cacheable (the predicate must have no
-    # opinion when its cookie is missing, not bypass everything).
-    none = {"Cookie": "other=1; unrelated=x"}
-    fetch(ng.port, "/phpbb/viewtopic-c", headers=none)
-    _, _, hn = fetch(ng.port, "/phpbb/viewtopic-c", headers=none)
-    assert hn.get("x-cache") == "HIT", \
-        f"no _u cookie at all must stay cacheable, got {hn.get('x-cache')}"
+        # Absent _u => no session => guest => cacheable (the predicate must have no
+        # opinion when its cookie is missing, not bypass everything).
+        none = {"Cookie": "other=1; unrelated=x"}
+        fetch(ng.port, "/phpbb/viewtopic-c", headers=none)
+        _, _, hn = fetch(ng.port, "/phpbb/viewtopic-c", headers=none)
+        assert hn.get("x-cache") == "HIT", \
+            f"no _u cookie at all must stay cacheable, got {hn.get('x-cache')}"
 
-    # Unparseable => fail CLOSED to bypass. A bare "_u" with no '=' gives us no
-    # value to test; guessing "guest" there would cache a possible member.
-    bare = {"Cookie": "phpbb3_sid=abc; phpbb3_u"}
-    fetch(ng.port, "/phpbb/viewtopic-d", headers=bare)
-    _, _, hb = fetch(ng.port, "/phpbb/viewtopic-d", headers=bare)
-    assert "x-cache" not in hb, \
-        (f"valueless '_u' must fail closed (bypass), got {hb.get('x-cache')} — "
-         "an unreadable cookie must never be assumed to be a guest")
+        # Unparseable => fail CLOSED to bypass. A bare "_u" with no '=' gives us no
+        # value to test; guessing "guest" there would cache a possible member.
+        bare = {"Cookie": "phpbb3_sid=abc; phpbb3_u"}
+        fetch(ng.port, "/phpbb/viewtopic-d", headers=bare)
+        _, _, hb = fetch(ng.port, "/phpbb/viewtopic-d", headers=bare)
+        assert "x-cache" not in hb, \
+            (f"valueless '_u' must fail closed (bypass), got {hb.get('x-cache')} — "
+             "an unreadable cookie must never be assumed to be a guest")
 
-    # "_u=10" must not satisfy "_u == 1": the compare is exact + length-checked,
-    # not a prefix. A member with user_id 10 is a member.
-    ten = {"Cookie": "phpbb3_u=10"}
-    fetch(ng.port, "/phpbb/viewtopic-e", headers=ten)
-    _, _, ht = fetch(ng.port, "/phpbb/viewtopic-e", headers=ten)
-    assert "x-cache" not in ht, \
-        f"_u=10 is user 10, not ANONYMOUS(1) — must bypass, got {ht.get('x-cache')}"
+        # "_u=10" must not satisfy "_u == 1": the compare is exact + length-checked,
+        # not a prefix. A member with user_id 10 is a member.
+        ten = {"Cookie": "phpbb3_u=10"}
+        fetch(ng.port, "/phpbb/viewtopic-e", headers=ten)
+        _, _, ht = fetch(ng.port, "/phpbb/viewtopic-e", headers=ten)
+        assert "x-cache" not in ht, \
+            f"_u=10 is user 10, not ANONYMOUS(1) — must bypass, got {ht.get('x-cache')}"
 
-    # Empty value "_u=" (a cleared/reset cookie, distinct from the bare "_u" with
-    # no '=' above): it reaches the value compare with a zero-length value. By the
-    # letter of "!= 1" an empty string is a non-member => bypass; that is also the
-    # safe reading for a malformed/cleared cookie (module.c:2532-2540). Exercises
-    # the empty-value arm of the NE predicate the non-empty members above skip.
-    empty = {"Cookie": "phpbb3_sid=abc; phpbb3_u="}
-    fetch(ng.port, "/phpbb/viewtopic-f", headers=empty)
-    _, _, he = fetch(ng.port, "/phpbb/viewtopic-f", headers=empty)
-    assert "x-cache" not in he, \
-        (f"empty '_u=' is not the guest literal '1' — must bypass (cleared/"
-         f"malformed cookie, safe direction), got {he.get('x-cache')}")
+        # Empty value "_u=" (a cleared/reset cookie, distinct from the bare "_u" with
+        # no '=' above): it reaches the value compare with a zero-length value. By the
+        # letter of "!= 1" an empty string is a non-member => bypass; that is also the
+        # safe reading for a malformed/cleared cookie (module.c:2532-2540). Exercises
+        # the empty-value arm of the NE predicate the non-empty members above skip.
+        empty = {"Cookie": "phpbb3_sid=abc; phpbb3_u="}
+        fetch(ng.port, "/phpbb/viewtopic-f", headers=empty)
+        _, _, he = fetch(ng.port, "/phpbb/viewtopic-f", headers=empty)
+        assert "x-cache" not in he, \
+            (f"empty '_u=' is not the guest literal '1' — must bypass (cleared/"
+             f"malformed cookie, safe direction), got {he.get('x-cache')}")
     drain_origin(origin)
 
 
@@ -1240,18 +1258,19 @@ def test_cookie_prefilter_negative_control(ng: Nginx, origin: Origin) -> None:
     _COOKIE_NEEDLE_TABLE is hand-derived from ngx_http_cache_turbo_presets[]
     (see the table's own comment); a preset added there with no row here is a
     silent coverage gap, not a passing test."""
-    for preset, (loc, needles) in _COOKIE_NEEDLE_TABLE.items():
-        for needle in needles:
-            uri = f"{loc}nc-{preset}-{hash(needle) & 0xffff:x}"
-            headers = {"Cookie": f"{needle}zzz=1"}
-            fetch(ng.port, uri, headers=headers)
-            status, _, h = fetch(ng.port, uri, headers=headers)
-            assert status == 200, (
-                f"{preset} needle {needle!r} request returned {status}")
-            assert "x-cache" not in h, (
-                f"{preset} needle {needle!r} must bypass the cache (the "
-                f"first-byte prefilter made it unreachable), got "
-                f"x-cache={h.get('x-cache')}")
+    with _no_origin_delay(origin):
+        for preset, (loc, needles) in _COOKIE_NEEDLE_TABLE.items():
+            for needle in needles:
+                uri = f"{loc}nc-{preset}-{hash(needle) & 0xffff:x}"
+                headers = {"Cookie": f"{needle}zzz=1"}
+                fetch(ng.port, uri, headers=headers)
+                status, _, h = fetch(ng.port, uri, headers=headers)
+                assert status == 200, (
+                    f"{preset} needle {needle!r} request returned {status}")
+                assert "x-cache" not in h, (
+                    f"{preset} needle {needle!r} must bypass the cache (the "
+                    f"first-byte prefilter made it unreachable), got "
+                    f"x-cache={h.get('x-cache')}")
     drain_origin(origin)
 
 
@@ -1351,118 +1370,119 @@ def test_2026_preset_expansion(ng: Nginx, origin: Origin) -> None:
     Extra assertions pin the suffix predicates, cookieless token auth, and
     current alternate cookie spellings that motivated the individual designs.
     """
-    _assert_new_preset_shape(
-        ng, "ct-textpattern", "txp_login_public=member", "textpattern/index.php"
-    )
-    _assert_new_preset_shape(
-        ng, "ct-bludit", "__Secure-BLUDIT-KEY=session", "admin/dashboard"
-    )
-    _assert_new_preset_shape(
-        ng, "ct-spip", "CUSTOM_session=member", "ecrire/"
-    )
-    _assert_new_preset_shape(
-        ng, "ct-bugzilla", "Bugzilla_logincookie=member", "editusers.cgi"
-    )
-    _assert_new_preset_shape(
-        ng, "ct-mantis", "ACME_STRING_COOKIE=member", "bug_report_page.php"
-    )
-    _assert_new_preset_shape(
-        ng, "ct-plone", "__ac=member", "@@login"
-    )
-    _assert_new_preset_shape(
-        ng, "ct-umbraco", "__Host-umbAccessToken-siteA=member", "umbraco/"
-    )
-    _assert_new_preset_shape(
-        ng, "ct-dotclear", "dcxd_blog=session", "pagespreview/draft"
-    )
-    _assert_new_preset_shape(
-        ng, "ct-wikijs", "jwt=token", "graphql"
-    )
-    _assert_new_preset_shape(
-        ng, "ct-classicpress", "wordpress_logged_in_hash=member", "wp-admin/"
-    )
-    _assert_new_preset_shape(
-        ng, "ct-backdrop", "SSESSabc=member", "user/login"
-    )
+    with _no_origin_delay(origin):
+        _assert_new_preset_shape(
+            ng, "ct-textpattern", "txp_login_public=member", "textpattern/index.php"
+        )
+        _assert_new_preset_shape(
+            ng, "ct-bludit", "__Secure-BLUDIT-KEY=session", "admin/dashboard"
+        )
+        _assert_new_preset_shape(
+            ng, "ct-spip", "CUSTOM_session=member", "ecrire/"
+        )
+        _assert_new_preset_shape(
+            ng, "ct-bugzilla", "Bugzilla_logincookie=member", "editusers.cgi"
+        )
+        _assert_new_preset_shape(
+            ng, "ct-mantis", "ACME_STRING_COOKIE=member", "bug_report_page.php"
+        )
+        _assert_new_preset_shape(
+            ng, "ct-plone", "__ac=member", "@@login"
+        )
+        _assert_new_preset_shape(
+            ng, "ct-umbraco", "__Host-umbAccessToken-siteA=member", "umbraco/"
+        )
+        _assert_new_preset_shape(
+            ng, "ct-dotclear", "dcxd_blog=session", "pagespreview/draft"
+        )
+        _assert_new_preset_shape(
+            ng, "ct-wikijs", "jwt=token", "graphql"
+        )
+        _assert_new_preset_shape(
+            ng, "ct-classicpress", "wordpress_logged_in_hash=member", "wp-admin/"
+        )
+        _assert_new_preset_shape(
+            ng, "ct-backdrop", "SSESSabc=member", "user/login"
+        )
 
-    # SPIP's cookie prefix is configurable. Every presentation/state suffix is
-    # intentionally prefix-agnostic and non-empty only.
-    for i, cookie in enumerate((
-        "site_admin=1",
-        "site_lang=fr",
-        "site_lang_ecrire=fr",
-        "site_accepte_ajax=1",
-    )):
-        uri = f"/ct-spip/predicate-{i}"
-        fetch(ng.port, uri, headers={"Cookie": cookie})
-        status, _, h = fetch(ng.port, uri, headers={"Cookie": cookie})
-        assert status == 200, f"SPIP predicate request returned {status}"
-        assert "x-cache" not in h, \
-            f"SPIP suffix cookie {cookie!r} must bypass, got {h.get('x-cache')}"
+        # SPIP's cookie prefix is configurable. Every presentation/state suffix is
+        # intentionally prefix-agnostic and non-empty only.
+        for i, cookie in enumerate((
+            "site_admin=1",
+            "site_lang=fr",
+            "site_lang_ecrire=fr",
+            "site_accepte_ajax=1",
+        )):
+            uri = f"/ct-spip/predicate-{i}"
+            fetch(ng.port, uri, headers={"Cookie": cookie})
+            status, _, h = fetch(ng.port, uri, headers={"Cookie": cookie})
+            assert status == 200, f"SPIP predicate request returned {status}"
+            assert "x-cache" not in h, \
+                f"SPIP suffix cookie {cookie!r} must bypass, got {h.get('x-cache')}"
 
-    # Empty suffix cookies are cleared state, not active identity/preferences.
-    empty_spip = {"Cookie": "site_session=; site_lang="}
-    fetch(ng.port, "/ct-spip/empty", headers=empty_spip)
-    status, _, hs = fetch(ng.port, "/ct-spip/empty", headers=empty_spip)
-    assert status == 200, f"empty SPIP-cookie request returned {status}"
-    assert hs.get("x-cache") == "HIT", \
-        f"empty SPIP state cookies must stay cacheable, got {hs.get('x-cache')}"
+        # Empty suffix cookies are cleared state, not active identity/preferences.
+        empty_spip = {"Cookie": "site_session=; site_lang="}
+        fetch(ng.port, "/ct-spip/empty", headers=empty_spip)
+        status, _, hs = fetch(ng.port, "/ct-spip/empty", headers=empty_spip)
+        assert status == 200, f"empty SPIP-cookie request returned {status}"
+        assert hs.get("x-cache") == "HIT", \
+            f"empty SPIP state cookies must stay cacheable, got {hs.get('x-cache')}"
 
-    # SPIP action/debug modes and Bugzilla query credential spellings can carry
-    # dynamic or authenticated state with no cookie at all.
-    for uri in (
-        "/ct-spip/public?action=logout",
-        "/ct-spip/public?var_mode=preview",
-        "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_api_key=secret",
-        "/ct-bugzilla/show_bug.cgi?id=1&api_key=secret",
-        "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_api_token=secret",
-        "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_token=secret",
-        "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_login=user",
-        "/ct-bugzilla/show_bug.cgi?id=1&token=secret",
-        "/ct-bugzilla/rest/bug/1",
-    ):
-        fetch(ng.port, uri)
-        status, _, h = fetch(ng.port, uri)
-        assert status == 200, f"cookieless dynamic request returned {status}"
-        assert "x-cache" not in h, \
-            f"cookieless dynamic request {uri!r} must bypass, got {h.get('x-cache')}"
+        # SPIP action/debug modes and Bugzilla query credential spellings can carry
+        # dynamic or authenticated state with no cookie at all.
+        for uri in (
+            "/ct-spip/public?action=logout",
+            "/ct-spip/public?var_mode=preview",
+            "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_api_key=secret",
+            "/ct-bugzilla/show_bug.cgi?id=1&api_key=secret",
+            "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_api_token=secret",
+            "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_token=secret",
+            "/ct-bugzilla/show_bug.cgi?id=1&Bugzilla_login=user",
+            "/ct-bugzilla/show_bug.cgi?id=1&token=secret",
+            "/ct-bugzilla/rest/bug/1",
+        ):
+            fetch(ng.port, uri)
+            status, _, h = fetch(ng.port, uri)
+            assert status == 200, f"cookieless dynamic request returned {status}"
+            assert "x-cache" not in h, \
+                f"cookieless dynamic request {uri!r} must bypass, got {h.get('x-cache')}"
 
-    # MantisBT's prefix is configurable and its anonymous form-token session is
-    # PHPSESSID by default. Project/list/collapse state changes public HTML.
-    for i, cookie in enumerate((
-        "PROJECTX_PROJECT_COOKIE=7",
-        "PROJECTX_VIEW_ALL_COOKIE=recent",
-        "PROJECTX_BUG_LIST_COOKIE=filter",
-        "PROJECTX_collapse_settings=1",
-        "PHPSESSID=anonymous-form-session",
-    )):
-        uri = f"/ct-mantis/predicate-{i}"
-        fetch(ng.port, uri, headers={"Cookie": cookie})
-        status, _, h = fetch(ng.port, uri, headers={"Cookie": cookie})
-        assert status == 200, f"MantisBT predicate request returned {status}"
-        assert "x-cache" not in h, \
-            f"MantisBT state cookie {cookie!r} must bypass, got {h.get('x-cache')}"
+        # MantisBT's prefix is configurable and its anonymous form-token session is
+        # PHPSESSID by default. Project/list/collapse state changes public HTML.
+        for i, cookie in enumerate((
+            "PROJECTX_PROJECT_COOKIE=7",
+            "PROJECTX_VIEW_ALL_COOKIE=recent",
+            "PROJECTX_BUG_LIST_COOKIE=filter",
+            "PROJECTX_collapse_settings=1",
+            "PHPSESSID=anonymous-form-session",
+        )):
+            uri = f"/ct-mantis/predicate-{i}"
+            fetch(ng.port, uri, headers={"Cookie": cookie})
+            status, _, h = fetch(ng.port, uri, headers={"Cookie": cookie})
+            assert status == 200, f"MantisBT predicate request returned {status}"
+            assert "x-cache" not in h, \
+                f"MantisBT state cookie {cookie!r} must bypass, got {h.get('x-cache')}"
 
-    # Remaining alternate/default cookie channels.
-    for root, cookie in (
-        ("ct-textpattern", "txp_login=admin"),
-        ("ct-bludit", "BLUDITREMEMBERTOKEN=remembered"),
-        ("ct-plone", "I18N_LANGUAGE=nl"),
-        ("ct-plone", "_ZopeId=session"),
-        ("ct-umbraco", ".AspNetCore.Identity.Application=member"),
-        ("ct-umbraco", "UMB_PREVIEW=preview"),
-        ("ct-umbraco", "UMB_SESSION=custom-state"),
-        ("ct-dotclear", "dc_admin=remembered"),
-        ("ct-dotclear", "dc_passwd=protected-post"),
-        ("ct-wikijs", "connect.sid=oauth-session"),
-        ("ct-wikijs", "loginRedirect=/private-page"),
-    ):
-        uri = f"/{root}/alternate-{cookie.split('=', 1)[0].replace('.', 'dot')}"
-        fetch(ng.port, uri, headers={"Cookie": cookie})
-        status, _, h = fetch(ng.port, uri, headers={"Cookie": cookie})
-        assert status == 200, f"{root} alternate-cookie request returned {status}"
-        assert "x-cache" not in h, \
-            f"{root} alternate cookie {cookie!r} must bypass, got {h.get('x-cache')}"
+        # Remaining alternate/default cookie channels.
+        for root, cookie in (
+            ("ct-textpattern", "txp_login=admin"),
+            ("ct-bludit", "BLUDITREMEMBERTOKEN=remembered"),
+            ("ct-plone", "I18N_LANGUAGE=nl"),
+            ("ct-plone", "_ZopeId=session"),
+            ("ct-umbraco", ".AspNetCore.Identity.Application=member"),
+            ("ct-umbraco", "UMB_PREVIEW=preview"),
+            ("ct-umbraco", "UMB_SESSION=custom-state"),
+            ("ct-dotclear", "dc_admin=remembered"),
+            ("ct-dotclear", "dc_passwd=protected-post"),
+            ("ct-wikijs", "connect.sid=oauth-session"),
+            ("ct-wikijs", "loginRedirect=/private-page"),
+        ):
+            uri = f"/{root}/alternate-{cookie.split('=', 1)[0].replace('.', 'dot')}"
+            fetch(ng.port, uri, headers={"Cookie": cookie})
+            status, _, h = fetch(ng.port, uri, headers={"Cookie": cookie})
+            assert status == 200, f"{root} alternate-cookie request returned {status}"
+            assert "x-cache" not in h, \
+                f"{root} alternate cookie {cookie!r} must bypass, got {h.get('x-cache')}"
 
     drain_origin(origin)
 
@@ -1892,22 +1912,23 @@ def test_arg_prefilter_negative_control(ng: Nginx, origin: Origin) -> None:
     (see the table's own comment); a preset added there with a non-empty
     args[] row and no row here is a silent coverage gap, not a passing
     test."""
-    for preset, (loc, needles) in _ARG_NEEDLE_TABLE.items():
-        for needle in needles:
-            path = f"nc-{preset}-{hash(needle) & 0xffff:x}"
-            if "=" in needle:
-                qs = needle
-            else:
-                qs = f"{needle}=1"
-            uri = f"{loc}{path}?{qs}"
-            fetch(ng.port, uri)
-            status, _, h = fetch(ng.port, uri)
-            assert status == 200, (
-                f"{preset} needle {needle!r} request returned {status}")
-            assert "x-cache" not in h, (
-                f"{preset} needle {needle!r} must bypass the cache (the "
-                f"first-byte prefilter made it unreachable), got "
-                f"x-cache={h.get('x-cache')}")
+    with _no_origin_delay(origin):
+        for preset, (loc, needles) in _ARG_NEEDLE_TABLE.items():
+            for needle in needles:
+                path = f"nc-{preset}-{hash(needle) & 0xffff:x}"
+                if "=" in needle:
+                    qs = needle
+                else:
+                    qs = f"{needle}=1"
+                uri = f"{loc}{path}?{qs}"
+                fetch(ng.port, uri)
+                status, _, h = fetch(ng.port, uri)
+                assert status == 200, (
+                    f"{preset} needle {needle!r} request returned {status}")
+                assert "x-cache" not in h, (
+                    f"{preset} needle {needle!r} must bypass the cache (the "
+                    f"first-byte prefilter made it unreachable), got "
+                    f"x-cache={h.get('x-cache')}")
     drain_origin(origin)
 
 
