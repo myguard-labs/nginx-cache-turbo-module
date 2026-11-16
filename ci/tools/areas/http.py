@@ -9,9 +9,12 @@ star-imports this module, so every test stays reachable as
 
 from __future__ import annotations
 
+import collections.abc
+import contextlib
 import http.client
 import socket
 import struct
+from typing import TYPE_CHECKING
 
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
@@ -24,6 +27,25 @@ from test_runtime_base import (
     _errlog_window_start,
     _fetch_keepalive,
 )
+
+if TYPE_CHECKING:
+    # Star imports do not re-export names test_runtime_base merely imported
+    # (no __all__), so the Origin annotation needs its defining module for
+    # mypy. Type-only: no runtime import, no change to the module load path.
+    from origin import Origin
+
+
+@contextlib.contextmanager
+def _no_origin_delay(origin: Origin) -> collections.abc.Iterator[None]:
+    """Serial fill/flood/classification loops with no single-flight,
+    lock_waits, burst or TTL oracle across the span run against a zero-delay
+    origin and ALWAYS restore the suite baseline via reset_delay() (never a
+    hardcoded 0.0: a leaked 0.0 voids every later burst test)."""
+    origin.delay = 0.0
+    try:
+        yield
+    finally:
+        origin.reset_delay()
 
 
 def test_nocache_breaker_open_honours_cache(ng: Nginx, origin: Origin) -> None:
@@ -109,55 +131,56 @@ def test_hostile_origin_framing_matrix(ng: Nginx, origin: Origin) -> None:
 
     may_store_complete_body = {"surplus-bytes", "103-sequence"}
 
-    for method, case in cases:
-        path = f"/c/hostile-origin/{case}"
-        non_200_statuses = {0, 204, 304, 502, 504}
-        if case == "103-sequence":
-            # nginx 1.22 can surface the leading informational response as the
-            # final status; it still must not store or replay the response.
-            non_200_statuses.add(103)
-        try:
-            status, body, headers = fetch_raw(ng.port, path, method=method)
-        except (http.client.HTTPException, OSError, TimeoutError) as exc:
-            status, body, headers = 0, f"{type(exc).__name__}: {exc}", {}
+    with _no_origin_delay(origin):
+        for method, case in cases:
+            path = f"/c/hostile-origin/{case}"
+            non_200_statuses = {0, 204, 304, 502, 504}
+            if case == "103-sequence":
+                # nginx 1.22 can surface the leading informational response as the
+                # final status; it still must not store or replay the response.
+                non_200_statuses.add(103)
+            try:
+                status, body, headers = fetch_raw(ng.port, path, method=method)
+            except (http.client.HTTPException, OSError, TimeoutError) as exc:
+                status, body, headers = 0, f"{type(exc).__name__}: {exc}", {}
 
-        assert headers.get("x-cache") != "HIT", \
-            f"{case}: first hostile request was served from cache: {headers}"
-        if status == 200:
-            assert "hostile-" not in body and "HELLOJUNK" not in body, \
-                f"{case}: hostile upstream bytes reached client: {body!r}"
-        else:
-            assert status in non_200_statuses, \
-                f"{case}: unexpected hostile status {status}, body={body!r}"
+            assert headers.get("x-cache") != "HIT", \
+                f"{case}: first hostile request was served from cache: {headers}"
+            if status == 200:
+                assert "hostile-" not in body and "HELLOJUNK" not in body, \
+                    f"{case}: hostile upstream bytes reached client: {body!r}"
+            else:
+                assert status in non_200_statuses, \
+                    f"{case}: unexpected hostile status {status}, body={body!r}"
 
-        try:
-            retry_status, retry_body, retry_headers = fetch_raw(
-                ng.port, path, method=method)
-        except (http.client.HTTPException, OSError, TimeoutError) as exc:
-            retry_status = 0
-            retry_body = f"{type(exc).__name__}: {exc}"
-            retry_headers = {}
-        if case not in may_store_complete_body:
-            assert retry_headers.get("x-cache") != "HIT", \
-                f"{case}: malformed upstream response was stored and replayed"
-        if retry_status == 200:
-            assert "hostile-" not in retry_body and "HELLOJUNK" not in retry_body, \
-                f"{case}: replayed hostile upstream bytes: {retry_body!r}"
-        else:
-            assert retry_status in non_200_statuses, \
-                f"{case}: unexpected retry status {retry_status}"
+            try:
+                retry_status, retry_body, retry_headers = fetch_raw(
+                    ng.port, path, method=method)
+            except (http.client.HTTPException, OSError, TimeoutError) as exc:
+                retry_status = 0
+                retry_body = f"{type(exc).__name__}: {exc}"
+                retry_headers = {}
+            if case not in may_store_complete_body:
+                assert retry_headers.get("x-cache") != "HIT", \
+                    f"{case}: malformed upstream response was stored and replayed"
+            if retry_status == 200:
+                assert "hostile-" not in retry_body and "HELLOJUNK" not in retry_body, \
+                    f"{case}: replayed hostile upstream bytes: {retry_body!r}"
+            else:
+                assert retry_status in non_200_statuses, \
+                    f"{case}: unexpected retry status {retry_status}"
 
-        conn = http.client.HTTPConnection(
-            "127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
-        try:
-            ok, ok_body, ok_headers = _fetch_keepalive(
-                conn, f"/c/hostile-clean-follow-{case}")
-            assert ok == 200 and ok_body, \
-                f"{case}: clean follow-up failed: {ok} {ok_body!r}"
-            assert ok_headers.get("x-cache") != "HIT", \
-                f"{case}: follow-up unexpectedly reused cache state"
-        finally:
-            conn.close()
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", ng.port, timeout=HTTP_TIMEOUT)
+            try:
+                ok, ok_body, ok_headers = _fetch_keepalive(
+                    conn, f"/c/hostile-clean-follow-{case}")
+                assert ok == 200 and ok_body, \
+                    f"{case}: clean follow-up failed: {ok} {ok_body!r}"
+                assert ok_headers.get("x-cache") != "HIT", \
+                    f"{case}: follow-up unexpectedly reused cache state"
+            finally:
+                conn.close()
 
     drain_origin(origin)
 
@@ -2234,8 +2257,9 @@ def test_keep_stale_no_reaper_lru_only_reclaim(ng: Nginx, origin: Origin) -> Non
     # Phase 2: force real LRU/max_size eviction in the SAME tiny zone by
     # flooding it with enough distinct keys to overflow 64k. The original key
     # must be gone afterward -- reclaim happens, just via capacity, not time.
-    for i in range(120):
-        fetch(ng.port, f"/ksev/flood-{i}")
+    with _no_origin_delay(origin):
+        for i in range(120):
+            fetch(ng.port, f"/ksev/flood-{i}")
 
     s2, b2, h2 = fetch(ng.port, key)
     assert s2 == 200, f"post-flood {key} -> {s2}"
@@ -2631,7 +2655,7 @@ def _evblind_trip_breaker(ng: Nginx, origin: Origin) -> None:
 
 
 def test_evict_blind_negative_control_closed_breaker_evicts_normally(
-        ng: Nginx) -> None:
+        ng: Nginx, origin: Origin) -> None:
     """S231-EVICT-BLIND negative control: with the breaker CLOSED (its
     default state -- this test runs standalone against evblindz and never
     trips it), a live-SIE-shaped entry gets NO second chance at all -- it is
@@ -2654,9 +2678,10 @@ def test_evict_blind_negative_control_closed_breaker_evicts_normally(
     s, _, h = fetch(ng.port, tracked)
     assert s == 200, f"control: tracked-key store returned {s}"
 
-    for i in range(120):
-        s, _, _ = fetch(ng.port, f"/evblind/sieserve/control-fill-{i}")
-        assert s == 200, f"control: fill key {i} returned {s}"
+    with _no_origin_delay(origin):
+        for i in range(120):
+            s, _, _ = fetch(ng.port, f"/evblind/sieserve/control-fill-{i}")
+            assert s == 200, f"control: fill key {i} returned {s}"
 
     s, _, h = fetch(ng.port, tracked)
     st = h.get("x-ct-status", "")
@@ -2699,9 +2724,10 @@ def test_evict_blind_second_chance(ng: Nginx, origin: Origin) -> None:
     # Fill the (tiny, 64k) zone first, all while the breaker is still CLOSED
     # (the only state a virgin key can be stored in at all) -- this is what
     # exercises real eviction/second-chance churn under ordinary conditions.
-    for i in range(120):
-        s, _, _ = fetch(ng.port, f"/evblind/sieserve/fill1-{i}")
-        assert s == 200, f"evblind: fill wave key {i} returned {s}"
+    with _no_origin_delay(origin):
+        for i in range(120):
+            s, _, _ = fetch(ng.port, f"/evblind/sieserve/fill1-{i}")
+            assert s == 200, f"evblind: fill wave key {i} returned {s}"
 
     # Store the tracked key LAST, so it is the most-recently-used entry and
     # therefore still resident (not yet aged to the LRU tail) when the
