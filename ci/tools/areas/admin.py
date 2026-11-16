@@ -2288,3 +2288,331 @@ def test_admin_lock_ttl_oversized_reads_back_clamped(ng: Nginx) -> None:
         f"lock_ttl field must report this location's effective value, not a "
         f"constant ceiling."
     )
+
+
+def test_admin_wire_contract(ng: Nginx) -> None:
+    """Freeze both ordered stats representations and safe scrape behavior."""
+    import json
+    from pathlib import Path
+
+    contract = json.loads((Path(__file__).resolve().parents[2] / "tests" /
+                           "stats-contract.json").read_text())
+    fetch(ng.port, "/c/c239-contract")
+    fetch(ng.port, "/c/c239-contract")
+    status, body, headers = fetch(ng.port, "/_cache")
+    assert status == 200 and headers["content-type"].startswith("application/json")
+    values = json.loads(body)
+    assert list(values) == contract["json_keys"], "JSON field order or names changed"
+    assert list(contract["json_types"]) == contract["json_keys"]
+    for key, expected_type in contract["json_types"].items():
+        actual_type = str if expected_type == "string" else int
+        assert type(values[key]) is actual_type, f"JSON type changed for {key}"
+    assert body == json.dumps(values, separators=(",", ":")) + "\n", "JSON bytes changed"
+    assert values["hits"] > 0 and values["misses"] > 0
+    families = contract["prometheus_families"]
+    lines: list[str] = []
+    for family in families:
+        name = family["name"]
+        key = name.removeprefix("cache_turbo_").removesuffix("_total")
+        if key == "regen_cost_ms":
+            key = "cost_ms"
+        value = values[key]
+        if key == "breaker_state":
+            value = {"closed": 0, "open": 1, "half-open": 2}[value]
+        lines.extend((f"# HELP {name} {family['help']}\n",
+                      f"# TYPE {name} {family['type']}\n",
+                      f'{name}{{zone="main"}} {value}\n'))
+    expected = "".join(lines)
+    status, actual, headers = fetch(ng.port, "/_cache?format=prometheus")
+    assert status == 200 and headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
+    assert actual == expected, "Prometheus bytes or snapshot values changed"
+    for suffix, content_type in (("", "application/json"),
+                                 ("?format=prometheus", "text/plain")):
+        status, head, headers = fetch(ng.port, "/_cache" + suffix, method="HEAD")
+        assert status == 200 and head == "" and headers["content-type"].startswith(content_type)
+    for suffix in ("", "?autotune=1", "?format=prometheus&autotune=1"):
+        status, repeated, _ = fetch(ng.port, "/_cache" + suffix)
+        assert status == 200
+        assert repeated == (expected if "prometheus" in suffix else body), \
+            f"safe scrape changed state: {suffix}"
+
+
+def test_admin_expired_breaker_scrape(ng: Nginx, origin: Origin) -> None:
+    """An expired OPEN breaker stays OPEN until a cache request probes it."""
+    import json
+
+    status, _, _ = fetch(ng.port, "/o45/c239-expired")
+    assert status == 200
+    time.sleep(1.3)
+    origin.fail = True
+    try:
+        status, _, _ = fetch(ng.port, "/o45/c239-expired")
+        assert status != 200, "failure did not trip the breaker"
+        status, before, _ = fetch(ng.port, "/_cache_o45")
+        assert status == 200 and json.loads(before)["breaker_state"] == "open"
+        time.sleep(2.3)
+        for method, suffix in (("GET", ""), ("GET", "?autotune=1"),
+                               ("HEAD", "?format=prometheus"),
+                               ("GET", "?format=prometheus&autotune=1"),
+                               ("GET", "")):
+            status, body, _ = fetch(ng.port, "/_cache_o45" + suffix, method=method)
+            assert status == 200
+            if method == "HEAD":
+                assert body == ""
+            elif "prometheus" in suffix:
+                assert 'cache_turbo_breaker_state{zone="o45z"} 1\n' in body
+            else:
+                assert body == before, "expired OPEN scrape changed shared state"
+    finally:
+        origin.fail = False
+        drain_origin(origin)
+
+
+def _assert_admin_stats_framing(body: str, zone: str) -> None:
+    """Require each frozen family once, in order, with one escaped sample."""
+    import json
+    import re
+    from pathlib import Path
+
+    contract = json.loads((Path(__file__).resolve().parents[2] / "tests" /
+                           "stats-contract.json").read_text())
+    families = contract["prometheus_families"]
+    lines = body.splitlines(keepends=True)
+    assert len(lines) == len(families) * 3, "label broke exposition framing"
+    escaped = zone.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    for index, family in enumerate(families):
+        name = family["name"]
+        help_line, type_line, sample = lines[index * 3:index * 3 + 3]
+        assert help_line == f"# HELP {name} {family['help']}\n", "HELP framing changed"
+        assert type_line == f"# TYPE {name} {family['type']}\n", "TYPE framing changed"
+        prefix = f'{name}{{zone="{escaped}"}} '
+        assert re.fullmatch(re.escape(prefix) + r"[0-9]+\n", sample), \
+            "sample name, escaped label or framing changed"
+
+
+def test_admin_raw_zone_labels(ng: Nginx) -> None:
+    """Ordinary label bytes stay stable; configuration metacharacters escape."""
+    import pathlib
+    import subprocess
+    import tempfile
+
+    load = f"load_module {ng.module};\n" if ng.module else ""
+    cases = (("", None), ("normal", "normal"), ("a-b.c_1", "a-b.c_1"),
+             ('a\\"b', 'a"b'), (r"a\\b", "a\\b"), (r"a\nb", "a\nb"))
+    for token, name in cases:
+        with tempfile.TemporaryDirectory(prefix="c239-zone-") as directory:
+            root = pathlib.Path(directory)
+            (root / "logs").mkdir()
+            config = root / "nginx.conf"
+            port = ng.port + 55
+            config.write_text(
+                f"{load}pid {root}/nginx.pid;\ndaemon off;\n"
+                f'events {{}}\nhttp {{ cache_turbo_zone "name={token}" 1m; '
+                f'server {{ listen 127.0.0.1:{port}; location /stats '
+                f'{{ cache_turbo_admin "{token}"; }} }} }}\n')
+            command = ng.runner + [str(ng.binary), "-p", directory, "-c", str(config)]
+            checked = subprocess.run(command + ["-t"], capture_output=True, text=True,
+                                     check=False, env=config_check_env())
+            if name is None:
+                assert checked.returncode != 0, "empty zone name accepted"
+                continue
+            assert checked.returncode == 0, (token, checked.stderr)
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(50):
+                    try:
+                        status, body, _ = fetch(port, "/stats?format=prometheus")
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+                else:
+                    raise AssertionError(f"nginx did not start for {token!r}")
+                assert status == 200
+                escaped = name.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                assert f'cache_turbo_hits_total{{zone="{escaped}"}} 0\n' in body
+                _assert_admin_stats_framing(body, name)
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+
+
+def test_admin_stats_reload_restart(ng: Nginx) -> None:
+    """A reused zone survives reload; a new master starts with fresh stats."""
+    import json
+    import pathlib
+    import signal
+    import subprocess
+    import tempfile
+
+    load = f"load_module {ng.module};\n" if ng.module else ""
+    with tempfile.TemporaryDirectory(prefix="c239-reload-") as directory:
+        root = pathlib.Path(directory)
+        (root / "logs").mkdir()
+        config = root / "nginx.conf"
+        port = ng.port + 56
+        config.write_text(
+            f"{load}pid {root}/nginx.pid;\ndaemon off;\n"
+            "events {}\nhttp { cache_turbo_zone name=contract 1m; "
+            f"server {{ listen 127.0.0.1:{port}; location /stats "
+            "{ cache_turbo_admin contract; } location /c/ { "
+            "cache_turbo contract; cache_turbo_key $uri; cache_turbo_valid 60s; "
+            f"proxy_pass http://127.0.0.1:{ng.origin_port}/; }} }} }}\n")
+        command = ng.runner + [str(ng.binary), "-p", directory, "-c", str(config)]
+
+        def start():
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+            for _ in range(50):
+                try:
+                    if fetch(port, "/stats")[0] == 200:
+                        return process
+                except OSError:
+                    time.sleep(0.05)
+            process.terminate()
+            process.wait(timeout=10)
+            raise AssertionError("isolated nginx did not start")
+
+        def stats():
+            status, body, _ = fetch(port, "/stats")
+            assert status == 200
+            return json.loads(body)
+
+        process = start()
+        try:
+            assert fetch(port, "/c/c239-reload")[0] == 200
+            assert fetch(port, "/c/c239-reload")[0] == 200
+            before = stats()
+            assert before["hits"] > 0 and before["misses"] > 0
+            children = pathlib.Path(f"/proc/{process.pid}/task/{process.pid}/children")
+            old_workers = set(children.read_text(encoding="ascii").split())
+            assert old_workers
+            process.send_signal(signal.SIGHUP)
+            for _ in range(100):
+                workers = set(children.read_text(encoding="ascii").split())
+                if workers and workers.isdisjoint(old_workers):
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("reload did not replace workers")
+            after = stats()
+            assert after["hits"] == before["hits"] and after["misses"] == before["misses"]
+            process.terminate()
+            process.wait(timeout=10)
+            process = start()
+            fresh = stats()
+            assert fresh["hits"] == 0 and fresh["misses"] == 0
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+
+def test_admin_stats_capacity(ng: Nginx) -> None:
+    """Real slab capacity stays bounded through eviction, exhaustion and reload."""
+    import json
+    import pathlib
+    import signal
+    import subprocess
+    import tempfile
+
+    load = f"load_module {ng.module};\n" if ng.module else ""
+    with tempfile.TemporaryDirectory(prefix="stats-capacity-") as directory:
+        root = pathlib.Path(directory)
+        (root / "logs").mkdir()
+        (root / "body").write_bytes(b"c" * 65536)
+        (root / "big").write_bytes(b"x" * (2 * 1024 * 1024))
+        config = root / "nginx.conf"
+        port = ng.port + 58
+        config.write_text(
+            f"{load}pid {root}/nginx.pid; daemon off; worker_processes 2;\n"
+            f"error_log {root}/error.log notice;\nevents {{}}\nhttp {{ "
+            f"access_log off; cache_turbo_zone name=capacity 1m; "
+            f"server {{ listen 127.0.0.1:{port + 1}; root {root}; "
+            "location / { try_files /body =404; } location = /big {} } "
+            f"server {{ listen 127.0.0.1:{port}; location /stats "
+            "{ cache_turbo_admin capacity; } location /c/ { "
+            "cache_turbo capacity; cache_turbo_key $request_uri; "
+            "cache_turbo_valid 1h; cache_turbo_max_size 4m; "
+            f"proxy_pass http://127.0.0.1:{port + 1}/; }} }} }}\n")
+        command = ng.runner + [str(ng.binary), "-p", directory, "-c", str(config)]
+        with (root / "stderr.log").open("w") as stderr:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr)
+
+        def stats():
+            status, body, _ = fetch(port, "/stats")
+            assert status == 200
+            values = json.loads(body)
+            assert values["zone_size_bytes"] == 1024 * 1024
+            assert 0 <= values["used_bytes"] <= values["zone_reserved_bytes"] \
+                <= values["zone_size_bytes"], f"invalid allocator sample: {values}"
+            assert type(values["entries"]) is int and 0 <= values["entries"] <= values["used_bytes"]
+            return values
+
+        try:
+            for _ in range(100):
+                try:
+                    empty = stats()
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                raise AssertionError("isolated capacity server did not start")
+            assert empty["used_bytes"] == 0 and empty["zone_reserved_bytes"] > 0
+            assert empty["entries"] == 0
+            status, body, _ = fetch(port, "/c/first")
+            assert status == 200 and len(body) == 65536
+            populated = stats()
+            assert populated["used_bytes"] > 0
+            assert populated["entries"] == 1
+            assert populated["zone_reserved_bytes"] > empty["zone_reserved_bytes"]
+            # A distinct-key working set exceeds the entire zone, forcing eviction.
+            for index in range(24):
+                assert fetch(port, f"/c/key-{index}")[0] == 200
+                stats()
+            evicted = stats()
+            assert evicted["evictions"] > populated["evictions"]
+            # The object fits max_size but cannot fit the zone even after eviction.
+            status, body, _ = fetch(port, "/c/big")
+            assert status == 200 and len(body) == 2 * 1024 * 1024
+            # Wait for both original allocator observations to become visible.
+            # A response can arrive before the other worker's stats scrape sees
+            # the terminal store state; polling here sends no cache traffic.
+            for _ in range(100):
+                exhausted = stats()
+                if (exhausted["evictions"] > evicted["evictions"]
+                        and exhausted["used_bytes"] < evicted["used_bytes"]):
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("capacity exhaustion did not evict and release bytes")
+            assert exhausted["evictions"] > evicted["evictions"]
+            assert exhausted["used_bytes"] < evicted["used_bytes"]
+            # Refill before reload; a new cycle must retain the same slab mapping.
+            assert fetch(port, "/c/reload")[0] == 200
+            before = stats()
+            children = pathlib.Path(f"/proc/{process.pid}/task/{process.pid}/children")
+            old_workers = set(children.read_text(encoding="ascii").split())
+            assert old_workers
+            process.send_signal(signal.SIGHUP)
+            for _ in range(100):
+                workers = set(children.read_text(encoding="ascii").split())
+                if workers and workers.isdisjoint(old_workers):
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("capacity reload did not replace workers")
+            after = stats()
+            for key in ("used_bytes", "zone_reserved_bytes", "zone_size_bytes", "entries"):
+                assert after[key] == before[key], f"reload changed {key}"
+            status, exposition, _ = fetch(port, "/stats?format=prometheus")
+            assert status == 200
+            for key in ("used_bytes", "zone_reserved_bytes", "zone_size_bytes", "entries"):
+                assert f'cache_turbo_{key}{{zone="capacity"}} {after[key]}\n' in exposition
+            print("capacity live: empty/populated/evicted/exhausted/reload passed")
+        finally:
+            process.send_signal(signal.SIGQUIT)
+            returncode = process.wait(timeout=10)
+            log = (root / "error.log").read_text() + (root / "stderr.log").read_text()
+            assert returncode == 0, f"capacity server exit {returncode}: {log}"
+            assert "AddressSanitizer" not in log and "runtime error:" not in log, log
+            assert "used_bytes underflow" not in log, log
+            assert "entries underflow" not in log, log

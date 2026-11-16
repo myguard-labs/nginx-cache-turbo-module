@@ -9,6 +9,7 @@
  */
 
 #include "ngx_http_cache_turbo_module.h"
+#include "ngx_http_cache_turbo_stats_schema.h"
 
 /* R5-1 (perf-microtier-hitpath): default-hide every symbol this TU defines
  * so a module-internal call becomes a direct call instead of a PLT-indirect
@@ -505,309 +506,36 @@ ngx_http_cache_turbo_admin_purge_dispatch(ngx_http_request_t *r,
 }
 
 
-/* GET/HEAD ?format=prometheus stats rendering. Returns the send_body rc
- * directly (sends its own response). */
+/* The descriptor walk measures full type widths before the only allocation.
+ * Rendering is bounded independently; never send a truncated representation. */
 static ngx_int_t
-ngx_http_cache_turbo_admin_stats_prometheus(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_stats_t *st)
+ngx_http_cache_turbo_admin_stats_reply(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    const ngx_http_cache_turbo_stats_snapshot_t *snapshot, ngx_flag_t prometheus)
 {
-    ngx_str_t   zname = clcf->admin_zone->shm.name;
-    ngx_str_t   body;
-    u_char     *p;
-    size_t      len;
+    ngx_str_t  body, zone;
+    size_t     capacity;
 
-    /* Twenty-eight counters (*_total) + seven gauges, each labelled by zone
-     * so one Prometheus job can scrape many zones. Exposition format
-     * 0.0.4. The per-metric budget must track the emitted count (35):
-     * every metric line renders one %V (zone) + one %uA (value), so a
-     * short multiplier could truncate the last line under a long zone
-     * name. The fixed term covers the HELP/TYPE prose, which grows
-     * with every metric added -- bump BOTH when adding one (L13 added
-     * the 14th and needed ~180 bytes of prose; a stale 13 truncated
-     * the JSON arm's neighbour into invalid output; S7.1 added three
-     * more, prose term bumped by ~450 bytes for their HELP/TYPE
-     * lines; H7.3a added breaker_opens_total (counter) and
-     * breaker_state (gauge), prose term bumped by ~350 bytes -- the
-     * breaker_state HELP documents the numeric mapping since the
-     * value itself is deliberately NOT a label, see the emit call
-     * below; P0-1 added eight refuse_*_total counters, prose term
-     * bumped by ~1050 bytes for their HELP/TYPE lines; P3-7 added
-     * bg_inflight (gauge), prose term bumped by ~180 bytes; P4-1b added
-     * sketch_gen (gauge), sketch_bumps_total (counter) and
-     * admission_refused_total (counter), prose term bumped by ~530 bytes
-     * for their HELP/TYPE lines and the count 28 -> 31; P4-2-s3a added
-     * used_bytes (gauge) and the count 31 -> 32; TAG-CAP-SILENT-DROP added
-     * tag_cap_drops_total (counter), prose term re-measured and the count
-     * 32 -> 35 -- ci/tools/lint-admin-buffer-budget.py caught the earlier
-     * miscount at CI time (the multiplier and term must track %V/%uA
-     * occurrences, not the metric-name comment above, which had already
-     * drifted before this bump)).
-     *
-     * ⚠ P4-2-s3a: the fixed term is no longer eyeballed. Every previous bump
-     * was an estimate ("~180 bytes", "~530 bytes") and they had drifted
-     * BELOW the truth: measured against the format string, the fixed prose
-     * was 5897 bytes while the term still said 5660. That 237-byte shortfall
-     * never truncated only because NGX_ATOMIC_T_LEN reserves 20 bytes per
-     * value and real counters render far shorter, so the per-value slack
-     * silently absorbed it -- i.e. the budget was already relying on an
-     * accident. The term below is the MEASURED fixed prose (sum of the
-     * literal bytes, less 2 per %V and 3 per %uA) plus lint-admin-buffer-
-     * budget.py's 128-byte margin. When adding a metric, re-measure rather
-     * than adding an estimate -- run the lint locally, it prints the exact
-     * required value. C3 added cache_turbo_markers (gauge), count 35 -> 36,
-     * fixed term re-measured 7152 -> 7345. PERF-AUD2-08's sketch_gen HELP
-     * text change re-measured 7345 -> 7376 (prose 7248 + 128 margin, no
-     * metric count change). */
-    len = 7376 + 36 * zname.len + 36 * NGX_ATOMIC_T_LEN;
-    p = ngx_pnalloc(r->pool, len);
-    if (p == NULL) {
+    zone = clcf->admin_zone->shm.name;
+    if (ngx_http_cache_turbo_stats_render(snapshot, zone, prometheus, 1,
+                                         NULL, (size_t) -1, &capacity) != NGX_OK)
+    {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
-    body.data = p;
-    body.len = ngx_snprintf(p, len,
-        "# HELP cache_turbo_hits_total Fresh L1 cache hits served.\n"
-        "# TYPE cache_turbo_hits_total counter\n"
-        "cache_turbo_hits_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_misses_total Misses that went to the origin.\n"
-        "# TYPE cache_turbo_misses_total counter\n"
-        "cache_turbo_misses_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_stale_serves_total Stale copies served while a refresh ran.\n"
-        "# TYPE cache_turbo_stale_serves_total counter\n"
-        "cache_turbo_stale_serves_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_refreshes_total Background single-flight refreshes started.\n"
-        "# TYPE cache_turbo_refreshes_total counter\n"
-        "cache_turbo_refreshes_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_evictions_total Entries evicted under memory pressure (LRU).\n"
-        "# TYPE cache_turbo_evictions_total counter\n"
-        "cache_turbo_evictions_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_l2_hits_total L1 misses satisfied by the L2 tier (Redis or memcached).\n"
-        "# TYPE cache_turbo_l2_hits_total counter\n"
-        "cache_turbo_l2_hits_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_l2_misses_total L1 misses that L2 could not satisfy (went to origin).\n"
-        "# TYPE cache_turbo_l2_misses_total counter\n"
-        "cache_turbo_l2_misses_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_lock_waits_total Cold-miss requests that waited for a single-flight fill (v10).\n"
-        "# TYPE cache_turbo_lock_waits_total counter\n"
-        "cache_turbo_lock_waits_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_min_uses_skips_total Cold misses sent to origin without storing because the key is below cache_turbo_min_uses (v15).\n"
-        "# TYPE cache_turbo_min_uses_skips_total counter\n"
-        "cache_turbo_min_uses_skips_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_l2_neg_skips_total L2 GETs skipped because a negative memo already recorded a miss for the key (L13).\n"
-        "# TYPE cache_turbo_l2_neg_skips_total counter\n"
-        "cache_turbo_l2_neg_skips_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_bypasses_total Requests skipped straight to origin by a cache_turbo_bypass predicate or a CMS backend preset (subset of misses).\n"
-        "# TYPE cache_turbo_bypasses_total counter\n"
-        "cache_turbo_bypasses_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_refuse_set_cookie_total Store refused because the response carried a Set-Cookie header.\n"
-        "# TYPE cache_turbo_refuse_set_cookie_total counter\n"
-        "cache_turbo_refuse_set_cookie_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_refuse_encoded_total Store refused because the response was already Content-Encoding'd (origin pre-compression or filter mis-order).\n"
-        "# TYPE cache_turbo_refuse_encoded_total counter\n"
-        "cache_turbo_refuse_encoded_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_refuse_vary_unsafe_total Store refused: Vary named an axis outside the whitelist or \"*\".\n"
-        "# TYPE cache_turbo_refuse_vary_unsafe_total counter\n"
-        "cache_turbo_refuse_vary_unsafe_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_refuse_authorization_total Store refused because the request carried Authorization.\n"
-        "# TYPE cache_turbo_refuse_authorization_total counter\n"
-        "cache_turbo_refuse_authorization_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_refuse_cache_control_total Store refused by a Cache-Control (or CDN-/Surrogate-) no-store/no-cache/private/max-age=0 directive.\n"
-        "# TYPE cache_turbo_refuse_cache_control_total counter\n"
-        "cache_turbo_refuse_cache_control_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_refuse_require_header_total Store refused because cache_turbo_require_header was unmet (absent or not affirmative).\n"
-        "# TYPE cache_turbo_refuse_require_header_total counter\n"
-        "cache_turbo_refuse_require_header_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_refuse_partial_total Store refused because the response was 206 Partial Content.\n"
-        "# TYPE cache_turbo_refuse_partial_total counter\n"
-        "cache_turbo_refuse_partial_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_refuse_head_total Store refused because the request was HEAD.\n"
-        "# TYPE cache_turbo_refuse_head_total counter\n"
-        "cache_turbo_refuse_head_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_regen_cost_ms Average origin regeneration cost in milliseconds.\n"
-        "# TYPE cache_turbo_regen_cost_ms gauge\n"
-        "cache_turbo_regen_cost_ms{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_autotuned_beta Live autotuned SWR beta (x1000; 0 = none).\n"
-        "# TYPE cache_turbo_autotuned_beta gauge\n"
-        "cache_turbo_autotuned_beta{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_autotuned_load Live load factor widening stale window + lock_ttl under load (x1000; 1000 = none).\n"
-        "# TYPE cache_turbo_autotuned_load gauge\n"
-        "cache_turbo_autotuned_load{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_sie_serves_total Responses served from a stale-if-error snapshot.\n"
-        "# TYPE cache_turbo_sie_serves_total counter\n"
-        "cache_turbo_sie_serves_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_breaker_serves_total Responses served from the circuit breaker's armed fallback while OPEN.\n"
-        "# TYPE cache_turbo_breaker_serves_total counter\n"
-        "cache_turbo_breaker_serves_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_origin_failures_total Origin responses recorded as a failure by the circuit breaker.\n"
-        "# TYPE cache_turbo_origin_failures_total counter\n"
-        "cache_turbo_origin_failures_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_varidx_drops_total Auto-Vary variant-index writes dropped before reaching the transport at store time (self-heals on the next hit).\n"
-        "# TYPE cache_turbo_varidx_drops_total counter\n"
-        "cache_turbo_varidx_drops_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_tag_index_drops_total Purge-by-tag index "
-        "writes dropped before reaching the transport at store time "
-        "(no self-heal; a later purge of the tag will not invalidate "
-        "the affected object until its own TTL).\n"
-        "# TYPE cache_turbo_tag_index_drops_total counter\n"
-        "cache_turbo_tag_index_drops_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_tag_cap_drops_total Tags silently dropped from "
-        "the purge-by-tag index because a response named more than "
-        "NGX_HTTP_CACHE_TURBO_MAX_TAGS distinct tags (no self-heal; a later "
-        "purge of a dropped tag will not invalidate the affected object "
-        "until its own TTL).\n"
-        "# TYPE cache_turbo_tag_cap_drops_total counter\n"
-        "cache_turbo_tag_cap_drops_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_breaker_opens_total Lifetime count of CLOSED->OPEN circuit breaker trips.\n"
-        "# TYPE cache_turbo_breaker_opens_total counter\n"
-        "cache_turbo_breaker_opens_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_breaker_state Circuit breaker state (0=closed, 1=open, 2=half-open).\n"
-        "# TYPE cache_turbo_breaker_state gauge\n"
-        "cache_turbo_breaker_state{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_bg_inflight Background-refresh subrequests currently in flight for this zone (cache_turbo_background_update_max cap).\n"
-        "# TYPE cache_turbo_bg_inflight gauge\n"
-        "cache_turbo_bg_inflight{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_sketch_gen W-TinyLFU sketch aging generation (full incremental halving laps completed so far; 0 = never aged or no sketch).\n"
-        "# TYPE cache_turbo_sketch_gen gauge\n"
-        "cache_turbo_sketch_gen{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_sketch_bumps_total Lifetime W-TinyLFU sketch increments (0 on a live zone means the sketch was never allocated).\n"
-        "# TYPE cache_turbo_sketch_bumps_total counter\n"
-        "cache_turbo_sketch_bumps_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_admission_refused_total New entries refused by W-TinyLFU admission control (cache_turbo_zone ... admission=on).\n"
-        "# TYPE cache_turbo_admission_refused_total counter\n"
-        "cache_turbo_admission_refused_total{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_used_bytes Slab bytes currently charged for cached payload and metadata in this zone (excludes fixed per-zone init overhead).\n"
-        "# TYPE cache_turbo_used_bytes gauge\n"
-        "cache_turbo_used_bytes{zone=\"%V\"} %uA\n"
-        "# HELP cache_turbo_markers Live count of L1 auto-Vary marker nodes resident in this zone (0 gates the vary-marker probe off, C3).\n"
-        "# TYPE cache_turbo_markers gauge\n"
-        "cache_turbo_markers{zone=\"%V\"} %uA\n",
-        &zname, st->hits, &zname, st->misses, &zname, st->stale_serves,
-        &zname, st->refreshes, &zname, st->evictions,
-        &zname, st->l2_hits, &zname, st->l2_misses, &zname, st->lock_waits,
-        &zname, st->min_uses_skips, &zname, st->l2_neg_skips,
-        &zname, st->bypasses,
-        &zname, st->refuse_set_cookie, &zname, st->refuse_encoded,
-        &zname, st->refuse_vary_unsafe, &zname, st->refuse_authorization,
-        &zname, st->refuse_cache_control, &zname, st->refuse_require_header,
-        &zname, st->refuse_partial, &zname, st->refuse_head,
-        &zname, st->cost_ms, &zname, st->autotuned_beta,
-        &zname, st->autotuned_load,
-        &zname, st->sie_serves, &zname, st->breaker_serves,
-        &zname, st->origin_failures,
-        &zname, st->varidx_drops, &zname, st->tag_index_drops,
-        &zname, st->tag_cap_drops,
-        &zname, st->breaker_opens,
-        &zname, (ngx_atomic_uint_t) ngx_http_cache_turbo_brk_state(
-            (ngx_uint_t) st->breaker_state),
-        &zname, st->bg_inflight,
-        &zname, st->sketch_gen, &zname, st->sketch_bumps,
-        &zname, st->admission_refused,
-        &zname, st->used_bytes,
-        &zname, st->markers) - p;
-
-    return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
-        "text/plain; version=0.0.4; charset=utf-8",
-        sizeof("text/plain; version=0.0.4; charset=utf-8") - 1);
-}
-
-
-/* GET/HEAD default JSON stats reply (the ?format=prometheus branch is handled
- * separately by admin_stats_prometheus before this runs).
- *
- * "lock_ttl" is the one EFFECTIVE-CONFIG field on this object; everything else
- * is a zone counter. It reports clcf->lock_ttl -- the post-merge, post-clamp
- * single-flight lock TTL in seconds, i.e. what the runtime claim path in
- * ngx_http_cache_turbo_access.c actually multiplies by effective_load(). It is
- * read off THIS ADMIN LOCATION's own loc_conf, not the cached location's:
- * lock_ttl is per-location while the counters are per-zone, so an operator
- * reading it back must set cache_turbo_lock_ttl on the admin location whose
- * value they mean to inspect (the fixture's /_cache_lockttl does exactly this).
- *
- * Only the effective value is exposed, not the raw configured one: the clamp in
- * ngx_http_cache_turbo_lock_ttl_conf() overwrites its local before storing into
- * lock_ttl_raw, so an out-of-range configured value is not retained anywhere
- * and there is no pre-clamp number left to report. Adding a field purely to
- * carry it would be a test-only knob on a shipped surface, which this module
- * deliberately does not do (C3 removed exactly that shape). The clamp is
- * observable as "an oversized value reads back as 4294967295", which is the
- * operator-facing question ("why does my 999999999s behave as a ceiling?")
- * answered by the value itself. */
-static ngx_int_t
-ngx_http_cache_turbo_admin_stats_json(ngx_http_request_t *r,
-    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_stats_t *st)
-{
-    ngx_str_t   body;
-    u_char     *p;
-    size_t      len;
-
-    len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
-                 "\"evictions\":,\"l2_hits\":,\"l2_misses\":,\"lock_waits\":,"
-                 "\"min_uses_skips\":,\"l2_neg_skips\":,\"bypasses\":,"
-                 "\"refuse_set_cookie\":,\"refuse_encoded\":,"
-                 "\"refuse_vary_unsafe\":,\"refuse_authorization\":,"
-                 "\"refuse_cache_control\":,\"refuse_require_header\":,"
-                 "\"refuse_partial\":,\"refuse_head\":,"
-                 "\"cost_ms\":,"
-                 "\"autotuned_beta\":,\"autotuned_load\":,"
-                 "\"breaker_state\":\"\",\"breaker_opens\":,"
-                 "\"sie_serves\":,\"breaker_serves\":,"
-                 "\"origin_failures\":,\"varidx_drops\":,"
-                 "\"tag_index_drops\":,\"tag_cap_drops\":,\"bg_inflight\":,"
-                 "\"sketch_gen\":,\"sketch_bumps\":,"
-                 "\"admission_refused\":,\"used_bytes\":,\"markers\":,"
-                 "\"lock_ttl\":}\n")
-          + 35 * NGX_ATOMIC_T_LEN
-          + sizeof("half-open") - 1    /* longest _breaker_state_str value */
-          /* lock_ttl renders as %T, a signed time_t, NOT an ngx_atomic_uint_t,
-           * so it is budgeted on its own rather than by bumping the 35 above:
-           * NGX_TIME_T_LEN is the width ngx_sprintf can emit for that type,
-           * sign included. It is capped at NGX_HTTP_CACHE_TURBO_TTL_MAX
-           * (4294967295, 10 digits) in practice, but budget the type's full
-           * width -- sizing to the value's practical range is exactly the
-           * estimate ci/tools/lint-admin-buffer-budget.py exists to forbid. */
-          + NGX_TIME_T_LEN;
-    p = ngx_pnalloc(r->pool, len);
-    if (p == NULL) {
+    body.data = ngx_pnalloc(r->pool, capacity);
+    if (body.data == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
-    body.data = p;
-    body.len = ngx_sprintf(p,
-        "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
-        "\"refreshes\":%uA,\"evictions\":%uA,\"l2_hits\":%uA,"
-        "\"l2_misses\":%uA,\"lock_waits\":%uA,\"min_uses_skips\":%uA,"
-        "\"l2_neg_skips\":%uA,"
-        "\"bypasses\":%uA,"
-        "\"refuse_set_cookie\":%uA,\"refuse_encoded\":%uA,"
-        "\"refuse_vary_unsafe\":%uA,\"refuse_authorization\":%uA,"
-        "\"refuse_cache_control\":%uA,\"refuse_require_header\":%uA,"
-        "\"refuse_partial\":%uA,\"refuse_head\":%uA,"
-        "\"cost_ms\":%uA,\"autotuned_beta\":%uA,"
-        "\"autotuned_load\":%uA,"
-        "\"breaker_state\":\"%s\",\"breaker_opens\":%uA,"
-        "\"sie_serves\":%uA,\"breaker_serves\":%uA,"
-        "\"origin_failures\":%uA,\"varidx_drops\":%uA,"
-        "\"tag_index_drops\":%uA,\"tag_cap_drops\":%uA,\"bg_inflight\":%uA,"
-        "\"sketch_gen\":%uA,\"sketch_bumps\":%uA,"
-        "\"admission_refused\":%uA,\"used_bytes\":%uA,\"markers\":%uA,"
-        "\"lock_ttl\":%T}\n",
-        st->hits, st->misses, st->stale_serves,
-        st->refreshes, st->evictions, st->l2_hits, st->l2_misses,
-        st->lock_waits, st->min_uses_skips, st->l2_neg_skips,
-        st->bypasses,
-        st->refuse_set_cookie, st->refuse_encoded, st->refuse_vary_unsafe,
-        st->refuse_authorization, st->refuse_cache_control,
-        st->refuse_require_header, st->refuse_partial, st->refuse_head,
-        st->cost_ms,
-        st->autotuned_beta, st->autotuned_load,
-        ngx_http_cache_turbo_shm_breaker_state_str(
-            (ngx_uint_t) st->breaker_state),
-        st->breaker_opens,
-        st->sie_serves, st->breaker_serves, st->origin_failures,
-        st->varidx_drops, st->tag_index_drops, st->tag_cap_drops,
-        st->bg_inflight,
-        st->sketch_gen, st->sketch_bumps, st->admission_refused,
-        st->used_bytes, st->markers,
-        clcf->lock_ttl) - p;
-
+    if (ngx_http_cache_turbo_stats_render(snapshot, zone, prometheus, 0,
+                                         body.data, capacity, &body.len) != NGX_OK)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    if (prometheus) {
+        return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
+            "text/plain; version=0.0.4; charset=utf-8",
+            sizeof("text/plain; version=0.0.4; charset=utf-8") - 1);
+    }
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
 
@@ -822,24 +550,25 @@ ngx_http_cache_turbo_admin_stats_dispatch(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_zone_t *z,
     ngx_uint_t force_autotune)
 {
-    ngx_http_cache_turbo_stats_t  st;
-    ngx_str_t                     arg;
+    ngx_http_cache_turbo_stats_snapshot_t  snapshot;
+    ngx_str_t                             arg;
 
     if (force_autotune) {
         ngx_http_cache_turbo_autotune_force(z);
     }
 
-    clcf->l1->stats(z, &st);
+    clcf->l1->stats(z, &snapshot.stats);
+    snapshot.lock_ttl = clcf->lock_ttl;
 
     if (r->args.len
         && ngx_http_arg(r, (u_char *) "format", 6, &arg) == NGX_OK
         && arg.len == sizeof("prometheus") - 1
         && ngx_strncmp(arg.data, "prometheus", arg.len) == 0)
     {
-        return ngx_http_cache_turbo_admin_stats_prometheus(r, clcf, &st);
+        return ngx_http_cache_turbo_admin_stats_reply(r, clcf, &snapshot, 1);
     }
 
-    return ngx_http_cache_turbo_admin_stats_json(r, clcf, &st);
+    return ngx_http_cache_turbo_admin_stats_reply(r, clcf, &snapshot, 0);
 }
 
 

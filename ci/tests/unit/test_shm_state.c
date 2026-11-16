@@ -24,6 +24,7 @@
  */
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -391,12 +392,27 @@ static void ngx_http_cache_turbo_lru_enforce_cap(
 /* --- test scaffolding ---------------------------------------------------- */
 static int tests_run, tests_failed;
 
+/* A failed diagnostic must still produce a failing test process. */
+static void
+report_error(const char *format, ...)
+{
+    va_list  args;
+    int      rc;
+
+    va_start(args, format);
+    rc = vfprintf(stderr, format, args);
+    va_end(args);
+    if (rc < 0) {
+        _Exit(EXIT_FAILURE);
+    }
+}
+
 #define CHECK(cond, msg)                                                      \
     do {                                                                      \
         tests_run++;                                                          \
         if (!(cond)) {                                                        \
             tests_failed++;                                                   \
-            fprintf(stderr, "  ✗ %s\n    at %s:%d: %s\n",                     \
+            report_error("  ✗ %s\n    at %s:%d: %s\n",                     \
                     (msg), __FILE__, __LINE__, #cond);                        \
         }                                                                     \
     } while (0)
@@ -413,7 +429,7 @@ static int tests_run, tests_failed;
         tests_run++;                                                          \
         if (!(cond)) {                                                        \
             tests_failed++;                                                   \
-            fprintf(stderr, "  ✗ %s (fatal)\n    at %s:%d: %s\n",             \
+            report_error("  ✗ %s (fatal)\n    at %s:%d: %s\n",             \
                     (msg), __FILE__, __LINE__, #cond);                        \
             return;                                                           \
         }                                                                     \
@@ -807,7 +823,10 @@ static void
 watchdog_arm(const char *what)
 {
     g_watchdog_what = what;
-    signal(SIGALRM, watchdog_fired);
+    if (signal(SIGALRM, watchdog_fired) == SIG_ERR) {
+        report_error("watchdog: signal registration failed\n");
+        exit(EXIT_FAILURE);
+    }
     alarm(10);
 }
 
@@ -942,7 +961,7 @@ mk_live_sie_entry(int keyn, int live)
     if (ctn == NULL) {
         tests_run++;
         tests_failed++;
-        fprintf(stderr, "  ✗ mk_live_sie_entry: node alloc failed (fatal)\n"
+        report_error("  ✗ mk_live_sie_entry: node alloc failed (fatal)\n"
                         "    at %s:%d\n", __FILE__, __LINE__);
         return NULL;
     }
@@ -964,7 +983,7 @@ mk_live_sie_entry(int keyn, int live)
     if (blob == NULL) {
         tests_run++;
         tests_failed++;
-        fprintf(stderr, "  ✗ mk_live_sie_entry: blob_alloc failed (fatal)\n"
+        report_error("  ✗ mk_live_sie_entry: blob_alloc failed (fatal)\n"
                         "    at %s:%d\n", __FILE__, __LINE__);
         return NULL;
     }
@@ -4483,7 +4502,7 @@ run_negative_controls(void)
     tests_run++;
     if (!caught) {
         tests_failed++;
-        fprintf(stderr, "  ✗ CONTROL CR-A: memo still readable with the bug "
+        report_error("  ✗ CONTROL CR-A: memo still readable with the bug "
                         "restored — test_cr_a_memo_survives_claim guards nothing\n");
     }
 
@@ -4508,7 +4527,7 @@ run_negative_controls(void)
     tests_run++;
     if (!caught) {
         tests_failed++;
-        fprintf(stderr, "  ✗ CONTROL CR-B: min_uses progress survived the bug — "
+        report_error("  ✗ CONTROL CR-B: min_uses progress survived the bug — "
                         "test_cr_b_unstub_preserves_counter guards nothing\n");
     }
 
@@ -4547,7 +4566,7 @@ run_negative_controls(void)
         tests_run++;
         if (!caught) {
             tests_failed++;
-            fprintf(stderr, "  ✗ CONTROL CTXRDR-ADOPT-LEASE: single-flight held "
+            report_error("  ✗ CONTROL CTXRDR-ADOPT-LEASE: single-flight held "
                             "with the bug restored — test_lease_owner_identity "
                             "guards nothing\n");
         }
@@ -4580,7 +4599,7 @@ run_negative_controls(void)
                       == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL O4.1-a: a non-rolling window did not "
+            report_error("  ✗ CONTROL O4.1-a: a non-rolling window did not "
                             "reach the threshold — test_breaker_window_rolls "
                             "guards nothing\n");
             tests_failed++;
@@ -4619,7 +4638,7 @@ run_negative_controls(void)
         caught = (g_sh.breaker_fails < 3);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL O4.5: the unguarded re-anchor still "
+            report_error("  ✗ CONTROL O4.5: the unguarded re-anchor still "
                             "reached the threshold — "
                             "test_breaker_losing_reanchor_does_not_clear_count "
                             "guards nothing\n");
@@ -4651,7 +4670,7 @@ run_negative_controls(void)
                   && second == NGX_HTTP_CACHE_TURBO_BREAKER_HALF_OPEN);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL O4.1-b: reading the stored state did "
+            report_error("  ✗ CONTROL O4.1-b: reading the stored state did "
                             "not admit a second probe — the single-winner "
                             "assertion guards nothing\n");
             tests_failed++;
@@ -4682,7 +4701,7 @@ run_negative_controls(void)
                       == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL O4.1-c: a retained failure run did not "
+            report_error("  ✗ CONTROL O4.1-c: a retained failure run did not "
                             "reach the threshold — the post-success assertion "
                             "guards nothing\n");
             tests_failed++;
@@ -4725,7 +4744,7 @@ run_negative_controls(void)
                   && g_sh.breaker_opens == 1);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL O4.2-a: counting 404 as an origin "
+            report_error("  ✗ CONTROL O4.2-a: counting 404 as an origin "
                             "failure did not trip the breaker — the "
                             "healthy-status assertions guard nothing\n");
             tests_failed++;
@@ -4759,7 +4778,7 @@ run_negative_controls(void)
                   && g_sh.breaker_opens == 0);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL O4.2-b: ignoring 507 still tripped "
+            report_error("  ✗ CONTROL O4.2-b: ignoring 507 still tripped "
                             "the breaker — the every-5xx assertions guard "
                             "nothing\n");
             tests_failed++;
@@ -4793,7 +4812,7 @@ run_negative_controls(void)
                   && g_sh.breaker_opens == 1);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL O4.2-c: admitting a response that "
+            report_error("  ✗ CONTROL O4.2-c: admitting a response that "
                             "did not come from the origin did not trip the "
                             "breaker — the from_origin assertion guards "
                             "nothing\n");
@@ -4820,7 +4839,7 @@ run_negative_controls(void)
         caught = (before == 2 && g_sh.breaker_fails == 0);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL O4.2-d: recording into a DISABLED "
+            report_error("  ✗ CONTROL O4.2-d: recording into a DISABLED "
                             "breaker did not touch shared state — the "
                             "'off is free' assertion guards nothing\n");
             tests_failed++;
@@ -4871,7 +4890,7 @@ run_negative_controls(void)
         caught = (g_sh.breaker_wedge_observed == 0);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL H-2/O4.4-j (negative): a "
+            report_error("  ✗ CONTROL H-2/O4.4-j (negative): a "
                             "fall-through case that must not count as a "
                             "wedge bumped breaker_wedge_observed — the "
                             "increment site's guard lost a conjunct\n");
@@ -4891,7 +4910,7 @@ run_negative_controls(void)
         caught = (g_sh.breaker_wedge_observed == 1);
         tests_run++;
         if (!caught) {
-            fprintf(stderr, "  ✗ CONTROL H-2/O4.4-j (positive): a genuine "
+            report_error("  ✗ CONTROL H-2/O4.4-j (positive): a genuine "
                             "generation mismatch did not bump "
                             "breaker_wedge_observed — the counter is dead, "
                             "not merely over-scoped\n");
@@ -4931,7 +4950,7 @@ run_negative_controls(void)
         tests_run++;
         if (!caught) {
             tests_failed++;
-            fprintf(stderr, "  ✗ CONTROL PERF-7-a: freeing on detach with a "
+            report_error("  ✗ CONTROL PERF-7-a: freeing on detach with a "
                             "server in flight left the slab accounted live — "
                             "test_blob_detach_defers_free_to_the_last_server "
                             "guards nothing\n");
@@ -4963,7 +4982,7 @@ run_negative_controls(void)
         tests_run++;
         if (!caught) {
             tests_failed++;
-            fprintf(stderr, "  ✗ CONTROL PERF-7-b: an unbiased refcount did "
+            report_error("  ✗ CONTROL PERF-7-b: an unbiased refcount did "
                             "NOT free a blob the owning node still holds — "
                             "test_blob_release_does_not_free_while_still_attached"
                             " guards nothing\n");
@@ -5017,7 +5036,7 @@ run_negative_controls(void)
         tests_run++;
         if (!caught) {
             tests_failed++;
-            fprintf(stderr, "  ✗ CONTROL PERF-7-c: a non-counting acquire() did "
+            report_error("  ✗ CONTROL PERF-7-c: a non-counting acquire() did "
                             "NOT let the owner's eviction free the slab out "
                             "from under the in-flight servers — "
                             "test_blob_multiple_servers_free_exactly_once "
@@ -5066,7 +5085,7 @@ run_negative_controls(void)
         tests_run++;
         if (!caught) {
             tests_failed++;
-            fprintf(stderr, "  ✗ CONTROL S231-EVICT-BLIND: evict_one did not "
+            report_error("  ✗ CONTROL S231-EVICT-BLIND: evict_one did not "
                             "take an already-spared live-SIE candidate — "
                             "test_evict_blind_second_chance_unit's fixture "
                             "cannot distinguish a build that skips live-SIE "
@@ -6367,11 +6386,146 @@ test_p4_2_s3a_used_bytes_survives_deferred_blob_free(void)
 
 
 
+/* Capacity occupancy is the existing resident-node tally, not the number of
+ * slab allocations. Run alone with CT_STATS_ENTRIES_ONLY=1 for focused checks;
+ * the ordinary state-machine CI run exercises it too. */
+static void
+test_stats_entries_transitions(void)
+{
+    ngx_http_cache_turbo_node_t *ctn;
+    ngx_http_cache_turbo_zone_t reloaded;
+    u_char body[] = "capacity-entry";
+    ngx_uint_t purged;
+    uint64_t owner;
+
+    printf("stats entries: insert, replace, free, eviction, failure and reload\n");
+    zone_reset();
+    CHECK(g_sh.n_entries == 0, "entries: empty zone starts at zero");
+    REQUIRE(ngx_http_cache_turbo_shm_store_locked(&g_zone, mkkey(0),
+                ngx_crc32_short(mkkey(0), 32), body, sizeof(body), 60, 0,
+                NULL, NULL) == NGX_OK, "entries: successful insert");
+    CHECK(g_sh.n_entries == 1, "entries: successful node insert adds exactly one");
+    REQUIRE(ngx_http_cache_turbo_shm_store_locked(&g_zone, mkkey(0),
+                ngx_crc32_short(mkkey(0), 32), body, sizeof(body), 60, 0,
+                NULL, NULL) == NGX_OK, "entries: replacement succeeds");
+    CHECK(g_sh.n_entries == 1, "entries: replacement does not add a node");
+    ngx_test_slab_fail_after(0);
+    CHECK(ngx_http_cache_turbo_shm_store_locked(&g_zone, mkkey(0),
+              ngx_crc32_short(mkkey(0), 32), body, sizeof(body), 60, 0,
+              NULL, NULL) == NGX_ERROR, "entries: refresh allocation fails");
+    CHECK(g_sh.n_entries == 1 && find(0) != NULL,
+          "entries: failed detached refresh preserves occupancy");
+    ngx_test_slab_fail_after(-1);
+
+    /* Retained shared state is exactly what a new config context references. */
+    reloaded = g_zone;
+    CHECK(ngx_http_cache_turbo_zone_sh(&reloaded)->n_entries == 1,
+          "entries: reload retains shared occupancy");
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, mkkey(1),
+        ngx_crc32_short(mkkey(1), 32), 2, 0);
+    REQUIRE(find(1) != NULL, "entries: counter node created");
+    CHECK(g_sh.n_entries == 2, "entries: counters count as resident nodes");
+    ngx_http_cache_turbo_shm_drop_locked(&g_zone, find(1));
+    CHECK(g_sh.n_entries == 1, "entries: paired drop decrements once");
+
+    ctn = ngx_http_cache_turbo_shm_alloc_evict(&g_zone, sizeof(*ctn));
+    REQUIRE(ctn != NULL, "entries: marker node allocation succeeds");
+    memset(ctn, 0, sizeof(*ctn));
+    ctn->kind = NGX_HTTP_CACHE_TURBO_NODE_MARKER;
+    ctn->node.key = ngx_http_cache_turbo_shm_key64(mkkey(2));
+    memcpy(ctn->key, mkkey(2), 32);
+    ngx_rbtree_insert(&g_sh.rbtree, &ctn->node);
+    ngx_http_cache_turbo_lru_insert_new(&g_zone, ctn);
+    g_sh.markers++;
+    CHECK(g_sh.n_entries == 2, "entries: markers count as resident nodes");
+    ngx_http_cache_turbo_shm_drop_locked(&g_zone, ctn);
+    CHECK(g_sh.n_entries == 1 && g_sh.markers == 0,
+          "entries: marker removal is paired");
+
+    ctn = find(0);
+    REQUIRE(ctn != NULL, "entries: entry remains before promotion");
+    ngx_http_cache_turbo_lru_unlink(&g_zone, ctn);
+    ctn->seg = NGX_HTTP_CACHE_TURBO_SEG_PROTECTED;
+    ngx_http_cache_turbo_lru_link_head(&g_zone, ctn);
+    CHECK(g_sh.n_entries == 1, "entries: LRU moves preserve occupancy");
+    CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 1,
+          "entries: protected eviction succeeds");
+    CHECK(g_sh.n_entries == 0 && g_sh.used_bytes == 0,
+          "entries: eviction decrements once and frees payload");
+    CHECK(ngx_test_alerts == 0, "entries: paired transitions do not underflow");
+
+    /* Failure after allocating a new node must roll it back before linkage. */
+    ngx_test_slab_fail_after(1);
+    CHECK(ngx_http_cache_turbo_shm_store_locked(&g_zone, mkkey(0),
+              ngx_crc32_short(mkkey(0), 32), body, sizeof(body), 60, 0,
+              NULL, NULL) == NGX_ERROR, "entries: new body allocation fails");
+    CHECK(g_sh.n_entries == 0 && g_sh.used_bytes == 0 && find(0) == NULL,
+          "entries: failed allocation must not change entries");
+    ngx_test_slab_fail_after(0);
+    CHECK(ngx_http_cache_turbo_shm_store_locked(&g_zone, mkkey(0),
+              ngx_crc32_short(mkkey(0), 32), body, sizeof(body), 60, 0,
+              NULL, NULL) == NGX_ERROR, "entries: new node allocation fails");
+    CHECK(g_sh.n_entries == 0,
+          "entries: failed node allocation adds no phantom entry");
+    ngx_test_slab_fail_after(-1);
+
+    /* A failed request can evict existing nodes while trying to allocate. */
+    REQUIRE(ngx_http_cache_turbo_shm_store_locked(&g_zone, mkkey(0),
+                ngx_crc32_short(mkkey(0), 32), body, sizeof(body), 60, 0,
+                NULL, NULL) == NGX_OK, "entries: refill before exhausted retry");
+    ngx_test_slab_fail_after(0);
+    CHECK(ngx_http_cache_turbo_shm_store_locked(&g_zone, mkkey(1),
+              ngx_crc32_short(mkkey(1), 32), body, sizeof(body), 60, 0,
+              NULL, NULL) == NGX_ERROR, "entries: eviction cannot rescue allocator");
+    CHECK(g_sh.n_entries == 0 && find(0) == NULL && find(1) == NULL,
+          "entries: failed retry reports post-eviction occupancy");
+    ngx_test_slab_fail_after(-1);
+
+    REQUIRE(ngx_http_cache_turbo_shm_claim(&g_zone, mkkey(0),
+                ngx_crc32_short(mkkey(0), 32), 5, &owner) == NGX_HTTP_CACHE_TURBO_CLAIM_WINNER,
+            "entries: cold stub claim succeeds");
+    CHECK(g_sh.n_entries == 1, "entries: single-flight stub is resident");
+    ngx_http_cache_turbo_shm_unstub(&g_zone, mkkey(0),
+        ngx_crc32_short(mkkey(0), 32), owner);
+    CHECK(g_sh.n_entries == 0, "entries: unstub decrements once");
+
+    /* Force the all-SIE-spared fallback branch with one genuine live body.
+     * mk_charged_entry charges both allocations; update its SIE timestamps. */
+    ctn = mk_charged_entry(0, CTB5_HDR_LEN);
+    REQUIRE(ctn != NULL, "entries: live-SIE fallback fixture created");
+    put_u64_le(ctn->data + 24, (uint64_t) ngx_test_now);
+    put_u32_le(ctn->data + 40, 60);
+    g_sh.breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_OPEN;
+    CHECK(ngx_http_cache_turbo_shm_evict_one(&g_zone) == 1,
+          "entries: all-spared fallback eviction succeeds");
+    CHECK(g_sh.n_entries == 0 && g_sh.used_bytes == 0,
+          "entries: fallback eviction decrements once");
+    g_sh.breaker_state = NGX_HTTP_CACHE_TURBO_BREAKER_CLOSED;
+
+    ngx_http_cache_turbo_shm_count_miss(&g_zone, mkkey(0),
+        ngx_crc32_short(mkkey(0), 32), 2, 0);
+    CHECK(ngx_http_cache_turbo_shm_purge_all(&g_zone, &purged) == NGX_OK,
+          "entries: purge drains resident nodes");
+    CHECK(purged == 1 && g_sh.n_entries == 0,
+          "entries: purge/free pairs restore empty gauge");
+    CHECK(ngx_test_alerts == 0, "entries: all real removals stay paired");
+    ngx_http_cache_turbo_shm_entry_removed(&g_zone);
+    CHECK(g_sh.n_entries == 0 && ngx_test_alerts == 1,
+          "entries: unmatched removal logs and cannot wrap below zero");
+    CHECK(ngx_test_lock_balanced(), "entries: no leaked slab lock");
+}
+
+
 int
 main(void)
 {
     memset(&g_sh, 0, sizeof(g_sh));
     zone_reset();
+
+    test_stats_entries_transitions();
+    if (getenv("CT_STATS_ENTRIES_ONLY") != NULL) {
+        goto finished;
+    }
 
     test_s8_evict_terminates_on_empty_queues();
     test_purge_all_zero_snapshot_detects_queue_skew();
@@ -6455,13 +6609,14 @@ main(void)
     test_blob_concurrent_release_vs_lookup();
     run_negative_controls();
 
+finished:
     /* Every node this run allocated must be accounted for. Under ASan a real
      * leak also trips the leak checker; this catches it in a plain build too. */
     zone_reset();
     tests_run++;
     if (ngx_test_slab_live != 0) {
         tests_failed++;
-        fprintf(stderr, "  ✗ %lu slab allocation(s) leaked\n",
+        report_error("  ✗ %lu slab allocation(s) leaked\n",
                 (unsigned long) ngx_test_slab_live);
     }
 

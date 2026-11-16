@@ -55,6 +55,14 @@ bash "$DIR/extract_cc_delta.sh"
 	-o "$DIR/test_cc_delta_narrow_time"
 "$DIR/test_cc_delta_narrow_time"
 
+# --- capacity sampling: one bounded slab-locked snapshot -----------------
+if [ "${COVERAGE:-0}" = 1 ]; then
+    CAPACITY_TEST_OUT="${CAPACITY_TEST_OUT:-$DIR/stats-capacity-coverage}" \
+        python3 "$DIR/test_stats_capacity.py"
+else
+    python3 "$DIR/test_stats_capacity.py"
+fi
+
 # --- auto-Vary purge generation wrap (AUD-GEN1) ----------------------------
 # Pure-math mirror of marker_store/variant_hash's gen write/truncate/fold --
 # see the header comment in test_vary_gen.c for why a mirror, not a #include.
@@ -145,6 +153,14 @@ bash "$DIR/extract_digest.sh"
 # shellcheck disable=SC2086
 "$CC" $CFLAGS "$DIR/test_digest.c" -o "$DIR/test_digest" -lssl -lcrypto
 "$DIR/test_digest"
+
+# --- typed admin schema: frozen bytes, maxima, escaping and bounds --------
+if [ "${COVERAGE:-0}" = 1 ]; then
+    STATS_TEST_OUT="${STATS_TEST_OUT:-$DIR/stats-schema-coverage}" \
+        python3 "$DIR/test_stats_schema.py"
+else
+    python3 "$DIR/test_stats_schema.py"
+fi
 
 # --- admin ?key= digest failure propagation (DIGEST-ERRORS-IGNORED) -------
 # Compile the real helper with a deterministic failing digest.  A mutation
