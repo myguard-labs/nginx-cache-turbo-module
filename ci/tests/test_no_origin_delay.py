@@ -13,26 +13,34 @@ import unittest
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO / "ci" / "tools"))
 
-from areas import core
+from areas import core, http
 from origin import Origin
 
 BASELINE = 0.05
 
 
 class NoOriginDelayTests(unittest.TestCase):
+    module = core
+
     def setUp(self) -> None:
         self.origin = Origin(0, delay=BASELINE)
 
     def test_zero_inside_and_restored_after_normal_exit(self) -> None:
-        with core._no_origin_delay(self.origin):
+        with self.module._no_origin_delay(self.origin):
             self.assertEqual(self.origin.delay, 0.0)
         self.assertEqual(self.origin.delay, BASELINE)
 
     def test_restored_after_exception_inside_block(self) -> None:
-        with self.assertRaises(RuntimeError), core._no_origin_delay(self.origin):
+        with self.assertRaises(RuntimeError), self.module._no_origin_delay(self.origin):
             self.assertEqual(self.origin.delay, 0.0)
             raise RuntimeError("boom inside the zero-delay block")
         self.assertEqual(self.origin.delay, BASELINE)
+
+
+class HttpNoOriginDelayTests(NoOriginDelayTests):
+    """Same contract for the areas/http.py helper (CI-L10d-T5b)."""
+
+    module = http
 
 
 if __name__ == "__main__":

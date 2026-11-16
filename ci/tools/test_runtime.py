@@ -327,7 +327,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_admin_purge_post_with_body(ng)
     test_concurrent_hits_no_deadlock(ng)
     test_lru_eviction(ng, origin)
-    test_evict_blind_negative_control_closed_breaker_evicts_normally(ng)  # S231-EVICT-BLIND, must run BEFORE the breaker trips
+    test_evict_blind_negative_control_closed_breaker_evicts_normally(ng, origin)  # S231-EVICT-BLIND, must run BEFORE the breaker trips
     test_evict_blind_second_chance(ng, origin)                    # S231-EVICT-BLIND
     test_p1_coarse_lru_splice_keeps_hot_key_resident(ng, origin)
     test_s8_scan_resistant_keeps_hot_key(ng, origin)
