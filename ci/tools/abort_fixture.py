@@ -76,14 +76,33 @@ ABORT_REPLY_DELAY = 0.1
 # or crashed. It must exceed the gap between a reply landing and nginx sending
 # its next command, so it is a real margin on a loaded host, not a tight fit.
 # The abort-arm and clean-arm lines print that gap (reply-to-next-max) against
-# half this margin, scaled, so a lane that drifts toward it shows up there.
+# half the settle, so a lane that drifts toward it shows up there. Read it
+# through abort_settle(), which picks the sanitizer margin when one applies.
 ABORT_SETTLE_MARGIN = 0.05
+# Under a sanitizer the settle must also outlast the crash itself: ASan prints
+# and symbolizes its report before the worker exits, measured 0.10-0.15s after
+# the last proxy activity in single-process mode, and the per-key crash check
+# only polls the process once the settle ends. At 0.05 x scale (0.1s) the
+# resume-order use-after-free was blamed on key 1/3 instead of key 0/3, so the
+# sanitizer settle stays at 0.1 x scale (0.2s), which attributes it to key 0/3.
+SANITIZED_ABORT_SETTLE_MARGIN = 0.1
 # How long the walk's UNLINK connection may trail the page connection's close:
 # both normally close in one proxy loop pass. A wait that returns on the close,
 # kept at its own value so the settle margin above does not narrow it.
 WALK_CLOSE_PAIR_WAIT = 0.1
 # Gap between two scheduled proxy deliveries (see the reply ordering below).
 REPLY_ORDER_EPS = 1e-6
+
+
+def abort_settle() -> float:
+    """Seconds of backend quiet that end a settle on this run, scaled.
+
+    The margin switches on the same condition as sanitizer_time_scale(), an
+    ASAN_OPTIONS entry in the environment (an empty one counts): the plain
+    margin without it, the sanitizer margin with it."""
+    sanitized = "ASAN_OPTIONS" in os.environ
+    margin = SANITIZED_ABORT_SETTLE_MARGIN if sanitized else ABORT_SETTLE_MARGIN
+    return margin * sanitizer_time_scale()
 
 # Boundary arm: offsets around the moment the reply lands, cycled over the keys.
 ABORT_BOUNDARY_OFFSETS = (-0.003, -0.002, -0.001, 0.0, 0.001, 0.002, 0.003)
@@ -905,7 +924,7 @@ class ProxyAnchor:
         return self.proxy.sighting(self.commands[-1]).reply_head
 
     def settle(self) -> None:
-        self.proxy.wait_quiet(ABORT_SETTLE_MARGIN * sanitizer_time_scale())
+        self.proxy.wait_quiet(abort_settle())
 
     def times(self) -> ParkTimes:
         first = self.proxy.sighting(self.commands[0])
@@ -1044,7 +1063,7 @@ class FileAnchor:
         if not self._closed.wait(WARM_FILE_TEST_DELAY + 5.0 * scale):
             raise AssertionError(f"{self.path.name}: the warm task never "
                                  f"closed the list")
-        _sleep_until(self.closes[0] + ABORT_SETTLE_MARGIN * scale)
+        _sleep_until(self.closes[0] + abort_settle())
         self.close()
 
     def times(self) -> ParkTimes:
@@ -1144,9 +1163,9 @@ class ColdWaitAnchor:
         scale = sanitizer_time_scale()
         if not self._leader_done.wait(10.0 * scale):
             raise AssertionError(f"{self.uri}: the leader never finished")
-        self.rig.proxy.wait_quiet(ABORT_SETTLE_MARGIN * scale)
+        self.rig.proxy.wait_quiet(abort_settle())
         _sleep_until(self.wait_final_reply() + COLD_WAIT_POLL
-                     + ABORT_SETTLE_MARGIN * scale)
+                     + abort_settle())
         if isinstance(self.leader_result, tuple):
             self.rig.bodies.setdefault(self.uri, self.leader_result[2])
 
@@ -1636,7 +1655,7 @@ def describe_reply_gaps(gaps: Sequence[float]) -> str:
     if not gaps:
         return "reply-to-next-max=n/a"
     worst = max(gaps)
-    limit = ABORT_SETTLE_MARGIN * sanitizer_time_scale() / 2
+    limit = abort_settle() / 2
     over = " over" if worst > limit else ""
     return (f"reply-to-next-max={worst * 1000:.1f}ms/{limit * 1000:.1f}ms "
             f"n={len(gaps)}{over}")
@@ -2759,7 +2778,7 @@ def _walk_timeout_arm(ng: Nginx, site: AbortSite, arm: str) -> None:
         else:
             problems.append("the old worker never exited")
         # Let the held reply land on the closed connection before more traffic.
-        rig.proxy.wait_quiet(ABORT_SETTLE_MARGIN * scale, timeout=hold + 5.0)
+        rig.proxy.wait_quiet(abort_settle(), timeout=hold + 5.0)
         rig.node.wait_worker()
         late = [ln for ln in rig.node.diagnostics().splitlines()
                 if TIMED_OUT in ln]

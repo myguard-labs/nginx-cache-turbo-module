@@ -8,6 +8,8 @@ no nginx, no Redis. The deadline checks feed a fake anchor.
 """
 
 import asyncio
+import contextlib
+import os
 import pathlib
 import sys
 import threading
@@ -21,6 +23,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO / "ci" / "tools"))
 
 import abort_fixture as af
+from test_runtime_base import ASAN_TIME_SCALE, sanitizer_time_scale
 
 A, B = b"GET /a ", b"GET /b "
 
@@ -192,38 +195,76 @@ class ReplyGapCase(ProxyCase):
         self.assertEqual(proxy.take_reply_gaps(), [])
 
 
+@contextlib.contextmanager
+def asan_env(options: str | None) -> typing.Iterator[None]:
+    """Run with ASAN_OPTIONS set to `options`, or absent for None: the switch
+    both sanitizer_time_scale() and abort_settle() read."""
+    with mock.patch.dict(os.environ):
+        os.environ.pop("ASAN_OPTIONS", None)
+        if options is not None:
+            os.environ["ASAN_OPTIONS"] = options
+        yield
+
+
+# What base b77c03b settled for under a sanitizer: 0.1 x the time scale. The
+# per-key crash attribution of the single-process ASan lane depends on it.
+BASE_SANITIZED_SETTLE = 0.1 * ASAN_TIME_SCALE
+
+
+class SettleCase(unittest.TestCase):
+    def test_plain_settle_is_the_plain_margin(self) -> None:
+        with asan_env(None):
+            self.assertEqual(sanitizer_time_scale(), 1.0)
+            self.assertEqual(af.abort_settle(), 0.05)
+
+    def test_sanitized_settle_is_the_base_value(self) -> None:
+        with asan_env("detect_leaks=0"):
+            self.assertEqual(af.abort_settle(), BASE_SANITIZED_SETTLE)
+            self.assertEqual(af.abort_settle(), 0.1 * sanitizer_time_scale())
+
+    def test_empty_asan_options_switches_like_the_time_scale(self) -> None:
+        # Presence, not content, flips both: an empty value is a sanitizer run.
+        with asan_env(""):
+            self.assertEqual(sanitizer_time_scale(), ASAN_TIME_SCALE)
+            self.assertEqual(af.abort_settle(), BASE_SANITIZED_SETTLE)
+
+    def test_sanitized_settle_outlasts_the_plain_one(self) -> None:
+        with asan_env(None):
+            plain = af.abort_settle()
+        with asan_env("detect_leaks=0"):
+            self.assertGreater(af.abort_settle(), plain * ASAN_TIME_SCALE)
+
+
 class DescribeGapsCase(unittest.TestCase):
-    def describe(self, gaps: list[float], scale: float = 1.0) -> str:
-        with mock.patch.object(af, "sanitizer_time_scale", return_value=scale):
+    def describe(self, gaps: list[float], options: str | None = None) -> str:
+        with asan_env(options):
             return af.describe_reply_gaps(gaps)
 
     def test_no_gap_is_not_applicable(self) -> None:
         self.assertEqual(self.describe([]), "reply-to-next-max=n/a")
 
-    def test_worst_gap_against_half_the_scaled_margin(self) -> None:
-        half = af.ABORT_SETTLE_MARGIN / 2
-        self.assertEqual(
-            self.describe([0.001, 0.0042]),
-            f"reply-to-next-max=4.2ms/{half * 1000:.1f}ms n=2")
-        self.assertEqual(
-            self.describe([0.0042], 2.0),
-            f"reply-to-next-max=4.2ms/{half * 2000:.1f}ms n=1")
+    def test_worst_gap_against_half_the_settle(self) -> None:
+        self.assertEqual(self.describe([0.001, 0.0042]),
+                         "reply-to-next-max=4.2ms/25.0ms n=2")
+        self.assertEqual(self.describe([0.0042], ""),
+                         "reply-to-next-max=4.2ms/100.0ms n=1")
 
-    def test_gap_past_half_the_margin_is_marked(self) -> None:
+    def test_gap_past_half_the_settle_is_marked(self) -> None:
         half = af.ABORT_SETTLE_MARGIN / 2
         self.assertTrue(self.describe([half + 0.001]).endswith(" over"))
         self.assertFalse(self.describe([half]).endswith(" over"))
-        # The same gap is inside the margin of a sanitizer build.
-        self.assertFalse(self.describe([half + 0.001], 2.0).endswith(" over"))
+        # The same gap is inside the settle of a sanitizer build.
+        self.assertFalse(self.describe([half + 0.001], "").endswith(" over"))
+        self.assertTrue(self.describe([BASE_SANITIZED_SETTLE / 2 + 0.001],
+                                      "").endswith(" over"))
 
     def test_arm_line_carries_the_gaps_only_when_collected(self) -> None:
         bare = af.ArmResult("s k t", [af.Landing(True, -0.01)], [])
         self.assertNotIn("reply-to-next", bare.describe())
-        with mock.patch.object(af, "sanitizer_time_scale", return_value=1.0):
+        with asan_env(None):
             line = af.ArmResult("s k t", [], [], [0.002]).describe()
-        self.assertTrue(line.endswith("fatal=0 reply-to-next-max=2.0ms/"
-                                      f"{af.ABORT_SETTLE_MARGIN * 500:.1f}ms "
-                                      "n=1"), line)
+        self.assertTrue(line.endswith(
+            "fatal=0 reply-to-next-max=2.0ms/25.0ms n=1"), line)
 
 
 class FakeAnchor:
