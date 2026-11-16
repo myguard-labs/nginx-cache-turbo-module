@@ -44,6 +44,92 @@ def wait_port(port: int, timeout: float = 15.0) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Opt-in per-test phase attribution (CI-L10d-T0). Only ever created by
+# enable_phase_accounting(), which test_runtime_base._instrument() calls when
+# --timings is set. With it off, PHASES is None and every hook below is a
+# single `is None` test: no behaviour or ordering change.
+#
+# Totals are cumulative and monotonic; the per-test span takes a snapshot at
+# entry and exit and reports the delta, so a nested test span is inclusive in
+# the same way TIMING is. Origin handlers run on server threads, hence the lock.
+# A background handler that straddles a test boundary is attributed best-effort:
+# its GET on entry, its delay when the sleep ends.
+class PhaseAccounting:
+    __slots__ = ("_lock", "gets", "lifecycle", "origin_delay", "sleeps")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.origin_delay = 0.0   # seconds slept inside Origin handlers
+        self.gets = 0             # Origin do_GET requests (counted on entry)
+        self.sleeps = 0.0         # main-thread time.sleep seconds (incl. polls)
+        self.lifecycle = 0.0      # nginx start/reload/stop seconds
+
+    def add(self, *, origin_delay: float = 0.0, gets: int = 0,
+            sleeps: float = 0.0, lifecycle: float = 0.0) -> None:
+        with self._lock:
+            self.origin_delay += origin_delay
+            self.gets += gets
+            self.sleeps += sleeps
+            self.lifecycle += lifecycle
+
+    def snapshot(self) -> tuple[float, int, float, float]:
+        with self._lock:
+            return (self.origin_delay, self.gets, self.sleeps, self.lifecycle)
+
+    @staticmethod
+    def format_line(name: str, before: tuple[float, int, float, float],
+                    after: tuple[float, int, float, float]) -> str:
+        d = [max(0, a - b) for a, b in zip(after, before, strict=True)]
+        return (f"PHASE {name} origin_delay={d[0]:.6f}s gets={int(d[1])} "
+                f"sleeps={d[2]:.6f}s lifecycle={d[3]:.6f}s")
+
+
+PHASES: PhaseAccounting | None = None
+_REAL_SLEEP = time.sleep
+
+
+def enable_phase_accounting() -> PhaseAccounting:
+    """Create the recorder (idempotent) and wrap time.sleep so main-thread
+    sleeps are totalled. Origin handler threads are excluded from `sleeps`
+    (they are reported as origin_delay instead)."""
+    global PHASES
+    if PHASES is not None:
+        return PHASES
+    acct = PhaseAccounting()
+
+    def _sleep(seconds):
+        started = time.monotonic()
+        try:
+            _REAL_SLEEP(seconds)
+        finally:
+            if threading.current_thread() is threading.main_thread():
+                acct.add(sleeps=max(0.0, time.monotonic() - started))
+
+    time.sleep = _sleep
+    PHASES = acct
+    return acct
+
+
+def _phase_get() -> None:
+    acct = PHASES
+    if acct is not None:
+        acct.add(gets=1)
+
+
+def _origin_sleep(delay: float) -> None:
+    """Origin handler delay; attributes the elapsed time when enabled."""
+    acct = PHASES
+    if acct is None:
+        time.sleep(delay)
+        return
+    started = time.monotonic()
+    try:
+        _REAL_SLEEP(delay)
+    finally:
+        acct.add(origin_delay=max(0.0, time.monotonic() - started))
+
+
+# --------------------------------------------------------------------------- #
 # Counting origin: every GET returns a unique body and bumps a hit counter.
 # --------------------------------------------------------------------------- #
 
@@ -271,7 +357,7 @@ class Origin:
                 # headers the module reads. This keeps per-test control without
                 # a path-marker per dependency list.
                 if origin.delay:
-                    time.sleep(origin.delay)
+                    _origin_sleep(origin.delay)
                 clen = int(self.headers.get("Content-Length") or 0)
                 req_body = self.rfile.read(clen) if clen else b""
                 with origin._lock:
@@ -1289,8 +1375,9 @@ class Origin:
                     self.send_header("Vary", "Accept")
 
             def do_GET(self):
+                _phase_get()
                 if origin.delay:
-                    time.sleep(origin.delay)
+                    _origin_sleep(origin.delay)
                 with origin._lock:
                     origin._n += 1
                     n = origin._n
