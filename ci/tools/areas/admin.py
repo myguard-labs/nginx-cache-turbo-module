@@ -10,6 +10,8 @@ star-imports this module, so every test stays reachable as
 from __future__ import annotations
 
 import collections
+import collections.abc
+import contextlib
 
 # Underscore-prefixed names are NOT re-exported by `import *`, so the
 # private helpers this module actually calls are imported explicitly.
@@ -910,15 +912,30 @@ def test_use_stale_config_parse(ng: Nginx) -> None:
     # are what must pin them down. See the S4.1 entry in issues.md.
 
 
-def test_lru_eviction(ng: Nginx) -> None:
+@contextlib.contextmanager
+def _no_origin_delay(origin: Origin) -> collections.abc.Iterator[None]:
+    """Serial cold-GET churn does not depend on the 0.05s regeneration window
+    (no single-flight / lock_waits / burst oracle), so run it against a
+    zero-delay origin and ALWAYS restore the suite baseline for whatever runs
+    next: a leaked 0.0 would make every later burst test vacuous."""
+    origin.delay = 0.0
+    try:
+        yield
+    finally:
+        origin.reset_delay()
+
+
+def test_lru_eviction(ng: Nginx, origin: Origin) -> None:
     """R6: with a tiny zone, old entries are evicted, not 500s."""
     # hammer many distinct keys through the tiny zone; must all 200, no errors
-    for i in range(200):
-        s, _, _ = fetch(ng.port, f"/e/{i}")
-        assert s == 200, f"/e/{i} returned {s}"
+    with _no_origin_delay(origin):
+        for i in range(200):
+            s, _, _ = fetch(ng.port, f"/e/{i}")
+            assert s == 200, f"/e/{i} returned {s}"
 
 
-def test_p1_coarse_lru_splice_keeps_hot_key_resident(ng: Nginx) -> None:
+def test_p1_coarse_lru_splice_keeps_hot_key_resident(ng: Nginx,
+                                                     origin: Origin) -> None:
     """P1: the LRU head-splice on a HIT is coarse-gated (re-splice only when
     now - last_access >= 1s) so a key hammered many times per second does not
     re-write the shared LRU list every hit. The gate must NOT let a genuinely
@@ -953,8 +970,9 @@ def test_p1_coarse_lru_splice_keeps_hot_key_resident(ng: Nginx) -> None:
         time.sleep(1.2)                  # cross a 1s boundary -> splice fires
         s, _, _ = fetch(ng.port, hot)    # re-promote to LRU head
         assert s == 200, f"hot re-touch {hot} -> {s}"
-        for i in range(250):
-            fetch(ng.port, f"/e/p1-cold-{wave}-{i}")
+        with _no_origin_delay(origin):
+            for i in range(250):
+                fetch(ng.port, f"/e/p1-cold-{wave}-{i}")
 
     # The hot key was re-promoted before each eviction wave, so a correct coarse
     # splice kept it RESIDENT. The property under test is non-eviction, so both
@@ -968,15 +986,17 @@ def test_p1_coarse_lru_splice_keeps_hot_key_resident(ng: Nginx) -> None:
         f"hot key evicted despite promotion: X-CT-Status={h.get('x-ct-status')}")
 
 
-def _s8_scan(ng: Nginx, prefix: str, tag: str, n: int = 400) -> None:
+def _s8_scan(ng: Nginx, origin: Origin, prefix: str, tag: str,
+             n: int = 400) -> None:
     """Walk n unique keys once each -- a crawler. Every one is a one-hit
     wonder, so under a segmented LRU they all stay in probation and can only
     evict each other."""
-    for i in range(n):
-        fetch(ng.port, f"{prefix}scan-{tag}-{i}")
+    with _no_origin_delay(origin):
+        for i in range(n):
+            fetch(ng.port, f"{prefix}scan-{tag}-{i}")
 
 
-def _s8_hot_status(ng: Nginx, prefix: str, tag: str) -> str:
+def _s8_hot_status(ng: Nginx, origin: Origin, prefix: str, tag: str) -> str:
     """Prime a hot key so it is PROTECTED-eligible, run a scan, then report the
     hot key's status. Promotion needs a SECOND hit, and the P1 coarse gate only
     splices when now - last_access >= 1s, so the two priming hits straddle a
@@ -998,14 +1018,14 @@ def _s8_hot_status(ng: Nginx, prefix: str, tag: str) -> str:
     assert h.get("x-ct-status") == "HIT", (
         f"priming touch2 should HIT: {h.get('x-ct-status')}")
 
-    _s8_scan(ng, prefix, tag)
+    _s8_scan(ng, origin, prefix, tag)
 
     s, _, h = fetch(ng.port, hot)
     assert s == 200, f"post-scan {hot} -> {s}"
     return h.get("x-ct-status", "")
 
 
-def test_s8_scan_resistant_keeps_hot_key(ng: Nginx) -> None:
+def test_s8_scan_resistant_keeps_hot_key(ng: Nginx, origin: Origin) -> None:
     """S8 test 1 -- THE ACTUAL FIX. With cache_turbo_scan_resistant on, a key
     that was hit twice is PROTECTED, so a crawler walking a large unique
     keyspace through a small zone cannot evict it: every scan key is a one-hit
@@ -1017,13 +1037,13 @@ def test_s8_scan_resistant_keeps_hot_key(ng: Nginx) -> None:
     NEGATIVE CONTROL (verified by hand, see the PR body): with evict_one()
     reverted to the flat `ngx_queue_last(&z->sh->lru)` this assertion fails --
     the hot key is evicted by the scan and comes back MISS."""
-    st = _s8_hot_status(ng, "/sr/", "on")
+    st = _s8_hot_status(ng, origin, "/sr/", "on")
     assert st == "HIT", (
         f"S8: scan evicted the protected hot key (X-CT-Status={st}); "
         "promote-on-second-hit or the probation-first victim pick is broken")
 
 
-def test_s8_default_on_is_scan_resistant(ng: Nginx) -> None:
+def test_s8_default_on_is_scan_resistant(ng: Nginx, origin: Origin) -> None:
     """P3-1 test -- ON BY DEFAULT, and the compiled-in default is genuinely
     scan-resistant, not merely settable.
 
@@ -1046,26 +1066,26 @@ def test_s8_default_on_is_scan_resistant(ng: Nginx) -> None:
     NGX_HTTP_CACHE_TURBO_PROTECTED_PCT_DEFAULT back to 0 makes this assertion
     fail with X-CT-Status=MISS -- the hot key is evicted by the scan exactly
     as it was pre-P3-1."""
-    st = _s8_hot_status(ng, "/sroff/", "off")
+    st = _s8_hot_status(ng, origin, "/sroff/", "off")
     assert st == "HIT", (
         f"S8/P3-1: default (directive absent) is not scan-resistant "
         f"(X-CT-Status={st}, expected HIT). The conf.c merge default for "
         "scan_resistant_pct must be PROTECTED_PCT_DEFAULT, not 0")
 
 
-def test_s8_explicit_off_restores_flat_lru(ng: Nginx) -> None:
+def test_s8_explicit_off_restores_flat_lru(ng: Nginx, origin: Origin) -> None:
     """P3-1: `cache_turbo_scan_resistant off` is the migration path back to
     the pre-P3-1 flat LRU for a deployment that relies on the old default.
     Since the compiled-in default flipped to on, explicit `off` must now
     differ from an absent directive (see test_s8_default_on_is_scan_resistant)
     and must still reproduce the original flat-LRU MISS."""
-    st = _s8_hot_status(ng, "/srexpoff/", "expoff")
+    st = _s8_hot_status(ng, origin, "/srexpoff/", "expoff")
     assert st == "MISS", (
         f"S8: explicit `off` no longer restores the flat LRU "
         f"(X-CT-Status={st}, expected MISS)")
 
 
-def test_s8_reload_on_to_off_drains_protected(ng: Nginx) -> None:
+def test_s8_reload_on_to_off_drains_protected(ng: Nginx, origin: Origin) -> None:
     """S8 reload arm -- THE BUG CLASS THE SUITE COULD NOT REACH.
 
     Every other S8 test starts from a fresh zone, so an entry can only ever be
@@ -1112,7 +1132,7 @@ def test_s8_reload_on_to_off_drains_protected(ng: Nginx) -> None:
     #    test could pass for the wrong reason: if priming silently failed the
     #    key would never be PROTECTED, the post-reload MISS would be trivially
     #    true, and the test would assert nothing about `off` at all.
-    _s8_scan(ng, prefix, f"{tag}-pre")
+    _s8_scan(ng, origin, prefix, f"{tag}-pre")
     s, _, h = fetch(ng.port, hot)
     assert s == 200, f"pre-reload {hot} -> {s}"
     assert h.get("x-ct-status") == "HIT", (
@@ -1138,7 +1158,7 @@ def test_s8_reload_on_to_off_drains_protected(ng: Nginx) -> None:
 
         # 5. Now the scan must be able to evict it, exactly as it does in the
         #    never-was-on case.
-        _s8_scan(ng, prefix, f"{tag}-post")
+        _s8_scan(ng, origin, prefix, f"{tag}-post")
         s, _, h = fetch(ng.port, hot)
         assert s == 200, f"post-scan {hot} -> {s}"
         st = h.get("x-ct-status", "")
@@ -1154,7 +1174,7 @@ def test_s8_reload_on_to_off_drains_protected(ng: Nginx) -> None:
         ng.reload(sr_off=False)
 
 
-def test_s8_scan_still_stores_and_evicts(ng: Nginx) -> None:
+def test_s8_scan_still_stores_and_evicts(ng: Nginx, origin: Origin) -> None:
     """S8 test 4 -- the anti-hang / anti-wedge arm at the HTTP level.
 
     Drive far more unique keys through the scan-resistant zone than it can
@@ -1167,9 +1187,11 @@ def test_s8_scan_still_stores_and_evicts(ng: Nginx) -> None:
     proves the same property through the real request path under real slab
     pressure, which is where a both-queues-consistency bug would actually
     surface."""
-    for i in range(1500):
-        s, _, _ = fetch(ng.port, f"/sr/churn-{i}")
-        assert s == 200, f"/sr/churn-{i} returned {s} (store or eviction wedged)"
+    with _no_origin_delay(origin):
+        for i in range(1500):
+            s, _, _ = fetch(ng.port, f"/sr/churn-{i}")
+            assert s == 200, (
+                f"/sr/churn-{i} returned {s} (store or eviction wedged)")
 
     # And the zone is still serving: a fresh key stores and then HITs, proving
     # eviction left the structure usable rather than merely not crashing.
@@ -1180,7 +1202,7 @@ def test_s8_scan_still_stores_and_evicts(ng: Nginx) -> None:
         f"zone unusable after churn: X-CT-Status={h.get('x-ct-status')}")
 
 
-def test_perf7_zero_copy_serve_under_eviction(ng: Nginx) -> None:
+def test_perf7_zero_copy_serve_under_eviction(ng: Nginx, origin: Origin) -> None:
     """PERF-7: a HIT serves the blob zero-copy DIRECTLY out of the shm slab
     (no per-hit copy into r->pool), holding a refcount on the buffer until the
     response drains. Hammer a working set far larger than the tiny zone in
@@ -1192,8 +1214,9 @@ def test_perf7_zero_copy_serve_under_eviction(ng: Nginx) -> None:
     import random
     keys = 300                       # > what the 8m tiny zone holds (see R6)
     reqs = 4000
-    for i in range(keys):            # prime, forcing continuous eviction
-        fetch(ng.port, f"/e/p7-{i}")
+    with _no_origin_delay(origin):
+        for i in range(keys):        # prime, forcing continuous eviction
+            fetch(ng.port, f"/e/p7-{i}")
 
     def hit(_: int) -> int:
         # STRESS_TIMEOUT, not the default: 4000 requests across 48 threads means
