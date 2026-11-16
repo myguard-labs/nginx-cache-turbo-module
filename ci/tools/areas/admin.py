@@ -509,7 +509,7 @@ def test_l2_negative_ttl_expires(ng: Nginx, origin: Origin,
         "forward on memoed misses and L2 is effectively disabled for this key "
         "(the !l2_neg_skipped re-arm guard is not working)")
 
-    time.sleep(3.5)
+    time.sleep(3.2)                       # memo ttl 3s + margin (0.3s already spent)
     skips1 = _admin_l2_neg_skips(ng, "/_cache_l2neglife")
     before = _redis_conns_received(redis)
     s, _, _ = fetch(ng.port, uri)
@@ -1288,10 +1288,10 @@ def test_shm_refresh_under_pressure(ng: Nginx) -> None:
     # zone. The refresh dice threshold is elapsed/window * beta with elapsed in
     # whole seconds; at elapsed == 0 (the first ~1s after fresh_until) it is 0 and
     # the dice CANNOT fire whatever beta is (documented on test_lock_redis_outage
-    # and the /atch/ churn test, which sleeps 2.7). fresh window is 2s; sleeping
-    # 3.2s puts the hot set >= ~1.2s into the stale window, so elapsed >= 1s for
+    # and the /atch/ churn test, which sleeps 2.7). fresh window is 1s; sleeping
+    # 2.2s puts the hot set >= ~1.2s into the stale window, so elapsed >= 1s for
     # the entire hammer below and the dice fires from its first request.
-    time.sleep(3.2)
+    time.sleep(2.2)
 
     def hit(n: int) -> int:
         # ~70% hot (stale -> refresh), ~30% cold (fresh miss -> eviction churn),

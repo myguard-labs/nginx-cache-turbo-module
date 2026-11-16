@@ -790,16 +790,35 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # self-heal variant: SHORT lock_ttl (2s) so BOTH the per-box L1 refresh
+        # one-second fresh variant of /lock/ for the single-node tests that only
+        # need one stale read burst (won-stale-body, redis-outage fallback):
+        # valid 1s with stale_mult 8 keeps the same 8s serveable window as
+        # /lock/ but reaches staleness a second sooner. test_multinode_lock keeps
+        # /lock/ (valid 2s): its 1.5s hammer must not outlive the post-regen
+        # fresh window, or a second stale roll would add a second regen.
+        location /lock1/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;     # stale window: serveable until t+8s
+            cache_turbo_stale_mult 8;
+            cache_turbo_beta     5000;
+            cache_turbo_lock_ttl 5s;
+            cache_turbo_lock     off;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # self-heal variant: SHORT lock_ttl (1s) so BOTH the per-box L1 refresh
         # lock and the cross-node NX PX clear quickly once the 'crashed' peer's
-        # lock expires; wide stale window (valid*4 = 8s) leaves room to observe
-        # the post-expiry regen.
+        # lock expires; wide stale window (valid 1s x stale_mult 8 = 8s) leaves
+        # room to observe the post-expiry regen. Private to test_lock_self_heal.
         location /lockh/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
-            cache_turbo_valid    2s;     # stale window: serveable until t+8s
+            cache_turbo_valid    1s;     # stale window: serveable until t+8s
+            cache_turbo_stale_mult 8;
             cache_turbo_beta     5000;
-            cache_turbo_lock_ttl 2s;     # local + NX hold = 2000ms
+            cache_turbo_lock_ttl 1s;     # local + NX hold = 1000ms
             cache_turbo_lock     off;    # isolate stale-path NX (see /lock/)
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -4291,7 +4310,8 @@ http {{
         location /shmref/ {{
             cache_turbo               shmref;
             cache_turbo_key           $uri;
-            cache_turbo_valid         2s;     # stale window opens at t+2s
+            cache_turbo_valid         1s;     # stale window opens at t+1s
+            cache_turbo_stale_mult    8;      # keep the 8s serveable window
             cache_turbo_beta          5000;   # aggressive: refresh fires early in stale
             cache_turbo_background_update on;
             proxy_pass http://127.0.0.1:{origin_port}/;
