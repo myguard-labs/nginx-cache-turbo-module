@@ -326,15 +326,15 @@ def run_all(ng: Nginx, origin: Origin,
     test_many_headers_survive_list_part_spill(ng)
     test_admin_purge_post_with_body(ng)
     test_concurrent_hits_no_deadlock(ng)
-    test_lru_eviction(ng)
+    test_lru_eviction(ng, origin)
     test_evict_blind_negative_control_closed_breaker_evicts_normally(ng)  # S231-EVICT-BLIND, must run BEFORE the breaker trips
     test_evict_blind_second_chance(ng, origin)                    # S231-EVICT-BLIND
-    test_p1_coarse_lru_splice_keeps_hot_key_resident(ng)
-    test_s8_scan_resistant_keeps_hot_key(ng)
-    test_s8_default_on_is_scan_resistant(ng)
-    test_s8_explicit_off_restores_flat_lru(ng)
-    test_s8_reload_on_to_off_drains_protected(ng)
-    test_s8_scan_still_stores_and_evicts(ng)
+    test_p1_coarse_lru_splice_keeps_hot_key_resident(ng, origin)
+    test_s8_scan_resistant_keeps_hot_key(ng, origin)
+    test_s8_default_on_is_scan_resistant(ng, origin)
+    test_s8_explicit_off_restores_flat_lru(ng, origin)
+    test_s8_reload_on_to_off_drains_protected(ng, origin)
+    test_s8_scan_still_stores_and_evicts(ng, origin)
     test_admin_stats(ng)
     test_admin_prometheus(ng)
     test_admin_unsupported_method_405(ng)
@@ -723,7 +723,7 @@ def run_all(ng: Nginx, origin: Origin,
     # 4000-request eviction churn keeps the workers busy, so placing it before a
     # timing-sensitive test (e.g. stale-if-error's ~0.8s bg-refresh window) can
     # starve that window under the slow ASan build. Here it can't perturb others.
-    test_perf7_zero_copy_serve_under_eviction(ng)
+    test_perf7_zero_copy_serve_under_eviction(ng, origin)
     test_shm_refresh_under_pressure(ng)
     test_admin_all_zero_does_not_purge(ng)
     test_admin_purge_all(ng)   # last: it empties the zone
