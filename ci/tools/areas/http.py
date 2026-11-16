@@ -1586,7 +1586,7 @@ def test_plain_5xx_releases_miss_lock(ng: Nginx, origin: Origin) -> None:
     s0, b0, _ = fetch(ng.port, path)
     assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
 
-    time.sleep(2.5)     # past fresh (1s) + stale window: fully expired
+    time.sleep(1.3)     # past fresh (1s, stale_mult 1 = no stale window): fully expired (TTL+0.3)
     origin.fail = True
     try:
         s1, _, _ = fetch(ng.port, path, timeout=10.0)
@@ -1974,18 +1974,18 @@ def test_use_stale_error_transport_only(ng: Nginx, origin: Origin) -> None:
 
 def test_keep_stale_loses_to_response_sie(ng: Nginx, origin: Origin) -> None:
     """S2.2 / D-1: a HONORED response stale-if-error wins over
-    cache_turbo_keep_stale when both are available -- NOT max(). /keepstalewins/
-    has keep_stale 1h (3600s) configured; the "sieshort" request-suffix marker
+    cache_turbo_keep_stale when both are available -- NOT max(). /keepstalewins2/
+    (/keepstalewins/ with stale_mult 2, CI-L10d-T3b) has keep_stale 1h (3600s) configured; the "sieshort" request-suffix marker
     makes the origin emit stale-if-error=5 for this request, a short-window
     sibling of the "sieserve" convention used by /sieserve/ (deliberately past
-    the location's own stale window -- stale_mult default 4 x 1s fresh = 4s --
+    the location's own stale window -- stale_mult 2 x 1s fresh = 2s --
     so phase 1 below lands inside the SIE window, not the ordinary stale one).
     If the precedence were max(), sie_window would be ttl+3600 and a request
     timed at ttl+~7.5s (well past the response SIE window but nowhere near the
     keep_stale window) would still serve stale. The correct precedence
     (response SIE wins outright, keep_stale is not consulted at all) makes that
     same request surface the dead origin's error instead."""
-    s0, b0, _ = fetch(ng.port, "/keepstalewins/sieshort-p1")
+    s0, b0, _ = fetch(ng.port, "/keepstalewins2/sieshort-p1")
     assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
 
     # Phase 1 -- past the ordinary stale window (4s) but inside the response's
@@ -1993,11 +1993,12 @@ def test_keep_stale_loses_to_response_sie(ng: Nginx, origin: Origin) -> None:
     # NB this assertion is NOT the discriminating one: it passes identically
     # whether the precedence is "response SIE wins" (window ~6s) or a max()
     # bug (window ~3601s). It only establishes that a window exists at all.
-    time.sleep(4.6)     # past fresh (1s) and the 4s stale window: fully expired,
-                        # but still inside the sie window (1+5=6s)
+    time.sleep(2.3)     # past fresh (1s) and the 2s stale window (/keepstalewins2/,
+                        # stale_mult 2; TTL window + 0.3): fully expired, but still
+                        # inside the sie window (1+5=6s)
     origin.fail = True
     try:
-        s, b, h = fetch(ng.port, "/keepstalewins/sieshort-p1")
+        s, b, h = fetch(ng.port, "/keepstalewins2/sieshort-p1")
         assert s == 200, f"within response-SIE window served {s}, expected 200"
         assert b == b0, f"served {b!r}, expected stale {b0!r}"
         assert h.get("x-cache") == "STALE-IF-ERROR", \
@@ -2019,10 +2020,11 @@ def test_keep_stale_loses_to_response_sie(ng: Nginx, origin: Origin) -> None:
     # deadline is free -- keep_stale runs to 3600s, so any time between 6s and
     # 3600s discriminates identically. The margin is deliberate; this box runs
     # loaded and a 0.5s cushion turns a correct test into a flake.
-    time.sleep(2.9)    # ~7.5s total since the store: response SIE expired
+    time.sleep(3.4)    # 2.3 + >=0.6 (drain_origin settle in phase 1) + 3.4 = >=6.3s since
+                       # the store: response SIE (1+5=6s) expired, +0.3
     origin.fail = True
     try:
-        s2, _, h2 = fetch(ng.port, "/keepstalewins/sieshort-p1")
+        s2, _, h2 = fetch(ng.port, "/keepstalewins2/sieshort-p1")
         # 503 (not 502): origin.fail returns an upstream 503, which passes
         # through once no serve-on-error window covers the request.
         # origin.drop is the transport-level failure that yields 502.
@@ -2065,7 +2067,8 @@ def test_5xx_never_overwrites_cached_body(ng: Nginx, origin: Origin) -> None:
     s0, b0, _ = fetch(ng.port, "/noclobber/x")
     assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
 
-    time.sleep(2.5)     # past fresh (1s), well inside stale window (fresh+4=5s)
+    time.sleep(2.3)     # whole-second dice: needs now-fresh_until >= 1s, i.e. 2s after the
+                        # store worst case (+0.3); still well inside stale window (5s)
     origin.fail = True
     try:
         # The stale-but-serveable dice winner regenerates inline (background_

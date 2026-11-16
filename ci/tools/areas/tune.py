@@ -1147,7 +1147,7 @@ def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
     # the STALE assertion below fails for a reason unrelated to stale_mult.
     fetch(ng.port, "/pa/win")                          # aggressive: gated miss
     fetch(ng.port, "/pa/win")                          # aggressive: stores
-    time.sleep(3.0)                                     # cons expired, aggr stale
+    time.sleep(2.3)                                     # cons expired (2s + 0.3), aggr stale
 
     # conservative: past stale_until -> a true MISS (no X-Cache, hits origin)
     sc, _, hc = fetch(ng.port, "/pc/win")
@@ -1189,7 +1189,7 @@ def test_stale_mult_directive_beats_preset(ng: Nginx, origin: Origin) -> None:
     fetch(ng.port, "/psm/win")                         # prime (stores)
     fetch(ng.port, "/pa/win2")                         # gated miss
     fetch(ng.port, "/pa/win2")                         # control prime (stores)
-    time.sleep(3.0)
+    time.sleep(1.3)                                    # psm expired (1s + 0.3), pa still stale
 
     # directive wins: stale_mult=1 -> stale_until == fresh_until -> hard MISS
     s, _, h = fetch(ng.port, "/psm/win")
@@ -1296,7 +1296,7 @@ def test_preset_micro_default_ttl(ng: Nginx, origin: Origin) -> None:
          "if the round trip raced past the 1s window under a slow sanitizer "
          f"build), got {sc} X-Cache={hc.get('x-cache')}")
 
-    time.sleep(3.0)                                     # past fresh+stale (~2s)
+    time.sleep(2.3)                                     # past fresh+stale (2s + 0.3)
     sc, _, hc = fetch(ng.port, "/pm/win")
     assert sc == 200, f"micro re-read status {sc}"
     assert "x-cache" not in hc, \
@@ -1483,7 +1483,7 @@ def test_autotune_load_widens_stale_window(ng: Nginx, origin: Origin) -> None:
     finally:
         origin.reset_delay()
 
-    time.sleep(3.0)                              # past static 2s, within widened ~5s
+    time.sleep(2.3)                              # past static 2s (+0.3), within widened ~5s
 
     # Burst so single-flight forces losers to serve stale (the dice winner may
     # regenerate); at least one STALE proves the load-widened window held.
@@ -1891,7 +1891,7 @@ def test_mc_keepalive_idle_timeout_drops(ng: Nginx, origin: Origin,
 
     # Idle timeout is 1s; wait comfortably past it so the read timer fires and
     # mc_ka_close_handler drops the pooled slot via the ev->timedout path.
-    time.sleep(2.0)
+    time.sleep(1.3)
 
     if not ng.single_process:
         assert ng.worker_pids() == workers_before, (
