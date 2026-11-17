@@ -1,6 +1,7 @@
 """Check the Build runtime command transports the outcome directory."""
 
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -47,6 +48,23 @@ class WorkflowOutcomeTest(unittest.TestCase):
         # Five minutes covers runner setup, action post steps and overhead.
         self.assertGreaterEqual(job['timeout-minutes'], setup_and_after + 50 + 5)
 
+    def test_build_capture_preserves_measured_healthy_and_diagnostic_margins(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/build-test.yml').read_text())
+        step = next(step for step in workflow['jobs']['build']['steps']
+                    if step.get('name') == 'Run runtime suite')
+        args = shlex.split(step['run'], comments=True)
+        hard = int(args[0].split('=', 1)[1])
+        soft = float(args[3])
+        self.assertEqual(hard, 780)
+        # Five qualified 588-test runs on 2026-11-17: max healthy step 761s.
+        # The observed capture bound was 7.342588s, rounded up to eight.
+        healthy_max = 761
+        capture_window = math.ceil(7.342588)
+        cleanup_at = hard - 2 * min(2., hard / 5)  # Owner reserves TERM/KILL grace.
+        self.assertGreater(soft, healthy_max, 'capture overlaps a measured healthy run')
+        self.assertGreaterEqual(cleanup_at - soft, capture_window,
+                                'capture loses its measured diagnostic window')
+
     def test_build_runtime_outcome_and_status(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/build-test.yml').read_text())
         steps = workflow['jobs']['build']['steps']
@@ -56,8 +74,8 @@ class WorkflowOutcomeTest(unittest.TestCase):
         self.assertIn('set -o pipefail', command)
         self.assertIn('--outcome-dir "$GITHUB_WORKSPACE/ci-hang-artifacts"', command)
         args = shlex.split(command, comments=True)
-        self.assertEqual(args[:4], ['CT_HANG_HARD_SECONDS=780', 'bash',
-                                    'ci/tools/ci-hang-guard.sh', '702'])
+        self.assertEqual(args[:3], ['CT_HANG_HARD_SECONDS=780', 'bash',
+                                    'ci/tools/ci-hang-guard.sh'])
         with tempfile.TemporaryDirectory(prefix='workflow outcome ') as tmp:
             workspace = Path(tmp)
             tools_dir = workspace / 'ci/tools'

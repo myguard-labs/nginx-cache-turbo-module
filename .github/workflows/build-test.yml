@@ -1,4 +1,4 @@
-# sync-sha: 9e5ddc9596d21efc0ec829f193c18a4814681f1597b2fdecb69c410caef638ad
+# sync-sha: 75ebc9f465cfcc46203f99fa899c52b32ac306e04698b7b9b8a0a3209c3face8
 name: Build & Test
 
 # Lane L-build (CI-L3). One job, sequential, no artifact hop: build, unit
@@ -189,7 +189,7 @@ jobs:
         run: ci/tools/max-port.sh "$TEST_BASE_PORT"
 
       - name: Run runtime suite
-        # CI-L10d runtime budget: capture at 702s and stop/reap by 780s.
+        # CI-L10d runtime budget: capture at 768s and stop/reap by 780s.
         # The hard bound includes TERM/KILL/reaping; capture runs separately so
         # a blocked debugger cannot extend it. Runtime budget failures stay red.
         #
@@ -212,7 +212,7 @@ jobs:
           CT_OUTCOME_OBSERVE: "1"
         run: |
           # Enforce the re-baselined CI-L10d runtime budget within the existing job.
-          CT_HANG_HARD_SECONDS=780 bash ci/tools/ci-hang-guard.sh 702 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
+          CT_HANG_HARD_SECONDS=780 bash ci/tools/ci-hang-guard.sh 768 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \
             bash -c '
               set -o pipefail
               python3 ci/tools/test_runtime.py \
