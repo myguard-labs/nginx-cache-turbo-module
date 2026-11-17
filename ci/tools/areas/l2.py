@@ -4630,8 +4630,8 @@ def _redis_lock_abort_site(redis: RedisServer, valid_s: int = 1,
     The dice is what would make this flaky. should_refresh() compares
     elapsed/window * beta with a random number, and elapsed counts whole seconds
     past fresh_until, so it is 0 at first and then can never win. Beta 10000 over
-    the 7s window beats the dice outright from elapsed 1, which waiting 2s after
-    priming guarantees for every key; /lock/'s beta 5000 over 6s would lose about
+    the 7s window beats the dice outright from elapsed 1, which the stale wait
+    below guarantees for every key; /lock/'s beta 5000 over 6s would lose about
     one roll in six there. A stale_mult of 8 leaves the 6s the keys need.
     A caller that needs longer passes a larger valid_s (stale_mult is capped at
     8) with beta scaled by the same factor, so elapsed 1 still beats the dice
@@ -4642,7 +4642,24 @@ def _redis_lock_abort_site(redis: RedisServer, valid_s: int = 1,
         return b"*6\r\n$3\r\nSET\r\n$%d\r\n%s\r\n" % (len(raw), raw)
 
     def go_stale_and_lose_lock(rig: AbortRig) -> None:
-        time.sleep(valid_s + 1.0)
+        # Wait to a clock-second deadline, not a fixed span. The store
+        # (shm_store_locked) sets fresh_until = ngx_time() + valid_s, and
+        # ngx_http_cache_turbo_should_refresh
+        # (src/ngx_http_cache_turbo_swr.c:99) rolls elapsed = ngx_time() -
+        # fresh_until in whole seconds. Every key's L1 store runs before its
+        # L2 SET (body_filter_store_tail), and _prime
+        # saw each L2 key before calling us, so each store's ngx_time() is at
+        # most floor(t_ref). Once time.time() reaches floor(t_ref) + valid_s + 1,
+        # every later request wakes nginx from epoll_wait, so ngx_time() is at
+        # least that second and elapsed >= 1 for every key, whatever second
+        # the store fell in and however slow the host is. A slow host only
+        # adds to elapsed. The loop re-reads the wall clock, the one both
+        # sides use, so no margin carries the proof; the 0.02s keeps the
+        # deadline off the exact second edge.
+        t_ref = time.time()
+        deadline = math.floor(t_ref) + valid_s + 1 + 0.02
+        while (left := deadline - time.time()) > 0:
+            time.sleep(left)
         for uri in rig.uris:
             redis.cli("SET", lock_key(uri), "peer-node", "PX", "60000")
 
