@@ -2203,7 +2203,7 @@ for fn in install_actionlint install_astgrep install_gitleaks; do
     dl_case 1 "installer $fn: control - leaked temp dir on failed download is detected" "$MUT/leaky.sh" "$fn" timeout 1 0 1
 done
 # Exercise extraction and installation separately without network or host writes.
-# shellcheck disable=SC2317 # Invoked indirectly through case_.
+# shellcheck disable=SC2329,SC2317 # Invoked indirectly through case_.
 late_probe() { # <installer> <function> <extract|install|success>
     local installer="$1" fn="$2" mode="$3" work status leaked result
     work="$(mktemp -d)"
