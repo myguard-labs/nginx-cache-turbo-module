@@ -154,7 +154,7 @@ class TerminationTests(unittest.TestCase):
     def test_start_failure_and_cli_usage(self):
         with tempfile.TemporaryDirectory() as directory:
             for error, code in ((FileNotFoundError(), 127), (PermissionError(), 126)):
-                with mock.patch.object(observer.subprocess, "Popen", side_effect=error), \
+                with mock.patch("ci_guard_lifecycle.subprocess.Popen", side_effect=error), \
                         contextlib.redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(observer.observe(directory, ["missing"]), code)
                 self.assertIn("UNKNOWN", output.getvalue())

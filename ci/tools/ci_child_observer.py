@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Observe only the command child owned by this parent, never suite success.
+"""Observe the lifecycle owner's command child, never suite success.
 
-States are UNKNOWN until Popen.wait observes EXITED or SIGNALED. Only this
-parent writes the identity and termination files, in a fresh private directory.
+States are UNKNOWN until the owner reports its Popen.wait over a private socket.
+Only this observer writes identity/termination files, in a fresh private directory.
 The unpredictable run ID is passed through the command environment to the runtime
 journal; (run ID, observer PID, child PID) identifies the owned command even if
 its PID is later reused. Shell/pipeline descendants share the run ID, but the
@@ -10,16 +10,19 @@ receipt describes the direct command only, not any descendant's wait status.
 Publication closes a private partial file before exclusively linking its final
 name: any open/write/flush/close/link failure leaves the receipt absent/UNKNOWN.
 Missing or mismatched evidence stays UNKNOWN. Exit zero never certifies tests.
-Parent death, descendant cleanup, deadlines and crash durability are separate.
+The lifecycle owner enforces bounded descendant cleanup and a hard deadline.
+A killed observer cannot publish completion. Owner/host SIGKILL and kernel
+uninterruptible waits remain outside the guarantee; missing evidence is UNKNOWN.
 """
 
 import json
 import os
 import pathlib
 import secrets
-import subprocess
 import sys
 import tempfile
+
+from ci_guard_lifecycle import run_owned, validate_deadlines
 
 
 def _publish(path, record):
@@ -70,31 +73,53 @@ def _report(message):
         pass  # A closed output pipe must not replace the command's exit status.
 
 
-def observe(directory, command):
+def observe(directory, command, *, enabled=True, soft=None, hard=600., capture=None):
     run_id = secrets.token_hex(16)
-    env = dict(os.environ, CT_OUTCOME_RUN_ID=run_id)
+    env = dict(os.environ, CT_OUTCOME_RUN_ID=run_id) if enabled else None
     run_dir = None
-    try:
-        run_dir = pathlib.Path(tempfile.mkdtemp(prefix="termination-", dir=directory))
-    except OSError:
-        pass  # Receipt failure must not prevent the original command from running.
-    try:
-        child = subprocess.Popen(command, env=env)
-    except OSError as error:
-        _report("TERMINATION UNKNOWN (command not started)")
-        return 127 if isinstance(error, FileNotFoundError) else 126
-    identity = {"run_id": run_id, "observer_pid": os.getpid(), "child_pid": child.pid}
-    ready = run_dir is not None and _publish(run_dir / "identity.json", identity)
-    code = child.wait()  # Popen owns/reaps this child; no PID rediscovery or reuse race.
-    record = {"version": 1, "identity": identity, "observed": True, "returncode": code}
-    decision = "UNKNOWN"
-    if ready and _publish(run_dir / "termination.json", record):
-        decision = consume_termination(json.dumps(record), identity)
-    _report(f"TERMINATION {decision} run={run_id} child={child.pid} receipt={run_dir}")
-    return 128 - code if code < 0 else code
+    if enabled:
+        try:
+            run_dir = pathlib.Path(tempfile.mkdtemp(prefix="termination-", dir=directory))
+        except OSError:
+            pass  # Receipt failure must not prevent the original command from running.
+    identity = None
+    ready = False
+
+    def started(pid):
+        nonlocal identity, ready
+        identity = {"run_id": run_id, "observer_pid": os.getpid(), "child_pid": pid}
+        ready = run_dir is not None and _publish(run_dir / "identity.json", identity)
+
+    result = run_owned(command, env, started, soft=soft, hard=hard, capture=capture)
+    if enabled:
+        decision = "UNKNOWN"
+        record = {"version": 1, "identity": identity, "observed": True,
+                  "returncode": result["code"]}
+        if result["code"] is not None and ready and _publish(run_dir / "termination.json", record):
+            decision = consume_termination(json.dumps(record), identity)
+        _report(f"TERMINATION {decision} run={run_id} receipt={run_dir} reason={result['reason']}")
+    return result["status"]
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--guard":
+        try:
+            soft = float(sys.argv[2])
+            directory = sys.argv[3]
+            hard = float(os.environ.get("CT_HANG_HARD_SECONDS", str(soft + 300)))
+            validate_deadlines(soft, hard)
+            if sys.argv[4] != "--" or not sys.argv[5:]:
+                raise ValueError("invalid guard deadline or command")
+        except (IndexError, ValueError):
+            print("usage: ci-hang-guard.sh soft_seconds artifact_dir -- command; "
+                  "finite hard deadline must leave time for capture and cleanup", file=sys.stderr)
+            return 2
+        pathlib.Path(directory).mkdir(parents=True, exist_ok=True)
+        guard = pathlib.Path(__file__).with_name("ci-hang-guard.sh")
+        return observe(directory, sys.argv[5:], enabled=os.environ.get("CT_OUTCOME_OBSERVE") == "1",
+                       soft=soft, hard=hard,
+                       capture=lambda pid: ["sh", str(guard), "--capture", str(pid),
+                                            directory, str(soft)])
     if len(sys.argv) < 4 or sys.argv[2] != "--":
         print("usage: ci_child_observer.py artifact_dir -- command [args...]", file=sys.stderr)
         return 2
