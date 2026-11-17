@@ -3468,7 +3468,7 @@ def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
     (2) the background refresh still lands and a later read sees the NEW
     generation, i.e. the entry is still evictable/replaceable afterward --
     a leaked reference from this arm would pin the OLD generation forever."""
-    uri = "/lock1/won"
+    uri = "/lock2/won"
     redis.cli("DEL", l2_key(uri), lock_key(uri))
 
     # nginx strips the /lock/ prefix before proxying, so the origin logs
@@ -3491,7 +3491,12 @@ def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
     assert wait_for(lambda: origin.hits_for(slug) >= 1, timeout=2.0), \
         "prime phase never registered its own origin contact"
 
-    time.sleep(1.5)                     # stale (fresh=1s), still < 8s window
+    # /lock2/ is cache_turbo_valid 2s. The prime's L1 store second s precedes
+    # the L2 EXISTS observed above (L1 store before L2 SET), so fresh_until =
+    # s+2 <= floor(t_obs)+2, and after sleeping 2.05s from t_obs ngx_time() >=
+    # s+2: not fresh, i.e. STALE (an event-loop wakeup refreshes ngx_time; the
+    # fixture sets no timer_resolution). Still << the 16s stale window.
+    time.sleep(2.05)
     drain_origin(origin)                # absorb any stray async bg before counting
     base = origin.hits_for(slug)
 
@@ -3535,6 +3540,14 @@ def test_cross_node_won_stale_body(ng: Nginx, origin: Origin,
         f"[base={base} now={origin.hits_for(slug)} global={origin.hits} " \
         f"x_cache={h1.get('x-cache')!r}]"
 
+    # HIT-window argument (CT-FLAKE-XNODE-HIT-WINDOW): freshness is
+    # `ngx_time() < fresh_until`, fresh_until = (store second) + valid, on a
+    # one-second clock. The refreshed generation stored at wall time t has
+    # fresh_until = floor(t)+2 > t+1, so it reports x-cache HIT for >= 1s
+    # whatever fraction of the second it landed in. At valid 1s that window was
+    # floor(t)+1-t in (0,1], and when t sat at the end of a second it fell
+    # below the 0.1s poll, leaving only STALE-with-new-body reads. The HIT
+    # assertion is kept as is; STALE is NOT accepted.
     def _got_refreshed() -> bool:
         _, b, h = fetch(ng.port, uri)
         return b != body0 and h.get("x-cache") == "HIT"

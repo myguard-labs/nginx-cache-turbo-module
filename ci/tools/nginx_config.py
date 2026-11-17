@@ -791,7 +791,8 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 
         # one-second fresh variant of /lock/ for the single-node tests that only
-        # need one stale read burst (won-stale-body, redis-outage fallback):
+        # need one stale read burst (redis-outage fallback; won-stale-body moved to
+        # /lock2/ below):
         # valid 1s with stale_mult 8 keeps the same 8s serveable window as
         # /lock/ but reaches staleness a second sooner. test_multinode_lock keeps
         # /lock/ (valid 2s): its 1.5s hammer must not outlive the post-regen
@@ -800,6 +801,24 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;     # stale window: serveable until t+8s
+            cache_turbo_stale_mult 8;
+            cache_turbo_beta     5000;
+            cache_turbo_lock_ttl 5s;
+            cache_turbo_lock     off;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # two-second fresh variant of /lock1/, private to
+        # test_cross_node_won_stale_body (CT-FLAKE-XNODE-HIT-WINDOW). Freshness
+        # is `ngx_time() < fresh_until` on a one-second clock, so a generation
+        # stored at any instant is fresh for [valid-1, valid] seconds: valid 1s
+        # leaves a HIT window of 0..1s (can be shorter than the test's 0.1s poll),
+        # valid 2s guarantees >= 1s. Same 8x stale multiplier.
+        location /lock2/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    2s;     # stale window: serveable until t+16s
             cache_turbo_stale_mult 8;
             cache_turbo_beta     5000;
             cache_turbo_lock_ttl 5s;
