@@ -1594,6 +1594,11 @@ http {{
     # real eviction -- an 8m zone holds tens of thousands of these tiny bodies,
     # so the scan would evict nothing and every S8 assertion would pass for the
     # wrong reason.
+    # CT-P1-SPLICE-TEST-VACUOUS: private 64k zone (as the S8 zones) for
+    # test_p1_coarse_lru_splice_keeps_hot_key_resident. On the 8m /e/ zone the
+    # cold churn never evicted anything, so skipping every coarse splice left
+    # that test green.
+    cache_turbo_zone name=p1splz 64k;
     cache_turbo_zone name=srz 64k;    # S8 scan-resistant ON (explicit)
     cache_turbo_zone name=sroffz 64k; # P3-1 default-on control (directive absent)
     cache_turbo_zone name=srexpz 64k; # S8 explicit `off` control (pre-P3-1 flat LRU)
@@ -4219,6 +4224,17 @@ http {{
         # tiny zone to force LRU eviction (R6)
         location /e/ {{
             cache_turbo          tiny;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # CT-P1-SPLICE-TEST-VACUOUS: own 64k zone so cold churn really evicts;
+        # same shape as /e/ (valid 30s, $uri key). See
+        # test_p1_coarse_lru_splice_keeps_hot_key_resident.
+        location /p1spl/ {{
+            cache_turbo          p1splz;
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
             add_header           X-CT-Status $cache_turbo_status always;
