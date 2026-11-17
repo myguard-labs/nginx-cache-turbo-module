@@ -2113,6 +2113,97 @@ case_ 0 "carve-init: count pin restored to the true count is clean again" pin_li
 case_ 0 "Deep lanes: inventory and failure continuation" env PYTHONUTF8=1 python3 "$ROOT/ci/tools/test_deep_lanes.py"
 case_ 0 "Abort soak workflow commands" env PYTHONUTF8=1 python3 "$ROOT/ci/tools/test_abort_ci.py"
 
+# install-linters.sh release downloads: every curl needs connect and total
+# timeouts, and a failed/timed-out download must not leak its mktemp dir. The
+# install_* function is lifted out of the installer text (the script itself runs
+# on source) and run against a stub `curl` on PATH: no network, no sudo, no
+# install (a stub payload fails the sha256 compare before any install step).
+# Prints "ARGV: ..." so the case can be asserted on, and exits with the
+# function's own status.
+dl_probe() {
+    local installer="$1" fn="$2" mode="$3" work out frc leaked
+    work="$(mktemp -d)"
+    mkdir -p "$work/bin" "$work/tmp"
+    cat > "$work/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_LOG"
+[ "$STUB_MODE" = timeout ] && exit 28
+while [ "$#" -gt 0 ]; do
+    [ "$1" = -o ] && { printf 'stub payload\n' > "$2"; exit 0; }
+    shift
+done
+exit 2
+STUB
+    chmod +x "$work/bin/curl"
+    {
+        grep -E '^HTTP_(CONNECT_TIMEOUT|MAX_TIME)=' "$installer"
+        awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{" {p=1} p {print} p && /^}/ {exit}' "$installer"
+        cat <<'RUNNER'
+SUDO=""
+"$1"
+RUNNER
+    } > "$work/fn.sh"
+    out="$(STUB_LOG="$work/log" STUB_MODE="$mode" PATH="$work/bin:$PATH" TMPDIR="$work/tmp" \
+        bash "$work/fn.sh" "$fn" 2>&1)"
+    frc=$?
+    leaked="$(find "$work/tmp" -mindepth 1 | wc -l)"
+    echo "ARGV: $(cat "$work/log" 2>/dev/null)"
+    echo "LEAKED: $leaked"
+    printf '%s\n' "$out"
+    rm -rf "${work:?}"
+    return "$frc"
+}
+dl_assert() { # <installer> <fn> <mode> <want-rc> <want-leaked> <want-flags 0|1>
+    local o
+    o="$(dl_probe "$1" "$2" "$3")"; local got=$?
+    [ "$got" -eq "$4" ] || { echo "rc $got != $4" >&2; return 1; }
+    grep -q "^LEAKED: $5\$" <<<"$o" || { echo "leaked != $5" >&2; return 1; }
+    if [ "$3" = ok ]; then
+        grep -q 'sha256 mismatch' <<<"$o" || { echo "download did not reach the sha256 compare" >&2; return 1; }
+    fi
+    local argv; argv="$(grep '^ARGV:' <<<"$o")"
+    if [ "$6" -eq 1 ]; then
+        if ! grep -Eq -e '--connect-timeout [0-9]+' <<<"$argv" ||
+            ! grep -Eq -e '--max-time [0-9]+' <<<"$argv"; then
+            echo "timeout flags missing: $argv" >&2
+            return 1
+        fi
+    fi
+    return 0
+}
+dl_case() { # <expected-exit> <description> <dl_assert arguments...>
+    local want="$1" desc="$2" out got
+    shift 2
+    out="$(dl_assert "$@" 2>&1)"; got=$?
+    if [ "$got" -eq "$want" ]; then
+        echo "ok   $desc (exit $got)"
+    else
+        echo "FAIL $desc: expected exit $want, got $got" >&2
+        printf '%s\n' "       | ${out//$'\n'/$'\n'       | }" >&2
+        rc=1
+    fi
+}
+INSTALLER="$ROOT/ci/linter/install-linters.sh"
+MUT="$(mktemp -d)"
+# Negative controls: the same installer with the bounds / the cleanup removed.
+# shellcheck disable=SC2016  # sed matches the literal variable references in the installer
+sed -e 's/ --connect-timeout "\$HTTP_CONNECT_TIMEOUT" --max-time "\$HTTP_MAX_TIME"//' \
+    "$INSTALLER" > "$MUT/unbounded.sh"
+# shellcheck disable=SC2016  # sed matches the literal parameter expansion in the installer
+sed -e 's/|| { rm -rf "\${tmp:?}"; return 1; }/|| return 1/' \
+    "$INSTALLER" > "$MUT/leaky.sh"
+for fn in install_actionlint install_astgrep install_gitleaks; do
+    # success: download ran with both bounds, reached the sha256 compare (stub
+    # payload mismatches -> rc 1) and cleaned up
+    dl_case 0 "installer $fn: curl carries --connect-timeout and --max-time" "$INSTALLER" "$fn" ok 1 0 1
+    # error: curl timeout (28) -> non-zero return, temp dir removed
+    dl_case 0 "installer $fn: timed-out download returns non-zero and removes its temp dir" "$INSTALLER" "$fn" timeout 1 0 1
+    # RED controls: these must be caught by the assertions above
+    dl_case 1 "installer $fn: control - unbounded curl is detected" "$MUT/unbounded.sh" "$fn" ok 1 0 1
+    dl_case 1 "installer $fn: control - leaked temp dir on failed download is detected" "$MUT/leaky.sh" "$fn" timeout 1 0 1
+done
+rm -rf "${MUT:?}"
+
 if [ "$rc" -eq 0 ]; then
     echo "== lint gate selftest: all controls held =="
 else
