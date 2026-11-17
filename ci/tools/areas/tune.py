@@ -800,15 +800,29 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     # must be counted, not just sleep+polls.
     t_entry = time.monotonic()
 
+    warm_observations: list[str] = []
+
     def _warm_to_hit() -> bool:
         """Establish a fresh HIT to prime the `en` cache slot for the stale
-        test."""
-        _status, body, response_headers = fetch(ng.port, uri, headers)
+        test. Every poll is recorded so a failure shows WHAT each poll saw
+        (status/X-CT-Status/body), not just that none was a HIT."""
+        status, body, response_headers = fetch(ng.port, uri, headers)
+        warm_observations.append(
+            f"+{time.monotonic() - t_entry:.3f}s status={status} "
+            f"x-ct-status={response_headers.get('x-ct-status')!r} "
+            f"same_body={body == body0} body={body[:40]!r}")
         return (response_headers.get("x-ct-status") == "HIT"
                 and body == body0)
 
+    # The HIT must land inside the entry's fresh window. Freshness is
+    # `now < fresh_until` on a ONE-SECOND clock, so an entry stored late in a
+    # second is fresh for only the rest of that second whatever the TTL
+    # rounds to; AVSWR_FRESH_TTL_S is 2s so that window is >= 1s at any
+    # store offset (CT-SWR-AVL-WARMUP-FLAKE). The oracle is unchanged:
+    # same-generation body AND a HIT.
     assert wait_for(_warm_to_hit, timeout=2.0, interval=0.05), \
-        "warm-up fetch never became a HIT"
+        (f"warm-up fetch never became a HIT (body0={body0[:40]!r}); "
+         "per-poll observations:\n  " + "\n  ".join(warm_observations))
 
     # Prime the SECOND, absent-Accept-Language slot on the same cache key.
     # Its ONLY job is the MISS + distinct-body assertion immediately below:
@@ -835,9 +849,9 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     # ASan margin rather than preserving it, so:
     #
     #   * the sleep is UNSCALED. Its only job is to cross a wall-clock
-    #     AVSWR_FRESH_TTL_S boundary, and 1.15s crosses a 1s TTL at every
-    #     scale. Scaling it (the pre-fix code used 1.3 * scale) bought nothing
-    #     and cost 1.3s of window under ASan.
+    #     AVSWR_FRESH_TTL_S boundary, and TTL + 0.15s crosses it at every
+    #     scale and store offset. Scaling it (the pre-fix code used 1.3 *
+    #     scale) bought nothing and cost 1.3s of window under ASan.
     #   * the two wait_for() timeouts are DERIVED from what is left of the
     #     window, not a fixed 1.0s (a fixed 1s lost the refresh-reached-origin
     #     poll on a CPU-starved runner: the refresh was only slow, not absent,
@@ -856,7 +870,7 @@ def test_swr_preserves_auto_vary_language(ng: Nginx, origin: Origin) -> None:
     # the same window before the sleep even starts. Fail loudly, up front, if
     # that ever stops holding, instead of discovering it later as a flaky
     # EXPIRED.
-    sleep_s = 1.15
+    sleep_s = AVSWR_FRESH_TTL_S + 0.15
     slack_s = 1.0
     poll_min_s = 1.0
     elapsed_s = time.monotonic() - t_entry
