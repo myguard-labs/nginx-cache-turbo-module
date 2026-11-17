@@ -76,17 +76,24 @@ def _children():
 def _adopted(anchors, sig):
     """Signal/reap adopted owned descendants without releasing group anchors."""
     pending = False
+    failure = None
     for pid in _children():
         if pid in anchors:
             continue
         # A direct unreaped child cannot have its PID reused under this owner.
-        fd = os.pidfd_open(pid)
         try:
-            signal.pidfd_send_signal(fd, sig)
-            waited, _ = os.waitpid(pid, os.WNOHANG)
-            pending |= waited == 0
-        finally:
-            os.close(fd)
+            fd = os.pidfd_open(pid)
+            try:
+                signal.pidfd_send_signal(fd, sig)
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+                pending |= waited == 0
+            finally:
+                os.close(fd)
+        except OSError as error:
+            failure = error
+    if failure is not None:
+        # Finish the pass before latching the error in the drain owner.
+        raise failure
     return pending
 
 
@@ -274,6 +281,6 @@ def run_owned(command, env, on_start, *, soft=None, hard=600., capture=None):
             os.waitpid(owner_pid, 0)
         for sig, handler in previous.items():
             signal.signal(sig, handler)
-    if requested:
+    if requested and result["code"] is not None:
         result["status"] = 128 + requested[0]
     return result

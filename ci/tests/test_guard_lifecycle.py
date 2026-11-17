@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from functools import partial
 from pathlib import Path
 from unittest import mock
 
@@ -228,10 +229,12 @@ class GuardLifecycleTests(unittest.TestCase):
         capture_script = ("import pathlib,signal,sys,time; "
                           "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
                           "pathlib.Path(sys.argv[1]).touch(); time.sleep(60)")
+        started = time.monotonic()
         result = lifecycle.run_owned(
             [sys.executable, '-c', command_script, str(ready)], None, self.pin,
             soft=0, hard=1,
             capture=lambda pid: [sys.executable, '-c', capture_script, str(ready)])
+        self.assertLess(time.monotonic() - started, 30, 'stubborn tail exceeded capture deadline')
         self.assertTrue(ready.exists(), 'capture never started')
         self.assertEqual(result['reason'], 'command exit')
         self.assertEqual(result['status'], 23)
@@ -305,6 +308,45 @@ class GuardLifecycleTests(unittest.TestCase):
                          [mock.call(signal.SIGTERM), mock.call(signal.SIGKILL)])
         self.assertTrue(owned.reaped)
 
+    def test_requested_signal_preserves_incomplete_cleanup_status(self):
+        drain = lifecycle._drain
+
+        def incomplete(*args):
+            drain(*args)  # Release the real fixture before injecting failure.
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            def started(pid, sig=sig):
+                self.pin(pid)
+                os.kill(os.getpid(), sig)
+
+            with self.subTest(signal=sig), \
+                    mock.patch.object(lifecycle, '_drain', side_effect=incomplete):
+                result = lifecycle.run_owned([sys.executable, '-c', 'pass'], None, started, hard=1)
+            self.assertEqual(result['status'], 125)
+            self.assertIsNone(result['code'])
+            self.assertEqual(result['reason'], 'cleanup incomplete')
+
+    def test_requested_signal_distinguishes_owner_loss_from_command_exit_125(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            for record in (None, {'status': 125, 'code': 125, 'reason': 'command exit'}):
+                def owner(wire, *_args, record=record):
+                    wire.send(json.dumps({'child': os.getpid()}).encode())
+                    wire.recv(1024)  # Wait until the guard has recorded the signal.
+                    if record is not None:
+                        wire.send(json.dumps(record).encode())
+
+                def started(pid, sig=sig):
+                    self.pin(pid)
+                    os.kill(os.getpid(), sig)
+
+                with self.subTest(signal=sig, record=record), \
+                        mock.patch.object(lifecycle, '_owner', side_effect=owner):
+                    result = lifecycle.run_owned(['never-started'], None, started, hard=1)
+                self.assertEqual(result['status'], 125 if record is None else 128 + sig)
+                self.assertEqual(result['code'], None if record is None else 125)
+                expected_reason = 'owner lost' if record is None else 'command exit'
+                self.assertEqual(result['reason'], expected_reason)
+
     def test_owner_setup_failure_does_not_launch(self):
         library = mock.Mock()
         library.prctl.return_value = -1
@@ -358,6 +400,82 @@ class GuardLifecycleTests(unittest.TestCase):
                                         env=env, capture_output=True, timeout=5, check=False)
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse(marker.exists())
+
+
+class AdoptedCleanupTests(unittest.TestCase):
+    def test_adopted_skips_anchors_and_tracks_waited_children(self):
+        for first_wait in (0, 202):
+            with (
+                self.subTest(first_wait=first_wait),
+                mock.patch.object(lifecycle, '_children', return_value=[101, 202, 303]),
+                mock.patch.object(lifecycle.os, 'pidfd_open', side_effect=[1202, 1303]) as opened,
+                mock.patch.object(lifecycle.signal, 'pidfd_send_signal') as sent,
+                mock.patch.object(lifecycle.os, 'waitpid',
+                                  side_effect=[(first_wait, 0), (303, 0)]) as waited,
+                mock.patch.object(lifecycle.os, 'close') as closed,
+            ):
+                self.assertEqual(lifecycle._adopted({101}, signal.SIGKILL), first_wait == 0)
+            self.assertEqual(opened.call_args_list, [mock.call(202), mock.call(303)])
+            self.assertEqual(sent.call_args_list,
+                             [mock.call(1202, signal.SIGKILL), mock.call(1303, signal.SIGKILL)])
+            self.assertEqual(waited.call_args_list,
+                             [mock.call(202, os.WNOHANG), mock.call(303, os.WNOHANG)])
+            self.assertEqual(closed.call_args_list, [mock.call(1202), mock.call(1303)])
+
+    def test_adopted_error_still_visits_and_reaps_later_child(self):
+        for operation in ('open', 'signal', 'wait', 'close'):
+            def fail(value, *_args, operation=operation, boundary=None):
+                if value in (202, 1202) and operation == boundary:
+                    raise PermissionError('controlled child failure')
+                return value + 1000 if boundary == 'open' else (value, 0)
+
+            with (
+                self.subTest(operation=operation),
+                mock.patch.object(lifecycle, '_children', return_value=[101, 202, 303]),
+                mock.patch.object(lifecycle.os, 'pidfd_open',
+                                  side_effect=partial(fail, boundary='open')) as opened,
+                mock.patch.object(lifecycle.signal, 'pidfd_send_signal',
+                                  side_effect=partial(fail, boundary='signal')) as sent,
+                mock.patch.object(lifecycle.os, 'waitpid',
+                                  side_effect=partial(fail, boundary='wait')) as waited,
+                mock.patch.object(lifecycle.os, 'close',
+                                  side_effect=partial(fail, boundary='close')) as closed,
+                self.assertRaisesRegex(PermissionError, 'controlled child failure'),
+            ):
+                lifecycle._adopted({101}, signal.SIGKILL)
+            self.assertEqual(opened.call_args_list, [mock.call(202), mock.call(303)])
+            sent.assert_any_call(1303, signal.SIGKILL)
+            waited.assert_any_call(303, os.WNOHANG)
+            closed.assert_any_call(1303)
+            if operation == 'open':
+                self.assertNotIn(mock.call(1202), closed.call_args_list)
+            else:
+                closed.assert_any_call(1202)
+
+    def test_drain_retains_error_after_children_are_eventually_reaped(self):
+        owned = mock.Mock(pid=101)
+        owned.exited.return_value = True
+        owned.reap.return_value = 0
+
+        def pidfd(pid):
+            if pid == 202:
+                raise PermissionError('controlled child failure')
+            return pid + 1000
+
+        children = [[101, 202, 303], [101], [101], [101]]
+        with mock.patch.object(lifecycle, '_children', side_effect=children), \
+                mock.patch.object(lifecycle.os, 'pidfd_open', side_effect=pidfd), \
+                mock.patch.object(lifecycle.signal, 'pidfd_send_signal') as sent, \
+                mock.patch.object(lifecycle.os, 'waitpid', return_value=(303, 0)) as waited, \
+                mock.patch.object(lifecycle.os, 'close') as closed:
+            result = lifecycle._drain([owned], 0, time.monotonic() + 1)
+        self.assertIsNone(result)
+        sent.assert_called_once_with(1303, signal.SIGTERM)
+        waited.assert_called_once_with(303, os.WNOHANG)
+        closed.assert_called_once_with(1303)
+        self.assertEqual(owned.send.call_args_list,
+                         [mock.call(signal.SIGTERM), mock.call(signal.SIGKILL)])
+        owned.reap.assert_called_once_with()
 
 
 if __name__ == '__main__':

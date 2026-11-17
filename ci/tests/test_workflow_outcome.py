@@ -25,8 +25,27 @@ class WorkflowOutcomeTest(unittest.TestCase):
                     args = shlex.split(command, comments=True)
                     self.assertEqual(args[:4], ['CT_HANG_HARD_SECONDS=3000', 'bash',
                                                 'ci/tools/ci-hang-guard.sh', '2700'])
-                    self.assertEqual(job['timeout-minutes'], 60)
+                    if job is workflow['jobs']['asan-single']:
+                        self.assertEqual(job['timeout-minutes'], 60)
         self.assertEqual(checked, 2)
+
+    def test_multi_worker_budget_covers_all_steps(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/asan.yml').read_text())
+        job = workflow['jobs']['asan-multi']
+        steps = job['steps']
+        guard = next(i for i, step in enumerate(steps)
+                     if 'ci-hang-guard.sh 2700' in step.get('run', ''))
+        upload = next(step for step in steps[guard + 1:]
+                      if step.get('name') == 'Upload hang-capture artifacts (multi-worker)')
+        self.assertEqual(upload['if'], 'always()')
+        # Every executable step outside the guarded command must have a bound.
+        other_steps = steps[:guard] + steps[guard + 1:]
+        self.assertTrue(all(isinstance(step.get('timeout-minutes'), int)
+                            and step['timeout-minutes'] > 0 for step in other_steps))
+        setup_and_after = sum(step['timeout-minutes'] for step in other_steps)
+        self.assertEqual(setup_and_after, 42)
+        # Five minutes covers runner setup, action post steps and overhead.
+        self.assertGreaterEqual(job['timeout-minutes'], setup_and_after + 50 + 5)
 
     def test_build_runtime_outcome_and_status(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/build-test.yml').read_text())
