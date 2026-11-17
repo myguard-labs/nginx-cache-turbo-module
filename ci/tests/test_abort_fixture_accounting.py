@@ -507,5 +507,36 @@ class ClosedWindowCase(unittest.TestCase):
         self.assertIn("log tail:", msg)
 
 
+class LateClosesCase(unittest.TestCase):
+    """CT-SHUTDOWN-CLOSE-ORACLE: a missing or late idle-client close fails the
+    shutdown arm; the " over" marker comes from the same predicate."""
+
+    def test_under_limit_is_clean(self):
+        self.assertEqual(af.late_closes([0.2, 0.21], 0.4), [])
+        self.assertNotIn("over", af.describe_close_latency([0.2, 0.21], 0.4))
+
+    def test_boundary(self):
+        self.assertEqual(len(af.late_closes([0.4], 0.4)), 1)
+        self.assertEqual(af.late_closes([0.3999], 0.4), [])
+
+    def test_missing_close(self):
+        got = af.late_closes([0.2, None], 0.4)
+        self.assertEqual(len(got), 1)
+        self.assertIn("key 1", got[0])
+        self.assertIn("not seen", got[0])
+        self.assertIn("limit 400.0ms", got[0])
+        self.assertTrue(af.describe_close_latency([0.2, None], 0.4)
+                        .endswith(" over"))
+
+    def test_late_close_names_value(self):
+        got = af.late_closes([0.2, 0.5], 0.4)
+        self.assertEqual(len(got), 1)
+        self.assertIn("key 1", got[0])
+        self.assertIn("+500.0ms", got[0])
+
+    def test_empty(self):
+        self.assertEqual(af.late_closes([], 0.4), [])
+
+
 if __name__ == "__main__":
     unittest.main()
