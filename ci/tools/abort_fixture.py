@@ -2490,17 +2490,28 @@ def _peer_closed(sock: socket.socket) -> bool:
                for _, events in poller.poll(0))
 
 
+def late_closes(closes: Sequence[float | None], limit: float) -> list[str]:
+    """One message per key whose idle-client close was not seen or came at or
+    past `limit` (seconds after the reload). The shutdown arms fail on these
+    and describe_close_latency marks the line "over" from the same list."""
+    return [f"key {i}: idle client close "
+            + ("not seen" if c is None else f"at {c * 1000:+.1f}ms")
+            + f", limit {limit * 1000:.1f}ms"
+            for i, c in enumerate(closes) if c is None or c >= limit]
+
+
 def describe_close_latency(closes: Sequence[float | None],
                            limit: float) -> str:
     """The shutdown timer's evidence: per key, when the old worker closed the
     idle client connection, seconds after the reload, against `limit` (the
     scaled reply delay minus SHUTDOWN_CLOSE_MARGIN). "over" marks a run where
-    a close was not seen or came at or past it."""
+    a close was not seen or came at or past it (late_closes), which also
+    fails the arm."""
     if not closes:
         return "close-minus-reload=n/a"
     keys = ",".join(f"k{i}:" + ("none" if c is None else f"{c * 1000:+.1f}ms")
                     for i, c in enumerate(closes))
-    over = " over" if any(c is None or c >= limit for c in closes) else ""
+    over = " over" if late_closes(closes, limit) else ""
     return f"close-minus-reload={keys}/{limit * 1000:.1f}ms{over}"
 
 
@@ -2681,10 +2692,13 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
                   flush=True)
             problems.extend(f"the op ended by its own timer: {ln[:160]}"
                             for ln in late)
+        close_limit = (site.proxy_delay or 0.0) * scale - SHUTDOWN_CLOSE_MARGIN
+        if track_close:
+            problems.extend(late_closes(closes, close_limit))
         fatal = rig.node.fatal_lines()
         result = ArmResult(name, landings, fatal + problems)
         close = ("" if not track_close else " " + describe_close_latency(
-            closes, (site.proxy_delay or 0.0) * scale - SHUTDOWN_CLOSE_MARGIN))
+            closes, close_limit))
         if own:
             close += " " + describe_own_timer(own_marks)
         print(f"shutdown-arm {result.describe()}{close} "
