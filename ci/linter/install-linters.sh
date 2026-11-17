@@ -250,8 +250,8 @@ install_actionlint() {
         rm -rf "${tmp:?}"
         return 1
     fi
-    tar -xzf "$tmp/al.tgz" -C "$tmp" actionlint || return 1
-    $SUDO install -m0755 "$tmp/actionlint" /usr/local/bin/actionlint || return 1
+    tar -xzf "$tmp/al.tgz" -C "$tmp" actionlint || { rm -rf "${tmp:?}"; return 1; }
+    $SUDO install -m0755 "$tmp/actionlint" /usr/local/bin/actionlint || { rm -rf "${tmp:?}"; return 1; }
     rm -rf "${tmp:?}"
 }
 
@@ -295,8 +295,8 @@ install_astgrep() {
     # The zip carries both `ast-grep` and its short alias `sg`. Only ast-grep is
     # installed: `sg` collides with util-linux's setgid tool on Debian, and
     # ci/linter/ spells it out in full.
-    unzip -qo "$tmp/ag.zip" ast-grep -d "$tmp" || return 1
-    $SUDO install -m0755 "$tmp/ast-grep" /usr/local/bin/ast-grep || return 1
+    unzip -qo "$tmp/ag.zip" ast-grep -d "$tmp" || { rm -rf "${tmp:?}"; return 1; }
+    $SUDO install -m0755 "$tmp/ast-grep" /usr/local/bin/ast-grep || { rm -rf "${tmp:?}"; return 1; }
     rm -rf "${tmp:?}"
 }
 
@@ -338,8 +338,8 @@ install_gitleaks() {
         rm -rf "${tmp:?}"
         return 1
     fi
-    tar -xzf "$tmp/gl.tgz" -C "$tmp" gitleaks || return 1
-    $SUDO install -m0755 "$tmp/gitleaks" /usr/local/bin/gitleaks || return 1
+    tar -xzf "$tmp/gl.tgz" -C "$tmp" gitleaks || { rm -rf "${tmp:?}"; return 1; }
+    $SUDO install -m0755 "$tmp/gitleaks" /usr/local/bin/gitleaks || { rm -rf "${tmp:?}"; return 1; }
     rm -rf "${tmp:?}"
 }
 

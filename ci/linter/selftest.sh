@@ -2202,6 +2202,45 @@ for fn in install_actionlint install_astgrep install_gitleaks; do
     dl_case 1 "installer $fn: control - unbounded curl is detected" "$MUT/unbounded.sh" "$fn" ok 1 0 1
     dl_case 1 "installer $fn: control - leaked temp dir on failed download is detected" "$MUT/leaky.sh" "$fn" timeout 1 0 1
 done
+# Exercise extraction and installation separately without network or host writes.
+# shellcheck disable=SC2329,SC2317 # Invoked indirectly through case_.
+late_probe() { # <installer> <function> <extract|install|success>
+    local installer="$1" fn="$2" mode="$3" work status leaked result
+    work="$(mktemp -d)"
+    mkdir -p "$work/tmp"
+    {
+        grep -E '^HTTP_(CONNECT_TIMEOUT|MAX_TIME)=' "$installer"
+        cat <<'STUBS'
+curl() { return 0; }
+sha256sum() { return 0; }
+tar() { [ "$MODE" != extract ]; }
+unzip() { [ "$MODE" != extract ]; }
+install() { [ "$MODE" != install ]; }
+SUDO=""
+ACTIONLINT_VERSION=stub
+STUBS
+        awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{" {p=1} p {print} p && /^}/ {exit}' "$installer"
+        # shellcheck disable=SC2016 # Expands in the generated runner.
+        printf '%s\n' '"$1"'
+    } > "$work/fn.sh"
+    MODE="$mode" TMPDIR="$work/tmp" bash "$work/fn.sh" "$fn" >/dev/null 2>&1
+    status=$?
+    leaked="$(find "$work/tmp" -mindepth 1 | wc -l)"
+    result=0
+    if { [ "$mode" = success ] && [ "$status" -ne 0 ]; } ||
+        { [ "$mode" != success ] && [ "$status" -eq 0 ]; } || [ "$leaked" -ne 0 ]; then
+        echo "$fn $mode: status=$status leaked=$leaked" >&2
+        result=1
+    fi
+    rm -rf "${work:?}"
+    return "$result"
+}
+for fn in install_actionlint install_astgrep install_gitleaks; do
+    for mode in extract install success; do
+        case_ 0 "installer $fn: $mode cleans temporary directory and preserves status" \
+            late_probe "$INSTALLER" "$fn" "$mode"
+    done
+done
 rm -rf "${MUT:?}"
 
 if [ "$rc" -eq 0 ]; then
