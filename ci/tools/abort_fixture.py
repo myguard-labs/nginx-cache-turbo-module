@@ -2467,7 +2467,7 @@ SHUTDOWN_ARMS = ("http1", "http2", "graceful", "http1_hit",
 # shutdown timer (reload + SHUTDOWN_TIMEOUT_MS, with a loaded-host margin) and
 # well before the reply.
 OWN_TIMEOUT = 1.0
-OWN_TIMEOUT_REPLY_DELAY = 2.5
+OWN_TIMEOUT_REPLY_DELAY = 1.5
 TIMED_OUT = "timed out"
 
 
@@ -2502,6 +2502,18 @@ def describe_close_latency(closes: Sequence[float | None],
                     for i, c in enumerate(closes))
     over = " over" if any(c is None or c >= limit for c in closes) else ""
     return f"close-minus-reload={keys}/{limit * 1000:.1f}ms{over}"
+
+
+def describe_own_timer(marks: Sequence[tuple[float | None, float | None]]
+                       ) -> str:
+    """The early_teardown arm's evidence: per key, the old worker's exit and
+    the backend reply, each relative to the op's own timer (negative: before
+    it). A key whose worker did not exit or whose reply time is unknown shows
+    "none" there."""
+    def ms(v: float | None) -> str:
+        return "none" if v is None else f"{v * 1000:+.1f}ms"
+    return "own-timer=" + ",".join(f"k{i}:exit{ms(e)}/reply{ms(r)}"
+                                   for i, (e, r) in enumerate(marks))
 
 
 def shutdown_site(site: AbortSite, timeout: bool,
@@ -2545,6 +2557,8 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
     # Per key, the idle HTTP/1 client's close seen after the reload, on the
     # arms with a shutdown timer.
     closes: list[float | None] = []
+    # Per key on the early_teardown arm: exit and reply minus the op's timer.
+    own_marks: list[tuple[float | None, float | None]] = []
     track_close = protocol == "http1" and arm != "graceful"
     # The op timeout lines are logged at info.
     with AbortRig(ng, site, f"shutdown-{arm}", ABORT_KEYS,
@@ -2636,6 +2650,9 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
                 # request cleanup, not the timer or the late reply, ended the
                 # op.
                 timer_at = parked_at + OWN_TIMEOUT * scale
+                own_marks.append((
+                    None if exited_at is None else exited_at - timer_at,
+                    end - timer_at if end else None))
                 if exited_at is not None and exited_at >= timer_at:
                     problems.append(
                         f"key {i}: the worker outlived the op's own timeout "
@@ -2668,6 +2685,8 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
         result = ArmResult(name, landings, fatal + problems)
         close = ("" if not track_close else " " + describe_close_latency(
             closes, (site.proxy_delay or 0.0) * scale - SHUTDOWN_CLOSE_MARGIN))
+        if own:
+            close += " " + describe_own_timer(own_marks)
         print(f"shutdown-arm {result.describe()}{close} "
               f"problems={len(problems)}", flush=True)
         assert not result.fatal, (
@@ -2702,12 +2721,12 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
 WALK_TIMEOUT_ARMS = ("own_timeout", "reply")
 # The site's L2 timeout, seconds before sanitizer scaling (the caller builds
 # the site with walk_timeout_ms()). Past the reload plus the shutdown timer.
-WALK_OP_TIMEOUT = 1.5
+WALK_OP_TIMEOUT = 1.0
 # How long the backend sits on the UNLINK reply in the reply arm, as a share
 # of that timeout.
 WALK_REPLY_SHARE = 0.5
 # The own_timeout arm holds the reply this long past the timeout.
-WALK_HOLD_PAST = 1.0
+WALK_HOLD_PAST = 0.5
 # Slack for a timer that fires a little early (nginx rounds its clock to ms).
 WALK_TIMER_SLACK = 0.02
 
