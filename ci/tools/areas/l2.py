@@ -4746,8 +4746,8 @@ def _cold_wait_abort_site(origin: Origin) -> AbortSite:
     serves from L1. Nothing is primed: the park needs a miss.
 
     One leader and one aborting waiter per key, keys one at a time, so a crash
-    belongs to the key that caused it. The leader's 0.6s origin delay gives the
-    waiter about six polls, so "before" lands before its first wake and "after"
+    belongs to the key that caused it. The leader's 0.35s origin delay gives the
+    waiter about three polls, so "before" lands before its first wake and "after"
     lands in a re-park, both well ahead of the fill.
     """
     return AbortSite(
@@ -4761,7 +4761,7 @@ def _cold_wait_abort_site(origin: Origin) -> AbortSite:
         arrange=lambda rig: None,
         prime=False,
         origin_proxy=True,
-        proxy_delay=0.6,
+        proxy_delay=0.35,
         server_extra="location = /_ab_status { cache_turbo_admin abort; }",
         origin_hits=1,
     )
