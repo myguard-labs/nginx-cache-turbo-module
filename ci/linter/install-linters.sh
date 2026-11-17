@@ -28,7 +28,8 @@ set -uo pipefail
 # shellcheck source=ci/linter/actionlint-version.sh
 . "$(dirname "${BASH_SOURCE[0]}")/actionlint-version.sh"
 
-CHECK=0 FORCE=0
+CHECK=0
+FORCE=0
 case "${1:-}" in
     --check) CHECK=1 ;;
     --force) FORCE=1 ;;
@@ -36,6 +37,13 @@ case "${1:-}" in
     "") ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
 esac
+
+# Download bounds for every release-asset curl below, in one place so the three
+# calls cannot drift. Seconds: connect phase, and the whole transfer (a few-MB
+# asset on a slow runner). The flags are spelled out at each call site because
+# ast-grep rule sh-blocking-http-curl-no-timeout needs a literal --max-time.
+HTTP_CONNECT_TIMEOUT=20
+HTTP_MAX_TIME=300
 
 SUDO=""
 [ "$(id -u)" -eq 0 ] || SUDO="sudo"
@@ -233,8 +241,8 @@ install_actionlint() {
     local sha="023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
     local tmp
     tmp="$(mktemp -d)"
-    curl -fsSL -o "$tmp/al.tgz" \
-        "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz" || return 1
+    curl -fsSL --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_MAX_TIME" -o "$tmp/al.tgz" \
+        "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz" || { rm -rf "${tmp:?}"; return 1; }
     if ! printf '%s  %s\n' "$sha" "$tmp/al.tgz" | sha256sum -c - >/dev/null 2>&1; then
         echo "actionlint ${ver}: sha256 mismatch" >&2
         echo "  expected: $sha" >&2
@@ -275,8 +283,8 @@ install_astgrep() {
     local sha="611f9e5e76f2611ecea1a35dd3468ceedf600641a11224b80341d79c6ee7b9dd"
     local tmp
     tmp="$(mktemp -d)"
-    curl -fsSL -o "$tmp/ag.zip" \
-        "https://github.com/ast-grep/ast-grep/releases/download/${ver}/app-x86_64-unknown-linux-gnu.zip" || return 1
+    curl -fsSL --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_MAX_TIME" -o "$tmp/ag.zip" \
+        "https://github.com/ast-grep/ast-grep/releases/download/${ver}/app-x86_64-unknown-linux-gnu.zip" || { rm -rf "${tmp:?}"; return 1; }
     if ! printf '%s  %s\n' "$sha" "$tmp/ag.zip" | sha256sum -c - >/dev/null 2>&1; then
         echo "ast-grep ${ver}: sha256 mismatch" >&2
         echo "  expected: $sha" >&2
@@ -321,8 +329,8 @@ install_gitleaks() {
     local sha="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
     local tmp
     tmp="$(mktemp -d)"
-    curl -fsSL -o "$tmp/gl.tgz" \
-        "https://github.com/gitleaks/gitleaks/releases/download/v${ver}/gitleaks_${ver}_linux_x64.tar.gz" || return 1
+    curl -fsSL --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_MAX_TIME" -o "$tmp/gl.tgz" \
+        "https://github.com/gitleaks/gitleaks/releases/download/v${ver}/gitleaks_${ver}_linux_x64.tar.gz" || { rm -rf "${tmp:?}"; return 1; }
     if ! printf '%s  %s\n' "$sha" "$tmp/gl.tgz" | sha256sum -c - >/dev/null 2>&1; then
         echo "gitleaks ${ver}: sha256 mismatch" >&2
         echo "  expected: $sha" >&2
