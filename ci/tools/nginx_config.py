@@ -4574,6 +4574,12 @@ http {{
             cache_turbo_valid    1s;
             cache_turbo_stale_mult 8;
             cache_turbo_auto_vary on;
+            # CT-AVS-STALE-MARKER-TEST-VACUOUS: the default 2s marker
+            # revalidation (c-2) fires on a marker aged >= 2 whole seconds and
+            # falls through to origin, making the post-sleep stale-marker check
+            # depend on sub-second phase. Off here: the test targets the marker's
+            # stale window, not the c-2 revalidation.
+            cache_turbo_vary_marker_revalidate 0;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 

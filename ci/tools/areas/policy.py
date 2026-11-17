@@ -1470,11 +1470,17 @@ def test_auto_vary_stale_marker_reachable(ng: Nginx, origin: Origin) -> None:
     """auto-Vary: once the variant and its L1 vary marker go stale (but are still
     inside the stale window), a request must still resolve to the variant via the
     stale marker and serve it from cache — not fall back to the base key and miss
-    to origin (codex follow-up)."""
-    ae = {"Accept-Encoding": "gzip"}
-    _, _, h0 = fetch(ng.port, "/avs1/m?v=ae", headers=ae)
+    to origin (codex follow-up).
+
+    CT-AVS-STALE-MARKER-TEST-VACUOUS: the axis is User-Agent (v=ua), not
+    Accept-Encoding. The origin body here is not pre-encoded, so the AE axis is
+    inert (vary.c P1-1): no marker was ever stored and a bare X-Cache check
+    passed with the marker gate mutated from stale_until to fresh_until."""
+    mob = {"User-Agent": "Mozilla/5.0 (iPhone; CPU) Mobile"}
+    p = "/avs1/m?v=ua"
+    _, _, h0 = fetch(ng.port, p, headers=mob)
     assert "x-cache" not in h0, "first should miss"
-    _, _, h1 = fetch(ng.port, "/avs1/m?v=ae", headers=ae)
+    _, _, h1 = fetch(ng.port, p, headers=mob)
     # TEST-MICROTTL-ORACLE (2026-08-23): HIT or a raced STALE both prove the
     # variant was stored, without racing the 2s fresh window over two live
     # HTTP round trips under a slow sanitizer build; see test_honor_cache_control
@@ -1482,11 +1488,14 @@ def test_auto_vary_stale_marker_reachable(ng: Nginx, origin: Origin) -> None:
     # this test exists to prove is the deterministic post-sleep check below.
     assert h1.get("x-cache") in ("HIT", "STALE"), \
         f"second should be served from cache, got {h1.get('x-cache')}"
+    hits_before = origin.hits_for("/m?v=ua")
     time.sleep(1.3)                          # past the 1s fresh TTL (TTL+0.3), inside stale
-    _, _, h2 = fetch(ng.port, "/avs1/m?v=ae", headers=ae)
-    assert "x-cache" in h2, \
+    _, _, h2 = fetch(ng.port, p, headers=mob)
+    assert h2.get("x-cache") == "STALE", \
         ("a stale-but-serveable variant must stay reachable via its stale marker, "
          f"got X-Cache={h2.get('x-cache')} (base-key fallback missed to origin)")
+    assert origin.hits_for("/m?v=ua") == hits_before, \
+        "stale variant serve must not reach origin synchronously"
 
 
 def test_206_never_cached(ng: Nginx, origin: Origin) -> None:
