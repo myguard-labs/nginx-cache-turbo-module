@@ -41,7 +41,11 @@ import re
 # precisely why the test's own budget (sleep + poll timeouts) must fit inside
 # AVSWR_STALE_WINDOW_S at the LARGEST scale the suite ever runs at, not at
 # scale 1.0.
-AVSWR_FRESH_TTL_S: float = 1.0
+# 2s, not 1s (CT-SWR-AVL-WARMUP-FLAKE): freshness is `ngx_time() <
+# fresh_until` on a one-second clock, so a 1s entry stored late in a second is
+# fresh for only the remainder of that second, which an ASan-loaded warm-up
+# HIT poll can miss. 2s guarantees a >= 1s HIT window at any store offset.
+AVSWR_FRESH_TTL_S: float = 2.0
 # NGX_HTTP_CACHE_TURBO_STALE_MULT_MAX (src/ngx_http_cache_turbo_module.h) is 8;
 # this is already at that ceiling, so the serveable window CANNOT be widened
 # further by raising the multiplier.
