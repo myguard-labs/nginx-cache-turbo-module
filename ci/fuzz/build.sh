@@ -57,11 +57,19 @@ ROWS="$(targets_rows)" || { echo "❌ fuzz target registry invalid" >&2; exit 1;
 ARG="${1:-}"
 if [ -n "$ARG" ] && [ ! -d "$ARG" ]; then
     # Explicit single-file output path -> RESP-reply target only (CI compat).
+    built=0
     while IFS=$'\t' read -r name src _corpus _dict extract; do
         [ "$name" = fuzz_resp_parser ] || continue
         bash "$FUZZ_DIR/$extract"
         build_one "$src" "$ARG"
+        built=1
     done <<<"$ROWS"
+    # A registry without the RESP row would otherwise exit 0 without writing
+    # $ARG, and the caller would run a stale binary.
+    if [ "$built" -ne 1 ]; then
+        echo "❌ fuzz target registry has no fuzz_resp_parser row; nothing built to $ARG" >&2
+        exit 1
+    fi
 else
     DIR="${ARG:-$FUZZ_DIR}"
     while IFS=$'\t' read -r name src _corpus _dict extract; do

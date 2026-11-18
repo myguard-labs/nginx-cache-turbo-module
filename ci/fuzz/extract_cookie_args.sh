@@ -47,8 +47,9 @@ fail() {
 
 : > "$OUT"
 
-# Anonymous `typedef struct { ... } NAME;` blocks from the module header.
-for t in $TYPES; do
+# Anonymous `typedef struct { ... } NAME;` blocks, each exactly once.
+slice_typedef() {
+    local file="$1" t="$2" n
     awk -v want="} ngx_http_cache_turbo_${t};" '
         /^typedef struct \{$/ { buf = $0 ORS; next }
         buf != "" {
@@ -56,28 +57,35 @@ for t in $TYPES; do
             if ($0 == want) { printf "%s\n", buf; buf = "" }
             else if ($0 ~ /^\} /) { buf = "" }
         }
-    ' "$HDR" > "$OUT.part"
+    ' "$file" > "$OUT.part"
     n=$(grep -c "^} ngx_http_cache_turbo_${t};" "$OUT.part" || true)
     if [ "$n" -ne 1 ]; then
-        fail "ngx_http_cache_turbo_${t}: expected exactly one typedef block, got $n"
+        fail "ngx_http_cache_turbo_${t}: expected exactly one typedef block in $(basename "$file"), got $n"
     fi
     cat "$OUT.part" >> "$OUT"
+}
+
+# Type blocks from the module header.
+for t in $TYPES; do
+    slice_typedef "$HDR" "$t"
 done
 
-# ARGS_MAX define plus the argspan_t / argparse_t typedef blocks.
-awk '
-    /^#define NGX_HTTP_CACHE_TURBO_ARGS_MAX / { capture = 1 }
-    capture { print }
-    capture && $0 == "} ngx_http_cache_turbo_argparse_t;" { capture = 0; print "" }
-' "$SRC" > "$OUT.part"
-if [ "$(grep -c '^#define NGX_HTTP_CACHE_TURBO_ARGS_MAX ' "$OUT.part" || true)" -ne 1 ] \
-    || [ "$(grep -c '^} ngx_http_cache_turbo_argparse_t;' "$OUT.part" || true)" -ne 1 ]; then
-    fail "ARGS_MAX define / argparse_t typedef block not found exactly once"
+# ARGS_MAX define (one line, needed by argparse_t), then argspan_t before
+# argparse_t, each validated on its own so a reordered source cannot drop one.
+grep '^#define NGX_HTTP_CACHE_TURBO_ARGS_MAX ' "$SRC" > "$OUT.part" || true
+if [ "$(wc -l < "$OUT.part")" -ne 1 ] || grep -q '\\$' "$OUT.part"; then
+    fail "ARGS_MAX define not found exactly once as a single line"
 fi
-cat "$OUT.part" >> "$OUT"
+{ cat "$OUT.part"; echo; } >> "$OUT"
+slice_typedef "$SRC" argspan_t
+slice_typedef "$SRC" argparse_t
 
 for f in $FUNCS; do
     awk -v want="ngx_http_cache_turbo_${f}(" '
+        # A capture must close on a bare "}". A top-level declaration reached
+        # first (e.g. the closing brace gained a trailing comment) would swallow
+        # the next function: reject the slice.
+        capture && ($0 ~ /^static / || $0 ~ /^[a-z_][a-z_0-9 ]*$/) { exit 3 }
         capture {
             print
             if ($0 == "}") { capture = 0; print "" }
@@ -88,7 +96,9 @@ for f in $FUNCS; do
         }
         /^(static )?[a-z_][a-z_0-9 ]*$/ { pending = 1; buf = $0 ORS; next }
         { pending = 0; buf = "" }
-    ' "$SRC" > "$OUT.part"
+    ' "$SRC" > "$OUT.part" || {
+        fail "ngx_http_cache_turbo_${f}: slice reached the next top-level declaration before the closing brace"
+    }
     n=$(grep -c "^ngx_http_cache_turbo_${f}(" "$OUT.part" || true)
     if [ "$n" -ne 1 ] || [ "$(tail -n2 "$OUT.part" | head -n1)" != "}" ]; then
         fail "ngx_http_cache_turbo_${f}: expected exactly one complete definition, got $n"

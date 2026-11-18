@@ -239,16 +239,22 @@ area_ok() {
 }
 
 fuzz_replay() {
-    local fz="$ROOT/ci/fuzz" t rc=0 files
+    local fz="$ROOT/ci/fuzz" t rc=0 files names
     bash "$fz/build.sh" "$PCT_TMP" >/dev/null || return 1
     # Target list: registry ci/fuzz/targets.tsv (validated by build.sh above).
-    for t in $(bash "$fz/targets.sh" names); do
+    # Captured on its own so a failing or empty listing fails the replay
+    # instead of silently replaying nothing (or only a valid prefix).
+    names="$(bash "$fz/targets.sh" names)" \
+        || { echo "fuzz replay FAILED: cannot list targets from ci/fuzz/targets.tsv" >&2; return 1; }
+    [ -n "$names" ] \
+        || { echo "fuzz replay FAILED: ci/fuzz/targets.tsv lists no targets" >&2; return 1; }
+    while IFS= read -r t; do
         # shellcheck disable=SC2207
         files=($(find "$fz/regressions/$t" -maxdepth 1 -type f ! -name README.md 2>/dev/null))
         if [ "${#files[@]}" -eq 0 ]; then echo "fuzz replay: $t: no regressions"; continue; fi
         "$PCT_TMP/$t" "${files[@]}" >/dev/null 2>"$PCT_TMP/$t.err" \
             || { echo "fuzz replay FAILED: $t" >&2; tail -5 "$PCT_TMP/$t.err" >&2; rc=1; }
-    done
+    done <<<"$names"
     return "$rc"
 }
 

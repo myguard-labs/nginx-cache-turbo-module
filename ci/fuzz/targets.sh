@@ -30,10 +30,13 @@ targets_rows() {
         return 1
     }
     local line n=0 rc=0 name source corpus dict extract rest seen=" "
+    local header=$'name\tsource\tcorpus\tdict\textract'
     while IFS= read -r line || [ -n "$line" ]; do
         n=$((n + 1))
         line="${line%$'\r'}"
-        [ "$n" -eq 1 ] && [ "${line%%$'\t'*}" = "name" ] && continue
+        # Skip line 1 only when it is the complete header; anything else on
+        # line 1 is a data row and is validated as one.
+        [ "$n" -eq 1 ] && [ "$line" = "$header" ] && continue
         [ -z "$line" ] && continue
         case "$line" in '#'*) continue ;; esac
         local tabs="${line//[^$'\t']/}"
@@ -51,7 +54,12 @@ targets_rows() {
         dict="${rest%%$'\t'*}"
         extract="${rest#*$'\t'}"
         case "$name" in
-        fuzz_[a-z0-9_]*) ;;
+        fuzz_*[!_[:digit:][:lower:]]*)
+            echo "targets: row at line $n has an invalid or empty name '$name' (want fuzz_<lowercase, digits, _>): $line" >&2
+            rc=1
+            continue
+            ;;
+        fuzz_?*) ;;
         *)
             echo "targets: row at line $n has an invalid or empty name '$name' (want fuzz_<...>): $line" >&2
             rc=1
@@ -65,6 +73,12 @@ targets_rows() {
             ;;
         esac
         seen="$seen$name "
+        case "$corpus$dict" in *:*)
+            echo "targets: row '$name' (line $n): ':' in corpus or dict would break the name:corpus:dict spec" >&2
+            rc=1
+            continue
+            ;;
+        esac
         if [ -z "$source" ] || [ ! -f "$FUZZ_DIR/$source" ]; then
             echo "targets: row '$name' (line $n): harness source '$source' not found in $FUZZ_DIR" >&2
             rc=1

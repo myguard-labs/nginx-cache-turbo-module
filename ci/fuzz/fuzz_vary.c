@@ -42,7 +42,9 @@
  *      whitelist (an unknown token, or one of the named vetoes) the final
  *      verdict MUST be nocache = 1 with bits = 0, and an unknown token must
  *      also set unsafe_axis. Checked separately from (1) so a drift in the
- *      model cannot mask a fail-open classifier.
+ *      model cannot mask a fail-open classifier. The expectation comes from a
+ *      hard-coded allow-list (kAllow / kVeto) and the harness's own ignore
+ *      mask, never from the reference model's arms.
  *   3. Tokeniser: a returned token lies inside [value, end), is non-empty and
  *      free of separators, the cursor always advances, and a 0 return means
  *      the value is exhausted.
@@ -108,12 +110,32 @@ ref_sep(int c)
     return c == ' ' || c == '\t' || c == ',';
 }
 
+/* Oracle 2 inputs. Deliberately separate from ref_token()'s arms: a
+ * hard-coded allow-list of the four whitelisted names and the three named
+ * vetoes, so a name wrongly whitelisted in BOTH the model and the shipped
+ * classifier still trips the fail-closed check below. */
+static const char *const kAllow[] = {
+    "Accept-Encoding", "User-Agent", "Accept-Language", "Origin"
+};
+static const char *const kVeto[] = { "*", "Cookie", "Authorization" };
+
+static int
+in_list(const u_char *t, size_t n, const char *const *list, size_t cnt)
+{
+    size_t  i;
+
+    for (i = 0; i < cnt; i++) {
+        if (ref_eq(t, n, list[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 typedef struct {
     ngx_int_t    bits;
     ngx_uint_t   nocache;
     ngx_uint_t   unsafe_axis;
-    int          refused;   /* a non-ignored token outside the whitelist */
-    int          unknown;   /* a non-ignored token no arm names */
 } verdict_t;
 
 static void
@@ -123,7 +145,6 @@ ref_token(verdict_t *v, const u_char *t, size_t n, int resp_enc)
         || ref_eq(t, n, "Authorization"))
     {
         v->nocache = 1;
-        v->refused = 1;
     } else if (ref_eq(t, n, "Accept-Encoding")) {
         if (resp_enc) {
             v->bits |= NGX_HTTP_CACHE_TURBO_VARY_ENCODING;
@@ -137,8 +158,6 @@ ref_token(verdict_t *v, const u_char *t, size_t n, int resp_enc)
     } else {
         v->nocache = 1;
         v->unsafe_axis = 1;
-        v->refused = 1;
-        v->unknown = 1;
     }
 }
 
@@ -189,6 +208,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     ngx_int_t                         bits = 0;
     ngx_uint_t                        nocache = 0, unsafe_axis = 0;
     verdict_t                         ref;
+    int                               must_refuse = 0, must_unsafe = 0;
 
     if (size < 2) {
         return 0;
@@ -275,6 +295,34 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             if (ngx_http_cache_turbo_vary_ignore_match(clcf, tok, tl)) {
                 continue;
             }
+            /* Oracle 2 bookkeeping, from the allow-list above only. The
+             * ignore list is re-derived from the harness's own mask, not
+             * from the model. */
+            {
+                int  ignored = 0;
+
+                if (mode == 2) {
+                    for (size_t k = 0; k < NIGNORE; k++) {
+                        if ((mask >> k & 1) && ref_eq(tok, tl, kIgnore[k])) {
+                            ignored = 1;
+                        }
+                    }
+                }
+                if (!ignored) {
+                    if (!in_list(tok, tl, kAllow,
+                                 sizeof(kAllow) / sizeof(kAllow[0])))
+                    {
+                        must_refuse = 1;
+                    }
+                    if (!in_list(tok, tl, kAllow,
+                                 sizeof(kAllow) / sizeof(kAllow[0]))
+                        && !in_list(tok, tl, kVeto,
+                                    sizeof(kVeto) / sizeof(kVeto[0])))
+                    {
+                        must_unsafe = 1;
+                    }
+                }
+            }
             ngx_http_cache_turbo_classify_vary_classify_token(tok, tl,
                                                                 &bits,
                                                                 &nocache,
@@ -302,11 +350,13 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         TRAP();
     }
 
-    /* Oracle 2: fail-closed property, independent of the model's arms. */
-    if (ref.refused && (!nocache || bits != 0)) {
+    /* Oracle 2: fail-closed property from the independent allow-list, not
+     * from ref.refused / ref.unknown (those are set by the same arms Oracle 1
+     * already compared, so they could never fail on their own). */
+    if (must_refuse && (!nocache || bits != 0)) {
         TRAP();
     }
-    if (ref.unknown && !unsafe_axis) {
+    if (must_unsafe && !unsafe_axis) {
         TRAP();
     }
 

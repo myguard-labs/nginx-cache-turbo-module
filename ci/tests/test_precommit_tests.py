@@ -114,6 +114,34 @@ class FakeRepo(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("RAN-BUILD", r.stdout)
 
+    def fuzz_root(self, names_script):
+        """Throwaway root whose ci/fuzz build.sh succeeds and targets.sh runs
+        `names_script`; the map's only row is the @fuzz-replay command."""
+        fz = self.root / "ci" / "fuzz"
+        (fz / "regressions" / "fuzz_ok").mkdir(parents=True)
+        (fz / "regressions" / "fuzz_ok" / "unit1").write_text("x")
+        (fz / "build.sh").write_text(
+            '#!/bin/sh\nprintf "#!/bin/sh\\nexit 0\\n" > "$1/fuzz_ok"\n'
+            'chmod +x "$1/fuzz_ok"\n')
+        (fz / "targets.sh").write_text(names_script)
+        (self.root / "fz.tsv").write_text("src/f.c\tnone\t@fuzz-replay\n")
+        return sh("--map", str(self.root / "fz.tsv"), "--files", "src/f.c",
+                  root=self.root)
+
+    def test_fuzz_replay_passes_with_a_valid_listing(self):
+        r = self.fuzz_root("#!/bin/sh\necho fuzz_ok\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_fuzz_replay_fails_when_target_listing_fails(self):
+        r = self.fuzz_root("#!/bin/sh\necho fuzz_ok\nexit 1\n")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("cannot list targets", r.stderr)
+
+    def test_fuzz_replay_fails_on_empty_listing(self):
+        r = self.fuzz_root("#!/bin/sh\nexit 0\n")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("lists no targets", r.stderr)
+
     def test_failing_command_fails_selector(self):
         r = self.run_sel("src/bad.c")
         self.assertEqual(r.returncode, 1)

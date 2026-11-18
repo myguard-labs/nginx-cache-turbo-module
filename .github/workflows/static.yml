@@ -1,4 +1,4 @@
-# sync-sha: 4a8291189ce61a922235e4ff7b3ad2e40279ca8c90eaeae8dd155c8b7687041f
+# sync-sha: 17a35028cd11352351f5efd227a08fcf739d78715a6f7ab90e2935fa10db7f95
 name: Static
 
 # Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
@@ -603,7 +603,11 @@ jobs:
           # "Run each target 60s" step and Deep). Iterating regressions/*/
           # instead would silently skip a deleted target directory.
           bash targets.sh validate
-          for bin in $(bash targets.sh names); do
+          # Own assignment so a failing or empty `names` stops the gate rather
+          # than leaving the loop with nothing to replay.
+          names="$(bash targets.sh names)" || { echo "::error::cannot list fuzz targets"; exit 1; }
+          [ -n "$names" ] || { echo "::error::no fuzz targets in the registry"; exit 1; }
+          for bin in $names; do
             dir="regressions/$bin/"
             [ -d "$dir" ] || { echo "❌ $bin: regressions directory $dir is missing"; failed=$((failed + 1)); continue; }
             [ -x "./$bin" ] || { echo "❌ no such fuzz target: $bin"; exit 1; }

@@ -37,6 +37,10 @@ fail() {
 : > "$OUT"
 for f in $FUNCS; do
     awk -v want="ngx_http_cache_turbo_${f}(" '
+        # An open capture must close on a bare "}". A top-level declaration
+        # reached first (e.g. the closing brace gained a trailing comment) means
+        # the slice would swallow the next function: reject it.
+        capture && ($0 ~ /^static / || $0 ~ /^[a-z_][a-z_0-9 ]*$/) { exit 3 }
         /^static / { pending = 1; buf = $0 ORS; next }
         pending && index($0, want) == 1 {
             capture = 1; pending = 0; printf "%s", buf; print; next
@@ -46,7 +50,10 @@ for f in $FUNCS; do
             print
             if ($0 == "}") { capture = 0; print "" }
         }
-    ' "$SRC" > "$OUT.part"
+    ' "$SRC" > "$OUT.part" || {
+        rm -f "$OUT.part"
+        fail "ngx_http_cache_turbo_${f}: slice reached the next top-level declaration before the closing brace"
+    }
     n=$(grep -c "^ngx_http_cache_turbo_${f}(" "$OUT.part" || true)
     if [ "$n" -ne 1 ] || [ "$(tail -n2 "$OUT.part" | head -n1)" != "}" ]; then
         rm -f "$OUT.part"

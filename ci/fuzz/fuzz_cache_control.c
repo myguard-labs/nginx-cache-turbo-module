@@ -60,7 +60,7 @@ lc(int c)
  * token boundaries first, then test them. */
 static int
 ref_find(const u_char *p, const u_char *last, const char *name,
-    const u_char **val, size_t *vlen, int *has_eq)
+    const u_char **val, size_t *vlen, int *has_eq, size_t *resume)
 {
     size_t   nlen = strlen(name);
     size_t   pos = 0, n = (size_t) (last - p);
@@ -105,6 +105,9 @@ ref_find(const u_char *p, const u_char *last, const char *name,
                 *has_eq = (i < b);
                 *val = (i < b) ? p + i + 1 : p + a;
                 *vlen = (i < b) ? b - (i + 1) : 0;
+                if (resume != NULL) {
+                    *resume = pos < n ? pos : n;    /* start of the next token */
+                }
                 return 1;
             }
         }
@@ -144,7 +147,7 @@ ref_delta(const u_char *p, const u_char *last, const char *name)
     size_t         vlen;
     int            eq;
 
-    if (!ref_find(p, last, name, &val, &vlen, &eq) || vlen == 0) {
+    if (!ref_find(p, last, name, &val, &vlen, &eq, NULL) || vlen == 0) {
         return -1;
     }
     return ref_delta_value(val, vlen);
@@ -272,7 +275,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         size_t        rvlen;
         int           req, rfound;
 
-        rfound = ref_find(v, e, name, &rv, &rvlen, &req);
+        rfound = ref_find(v, e, name, &rv, &rvlen, &req, NULL);
         if ((ngx_http_cache_turbo_cc_has(v, e, name, nlen) != 0) != rfound) {
             TRAP();
         }
@@ -292,16 +295,38 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             TRAP();
         }
 
-        /* Repeated-scan loop as in the request path (max-age/min-fresh):
-         * must terminate and keep the cursor inside the buffer. */
+        /* Repeated-scan loop as in the request path (max-age/min-fresh): every
+         * result must be the next reference match, in order, with the same
+         * value and valued flag; when the production tokenizer returns NULL the
+         * reference must be exhausted too. A tokenizer that stopped after the
+         * first of several matching directives fails here. */
         cur = v;
-        while ((q = ngx_http_cache_turbo_cc_token(&cur, e, name, nlen, &vlen,
-                                                  NULL)) != NULL)
         {
-            if (cur < v || cur > e || q < v || q > e
-                || ++steps > lines[i].value.len + 1)
-            {
-                TRAP();
+            size_t         rpos = 0, rres;
+            const u_char  *nrv;
+            size_t         nrvlen;
+            int            nreq, nfound;
+
+            for ( ;; ) {
+                valued = -1;
+                q = ngx_http_cache_turbo_cc_token(&cur, e, name, nlen, &vlen,
+                                                  &valued);
+                nfound = ref_find(v + rpos, e, name, &nrv, &nrvlen, &nreq,
+                                  &rres);
+                if ((q != NULL) != nfound) {
+                    TRAP();
+                }
+                if (q == NULL) {
+                    break;
+                }
+                if (cur < v || cur > e || q < v || q > e
+                    || ++steps > lines[i].value.len + 1
+                    || q != nrv || vlen != nrvlen || valued != nreq
+                    || cur != v + rpos + rres)
+                {
+                    TRAP();
+                }
+                rpos += rres;
             }
         }
 

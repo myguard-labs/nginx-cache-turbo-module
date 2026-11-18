@@ -58,6 +58,10 @@ slice_define() {
     if [ "$n" -ne 1 ]; then
         fail "$name: expected exactly one #define in $(basename "$file"), got $n"
     fi
+    # A continued definition would splice the next line into this macro.
+    if grep -q '\\$' "$OUT.part"; then
+        fail "$name: #define in $(basename "$file") is continued with a backslash"
+    fi
     cat "$OUT.part" >> "$OUT"
 }
 
@@ -72,6 +76,10 @@ echo >> "$OUT"
 slice_func() {
     local file="$1" name="$2" n
     awk -v want="ngx_http_cache_turbo_${name}(" '
+        # A capture must close on a bare "}". A top-level declaration reached
+        # first (e.g. the closing brace gained a trailing comment) would swallow
+        # the next function: reject the slice.
+        capture && ($0 ~ /^static / || $0 ~ /^[a-z_][a-z_0-9 ]*$/) { exit 3 }
         capture {
             print
             if ($0 == "}") { capture = 0; print "" }
@@ -82,7 +90,9 @@ slice_func() {
         }
         /^(static )?[a-z_][a-z_0-9 ]*$/ { pending = 1; buf = $0 ORS; next }
         { pending = 0; buf = "" }
-    ' "$file" > "$OUT.part"
+    ' "$file" > "$OUT.part" || {
+        fail "ngx_http_cache_turbo_${name}: slice reached the next top-level declaration before the closing brace"
+    }
     n=$(grep -c "^ngx_http_cache_turbo_${name}(" "$OUT.part" || true)
     if [ "$n" -ne 1 ] || [ "$(tail -n2 "$OUT.part" | head -n1)" != "}" ]; then
         fail "ngx_http_cache_turbo_${name}: expected exactly one complete definition in $(basename "$file"), got $n"
