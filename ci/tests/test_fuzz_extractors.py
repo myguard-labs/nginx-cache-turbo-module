@@ -55,7 +55,7 @@ class ExtractorTest(unittest.TestCase):
         e = dict(os.environ, **env)
         return subprocess.run(
             ["bash", str(self.root / "ci" / "fuzz" / script)],
-            capture_output=True, text=True, env=e)
+            capture_output=True, text=True, env=e, check=False)
 
     def inc(self, name):
         return (self.root / "ci" / "fuzz" / name)
@@ -97,7 +97,7 @@ class ExtractorTest(unittest.TestCase):
         self.tree()
         self.mutate("ngx_http_cache_turbo_module.h", lambda t: re.sub(
             r"^(#define NGX_HTTP_CACHE_TURBO_MAX_TAGS\s+)(\S+)",
-            r"\1\\\n    \2", t, count=1, flags=re.M))
+            r"\1\\\n    \2", t, count=1, flags=re.MULTILINE))
         r = self.run_ex("extract_control_inputs.sh")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("continued with a backslash", r.stderr)
