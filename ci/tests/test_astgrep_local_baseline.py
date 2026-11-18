@@ -172,13 +172,70 @@ class AstGrepLocal(unittest.TestCase):
     def test_scan_fails_when_a_c_file_is_skipped(self):
         root = self._scratch()
         (root / "src" / "latin1_b3.c").write_bytes(b"/* \xff\xfe */\nint x;\n")
-        with self.assertRaisesRegex(RuntimeError, "not scanned"):
+        with self.assertRaisesRegex(RuntimeError, "src/latin1_b3.c"):
             cb.scan(repo=root)
 
-    def test_scan_allows_blank_files(self):
+    def test_scan_allows_zero_byte_file_alone(self):
         root = self._scratch()
         (root / "src" / "empty_b3.c").write_bytes(b"")
         self.assertEqual(len(cb.scan(repo=root)), 1)
+
+    def test_whitespace_file_does_not_mask_skipped_file(self):
+        # ast-grep scans a whitespace-only file, so it must not offset a real skip
+        root = self._scratch()
+        (root / "src" / "blank_b3.c").write_text("  \n\t\n", encoding="utf-8")
+        (root / "src" / "latin1_b3.c").write_bytes(b"/* \xff\xfe */\nint x;\n")
+        with self.assertRaisesRegex(RuntimeError, "src/latin1_b3.c"):
+            cb.scan(repo=root)
+
+    def test_whitespace_file_alone_passes(self):
+        root = self._scratch()
+        (root / "src" / "blank_b3.c").write_text("  \n", encoding="utf-8")
+        self.assertEqual(len(cb.scan(repo=root)), 1)
+
+    def test_zero_byte_file_does_not_mask_skipped_file(self):
+        root = self._scratch()
+        (root / "src" / "empty_b3.c").write_bytes(b"")
+        (root / "src" / "latin1_b3.h").write_bytes(b"\xff\xfe\n")
+        with self.assertRaisesRegex(RuntimeError, "src/latin1_b3.h"):
+            cb.scan(repo=root)
+
+    def test_hidden_blank_file_does_not_offset_a_skip(self):
+        root = self._scratch()
+        (root / "src" / ".hidden").mkdir()
+        (root / "src" / ".hidden" / "empty_b3.c").write_bytes(b"")
+        (root / "src" / "latin1_b3.c").write_bytes(b"\xff\n")
+        with self.assertRaisesRegex(RuntimeError, "src/latin1_b3.c"):
+            cb.scan(repo=root)
+
+    def test_site_matching_both_rules_yields_two_rows(self):
+        # Intended (documented in both rule notes): rows are per rule.
+        root = self._scratch(
+            "int both_b3(u_char *p, size_t len, u_char *end)\n"
+            "{\n    return p + len > end;\n}\n"
+        )
+        rules = sorted({h[0] for h in cb.scan(repo=root)})
+        self.assertEqual(
+            rules, ["c-ptr-add-bound-overflow", "c-ptr-add-len-bound-overflow"]
+        )
+
+    def test_update_is_atomic(self):
+        root = self._scratch()
+        baseline = root / "baseline.tsv"
+        baseline.write_text(cb.format_baseline([]), encoding="utf-8")
+        before = baseline.read_text(encoding="utf-8")
+        with mock.patch.object(cb.os, "replace", side_effect=OSError("boom")):
+            rc, _o, _e = self._run_main(root, baseline, ["--update"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(baseline.read_text(encoding="utf-8"), before)
+        self.assertEqual(
+            sorted(p.name for p in root.glob("baseline.tsv*")), ["baseline.tsv"]
+        )
+        rc, _o, err = self._run_main(root, baseline, ["--update"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(
+            sorted(p.name for p in root.glob("baseline.tsv*")), ["baseline.tsv"]
+        )
 
     def test_update_refuses_when_a_file_is_skipped(self):
         root = self._scratch()

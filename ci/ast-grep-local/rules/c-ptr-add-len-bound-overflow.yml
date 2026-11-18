@@ -18,6 +18,8 @@ note: >-
   size, length or nbytes, also inside redundant parentheses); the bound is
   deliberately unconstrained, so integer forms such as `off + len > size` match
   too (the same unsigned-wrap class).
+  A site matching both rules (e.g. `p + len > end`) is reported once per rule, so the
+  baseline holds two rows for it; this is intended, each rule gates independently.
 rule:
   any:
     - pattern: $P + $N > $B

@@ -19,6 +19,7 @@ Usage: check_baseline.py [--update]
 """
 
 import collections
+import contextlib
 import json
 import os
 import pathlib
@@ -26,6 +27,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -37,21 +39,35 @@ SUMMARY_RE = re.compile(r"scannedFileCount=(\d+),skippedFileCount=(\d+)")
 C_SUFFIXES = (".c", ".h")  # the extensions ast-grep maps to its C language
 
 
-def _is_blank(path):
-    """True for a file ast-grep legitimately skips (no content, so no hits)."""
-    try:
-        return not path.read_bytes().strip()
-    except OSError:
-        return False
+ENTITY_FILE_RE = re.compile(r"^sg: entity\|file\|(.+): language=", re.MULTILINE)
 
 
-def _blank_c_files(root):
-    return sum(
-        1
-        for dirpath, _dirs, files in os.walk(root)
-        for name in files
-        if name.endswith(C_SUFFIXES) and _is_blank(pathlib.Path(dirpath, name))
-    )
+def _unscanned_c_files(repo, target, scanned):
+    """Non-empty C files under target that ast-grep did not scan.
+
+    `scanned` is the set of repo-relative paths from `--inspect entity`
+    (0.44.1 and 0.51.0 list every scanned file there and omit skipped ones).
+    A zero-byte file is legitimately skipped (no content, so no hits); a
+    whitespace-only file is scanned, so it appears in `scanned` and never
+    masks anything. Hidden files/dirs are not visited by ast-grep and are
+    pruned like it does; a gitignored non-empty C file fails closed.
+    """
+    root = pathlib.Path(repo)
+    missing = []
+    for dirpath, dirs, files in os.walk(root / target):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if not name.endswith(C_SUFFIXES) or name.startswith("."):
+                continue
+            path = pathlib.Path(dirpath, name)
+            rel = path.relative_to(root).as_posix()
+            try:
+                empty = path.stat().st_size == 0
+            except OSError:
+                empty = False
+            if rel not in scanned and not empty:
+                missing.append(rel)
+    return sorted(missing)
 
 
 def scan(repo=REPO, config=None, target="src"):
@@ -60,15 +76,15 @@ def scan(repo=REPO, config=None, target="src"):
     Raises RuntimeError unless the scan provably covered every C file:
     ast-grep exits 0 for warning-severity hits (1 only for error severity,
     6/8 for a bad config/rule), prints a JSON array, and skips unreadable,
-    non-UTF-8 or oversized files silently, so the summary's skippedFileCount
-    must not exceed the number of blank files (which have no hits to miss).
+    non-UTF-8 or oversized files silently, so every non-empty C file under
+    target must appear in the `--inspect entity` list of scanned files.
     """
     exe = shutil.which("ast-grep")
     if exe is None:
         raise RuntimeError("ast-grep not found on PATH")
     cfg = config or HERE / "sgconfig.yml"
     proc = subprocess.run(
-        [exe, "scan", "-c", str(cfg), "--json=compact", "--inspect", "summary", target],
+        [exe, "scan", "-c", str(cfg), "--json=compact", "--inspect", "entity", target],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -86,13 +102,12 @@ def scan(repo=REPO, config=None, target="src"):
     summary = SUMMARY_RE.search(proc.stderr)
     if summary is None:
         raise RuntimeError("ast-grep printed no scan summary; coverage unknown")
-    skipped = int(summary.group(2))
-    blank = _blank_c_files(pathlib.Path(repo) / target)
-    if skipped > blank:
+    scanned = set(ENTITY_FILE_RE.findall(proc.stderr))
+    missing = _unscanned_c_files(repo, target, scanned)
+    if missing:
         raise RuntimeError(
-            f"ast-grep skipped {skipped} C file(s) but only {blank} are blank: "
-            "an unreadable, non-UTF-8 or oversized file under "
-            f"{target}/ was not scanned"
+            f"ast-grep did not scan {len(missing)} non-empty C file(s) (unreadable, "
+            f"non-UTF-8 or oversized): {', '.join(missing[:5])}"
         )
     out = []
     for h in hits:
@@ -146,11 +161,25 @@ def report(new, stale, moved):
     return lines
 
 
+def _write_atomic(path, text):
+    """Write via a temp file in the same directory, then os.replace."""
+    path = pathlib.Path(path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def main(argv):
     try:
         actual = scan()
         if "--update" in argv:
-            BASELINE.write_text(format_baseline(actual), encoding="utf-8")
+            _write_atomic(BASELINE, format_baseline(actual))
             print(f"baseline updated: {len(actual)} hit(s)")
             return 0
         baseline = load_baseline()

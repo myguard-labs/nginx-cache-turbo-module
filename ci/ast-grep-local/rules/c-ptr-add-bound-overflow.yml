@@ -16,6 +16,8 @@ note: >-
   genuinely safe hit is rewritten anyway (HARD-B4), not suppressed. Companion
   rule: c-ptr-add-len-bound-overflow. This rule keys on the bound being named like a buffer end (last, end,
   limit, eob, *_end, *_last).
+  A site matching both rules (e.g. `p + len > end`) is reported once per rule, so the
+  baseline holds two rows for it; this is intended, each rule gates independently.
 rule:
   any:
     - pattern: $P + $N > $B
