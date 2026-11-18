@@ -1,4 +1,4 @@
-# sync-sha: 38bbb80554585240ef66b9f5a7fd259074ffa0f9abd7151ead43f2f44d98e411
+# sync-sha: a84051813ecbe7c0e15756ac2425bd40ccb86b17d72b0c6c88d86370b76455f6
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -7,8 +7,8 @@ name: CI Deep
 # THIS file keeps the long/exhaustive runs. CodeQL remains in codeql.yml; this
 # workflow complements it with long dynamic-analysis and scanner jobs.
 #
-# Lanes: D-soak (8 ASan repetitions), D-fuzz-a (3 targets + coverage),
-# D-fuzz-b (2 targets + scanbench + analyzer), D-compat (all compatibility,
+# Lanes: D-soak (8 ASan repetitions), D-fuzz-a (first half of the fuzz registry + coverage),
+# D-fuzz-b (second half of the fuzz registry + scanbench + analyzer), D-compat (all compatibility,
 # Valgrind, testkit and full scanners). Long fuzz inputs retain their budget.
 # Structural regroup only: the <=125m measured wall target remains open.
 #   * memcheck runs under ci/tools/soak.sh, which passes
@@ -304,8 +304,12 @@ jobs:
   D-fuzz-a:
     name: D-fuzz-a
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    # Inputs through 14400s retain four hours of fuzz CPU per target plus tails.
-    timeout-minutes: ${{ inputs.fuzz_seconds > 3600 && 420 || 180 }}
+    # Targets run FUZZ_JOBS (3) at a time and each gets the full fuzz_seconds,
+    # so a lane with more than three targets runs ceil(n/3) = 2 sequential
+    # waves: 2 x 14400s = 480m at the largest accepted input, plus 120m for
+    # setup, corpus merge and (lane a) coverage. ci/tools/test_deep_lanes.py
+    # derives the wave count from the registry and checks both budgets.
+    timeout-minutes: ${{ inputs.fuzz_seconds > 3600 && 600 || 240 }}
     env:
       TEST_BASE_PORT: 19200
     steps:
@@ -394,7 +398,12 @@ jobs:
           # waits on all of them and fails on a non-zero exit or any crash-/
           # leak-/timeout-/oom- artifact (written as ci/fuzz/crash-<bin>-*,
           # which the upload step below globs). Logs: ci/fuzz/fuzz-logs/.
-          bash run-concurrent.sh fuzz_resp_parser:corpus:fuzz.dict fuzz_norm_args:corpus_norm_args: fuzz_mc_parser:corpus_mc:fuzz_mc.dict
+          # Targets come from the registry ci/fuzz/targets.tsv: lane a runs the
+          # first half of its rows, lane b the rest, so a new row is always fuzzed.
+          specs="$(bash targets.sh specs a)"
+          [ -n "$specs" ] || { echo "::error::no fuzz targets for lane a"; exit 1; }
+          mapfile -t specs <<<"$specs"
+          bash run-concurrent.sh "${specs[@]}"
 
         id: fuzz_a_06
         env:
@@ -672,8 +681,12 @@ jobs:
   D-fuzz-b:
     name: D-fuzz-b
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    # Inputs through 14400s retain four hours of fuzz CPU per target plus tails.
-    timeout-minutes: ${{ inputs.fuzz_seconds > 3600 && 420 || 180 }}
+    # Targets run FUZZ_JOBS (3) at a time and each gets the full fuzz_seconds,
+    # so a lane with more than three targets runs ceil(n/3) = 2 sequential
+    # waves: 2 x 14400s = 480m at the largest accepted input, plus 120m for
+    # setup, corpus merge, scanbench and the analyzer. ci/tools/test_deep_lanes.py
+    # derives the wave count from the registry and checks both budgets.
+    timeout-minutes: ${{ inputs.fuzz_seconds > 3600 && 600 || 240 }}
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -760,7 +773,12 @@ jobs:
           # waits on all of them and fails on a non-zero exit or any crash-/
           # leak-/timeout-/oom- artifact (written as ci/fuzz/crash-<bin>-*,
           # which the upload step below globs). Logs: ci/fuzz/fuzz-logs/.
-          bash run-concurrent.sh fuzz_auto_classify:corpus_auto: fuzz_blob:corpus_blob:
+          # Targets come from the registry ci/fuzz/targets.tsv: lane a runs the
+          # first half of its rows, lane b the rest, so a new row is always fuzzed.
+          specs="$(bash targets.sh specs b)"
+          [ -n "$specs" ] || { echo "::error::no fuzz targets for lane b"; exit 1; }
+          mapfile -t specs <<<"$specs"
+          bash run-concurrent.sh "${specs[@]}"
 
         id: fuzz_b_06
         env:

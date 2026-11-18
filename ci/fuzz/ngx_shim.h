@@ -55,6 +55,11 @@ struct ngx_http_cache_turbo_loc_conf_s {
 #define ngx_string(str)     { sizeof(str) - 1, (u_char *) str }
 #define ngx_null_string     { 0, NULL }
 
+/* nginx ngx_buf.h / ngx_times.h: the readers only move ngx_buf_t pointers
+ * (op->send = op->command) and pass op->timeout to the timer shim. */
+typedef struct ngx_buf_s  ngx_buf_t;
+typedef ngx_uint_t        ngx_msec_t;
+
 /* --- core constants (nginx ngx_core.h / ngx_config.h) --- */
 #define NGX_OK            0
 #define NGX_ERROR        -1
@@ -165,6 +170,22 @@ typedef struct {
     size_t      frame_off;
     ngx_uint_t  frame_remain[NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH];
     ngx_uint_t  frame_depth;
+
+    /* AUTH/SELECT preamble and lock (SET NX PX) reply readers
+     * (read_preamble / read_lock, sliced by extract_redis_readers.sh). Same
+     * field names and meaning as the shipped struct: the replies accumulate in
+     * the fixed recv[] scratch (recv_len bytes), clean marks a framed reply,
+     * unconnected arms the first-reply backoff clear, and the preamble path
+     * swaps send from the preamble to the real command when it completes. */
+    ngx_buf_t  *send;
+    ngx_buf_t  *command;
+    ngx_msec_t  timeout;
+    ngx_uint_t  preamble_replies;
+    unsigned    in_preamble:1;
+    unsigned    clean:1;
+    unsigned    unconnected:1;
+    u_char      recv[256];
+    size_t      recv_len;
 } ngx_http_cache_turbo_redis_op_t;
 
 /* --- verbatim from nginx src/core/ngx_string.h --- */

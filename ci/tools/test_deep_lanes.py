@@ -4,8 +4,8 @@
 """Check Deep's retained inventory and execute its lane verdict controls.
 
 Inventory hashes cover original commands, step environments, actions and inputs.
-Only lane wiring (paths, resolved matrix values and the explicit fuzz partition)
-normalizes away. --baseline proves the manifest against a pre-regroup workflow.
+Only lane wiring (paths, resolved matrix values and the registry-derived fuzz
+partition) and comments in the fuzz step normalize away. --baseline proves the manifest against a pre-regroup workflow.
 The local runner models GitHub outcome guards; it does not run runtime checks.
 """
 
@@ -85,6 +85,17 @@ def protected(step, group, original_env=None):
         run = run.replace('build=".build/', 'build="${BUILD_ROOT}/')
         if step["name"].endswith("Fuzz targets concurrently"):
             run = re.sub(r"bash run-concurrent.sh[^\n]*", "bash run-concurrent.sh", run)
+            # The registry-derived partition (specs/guard/mapfile lines) is lane
+            # wiring, like the explicit list it replaced, and comments carry no
+            # behaviour; test_fuzz_partition_reaches_the_runner executes the
+            # guard and checks the arguments the runner receives instead.
+            run = re.sub(
+                r'^[ \t]*(#[^\n]*|specs=[^\n]*|\[ -n "\$specs" \][^\n]*'
+                r"|mapfile -t specs[^\n]*)\n",
+                "",
+                run,
+                flags=re.MULTILINE,
+            )
         data["run"] = run
     for key, value in data.get("env", {}).items():
         if isinstance(value, str):
@@ -335,28 +346,106 @@ class DeepLanes(unittest.TestCase):
             WORKFLOW["concurrency"],
             {"group": "ci-deep-${{ github.ref }}", "cancel-in-progress": False},
         )
-        for lane, targets in {
-            "D-fuzz-a": [
-                "fuzz_resp_parser:corpus:fuzz.dict",
-                "fuzz_norm_args:corpus_norm_args:",
-                "fuzz_mc_parser:corpus_mc:fuzz_mc.dict",
-            ],
-            "D-fuzz-b": ["fuzz_auto_classify:corpus_auto:", "fuzz_blob:corpus_blob:"],
-        }.items():
+        # Always the checked-in registry: drop any inherited override.
+        env = {k: v for k, v in os.environ.items() if k != "FUZZ_TARGETS_TSV"}
+
+        def specs(part):
+            return subprocess.run(
+                ["bash", str(ROOT / "ci/fuzz/targets.sh"), "specs", part],
+                check=True, capture_output=True, text=True, env=env,
+            ).stdout.split()
+
+        registry = specs("all")
+        half = (len(registry) + 1) // 2
+        for lane, part in {"D-fuzz-a": "a", "D-fuzz-b": "b"}.items():
             job = WORKFLOW["jobs"][lane]
-            self.assertEqual(
-                job["timeout-minutes"],
-                "${{ inputs.fuzz_seconds > 3600 && 420 || 180 }}",
-            )
             step = next(
                 s
                 for s in job["steps"]
                 if s["name"].endswith("Fuzz targets concurrently")
             )
+            # The lane derives its targets from the registry: no hard-coded list.
+            self.assertIn("targets.sh specs " + part, step["run"])
+            self.assertNotIn("fuzz_resp_parser", step["run"])
             self.assertEqual(
-                step["run"].split("bash run-concurrent.sh ")[1].strip().split(), targets
+                {"a": registry[:half], "b": registry[half:]}[part], specs(part)
             )
             self.assertEqual(step["env"]["FUZZ_JOBS"], "3")
+            self.assert_fuzz_timeout(job, len(specs(part)), int(step["env"]["FUZZ_JOBS"]))
+
+    def assert_fuzz_timeout(self, job, targets, jobs):
+        """Each lane fits ceil(targets/jobs) sequential waves of the full per-target
+        budget plus the non-fuzz steps, at the smallest and the largest input."""
+        match = re.fullmatch(
+            r"\$\{\{ inputs\.fuzz_seconds > (\d+) && (\d+) \|\| (\d+) \}\}",
+            job["timeout-minutes"],
+        )
+        self.assertIsNotNone(match, job["timeout-minutes"])
+        threshold, long_limit, short_limit = map(int, match.groups())
+        waves = -(-targets // jobs)
+        overhead = 120  # setup, corpus merge and (lane a) coverage, minutes
+        # fuzz_seconds is capped at 14400 by the "Select fuzz duration" step.
+        for seconds in (3600, 3601, 14400):
+            limit = long_limit if seconds > threshold else short_limit
+            self.assertGreaterEqual(
+                limit, waves * seconds / 60 + overhead,
+                f"{waves} wave(s) of {seconds}s do not fit {limit}m",
+            )
+        # An unset input (schedule) resolves to the short limit and 3600s.
+        self.assertGreaterEqual(short_limit, waves * 60 + overhead)
+
+    def test_fuzz_partition_reaches_the_runner(self):
+        """Run each lane's real step with a stub run-concurrent.sh and compare the
+        arguments it receives with the registry partition."""
+        env = {k: v for k, v in os.environ.items() if k != "FUZZ_TARGETS_TSV"}
+        fuzz = ROOT / "ci/fuzz"
+        for lane, part in {"D-fuzz-a": "a", "D-fuzz-b": "b"}.items():
+            step = next(
+                s
+                for s in WORKFLOW["jobs"][lane]["steps"]
+                if s["name"].endswith("Fuzz targets concurrently")
+            )
+            expected = subprocess.run(
+                ["bash", str(fuzz / "targets.sh"), "specs", part],
+                check=True, capture_output=True, text=True, env=env,
+            ).stdout.split()
+            with self.subTest(lane=lane), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                (work / "ci/fuzz").mkdir(parents=True)
+                for entry in fuzz.iterdir():
+                    if entry.name != "run-concurrent.sh":
+                        (work / "ci/fuzz" / entry.name).symlink_to(entry)
+                record = work / "args"
+                (work / "ci/fuzz/run-concurrent.sh").write_text(
+                    '#!/bin/sh\nprintf "%s\\n" "$@" > "$RECORD"\n', encoding="utf-8"
+                )
+                result = subprocess.run(
+                    ["bash", "-e", "-c", step["run"]],
+                    cwd=work, env={**env, "RECORD": str(record)},
+                    text=True, capture_output=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(record.read_text(encoding="utf-8").split(), expected)
+                # Negative control: a registry the step cannot list stops the lane
+                # before the runner is reached.
+                record.unlink()
+                result = subprocess.run(
+                    ["bash", "-e", "-c", step["run"]],
+                    cwd=work,
+                    env={**env, "RECORD": str(record),
+                         "FUZZ_TARGETS_TSV": str(work / "missing.tsv")},
+                    text=True, capture_output=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(record.exists(), "runner ran with no target list")
+
+    def test_fuzz_manifest_digests_match(self):
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        digest = {
+            g: next(r["sha256"] for r in manifest[g] if r["name"] == "Fuzz targets concurrently")
+            for g in ("fuzz-a", "fuzz-b")
+        }
+        self.assertEqual(digest["fuzz-a"], digest["fuzz-b"])
 
     def test_actions_and_private_outputs(self):
         for lane, job in WORKFLOW["jobs"].items():

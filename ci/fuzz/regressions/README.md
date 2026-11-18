@@ -20,6 +20,10 @@ regressions/
   fuzz_mc_parser/
   fuzz_auto_classify/
   fuzz_blob/
+  fuzz_cache_control/
+  fuzz_vary/
+  fuzz_cookie_args/
+  fuzz_control_inputs/
 ```
 
 Every target must hold at least one unit; the replay step FAILS on an empty

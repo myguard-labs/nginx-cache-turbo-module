@@ -1,8 +1,8 @@
 # Fuzzing
 
 Coverage-guided (libFuzzer) fuzzing of the module's attacker-controlled
-parsers. Four targets, each built from the SHIPPED source by its own
-`extract_*.sh` slicer (no hand-maintained copy):
+parsers. Registered targets (see below), each built from the SHIPPED source by
+its own `extract_*.sh` slicer (no hand-maintained copy):
 
 - **`fuzz_resp_parser`** → the three Redis (RESP) reply parsers (below).
 - **`fuzz_mc_parser`** → `ngx_http_cache_turbo_mc_parse()` (v13), the memcached
@@ -28,6 +28,122 @@ parsers. Four targets, each built from the SHIPPED source by its own
   `Cookie` header / request URI / args. Bug classes: OOB reads in the cookie
   substring / value-predicate scans and the URI/arg matchers. Sliced by
   `extract_auto_classify.sh` into `generated_auto_classify.inc`.
+- **`fuzz_cache_control`** → the origin `Cache-Control` / `Surrogate-Control`
+  parser: `cc_token` (quoted-string / quoted-pair aware directive scan),
+  `cc_has`, `cc_parse_delta` (saturating delta-seconds), `cc_delta` and
+  `cc_delta_all` (every field-line walk over an `ngx_list_t`). Bug classes: an
+  OOB-read at/over `last` on exact-sized, non-NUL-terminated values and an
+  integer overflow in the delta accumulator. Sliced by `extract_cache_control.sh`
+  into `generated_cache_control.inc`; shim is `ngx_shim_cc.h`; corpus is
+  `corpus_cache_control/` (duplicated/conflicting directives, quoted
+  delimiters, unterminated quotes, `=` without value, 20+ digit and signed
+  deltas, NUL/CTL/obs-text, 1000 directives/lines). Oracle: an independent
+  reference model in the harness; `-1` is the only negative result and a delta
+  saturates at `NGX_MAX_TIME_T_VALUE`.
+- **`fuzz_vary`** → the origin `Vary` classifier:
+  `classify_vary_next_token` (comma/whitespace tokeniser),
+  `classify_vary_classify_token` (per-axis verdict) and `vary_ignore_match`
+  (`cache_turbo_vary_ignore` lookup), driven in the shipped caller's loop shape.
+  Bug classes: an OOB read over the end of an exact-sized, non-NUL-terminated
+  value and a fail-open verdict. Sliced by `extract_vary.sh` into
+  `generated_vary.inc`; shim is `ngx_shim_vary.h`; corpus is `corpus_vary/`
+  (`*`, empty tokens, comma/whitespace runs, case variants, 1000 tokens,
+  over-long names, NUL, ignore-list modes). Oracle: an independent reference
+  model plus a fail-closed property (a non-ignored token outside the four
+  whitelisted axes must leave `nocache` set and `bits` 0).
+
+- **`fuzz_cookie_args`** → the client Cookie index and query-string parsers in
+  `match.c`: `cookie_index_parse_one` (+ its `cookie_index_add` helper),
+  `cookie_ac_scan_one`, `argparse_tail_count` and `argparse_build` (+ `hexval`,
+  `qs_first_mangled`). Inputs are exact-sized, non-NUL-terminated Cookie header
+  values (`;` without a space, empty names, `=` inside values, quoted values,
+  duplicates, 4096 crumbs) and query strings (`&&`, bare `=`, truncated
+  `%`-escapes, `+`, 10000 args). Bug classes: an OOB read at/over the end of a
+  value, a write past the span array / pair array if the counting walk and the
+  recording walk disagree, and a Cookie/arg mis-split. Sliced by
+  `extract_cookie_args.sh` (verbatim type blocks from `module.h` plus the
+  functions from `match.c`; fails closed if any one is missing) into
+  `generated_cookie_args.inc`; shim is `ngx_shim_cookie_args.h` (a recording
+  pool whose allocations are exact heap blocks); corpus is
+  `corpus_cookie_args/`. Oracle: ASan/UBSan plus independent reference models,
+  and a bound oracle - `argparse_tail_count` equals the reference count, the
+  recorded span count never exceeds the computed capacity and an overflowed
+  array is allocated at exactly `capacity * sizeof(span)`. Layout: byte 0 flags
+  (failing pool, empty needle, NULL automaton, NULL data), byte 1 needle mask,
+  byte 2 tail-offset selector, then `0xFF`-separated sections (query string,
+  then up to 8 Cookie header values). The 10000-arg and 4096-crumb seeds exceed
+  libFuzzer's default 4096-byte limit, which it raises to the largest seed.
+
+- **`fuzz_control_inputs`** → the operator/origin control-input parsers:
+  `hexdecode` (`purge.c`, tag-set member hex to key bytes; + the `match.c`
+  `hexval` helper), `body_filter_tag_split` (`filters.c`, origin
+  Surrogate-Key / Cache-Tag tokeniser capped at `MAX_TAGS` entries of
+  `MAX_TAG_LEN` bytes) and the admin warm-list splitter in `admin.c`: `warm`
+  (`,`/`\n` split, CR trim, `?query` suffix split, percent-decode into an exact
+  allocation, `warm_max` fan-out cap), `warm_uri_is_safe`, `warm_raw_is_safe`
+  and `warm_file_finish` (the `WARM_LINE_MAX_LEN` gate). Bug classes: an OOB
+  read at/over the end of an exact-sized, non-NUL-terminated buffer, a write
+  past `seen[]` or the decode allocation, a cap that stops holding, and a
+  CR/NUL/CTL byte or `..` segment reaching the subrequest. Sliced by
+  `extract_control_inputs.sh` (the cap defines from `module.h` / `admin.c` plus
+  the functions; fails closed if any one is missing) into
+  `generated_control_inputs.inc`; shim is `ngx_shim_control_inputs.h` (verbatim
+  nginx `ngx_unescape_uri`, an exact-block pool with a fail-at index, and
+  recorders standing in for `warm_one` and `send_json`); corpus is
+  `corpus_control_inputs/`. Oracle: ASan/UBSan plus independent reference models
+  and a cap oracle - tag count never exceeds `MAX_TAGS`, every tag is
+  1..`MAX_TAG_LEN` bytes, the successful warm subrequests never exceed
+  `warm_max` and equal the reply, and a list with a line over
+  `WARM_LINE_MAX_LEN` fires nothing. Layout: byte 0 flags (`warm_max`
+  selector, `warm_one` failure schedule, pool failure, tag resume), byte 1 pool
+  failure index, then the hex string, the tag value (each ended by `0xFF`) and
+  the warm list (the rest). **Ownership deviation:** `ngx_http_arg` (the
+  `?url=` / `?url_file=` / `?tag=` / `?key=` lookup) is nginx core, not module
+  code, so it is not driven; the in-tree query readers are warm's `?query`
+  suffix split and its percent-decoder, both covered here. `hexval` is
+  also sliced into `fuzz_cookie_args` and `fuzz_auto_classify` (argparse
+  helper); here it is asserted only through `hexdecode`.
+
+### Function ownership (match.c auto-classify FUZZ-EXTRACT block)
+
+`fuzz_auto_classify` compiles match.c with `NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO`
+defined, which compiles OUT every `!FUZZ_SHIM_AUTO` function and compiles IN the
+legacy per-pair predicate path. Each function below is actively driven by exactly
+one target; the other target either never compiles it or only reaches it as an
+unasserted feeder.
+
+| function | owner | note |
+|---|---|---|
+| `cookie_index_add`, `cookie_index_parse_one` | `fuzz_cookie_args` | `!FUZZ_SHIM_AUTO`: not compiled into `fuzz_auto_classify` |
+| `cookie_ac_scan_one` | `fuzz_cookie_args` | `!FUZZ_SHIM_AUTO`: not compiled into `fuzz_auto_classify` |
+| `argparse_tail_count`, `argparse_build` (+ `hexval`, `qs_first_mangled`) | `fuzz_cookie_args` | always compiled, so `fuzz_auto_classify` also runs them as the front half of `auto_skip` with no assertion on their output; the span/size bound oracle lives only here |
+| `hexdecode`, `body_filter_tag_split`, `warm`, `warm_uri_is_safe`, `warm_raw_is_safe`, `warm_file_finish` | `fuzz_control_inputs` | not in `match.c`; compiled into no other target |
+| `read_preamble`, `read_lock` (`redis.c`, event-handler readers over the op's `recv[]` scratch) | `fuzz_resp_parser` | not in `match.c`; sliced by `extract_redis_readers.sh` into `generated_redis_readers.inc`, compiled into no other target; `read_lock` reaches `redis_frame`, which is only an unasserted feeder here |
+| `cookie_pred_one_next_pair`, `cookie_pred_one_split` (+ `_dispatch`, `cookie_pred`) | `fuzz_auto_classify` | `FUZZ_SHIM_AUTO`-only; driven through `auto_skip` over the preset predicate rows, so NOT sliced into `fuzz_cookie_args` |
+| `cookie_byteset_build`, `cookie_contains`, `cookie_has`, `qs_eq`, `arg_match`, `uri_prefix`, `auto_skip`, preset registry | `fuzz_auto_classify` | unchanged |
+
+## Target registry
+
+`targets.tsv` is the single list of fuzz targets (tab-separated, header row,
+columns `name source corpus dict extract`; `dict` is `-` when none). `build.sh`,
+`run-concurrent.sh` (no-arg default), `ci/tools/precommit-tests.sh`, the PR
+regression/60s steps in `static.yml` and both Deep fuzz lanes read it through
+`targets.sh`, so a new target needs one registry row (plus its harness, slicer
+and corpus) and is built, replayed on every PR and long-fuzzed in Deep. Deep
+lane `a` runs the first half of the rows (rounded up), lane `b` the rest.
+`targets.sh validate` fails naming the first bad row (missing source, corpus,
+dict or slicer, wrong column count, empty/duplicate name, a name that is not
+`fuzz_` plus lowercase letters, digits or `_`, or a `:` in the corpus or dict
+field, which would break the `name:corpus:dict` spec); line 1 is skipped only
+when it is the complete header. It is covered by
+`ci/tests/test_fuzz_targets_registry.py`.
+
+A registry row is not enough for the PR gate. The Static "Replay recorded
+regressions" step also needs `regressions/<target>/` to hold at least one
+recorded unit (a file other than `README.md`) that replays clean with
+`./<target> -runs=1`; a missing directory or one holding only `README.md` fails
+the step. Add the directory and a first pin (see `regressions/README.md`) in the
+same change as the row.
 
 ## RESP reply parsers
 
@@ -44,6 +160,49 @@ length-line and bulk-string pointer arithmetic against `op->rbuf .. op->rbuf +
 op->rlen`. A single off-by-one in a CRLF scan or a missing length bound is a
 worker-crashing out-of-bounds read or a signed-overflow UB — exactly the bug
 class coverage-guided fuzzing finds and the runtime suite misses.
+
+## Streaming split mode and the Redis readers
+
+Block 4 of `fuzz_resp_parser` cuts the GET reply once, at every point, and
+always resumes with the complete reply. A socket can cut a reply any number of
+times and `read_get()` re-enters the parser on every `NGX_AGAIN` with the same
+op and a grown buffer, so blocks 5-7 (and the same mode in `fuzz_mc_parser`)
+let the fuzzer choose the cuts. The choice comes from a CONTROL PREFIX that is
+never part of the reply (`fuzz_stream.h`):
+
+| bytes | meaning |
+|---|---|
+| `data[0]` bits 0-3 | `K`, the number of explicit segment lengths; `0` means dribble (one byte per segment, capped at 1024 segments, the rest delivered whole) |
+| `data[0]` bits 4-7 | target-specific flags |
+| `data[1 .. 1+K)` | segment lengths: byte `b` is a segment of `b + 1` bytes |
+| `data[1+K ..]` | the reply `R`; whatever the `K` segments do not cover arrives as one final segment |
+
+The prefix decides only where the cuts fall, never what the reply is: every
+oracle compares `R` fed in segments with `R` (or a prefix of it) fed whole. The
+whole-input blocks still parse `data[0..size)` as a reply, so the corpus of
+complete replies keeps its value; entries named `NN_stream_*` carry a prefix.
+
+- **Block 5** (`check_stream_get`): GET parser re-entered per segment on a
+  re-allocated exact-size buffer. Every step must equal a fresh one-shot parse
+  of the identical prefix (verdict, blob offset, length); end to end, the stream
+  must end with the whole-`R` verdict and blob only when `R` is OK, DECLINED or
+  AGAIN, and never before all of `R` has arrived. Deliberately NOT asserted for
+  an `R` that parses to `NGX_ERROR`: a complete reply plus trailing bytes may
+  legitimately answer before the trailer arrives. `fuzz_mc_parser` runs the same
+  check and also asserts the end-to-end verdict and `consumed` unconditionally,
+  because the memcached parser ignores trailing bytes.
+- **Block 6** (`read_preamble`, AUTH/SELECT one-line replies) and **block 7**
+  (`read_lock`, SET NX PX reply): the extracted handlers run against
+  `ngx_shim_redis_readers.h`, whose `recv()` hands out the scripted segments and
+  ASan-poisons `recv[]` past `recv_len`, so a read beyond the received bytes is a
+  use-after-poison report. Each runs whole-buffer and segmented; the preamble
+  verdict must not depend on segmentation, and the lock verdict is compared only
+  when `R` is exactly one framed reply.
+
+`extract_redis_readers.sh` (called by `extract_parser.sh`) fails closed when
+either reader is renamed or reshaped, or when the `recv[]` size drifts from the
+shim, and leaves no `.inc` behind. `FUZZ_REDIS_READERS_SRC` / `_OUT` override its
+input and output for the vanish control.
 
 ## No copy drift
 

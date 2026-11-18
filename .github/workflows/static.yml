@@ -1,4 +1,4 @@
-# sync-sha: 4f45eb2c7a0dc9c3b225df31ef995adde2ab6ab3b6c07957ba9a2be080868b7e
+# sync-sha: 9d4df4bb2df750d9a370003cb9978d6b368befd38b45b3447702817413dcc8af
 name: Static
 
 # Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
@@ -599,10 +599,15 @@ jobs:
           cd ci/fuzz
           total=0
           failed=0
-          # Explicit target list, kept in sync with the "Run each target 60s"
-          # step below. Iterating regressions/*/ instead would silently skip a
-          # deleted target directory.
-          for bin in fuzz_resp_parser fuzz_norm_args fuzz_mc_parser fuzz_auto_classify fuzz_blob; do
+          # Target list from the registry ci/fuzz/targets.tsv (shared with the
+          # "Run each target 60s" step and Deep). Iterating regressions/*/
+          # instead would silently skip a deleted target directory.
+          bash targets.sh validate
+          # Own assignment so a failing or empty `names` stops the gate rather
+          # than leaving the loop with nothing to replay.
+          names="$(bash targets.sh names)" || { echo "::error::cannot list fuzz targets"; exit 1; }
+          [ -n "$names" ] || { echo "::error::no fuzz targets in the registry"; exit 1; }
+          for bin in $names; do
             dir="regressions/$bin/"
             [ -d "$dir" ] || { echo "❌ $bin: regressions directory $dir is missing"; failed=$((failed + 1)); continue; }
             [ -x "./$bin" ] || { echo "❌ no such fuzz target: $bin"; exit 1; }
@@ -650,11 +655,9 @@ jobs:
           set -euo pipefail
           cd ci/fuzz
           # target:corpus:dict — dict empty where a token dictionary does not help.
-          targets="fuzz_resp_parser:corpus:fuzz.dict \
-                   fuzz_norm_args:corpus_norm_args: \
-                   fuzz_mc_parser:corpus_mc:fuzz_mc.dict \
-                   fuzz_auto_classify:corpus_auto: \
-                   fuzz_blob:corpus_blob:"
+          # Registry: ci/fuzz/targets.tsv via targets.sh.
+          targets="$(bash targets.sh specs all)" || { echo "::error::cannot list fuzz targets"; exit 1; }
+          [ -n "$targets" ] || { echo "::error::no fuzz targets in the registry"; exit 1; }
           for t in $targets; do
             bin="${t%%:*}"; rest="${t#*:}"; corp="${rest%%:*}"; dict="${rest#*:}"
             echo "=== $bin over $corp (${FUZZ_SECONDS}s)${dict:+ dict=$dict} ==="

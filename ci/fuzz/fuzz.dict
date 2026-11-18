@@ -15,3 +15,7 @@ str_ok="+OK\x0d\x0a"
 zero="0"
 big="9999999999"
 scan_cursor="*2\x0d\x0a$1\x0d\x0a0\x0d\x0a"
+# AUTH/SELECT preamble and lock replies (blocks 6-7).
+auth_rejected="-WRONGPASS"
+ok_ok="+OK\x0d\x0a+OK\x0d\x0a"
+err_db="-ERR DB index"

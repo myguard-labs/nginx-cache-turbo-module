@@ -34,6 +34,10 @@
  * memcached GET reply parser. */
 #include "generated_mc_parser.inc"
 
+#include "fuzz_stream.h"
+
+static void check_stream_get(const ngx_fuzz_stream_t *s);
+
 /* Validate that an ngx_str_t the parser handed back references INTO the input
  * buffer (or is the NULL nil sentinel), never outside it. A parser that returns
  * NGX_OK with a blob pointing past the buffer is a bug ASAN would not otherwise
@@ -95,7 +99,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     /* L13-fix: tri-state on failure, mirroring the RESP parser. NGX_DECLINED is
      * a bare "END" line (a DEFINITIVE miss, the only outcome allowed to arm the
      * L13 negative memo); NGX_ERROR is an ERROR/CLIENT_ERROR/SERVER_ERROR reply,
-     * a malformed header line, or an unparseable field. Both are legal. */
+     * a malformed header line, or an unparsable field. Both are legal. */
     if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED
         && rc != NGX_ERROR)
     {
@@ -116,5 +120,166 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     }
 
     free(buf);
+
+    /* STREAMING SPLIT MODE. Everything above hands the parser the whole reply
+     * in one buffer. read_get() in the memcached driver instead re-enters the
+     * parser on every NGX_AGAIN with the SAME op, op->rbuf grown by fill() and
+     * op->rlen advanced by one recv(). The fuzzer chooses the cuts through a
+     * control prefix that is NOT part of the reply (layout and rationale in
+     * fuzz_stream.h; no flag bits are used here). */
+    {
+        ngx_fuzz_stream_t  s;
+
+        if (ngx_fuzz_stream_decode(data, size, &s)) {
+            check_stream_get(&s);
+        }
+    }
+
     return 0;
+}
+
+
+/* Harness-only sentinel: a harness allocation failed, skip the comparison.
+ * Distinct from every NGX_* return code. */
+#define MC_FUZZ_OOM  (-100)
+
+/* Parse `n` bytes of `bytes` once, from a fresh op over an exact-size heap
+ * copy (*copy, freed by the caller; never NULL so no NULL arithmetic). */
+static ngx_int_t
+mc_get_once(const u_char *bytes, size_t n, u_char **copy, u_char **blob,
+    size_t *blob_len, size_t *consumed)
+{
+    ngx_http_cache_turbo_mc_op_t  op;
+
+    *blob = NULL;
+    *blob_len = 0;
+    *consumed = 0;
+
+    *copy = (u_char *) malloc(n ? n : 1);
+    if (*copy == NULL) {
+        return MC_FUZZ_OOM;
+    }
+    if (n) {
+        memcpy(*copy, bytes, n);
+    }
+
+    op.rbuf = *copy;
+    op.rlen = n;
+
+    return ngx_http_cache_turbo_mc_parse(&op, blob, blob_len, consumed);
+}
+
+
+/* The memcached GET parser under fuzzer-chosen multi-split delivery, driven
+ * the way the memcached read_get() drives it: one op for the whole reply,
+ * op->rbuf reallocated and op->rlen advanced by each segment, `consumed`
+ * zeroed before each call, the parser re-entered while it answers NGX_AGAIN.
+ *
+ * Oracle, limited to what the contract guarantees:
+ *
+ *   (a) every step: the re-entered parse equals a fresh one-shot parse of the
+ *       identical prefix -- verdict, blob offset and length, and `consumed`.
+ *       The parser re-parses rbuf from the start on every call; anything it
+ *       carried across calls shows up here.
+ *   (b) end to end: the stream ends with the verdict, blob and `consumed` of
+ *       the whole reply R. Unlike the RESP GET parser this one never rejects
+ *       bytes behind a complete reply (it reports them through `consumed`,
+ *       and the caller declines to pool), and every verdict is settled by a
+ *       prefix: once a prefix is decided, the longer buffer decides the same
+ *       way. So the segmentation can move WHEN the verdict arrives, never
+ *       WHAT it is.
+ *
+ * Exact-size heap blocks per step make a read at or past op->rlen an ASan
+ * heap-buffer-overflow and a pointer kept across calls a use-after-free. */
+static void
+check_stream_get(const ngx_fuzz_stream_t *s)
+{
+    ngx_http_cache_turbo_mc_op_t  op;
+    u_char                       *wcopy, *wblob, *blob = NULL;
+    size_t                        wlen, wconsumed, blob_len = 0, consumed = 0;
+    size_t                        pos, step;
+    ngx_int_t                     rc_whole, rc = NGX_AGAIN;
+    unsigned                      oom = 0;
+
+    rc_whole = mc_get_once(s->reply, s->len, &wcopy, &wblob, &wlen,
+                           &wconsumed);
+    if (rc_whole == MC_FUZZ_OOM) {
+        return;
+    }
+
+    op.rbuf = NULL;
+    op.rlen = 0;
+
+    for (pos = 0, step = 0; pos < s->len; step++) {
+        u_char    *grow, *rcopy, *rblob;
+        size_t     end, rlen, rconsumed;
+        ngx_int_t  rc_ref;
+
+        end = ngx_fuzz_stream_end(s, step, pos);
+
+        grow = (u_char *) malloc(end);
+        if (grow == NULL) {
+            oom = 1;
+            break;
+        }
+        memcpy(grow, s->reply, end);
+        free(op.rbuf);
+        op.rbuf = grow;
+        op.rlen = end;
+        pos = end;
+
+        blob = NULL;
+        blob_len = 0;
+        consumed = 0;
+        rc = ngx_http_cache_turbo_mc_parse(&op, &blob, &blob_len, &consumed);
+
+        if (rc != NGX_OK && rc != NGX_AGAIN && rc != NGX_DECLINED
+            && rc != NGX_ERROR)
+        {
+            __builtin_trap();              /* undocumented return */
+        }
+        if (rc != NGX_OK && (blob != NULL || blob_len != 0)) {
+            __builtin_trap();              /* failure handed back a blob */
+        }
+        if ((rc == NGX_OK || rc == NGX_DECLINED) && consumed > op.rlen) {
+            __builtin_trap();              /* consumed past the buffer */
+        }
+
+        rc_ref = mc_get_once(s->reply, end, &rcopy, &rblob, &rlen, &rconsumed);
+        if (rc_ref == MC_FUZZ_OOM) {
+            oom = 1;
+            break;
+        }
+        if (rc != rc_ref || consumed != rconsumed) {
+            __builtin_trap();              /* (a) re-entry changed the verdict */
+        }
+        if (rc == NGX_OK) {
+            check_in_bounds(blob, blob_len, op.rbuf, op.rlen);
+            if (blob_len != rlen || blob - op.rbuf != rblob - rcopy) {
+                __builtin_trap();          /* (a) re-entry changed the blob */
+            }
+        }
+        free(rcopy);
+
+        if (rc != NGX_AGAIN) {
+            break;                         /* read_get() stops here */
+        }
+    }
+
+    if (!oom) {
+        if (rc != rc_whole) {
+            __builtin_trap();              /* (b) segmentation changed verdict */
+        }
+        if ((rc == NGX_OK || rc == NGX_DECLINED) && consumed != wconsumed) {
+            __builtin_trap();              /* (b) segmentation moved the frame */
+        }
+        if (rc == NGX_OK
+            && (blob_len != wlen || blob - op.rbuf != wblob - wcopy))
+        {
+            __builtin_trap();              /* (b) segmentation changed blob */
+        }
+    }
+
+    free(op.rbuf);
+    free(wcopy);
 }
