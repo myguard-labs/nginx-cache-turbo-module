@@ -14,6 +14,7 @@ A script is a list of :class:`Step` objects, one consumed per received command:
     Step(reply=b"$5\\r\\nhel", then=CLOSE)                       # truncate+close
     Step(reply=big, chunk=7, delay=0.01)                        # dribble
     Step(then=RST) / Step(then=HALF_CLOSE) / Step(never=True)   # no/odd reply
+    Step(reply=b"+OK\r\n", late=b"$-1\r\n", late_delay=0.2)    # unsolicited
 
 ``expect`` is compared with the received command joined by single spaces
 (``GET key``), the verb case-folded for redis.  ``None`` accepts anything.  A
@@ -58,12 +59,14 @@ class Step:
     then: str = NONE
     never: bool = False         # consume the command, send nothing, hold open
     on_mismatch: str = CLOSE    # CLOSE | RST | "ignore" (reply anyway)
+    late: bytes = b""           # sent in one write late_delay s after reply
+    late_delay: float = 0.0     # (an unsolicited reply on an idle connection)
 
     def __post_init__(self) -> None:
         if self.then not in _THENS:
             raise ValueError(f"bad then={self.then!r}")
-        if self.chunk < 0 or self.delay < 0:
-            raise ValueError("chunk and delay must be >= 0")
+        if self.chunk < 0 or self.delay < 0 or self.late_delay < 0:
+            raise ValueError("chunk, delay and late_delay must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -396,6 +399,10 @@ class Peer:
                     if self._stop.wait(step.delay):
                         return False
                 conn.sendall(data[i:i + size])
+            if step.late:
+                if self._stop.wait(step.late_delay):
+                    return False
+                conn.sendall(step.late)
         except OSError:
             return False
         return True

@@ -26,6 +26,7 @@ from areas.admin import *
 from areas.breaker import *
 from areas.core import *
 from areas.faults import *
+from areas.hostile_l2 import *
 from areas.http import *
 from areas.l2 import *
 from areas.policy import *
@@ -399,6 +400,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_use_stale_403_429(ng, origin)                      # S4.2 non-5xx tokens
     test_use_stale_error_transport_only(ng, origin)         # P5-5 transport-vs-origin 5xx
     test_hostile_origin_framing_matrix(ng, origin)          # HOSTILE-ORIGIN-MATRIX
+    test_hostile_l2_matrix(ng)                              # HARD-L2
     test_keep_stale_no_reaper_lru_only_reclaim(ng, origin)  # S2.3 no-reaper contract
     test_5xx_never_overwrites_cached_body(ng, origin)       # O6/S3.1 5xx-never-clobbers
     test_5xx_cta_bypass_never_overwrites_cached_body(ng, origin)  # AUD-5XX-CTA
