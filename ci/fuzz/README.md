@@ -118,6 +118,7 @@ unasserted feeder.
 | `cookie_ac_scan_one` | `fuzz_cookie_args` | `!FUZZ_SHIM_AUTO`: not compiled into `fuzz_auto_classify` |
 | `argparse_tail_count`, `argparse_build` (+ `hexval`, `qs_first_mangled`) | `fuzz_cookie_args` | always compiled, so `fuzz_auto_classify` also runs them as the front half of `auto_skip` with no assertion on their output; the span/size bound oracle lives only here |
 | `hexdecode`, `body_filter_tag_split`, `warm`, `warm_uri_is_safe`, `warm_raw_is_safe`, `warm_file_finish` | `fuzz_control_inputs` | not in `match.c`; compiled into no other target |
+| `read_preamble`, `read_lock` (`redis.c`, event-handler readers over the op's `recv[]` scratch) | `fuzz_resp_parser` | not in `match.c`; sliced by `extract_redis_readers.sh` into `generated_redis_readers.inc`, compiled into no other target; `read_lock` reaches `redis_frame`, which is only an unasserted feeder here |
 | `cookie_pred_one_next_pair`, `cookie_pred_one_split` (+ `_dispatch`, `cookie_pred`) | `fuzz_auto_classify` | `FUZZ_SHIM_AUTO`-only; driven through `auto_skip` over the preset predicate rows, so NOT sliced into `fuzz_cookie_args` |
 | `cookie_byteset_build`, `cookie_contains`, `cookie_has`, `qs_eq`, `arg_match`, `uri_prefix`, `auto_skip`, preset registry | `fuzz_auto_classify` | unchanged |
 
@@ -149,6 +150,49 @@ length-line and bulk-string pointer arithmetic against `op->rbuf .. op->rbuf +
 op->rlen`. A single off-by-one in a CRLF scan or a missing length bound is a
 worker-crashing out-of-bounds read or a signed-overflow UB — exactly the bug
 class coverage-guided fuzzing finds and the runtime suite misses.
+
+## Streaming split mode and the Redis readers
+
+Block 4 of `fuzz_resp_parser` cuts the GET reply once, at every point, and
+always resumes with the complete reply. A socket can cut a reply any number of
+times and `read_get()` re-enters the parser on every `NGX_AGAIN` with the same
+op and a grown buffer, so blocks 5-7 (and the same mode in `fuzz_mc_parser`)
+let the fuzzer choose the cuts. The choice comes from a CONTROL PREFIX that is
+never part of the reply (`fuzz_stream.h`):
+
+| bytes | meaning |
+|---|---|
+| `data[0]` bits 0-3 | `K`, the number of explicit segment lengths; `0` means dribble (one byte per segment, capped at 1024 segments, the rest delivered whole) |
+| `data[0]` bits 4-7 | target-specific flags |
+| `data[1 .. 1+K)` | segment lengths: byte `b` is a segment of `b + 1` bytes |
+| `data[1+K ..]` | the reply `R`; whatever the `K` segments do not cover arrives as one final segment |
+
+The prefix decides only where the cuts fall, never what the reply is: every
+oracle compares `R` fed in segments with `R` (or a prefix of it) fed whole. The
+whole-input blocks still parse `data[0..size)` as a reply, so the corpus of
+complete replies keeps its value; entries named `NN_stream_*` carry a prefix.
+
+- **Block 5** (`check_stream_get`): GET parser re-entered per segment on a
+  re-allocated exact-size buffer. Every step must equal a fresh one-shot parse
+  of the identical prefix (verdict, blob offset, length); end to end, the stream
+  must end with the whole-`R` verdict and blob only when `R` is OK, DECLINED or
+  AGAIN, and never before all of `R` has arrived. Deliberately NOT asserted for
+  an `R` that parses to `NGX_ERROR`: a complete reply plus trailing bytes may
+  legitimately answer before the trailer arrives. `fuzz_mc_parser` runs the same
+  check and also asserts the end-to-end verdict and `consumed` unconditionally,
+  because the memcached parser ignores trailing bytes.
+- **Block 6** (`read_preamble`, AUTH/SELECT one-line replies) and **block 7**
+  (`read_lock`, SET NX PX reply): the extracted handlers run against
+  `ngx_shim_redis_readers.h`, whose `recv()` hands out the scripted segments and
+  ASan-poisons `recv[]` past `recv_len`, so a read beyond the received bytes is a
+  use-after-poison report. Each runs whole-buffer and segmented; the preamble
+  verdict must not depend on segmentation, and the lock verdict is compared only
+  when `R` is exactly one framed reply.
+
+`extract_redis_readers.sh` (called by `extract_parser.sh`) fails closed when
+either reader is renamed or reshaped, or when the `recv[]` size drifts from the
+shim, and leaves no `.inc` behind. `FUZZ_REDIS_READERS_SRC` / `_OUT` override its
+input and output for the vanish control.
 
 ## No copy drift
 
