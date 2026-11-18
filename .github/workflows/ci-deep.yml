@@ -1,4 +1,4 @@
-# sync-sha: b9af0420001eba1e2fa2cca406f14a8ca47c81225b0230741737d403a86c428c
+# sync-sha: a84051813ecbe7c0e15756ac2425bd40ccb86b17d72b0c6c88d86370b76455f6
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -684,7 +684,7 @@ jobs:
     # Targets run FUZZ_JOBS (3) at a time and each gets the full fuzz_seconds,
     # so a lane with more than three targets runs ceil(n/3) = 2 sequential
     # waves: 2 x 14400s = 480m at the largest accepted input, plus 120m for
-    # setup, corpus merge and (lane a) coverage. ci/tools/test_deep_lanes.py
+    # setup, corpus merge, scanbench and the analyzer. ci/tools/test_deep_lanes.py
     # derives the wave count from the registry and checks both budgets.
     timeout-minutes: ${{ inputs.fuzz_seconds > 3600 && 600 || 240 }}
     steps:

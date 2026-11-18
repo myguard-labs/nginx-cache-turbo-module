@@ -26,6 +26,10 @@ SRC="${FUZZ_REDIS_READERS_SRC:-$FUZZ_DIR/../../src/ngx_http_cache_turbo_redis.c}
 SHIM="$FUZZ_DIR/ngx_shim.h"
 OUT="${FUZZ_REDIS_READERS_OUT:-$FUZZ_DIR/generated_redis_readers.inc}"
 
+# Fail closed from the first line: drop any .inc from an earlier run so no
+# failure path (missing source, recv[] drift, bad slice) leaves a stale slice.
+rm -f "$OUT" "$OUT.part"
+
 if [ ! -f "$SRC" ]; then
     echo "✗ cannot find $SRC" >&2
     exit 1

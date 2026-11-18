@@ -134,19 +134,24 @@ class ExtractorTest(unittest.TestCase):
 
     def test_missing_recv_decl_names_the_file(self):
         self.tree()
+        self.assertEqual(self.run_ex("extract_redis_readers.sh").returncode, 0)
+        self.assertTrue(self.inc("generated_redis_readers.inc").exists())
         self.mutate("ngx_http_cache_turbo_redis.c",
                     lambda t: t.replace("u_char                       recv[256];", "u_char recv_x;"))
         r = self.run_ex("extract_redis_readers.sh")
+        self.assertFalse(self.inc("generated_redis_readers.inc").exists(), "stale .inc removed")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("recv[] scratch not found in", r.stderr)
         self.assertIn("ngx_http_cache_turbo_redis.c", r.stderr)
         # The shim side is reported separately and names the shim.
         self.tree()
+        self.assertEqual(self.run_ex("extract_redis_readers.sh").returncode, 0)
         shim = self.root / "ci" / "fuzz" / "ngx_shim.h"
         shim.write_text(shim.read_text().replace("recv[256]", "recvx"))
         r = self.run_ex("extract_redis_readers.sh")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("shim", r.stderr)
+        self.assertFalse(self.inc("generated_redis_readers.inc").exists(), "stale .inc removed")
 
 
 if __name__ == "__main__":
