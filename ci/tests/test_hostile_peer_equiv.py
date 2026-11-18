@@ -86,3 +86,18 @@ def test_corrupt_bulk_len_changes_only_bulk_header(tmp_path: Path) -> None:
     assert r(cmd(b"GET", b"k")).reply == b"$4\r\nabc\r\n"
     assert r(cmd(b"GET", b"n")).reply == b"$-1\r\n"
     assert r(cmd(b"EXISTS", b"k")).reply == b":1\r\n"
+
+
+def test_replay_future_epoch_reply_is_a_miss(tmp_path: Path) -> None:
+    r = make_replay(tmp_path, [entry("EXISTS", b"k", 2, b":1\r\n"),
+                               entry("SET", b"k", 0, b"+OK\r\n")])
+    assert r(cmd(b"EXISTS", b"k")).reply.startswith(b"-ERR")   # epoch 0 < 2
+    assert r.misses == [b"EXISTS k"]
+
+
+def test_empty_command_tolerated(tmp_path: Path) -> None:
+    r = make_replay(tmp_path, [])
+    assert r(cmd()).reply.startswith(b"-ERR")
+    assert r.misses == [b"<empty command>"]
+    cap = eq.Capture.__new__(eq.Capture)
+    assert cap(cmd()).reply.startswith(b"-ERR")

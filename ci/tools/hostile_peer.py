@@ -114,6 +114,8 @@ class _Reader:
         return ln
 
     def exact(self, n: int) -> bytes:
+        if n < 0:
+            raise ValueError(f"negative data length {n}")
         while len(self.buf) < n:
             self._fill()
         out, self.buf = self.buf[:n], self.buf[n:]
@@ -175,6 +177,7 @@ class Peer:
         self._records: list[ConnRecord] = []
         self._mismatches: list[tuple[int, bytes, Command]] = []
         self._socks: set[socket.socket] = set()
+        self._errors: list[Exception] = []
         self._threads: list[threading.Thread] = []
         self._srv: socket.socket | None = None
         self._stop = threading.Event()
@@ -252,6 +255,13 @@ class Peer:
         with self._lock:
             return list(self._mismatches)
 
+    @property
+    def errors(self) -> list[Exception]:
+        """Unexpected exceptions raised while serving (script selection,
+        responder); the connection is still closed and recorded."""
+        with self._lock:
+            return list(self._errors)
+
     def wait_for_commands(self, n: int, timeout: float = 5.0) -> bool:
         end = time.monotonic() + timeout
         with self._cond:
@@ -306,9 +316,11 @@ class Peer:
     def _serve(self, conn: socket.socket, rec: ConnRecord) -> None:
         rd = _Reader(conn)
         read = _read_redis if self.proto == "redis" else _read_memcached
-        script = None if self._responder else self._script_for(rec.index)
+        script: Script | None = None
         pos = 0
         try:
+            if self._responder is None:
+                script = self._script_for(rec.index)
             while not self._stop.is_set():
                 args, data = read(rd)
                 cmd = Command(rec.index, args, data)
@@ -345,6 +357,9 @@ class Peer:
                         return
         except (_Eof, OSError, ValueError):
             pass
+        except Exception as exc:  # noqa: BLE001  bad selector, Peer([]), responder
+            with self._cond:
+                self._errors.append(exc)
         finally:
             with self._cond:
                 if rec.closed is None:

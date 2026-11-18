@@ -69,21 +69,77 @@ def test_mismatch_ignore_still_replies() -> None:
 
 
 def test_chunking_with_per_chunk_delay() -> None:
+    # Byte content and pacing only: TCP does not preserve write boundaries, so
+    # chunk sizes are asserted at the send side (test_send_chunk_boundaries).
     reply = b"$10\r\n0123456789\r\n"
     with Peer([[Step(reply=reply, chunk=4, delay=0.05)]]) as p, dial(p) as s:
         t0 = time.monotonic()
         s.sendall(resp(b"GET", b"k"))
         s.settimeout(3)
-        got, sizes = b"", []
+        got = b""
         while len(got) < len(reply):
             d = s.recv(4096)
-            sizes.append(len(d))
+            assert d
             got += d
         elapsed = time.monotonic() - t0
     assert got == reply
-    assert max(sizes) <= 4 + 4 and len(sizes) >= 2   # arrived in pieces
     # 17 bytes / 4 = 5 chunks, each preceded by 50 ms
     assert elapsed >= 0.2
+
+
+class _RecSock:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    def sendall(self, b: bytes) -> None:
+        self.sent.append(bytes(b))
+
+
+def test_send_chunk_boundaries() -> None:
+    reply = b"$10\r\n0123456789\r\n"
+    p = Peer([[]])
+    rec = _RecSock()
+    assert p._send(rec, Step(reply=reply, chunk=4))        # type: ignore[arg-type]
+    assert [len(c) for c in rec.sent] == [4, 4, 4, 4, 1]
+    assert b"".join(rec.sent) == reply
+    one = _RecSock()
+    assert p._send(one, Step(reply=reply))                 # type: ignore[arg-type]
+    assert one.sent == [reply]
+
+
+def test_negative_data_length_rejected() -> None:
+    rd = hp._Reader(None)                                  # type: ignore[arg-type]
+    rd.buf = b"abc"
+    with pytest.raises(ValueError):
+        rd.exact(-2)
+    assert rd.buf == b"abc"
+    assert rd.exact(0) == b""                              # zero stays valid
+    with Peer([[Step(reply=b"+OK\r\n")]]) as p, dial(p) as s:
+        s.sendall(b"*1\r\n$-2\r\nPING\r\n")
+        assert recv_all(s) in (b"", b"<RST>")              # closed, no reply
+        assert p.wait_for_closed(1)
+        assert p.commands() == []
+    with Peer([[Step(reply=b"STORED\r\n")]], proto="memcached") as p, dial(p) as s:
+        s.sendall(b"set k 0 0 -2\r\nhi\r\n")
+        assert recv_all(s) in (b"", b"<RST>")
+        assert p.wait_for_closed(1)
+        assert p.commands() == []
+    with Peer([[Step(reply=b"+OK\r\n")]]) as p, dial(p) as s:   # $0 valid
+        s.sendall(b"*1\r\n$0\r\n\r\n")
+        assert s.recv(16) == b"+OK\r\n"
+
+
+def test_bad_script_selection_still_closes_connection() -> None:
+    def boom(_i: int) -> list[Step]:
+        raise RuntimeError("selector")
+
+    for peer in (Peer(boom), Peer([])):
+        with peer as p, dial(p) as s:
+            assert p.wait_for_closed(1)
+            assert recv_all(s) in (b"", b"<RST>")
+            assert p.connections[0].closed is not None
+            assert p._socks == set()
+            assert len(p.errors) == 1
 
 
 def test_close_after_reply() -> None:

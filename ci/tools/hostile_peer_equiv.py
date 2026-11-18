@@ -31,7 +31,8 @@ than its payload: a negative control that must make the smoke tests fail.
 
 Replay model.  A reply is looked up by (verb, first-argument key) and the
 number of mutating commands already seen for that key (its epoch), taking the
-newest recorded epoch <= the current one.  That reproduces "EXISTS is 0, then 1
+newest recorded epoch <= the current one; a reply recorded only at a later
+epoch is a miss, never served early.  That reproduces "EXISTS is 0, then 1
 after the SET lands" without depending on how often a test polls.  Values the
 tests themselves wrote are not replayed from a stale capture: when the recorded
 GET reply equalled the last SET value (or STRLEN its length), the replay
@@ -124,6 +125,8 @@ class Capture:
         self.entries: list[dict] = []
 
     def __call__(self, cmd: hp.Command) -> hp.Step:
+        if not cmd.args:
+            return hp.Step(reply=b"-ERR hostile_peer capture: empty command\r\n")
         raw = b"*%d\r\n" % len(cmd.args) + b"".join(_bulk(a) for a in cmd.args)
         verb, key = cmd.args[0].upper(), _key(cmd)
         with self.lock:
@@ -168,6 +171,9 @@ class Replay:
         self.misses: list[bytes] = []
 
     def __call__(self, cmd: hp.Command) -> hp.Step:
+        if not cmd.args:
+            self.misses.append(b"<empty command>")
+            return hp.Step(reply=b"-ERR hostile_peer replay: empty command\r\n")
         verb, key = cmd.args[0].upper(), _key(cmd)
         with self.lock:
             ep = self.epoch.get(key, 0)
@@ -180,8 +186,14 @@ class Replay:
                 self.misses.append(cmd.line)
                 return hp.Step(reply=b"-ERR hostile_peer replay: no recorded "
                                      b"reply\r\n")
-            use = max((e for e in slot if e <= ep), default=min(slot))
-            rec = slot[use]
+            past = [e for e in slot if e <= ep]
+            if not past:
+                # Only replies from a FUTURE mutation epoch were recorded:
+                # serving one would answer before the write it depends on.
+                self.misses.append(cmd.line)
+                return hp.Step(reply=b"-ERR hostile_peer replay: only a "
+                                     b"future-epoch reply recorded\r\n")
+            rec = slot[max(past)]
             reply = rec["reply"]
             last = self.last_set.get(key)
             if rec["echo"] == "bulk" and last is not None:
@@ -239,6 +251,9 @@ def main() -> int:
             peer = state.pop("peer", None)
             if isinstance(peer, hp.Peer):
                 peer.stop()
+                errs = state.setdefault("errors", [])
+                assert isinstance(errs, list)
+                errs.extend(peer.errors)
             super().stop()
 
     def factory(binary, root, port, password=None, tls_certs=None):
@@ -250,6 +265,12 @@ def main() -> int:
     T.RedisServer = factory
     sys.argv = ["run_named.py", *rest]
     rc = run_named.main()
+    errors = state.get("errors")
+    if isinstance(errors, list) and errors:
+        print(f"peer errors: {len(errors)}")        # a swallowed responder bug
+        for e in errors:
+            print("  ", repr(e)[:120])
+        rc = rc or 1
     if a.mode == "capture":
         cap = state.get("cap")
         assert isinstance(cap, Capture)
