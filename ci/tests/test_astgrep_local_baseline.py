@@ -251,14 +251,21 @@ class AstGrepLocal(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 cb._hit_row(bad)
         root = self._scratch()
+        # The entity line marks the scratch file as scanned, so exit 2 must
+        # come from _hit_row rejecting the row, not from the coverage guard.
         proc = subprocess.CompletedProcess(
-            [], 0, "[{}]", "scannedFileCount=1,skippedFileCount=0"
+            [],
+            0,
+            "[{}]",
+            "sg: entity|file|src/fixture_b3.c: language=C\n"
+            "scannedFileCount=1,skippedFileCount=0",
         )
         baseline = root / "baseline.tsv"
         baseline.write_text(cb.format_baseline([]), encoding="utf-8")
         with mock.patch.object(cb.subprocess, "run", return_value=proc):
             rc, _o, err = self._run_main(root, baseline)
         self.assertEqual(rc, 2, err)
+        self.assertIn("malformed ast-grep hit", err)
 
     def test_invalid_baseline_locations_exit_2(self):
         root = self._scratch()
