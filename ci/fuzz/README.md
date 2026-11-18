@@ -132,8 +132,18 @@ regression/60s steps in `static.yml` and both Deep fuzz lanes read it through
 and corpus) and is built, replayed on every PR and long-fuzzed in Deep. Deep
 lane `a` runs the first half of the rows (rounded up), lane `b` the rest.
 `targets.sh validate` fails naming the first bad row (missing source, corpus,
-dict or slicer, wrong column count, empty/duplicate name); it is covered by
+dict or slicer, wrong column count, empty/duplicate name, a name that is not
+`fuzz_` plus lowercase letters, digits or `_`, or a `:` in the corpus or dict
+field, which would break the `name:corpus:dict` spec); line 1 is skipped only
+when it is the complete header. It is covered by
 `ci/tests/test_fuzz_targets_registry.py`.
+
+A registry row is not enough for the PR gate. The Static "Replay recorded
+regressions" step also needs `regressions/<target>/` to hold at least one
+recorded unit (a file other than `README.md`) that replays clean with
+`./<target> -runs=1`; a missing directory or one holding only `README.md` fails
+the step. Add the directory and a first pin (see `regressions/README.md`) in the
+same change as the row.
 
 ## RESP reply parsers
 
