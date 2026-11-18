@@ -1,4 +1,4 @@
-# sync-sha: 17a35028cd11352351f5efd227a08fcf739d78715a6f7ab90e2935fa10db7f95
+# sync-sha: 9d4df4bb2df750d9a370003cb9978d6b368befd38b45b3447702817413dcc8af
 name: Static
 
 # Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
@@ -656,7 +656,8 @@ jobs:
           cd ci/fuzz
           # target:corpus:dict — dict empty where a token dictionary does not help.
           # Registry: ci/fuzz/targets.tsv via targets.sh.
-          targets="$(bash targets.sh specs all)"
+          targets="$(bash targets.sh specs all)" || { echo "::error::cannot list fuzz targets"; exit 1; }
+          [ -n "$targets" ] || { echo "::error::no fuzz targets in the registry"; exit 1; }
           for t in $targets; do
             bin="${t%%:*}"; rest="${t#*:}"; corp="${rest%%:*}"; dict="${rest#*:}"
             echo "=== $bin over $corp (${FUZZ_SECONDS}s)${dict:+ dict=$dict} ==="

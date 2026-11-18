@@ -53,6 +53,14 @@ class TargetsRegistryTest(unittest.TestCase):
         for x in specs:
             self.assertEqual(x.count(":"), 2, x)
 
+    def test_every_registry_corpus_has_a_gitignore_pair(self):
+        """Fuzz-generated corpus files must stay untracked except numbered seeds."""
+        ignore = (FUZZ.parents[1] / ".gitignore").read_text().splitlines()
+        rows = (FUZZ / "targets.tsv").read_text().splitlines()[1:]
+        for corpus in {r.split("\t")[2] for r in rows if r}:
+            self.assertIn(f"ci/fuzz/{corpus}/*", ignore, corpus)
+            self.assertIn(f"!ci/fuzz/{corpus}/[0-9][0-9]_*", ignore, corpus)
+
     def test_real_lane_partition_covers_every_target_once(self):
         a = run(["specs", "a"]).stdout.split()
         b = run(["specs", "b"]).stdout.split()

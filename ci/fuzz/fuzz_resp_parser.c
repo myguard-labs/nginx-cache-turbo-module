@@ -751,6 +751,9 @@ check_stream_readers(const ngx_fuzz_stream_t *s)
 
     for (lock = 0; lock < 2; lock++) {
         drive_reader(lock, s->reply, s->len, s, nreplies, unconnected, &split);
+        if (split.verdict == RESP_FUZZ_OOM) {
+            return;                        /* delivered/clean are unwritten */
+        }
         drive_reader(lock, s->reply, split.delivered, NULL, nreplies,
                      unconnected, &prefix);
         drive_reader(lock, s->reply, s->len, NULL, nreplies, unconnected,
