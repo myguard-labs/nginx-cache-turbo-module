@@ -4,3 +4,4 @@ fuzz_norm_args	fuzz_norm_args.c	corpus_norm_args	-	extract_norm_args.sh
 fuzz_mc_parser	fuzz_mc_parser.c	corpus_mc	fuzz_mc.dict	extract_mc_parser.sh
 fuzz_auto_classify	fuzz_auto_classify.c	corpus_auto	-	extract_auto_classify.sh
 fuzz_blob	fuzz_blob.c	corpus_blob	-	extract_blob.sh
+fuzz_cache_control	fuzz_cache_control.c	corpus_cache_control	fuzz_cache_control.dict	extract_cache_control.sh

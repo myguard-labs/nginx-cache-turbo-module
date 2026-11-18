@@ -28,6 +28,18 @@ its own `extract_*.sh` slicer (no hand-maintained copy):
   `Cookie` header / request URI / args. Bug classes: OOB reads in the cookie
   substring / value-predicate scans and the URI/arg matchers. Sliced by
   `extract_auto_classify.sh` into `generated_auto_classify.inc`.
+- **`fuzz_cache_control`** → the origin `Cache-Control` / `Surrogate-Control`
+  parser: `cc_token` (quoted-string / quoted-pair aware directive scan),
+  `cc_has`, `cc_parse_delta` (saturating delta-seconds), `cc_delta` and
+  `cc_delta_all` (every field-line walk over an `ngx_list_t`). Bug classes: an
+  OOB-read at/over `last` on exact-sized, non-NUL-terminated values and an
+  integer overflow in the delta accumulator. Sliced by `extract_cache_control.sh`
+  into `generated_cache_control.inc`; shim is `ngx_shim_cc.h`; corpus is
+  `corpus_cache_control/` (duplicated/conflicting directives, quoted
+  delimiters, unterminated quotes, `=` without value, 20+ digit and signed
+  deltas, NUL/CTL/obs-text, 1000 directives/lines). Oracle: an independent
+  reference model in the harness; `-1` is the only negative result and a delta
+  saturates at `NGX_MAX_TIME_T_VALUE`.
 
 ## Target registry
 
