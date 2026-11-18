@@ -12,6 +12,7 @@ invalid:
   - 'if ((p + body_size) <= q) { use(p); }'
   - 'if (q >= (p + hdr->len)) { use(p); }'
   - 'if (p + (len) > q) { return -1; }'
+  - 'if (p + ( (len) ) > q) { return -1; }'
   - 'if (q < (p + (hdr->len))) { return -1; }'
   # the bound is unconstrained by design: integer bounds match too
   - 'if (off + len > size) { return -1; }'

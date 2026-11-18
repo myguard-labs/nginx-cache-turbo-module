@@ -214,10 +214,65 @@ class AstGrepLocal(unittest.TestCase):
             "int both_b3(u_char *p, size_t len, u_char *end)\n"
             "{\n    return p + len > end;\n}\n"
         )
-        rules = sorted({h[0] for h in cb.scan(repo=root)})
+        rules = sorted(h[0] for h in cb.scan(repo=root))
         self.assertEqual(
             rules, ["c-ptr-add-bound-overflow", "c-ptr-add-len-bound-overflow"]
         )
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
+    def test_unreadable_source_directory_fails_closed(self):
+        root = self._scratch()
+        sub = root / "src" / "locked_b3"
+        sub.mkdir()
+        (sub / "x_b3.c").write_text("int x;\n", encoding="utf-8")
+        sub.chmod(0)
+        self.addCleanup(sub.chmod, 0o755)
+        with self.assertRaisesRegex(RuntimeError, "cannot list source directory"):
+            cb.scan(repo=root)
+
+    def test_malformed_scanner_rows_are_runtime_errors(self):
+        good = {
+            "text": "p + n > last",
+            "ruleId": "r",
+            "file": "src/a.c",
+            "range": {"start": {"line": 2}},
+        }
+        self.assertEqual(cb._hit_row(good), ("r", "src/a.c", 3, "p + n > last"))
+        for bad in (
+            {},
+            [],
+            {**good, "text": None},
+            {**good, "ruleId": ""},
+            {**good, "file": 7},
+            {**good, "range": {}},
+            {**good, "range": {"start": {"line": "2"}}},
+            {**good, "range": {"start": {"line": -1}}},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                cb._hit_row(bad)
+        root = self._scratch()
+        proc = subprocess.CompletedProcess(
+            [], 0, "[{}]", "scannedFileCount=1,skippedFileCount=0"
+        )
+        baseline = root / "baseline.tsv"
+        baseline.write_text(cb.format_baseline([]), encoding="utf-8")
+        with mock.patch.object(cb.subprocess, "run", return_value=proc):
+            rc, _o, err = self._run_main(root, baseline)
+        self.assertEqual(rc, 2, err)
+
+    def test_invalid_baseline_locations_exit_2(self):
+        root = self._scratch()
+        baseline = root / "baseline.tsv"
+        for loc in ("src/fixture_b3.c:0", ":3", "nocolon", "src/a.c:", "src/a.c:x"):
+            with self.subTest(loc=loc):
+                baseline.write_text(f"r\t{loc}\tt\n", encoding="utf-8")
+                self.assertEqual(self._run_main(root, baseline)[0], 2)
+        # a valid positive line that has moved is drift (1), not malformed
+        baseline.write_text(
+            f"c-ptr-add-bound-overflow\t{TARGET}:99\tp + n > last\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self._run_main(root, baseline)[0], 1)
 
     def test_update_is_atomic(self):
         root = self._scratch()

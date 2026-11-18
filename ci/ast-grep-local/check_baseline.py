@@ -14,7 +14,8 @@ line must refresh it with `--update`, which keeps the diff reviewable.
 
 Usage: check_baseline.py [--update]
   Exit: 0 match, 1 drift found by a complete scan, 2 cannot run (ast-grep
-  failed or skipped a src/ C file, baseline unreadable/unparsable/unwritable;
+  failed or skipped a src/ C file or could not list a src/ directory, a
+  malformed hit row, baseline unreadable/unparsable/unwritable/malformed;
   --update then leaves baseline.tsv untouched).
 """
 
@@ -54,7 +55,11 @@ def _unscanned_c_files(repo, target, scanned):
     """
     root = pathlib.Path(repo)
     missing = []
-    for dirpath, dirs, files in os.walk(root / target):
+
+    def _fail(exc):
+        raise RuntimeError(f"cannot list source directory: {exc}") from exc
+
+    for dirpath, dirs, files in os.walk(root / target, onerror=_fail):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         for name in files:
             if not name.endswith(C_SUFFIXES) or name.startswith("."):
@@ -109,11 +114,26 @@ def scan(repo=REPO, config=None, target="src"):
             f"ast-grep did not scan {len(missing)} non-empty C file(s) (unreadable, "
             f"non-UTF-8 or oversized): {', '.join(missing[:5])}"
         )
-    out = []
-    for h in hits:
-        text = " ".join(h["text"].split())
-        out.append((h["ruleId"], h["file"], h["range"]["start"]["line"] + 1, text))
-    return sorted(out)
+    return sorted(_hit_row(h) for h in hits)
+
+
+def _hit_row(h):
+    """(rule, file, line, text) from one ast-grep JSON hit; RuntimeError if malformed."""
+    try:
+        text, rule, file = h["text"], h["ruleId"], h["file"]
+        line = h["range"]["start"]["line"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(f"malformed ast-grep hit {h!r}: missing {exc}") from exc
+    if (
+        not all(isinstance(v, str) for v in (text, rule, file))
+        or not rule
+        or not file
+        or isinstance(line, bool)
+        or not isinstance(line, int)
+        or line < 0
+    ):
+        raise RuntimeError(f"malformed ast-grep hit: {h!r}")
+    return (rule, file, line + 1, " ".join(text.split()))
 
 
 def load_baseline(path=None):
@@ -122,7 +142,11 @@ def load_baseline(path=None):
         if not raw.strip() or raw.startswith("#"):
             continue
         rule, loc, text = raw.split("\t", 2)
-        file, _, line = loc.rpartition(":")
+        file, sep, line = loc.rpartition(":")
+        if not rule or not sep or not file or not line.isascii() or not line.isdigit():
+            raise ValueError(f"malformed baseline location {loc!r}")
+        if int(line) < 1:
+            raise ValueError(f"baseline line must be positive: {loc!r}")
         entries.append((rule, file, int(line), text))
     return sorted(entries)
 

@@ -42,6 +42,6 @@ constraints:
       any:
         - kind: number_literal
         # redundant parentheses around a literal: `p + (1) < last`
-        - regex: '^\(+\s*(0[xX][0-9a-fA-F]+|[0-9]+)[uUlL]*\s*\)+$'
+        - regex: '^[(\s]+(0[xX][0-9a-fA-F]+|[0-9]+)[uUlL]*[)\s]+$'
   B:
     regex: '(^|[._>])(last|end|limit|eob)$|_(last|end)$'
