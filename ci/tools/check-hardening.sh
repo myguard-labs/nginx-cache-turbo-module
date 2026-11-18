@@ -60,19 +60,61 @@ else
     miss canary "no __stack_chk_fail reference (build with -fstack-protector-strong)"
 fi
 
-stack_line="$(grep 'GNU_STACK' <<<"$phdrs" || true)"
-if [ -z "$stack_line" ]; then
+# p_flags are read straight from the program headers (PF_X=1, PF_W=2): the
+# readelf flag column holds spaces ("R E") and omits letters, so text matching
+# on it is unreliable (RWE-only tests miss "R E" and " WE"). readelf stays the
+# authority; checksec 2.6.0 has the same RWE-only test, hence the cross-check
+# below cannot catch these cases.
+ph_flags="$(SO="$so" python3 -I -c '
+import os, struct, sys
+with open(os.environ["SO"], "rb") as f:
+    d = f.read()
+try:
+    if d[:4] != b"\x7fELF":
+        raise ValueError("not an ELF file")
+    e = "<" if d[5] == 1 else ">"
+    if d[4] == 2:
+        off, esz, num = struct.unpack_from(e + "Q", d, 32)[0], *struct.unpack_from(e + "HH", d, 54)
+        foff = 4
+    elif d[4] == 1:
+        off, esz, num = struct.unpack_from(e + "I", d, 28)[0], *struct.unpack_from(e + "HH", d, 42)
+        foff = 24
+    else:
+        raise ValueError("bad ELF class")
+    for i in range(num):
+        b = off + i * esz
+        t = struct.unpack_from(e + "I", d, b)[0]
+        fl = struct.unpack_from(e + "I", d, b + foff)[0]
+        print(t, fl)
+except Exception as exc:
+    print("error: %s" % exc)
+    sys.exit(1)
+')" || { echo "check-hardening: cannot parse program headers of $so" >&2; exit 2; }
+
+# PT_LOAD=1, PT_GNU_STACK=0x6474e551=1685382481
+stack_flags=""
+rwx_load=0
+while read -r ptype pflags; do
+    [ -n "$ptype" ] || continue
+    if [ "$ptype" -eq 1685382481 ]; then
+        stack_flags="$pflags"
+    elif [ "$ptype" -eq 1 ] && [ $((pflags & 3)) -eq 3 ]; then
+        rwx_load=1
+    fi
+done <<<"$ph_flags"
+
+if [ -z "$stack_flags" ]; then
     miss NX "no PT_GNU_STACK segment (stack defaults to executable)"
     miss execstack "no PT_GNU_STACK segment"
-elif grep -Eq '[[:space:]]RWE[[:space:]]' <<<"$stack_line"; then
+elif [ $((stack_flags & 1)) -ne 0 ]; then
     miss NX "PT_GNU_STACK is executable"
-    miss execstack "PT_GNU_STACK flags RWE"
+    miss execstack "PT_GNU_STACK flags include PF_X (p_flags=$stack_flags)"
 else
     ok NX
     ok execstack
 fi
 
-if grep -E '^[[:space:]]*LOAD' <<<"$phdrs" | grep -q 'RWE'; then
+if [ "$rwx_load" -eq 1 ]; then
     miss RWX "a PT_LOAD segment is writable and executable"
 else
     ok RWX

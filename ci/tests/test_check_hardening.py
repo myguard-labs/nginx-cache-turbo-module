@@ -1,6 +1,7 @@
 """Per-property controls for ci/tools/check-hardening.sh on tiny shared objects."""
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -82,6 +83,49 @@ class CheckHardeningTest(unittest.TestCase):
                                                  "MISSING checksec",
                                                  "MISSING execstack"))]
                 self.assertEqual(others, [], r.stdout)
+
+    def patched(self, name, ptype, new_flags):
+        """Copy the hardened .so, rewriting p_flags of the first phdr of ptype."""
+        data = bytearray(self.build("base_" + name, HARD).read_bytes())
+        off, = struct.unpack_from("<Q", data, 32)
+        esz, num = struct.unpack_from("<HH", data, 54)
+        for i in range(num):
+            b = off + i * esz
+            if struct.unpack_from("<I", data, b)[0] == ptype:
+                struct.pack_into("<I", data, b + 4, new_flags)
+                out = self.dir / (name + ".so")
+                out.write_bytes(data)
+                return out
+        raise AssertionError(f"no phdr of type {ptype:#x}")
+
+    PT_LOAD, PT_GNU_STACK = 1, 0x6474E551
+    PF_X, PF_W, PF_R = 1, 2, 4
+
+    def test_gnu_stack_rx_is_executable(self):
+        r = run_check(self.patched("stack_rx", self.PT_GNU_STACK, self.PF_R | self.PF_X))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("MISSING NX", r.stdout)
+        self.assertIn("MISSING execstack", r.stdout)
+
+    def test_gnu_stack_rwx_still_detected(self):
+        r = run_check(self.patched("stack_rwx", self.PT_GNU_STACK, 7))
+        self.assertIn("MISSING NX", r.stdout)
+        self.assertIn("MISSING execstack", r.stdout)
+
+    def test_gnu_stack_rw_stays_ok(self):
+        r = run_check(self.patched("stack_rw", self.PT_GNU_STACK, self.PF_R | self.PF_W))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ok NX", r.stdout)
+        self.assertIn("ok execstack", r.stdout)
+
+    def test_load_wx_without_r_is_rwx(self):
+        r = run_check(self.patched("load_wx", self.PT_LOAD, self.PF_W | self.PF_X))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("MISSING RWX", r.stdout)
+
+    def test_load_rx_and_rw_split_is_ok(self):
+        r = run_check(self.patched("load_rx", self.PT_LOAD, self.PF_R | self.PF_X))
+        self.assertIn("ok RWX", r.stdout)
 
     def test_missing_checksec_fails_not_skips(self):
         bindir = self.dir / "nochecksec"
