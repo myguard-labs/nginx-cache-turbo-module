@@ -7,3 +7,4 @@ fuzz_blob	fuzz_blob.c	corpus_blob	-	extract_blob.sh
 fuzz_cache_control	fuzz_cache_control.c	corpus_cache_control	fuzz_cache_control.dict	extract_cache_control.sh
 fuzz_vary	fuzz_vary.c	corpus_vary	fuzz_vary.dict	extract_vary.sh
 fuzz_cookie_args	fuzz_cookie_args.c	corpus_cookie_args	fuzz_cookie_args.dict	extract_cookie_args.sh
+fuzz_control_inputs	fuzz_control_inputs.c	corpus_control_inputs	fuzz_control_inputs.dict	extract_control_inputs.sh

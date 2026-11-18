@@ -7,8 +7,9 @@ from pathlib import Path
 
 FUZZ = Path(__file__).resolve().parents[1] / "fuzz"
 HELPER = FUZZ / "targets.sh"
-FIVE = ["fuzz_resp_parser", "fuzz_norm_args", "fuzz_mc_parser",
-        "fuzz_auto_classify", "fuzz_blob"]
+REGISTERED = ["fuzz_resp_parser", "fuzz_norm_args", "fuzz_mc_parser",
+              "fuzz_auto_classify", "fuzz_blob", "fuzz_cache_control",
+              "fuzz_vary", "fuzz_cookie_args", "fuzz_control_inputs"]
 HEADER = "name\tsource\tcorpus\tdict\textract\n"
 GOOD = "fuzz_norm_args\tfuzz_norm_args.c\tcorpus_norm_args\t-\textract_norm_args.sh"
 
@@ -29,22 +30,27 @@ class TargetsRegistryTest(unittest.TestCase):
         p.write_text(body)
         return p
 
-    def test_real_registry_is_the_five_targets(self):
+    def test_real_registry_lists_every_target(self):
         r = run(["validate"])
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(run(["names"]).stdout.split(), FIVE)
+        self.assertEqual(run(["names"]).stdout.split(), REGISTERED)
         self.assertEqual(run(["specs", "all"]).stdout.split(), [
             "fuzz_resp_parser:corpus:fuzz.dict",
             "fuzz_norm_args:corpus_norm_args:",
             "fuzz_mc_parser:corpus_mc:fuzz_mc.dict",
             "fuzz_auto_classify:corpus_auto:",
-            "fuzz_blob:corpus_blob:"])
+            "fuzz_blob:corpus_blob:",
+            "fuzz_cache_control:corpus_cache_control:fuzz_cache_control.dict",
+            "fuzz_vary:corpus_vary:fuzz_vary.dict",
+            "fuzz_cookie_args:corpus_cookie_args:fuzz_cookie_args.dict",
+            ("fuzz_control_inputs:corpus_control_inputs:"
+             "fuzz_control_inputs.dict")])
 
     def test_lane_partition_covers_every_target_once(self):
         a = run(["specs", "a"]).stdout.split()
         b = run(["specs", "b"]).stdout.split()
         self.assertEqual(a + b, run(["specs", "all"]).stdout.split())
-        self.assertEqual((len(a), len(b)), (3, 2))
+        self.assertEqual((len(a), len(b)), (5, 4))
         self.assertEqual(run(["specs", "c"]).returncode, 2)
 
     def test_scratch_registry_good_row(self):

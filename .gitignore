@@ -94,6 +94,9 @@ ci/fuzz/auto_classify_empty_smoke
 ci/fuzz/fuzz_blob
 ci/fuzz/fuzz_blob_fixtures
 ci/fuzz/fuzz_cookie_args
+ci/fuzz/fuzz_cache_control
+ci/fuzz/fuzz_vary
+ci/fuzz/fuzz_control_inputs
 ci/tests/unit/blob_fixtures
 ci/tests/unit/auto_classify_fixtures
 ci/tests/unit/resp_parser_fixtures
@@ -102,6 +105,7 @@ ci/fuzz/generated_norm_args.inc
 ci/fuzz/generated_cache_control.inc
 ci/fuzz/generated_vary.inc
 ci/fuzz/generated_cookie_args.inc
+ci/fuzz/generated_control_inputs.inc
 ci/fuzz/generated_mc_parser.inc
 ci/fuzz/generated_auto_classify.inc
 ci/fuzz/generated_blob.inc
@@ -125,6 +129,8 @@ ci/fuzz/corpus_vary/*
 !ci/fuzz/corpus_vary/[0-9][0-9]_*
 ci/fuzz/corpus_cookie_args/*
 !ci/fuzz/corpus_cookie_args/[0-9][0-9]_*
+ci/fuzz/corpus_control_inputs/*
+!ci/fuzz/corpus_control_inputs/[0-9][0-9]_*
 
 # Test::Nginx::Socket regenerates these per run (ci/t/*.t). Under
 # TEST_NGINX_RANDOMIZE the scaffold hardcodes t/servroot_<port>/ as the root,

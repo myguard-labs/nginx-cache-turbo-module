@@ -74,6 +74,36 @@ its own `extract_*.sh` slicer (no hand-maintained copy):
   then up to 8 Cookie header values). The 10000-arg and 4096-crumb seeds exceed
   libFuzzer's default 4096-byte limit, which it raises to the largest seed.
 
+- **`fuzz_control_inputs`** → the operator/origin control-input parsers:
+  `hexdecode` (`purge.c`, tag-set member hex to key bytes; + the `match.c`
+  `hexval` helper), `body_filter_tag_split` (`filters.c`, origin
+  Surrogate-Key / Cache-Tag tokeniser capped at `MAX_TAGS` entries of
+  `MAX_TAG_LEN` bytes) and the admin warm-list splitter in `admin.c`: `warm`
+  (`,`/`\n` split, CR trim, `?query` suffix split, percent-decode into an exact
+  allocation, `warm_max` fan-out cap), `warm_uri_is_safe`, `warm_raw_is_safe`
+  and `warm_file_finish` (the `WARM_LINE_MAX_LEN` gate). Bug classes: an OOB
+  read at/over the end of an exact-sized, non-NUL-terminated buffer, a write
+  past `seen[]` or the decode allocation, a cap that stops holding, and a
+  CR/NUL/CTL byte or `..` segment reaching the subrequest. Sliced by
+  `extract_control_inputs.sh` (the cap defines from `module.h` / `admin.c` plus
+  the functions; fails closed if any one is missing) into
+  `generated_control_inputs.inc`; shim is `ngx_shim_control_inputs.h` (verbatim
+  nginx `ngx_unescape_uri`, an exact-block pool with a fail-at index, and
+  recorders standing in for `warm_one` and `send_json`); corpus is
+  `corpus_control_inputs/`. Oracle: ASan/UBSan plus independent reference models
+  and a cap oracle - tag count never exceeds `MAX_TAGS`, every tag is
+  1..`MAX_TAG_LEN` bytes, the successful warm subrequests never exceed
+  `warm_max` and equal the reply, and a list with a line over
+  `WARM_LINE_MAX_LEN` fires nothing. Layout: byte 0 flags (`warm_max`
+  selector, `warm_one` failure schedule, pool failure, tag resume), byte 1 pool
+  failure index, then the hex string, the tag value (each ended by `0xFF`) and
+  the warm list (the rest). **Ownership deviation:** `ngx_http_arg` (the
+  `?url=` / `?url_file=` / `?tag=` / `?key=` lookup) is nginx core, not module
+  code, so it is not driven; the in-tree query readers are warm's `?query`
+  suffix split and its percent-decoder, both covered here. `hexval` is
+  also sliced into `fuzz_cookie_args` and `fuzz_auto_classify` (argparse
+  helper); here it is asserted only through `hexdecode`.
+
 ### Function ownership (match.c auto-classify FUZZ-EXTRACT block)
 
 `fuzz_auto_classify` compiles match.c with `NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO`
@@ -87,6 +117,7 @@ unasserted feeder.
 | `cookie_index_add`, `cookie_index_parse_one` | `fuzz_cookie_args` | `!FUZZ_SHIM_AUTO`: not compiled into `fuzz_auto_classify` |
 | `cookie_ac_scan_one` | `fuzz_cookie_args` | `!FUZZ_SHIM_AUTO`: not compiled into `fuzz_auto_classify` |
 | `argparse_tail_count`, `argparse_build` (+ `hexval`, `qs_first_mangled`) | `fuzz_cookie_args` | always compiled, so `fuzz_auto_classify` also runs them as the front half of `auto_skip` with no assertion on their output; the span/size bound oracle lives only here |
+| `hexdecode`, `body_filter_tag_split`, `warm`, `warm_uri_is_safe`, `warm_raw_is_safe`, `warm_file_finish` | `fuzz_control_inputs` | not in `match.c`; compiled into no other target |
 | `cookie_pred_one_next_pair`, `cookie_pred_one_split` (+ `_dispatch`, `cookie_pred`) | `fuzz_auto_classify` | `FUZZ_SHIM_AUTO`-only; driven through `auto_skip` over the preset predicate rows, so NOT sliced into `fuzz_cookie_args` |
 | `cookie_byteset_build`, `cookie_contains`, `cookie_has`, `qs_eq`, `arg_match`, `uri_prefix`, `auto_skip`, preset registry | `fuzz_auto_classify` | unchanged |
 
