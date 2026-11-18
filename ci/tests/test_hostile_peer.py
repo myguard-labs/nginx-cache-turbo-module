@@ -110,7 +110,7 @@ def test_send_chunk_boundaries() -> None:
 def test_negative_data_length_rejected() -> None:
     rd = hp._Reader(None)                                  # type: ignore[arg-type]
     rd.buf = b"abc"
-    with pytest.raises(ValueError):
+    with pytest.raises(hp._ProtocolError):
         rd.exact(-2)
     assert rd.buf == b"abc"
     assert rd.exact(0) == b""                              # zero stays valid
@@ -127,6 +127,27 @@ def test_negative_data_length_rejected() -> None:
     with Peer([[Step(reply=b"+OK\r\n")]]) as p, dial(p) as s:   # $0 valid
         s.sendall(b"*1\r\n$0\r\n\r\n")
         assert s.recv(16) == b"+OK\r\n"
+
+
+def test_responder_valueerror_recorded_in_errors() -> None:
+    def respond(_cmd: hp.Command) -> Step | None:
+        raise ValueError("responder bug")
+    with Peer(responder=respond) as p, dial(p) as s:
+        s.sendall(resp(b"PING"))
+        assert recv_all(s) in (b"", b"<RST>")
+        assert p.wait_for_closed(1)
+        assert len(p.errors) == 1 and isinstance(p.errors[0], ValueError)
+        assert not isinstance(p.errors[0], hp._ProtocolError)
+
+
+def test_malformed_client_input_is_silent() -> None:
+    for payload in (b"*1\r\n$-2\r\nPING\r\n", b"*x\r\n", b"*1\r\n$zz\r\n",
+                    b"*1\r\n+OK\r\n"):
+        with Peer([[Step(reply=b"+OK\r\n")]]) as p, dial(p) as s:
+            s.sendall(payload)
+            assert recv_all(s) in (b"", b"<RST>")
+            assert p.wait_for_closed(1)
+            assert p.errors == []
 
 
 def test_bad_script_selection_still_closes_connection() -> None:

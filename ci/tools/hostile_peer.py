@@ -96,6 +96,14 @@ class _Eof(Exception):
     pass
 
 
+class _ProtocolError(ValueError):
+    """Malformed client input: handled silently (connection closed).
+
+    Only this, EOF and socket errors are silent; any other exception raised
+    while serving (responder, script selector/callable) goes to Peer.errors.
+    """
+
+
 class _Reader:
     def __init__(self, sock: socket.socket) -> None:
         self.sock = sock
@@ -115,11 +123,18 @@ class _Reader:
 
     def exact(self, n: int) -> bytes:
         if n < 0:
-            raise ValueError(f"negative data length {n}")
+            raise _ProtocolError(f"negative data length {n}")
         while len(self.buf) < n:
             self._fill()
         out, self.buf = self.buf[:n], self.buf[n:]
         return out
+
+
+def _parse_int(raw: bytes) -> int:
+    try:
+        return int(raw)
+    except ValueError:
+        raise _ProtocolError(f"bad integer {raw[:16]!r}") from None
 
 
 def _read_redis(rd: _Reader) -> tuple[tuple[bytes, ...], None]:
@@ -127,14 +142,15 @@ def _read_redis(rd: _Reader) -> tuple[tuple[bytes, ...], None]:
     if first[:1] != b"*":
         return tuple(first.split()), None          # inline command
     args = []
-    for _ in range(int(first[1:])):
+    count = _parse_int(first[1:])
+    for _ in range(count):
         hdr = rd.line()
         if hdr[:1] != b"$":
-            raise ValueError(f"bad RESP item header {hdr[:16]!r}")
-        n = int(hdr[1:])
+            raise _ProtocolError(f"bad RESP item header {hdr[:16]!r}")
+        n = _parse_int(hdr[1:])
         args.append(rd.exact(n))
         if rd.exact(2) != b"\r\n":
-            raise ValueError("RESP item not CRLF terminated")
+            raise _ProtocolError("RESP item not CRLF terminated")
     return tuple(args), None
 
 
@@ -144,10 +160,10 @@ _MC_STORE = {b"set", b"add", b"replace", b"append", b"prepend", b"cas"}
 def _read_memcached(rd: _Reader) -> tuple[tuple[bytes, ...], bytes | None]:
     toks = tuple(rd.line().split())
     if toks and toks[0].lower() in _MC_STORE and len(toks) >= 5:
-        n = int(toks[4])
+        n = _parse_int(toks[4])
         data = rd.exact(n)
         if rd.exact(2) != b"\r\n":
-            raise ValueError("memcached data block not CRLF terminated")
+            raise _ProtocolError("memcached data block not CRLF terminated")
         return toks, data
     return toks, None
 
@@ -355,7 +371,7 @@ class Peer:
                     self._finish(conn, step.then)
                     if step.then != HALF_CLOSE:
                         return
-        except (_Eof, OSError, ValueError):
+        except (_Eof, OSError, _ProtocolError):
             pass
         except Exception as exc:  # noqa: BLE001  bad selector, Peer([]), responder
             with self._cond:
