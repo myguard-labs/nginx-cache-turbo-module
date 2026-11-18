@@ -6,6 +6,8 @@ valid:
   # Literal offset cannot be attacker-sized.
   - 'if (p + 1 < last) { p++; }'
   - 'if (crlf + 1 >= end) { return -1; }'
+  - 'if (p + (1) < last) { p++; }'
+  - 'if (p + ((0x10)) <= end) { p++; }'
   # Not a bounds comparison against an end pointer.
   - 'if (now < created + ttl) { return 0; }'
   - 'p = (end < last) ? end : last;'
@@ -18,3 +20,5 @@ invalid:
   - 'if (last < p + n) { return -1; }'
   - 'if (end >= p + n) { use(p, n); }'
   - 'if (b->pos + n > b->last) { return -1; }'
+  - 'if (p + (n) > last) { return -1; }'
+  - 'if (p + (1 + n) >= last) { return -1; }'

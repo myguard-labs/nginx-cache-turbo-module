@@ -7,11 +7,17 @@ test, run by the static job's `pytest ci/tests/*.py` step (after
 install-linters.sh put ast-grep on PATH), proves:
   * the rule fixtures pass (`ast-grep test`),
   * the src/ hits equal the committed baseline,
-  * the baseline gate itself fires on a new hit, a moved hit and a fixed hit
-    (scratch copies of src/, the real tree is never touched).
+  * the baseline gate itself fires on a new hit, a moved hit and a fixed hit,
+    refuses an incomplete scan (failed ast-grep, skipped non-UTF-8 file) and
+    returns 2 when it cannot run. Those controls scan a private scratch tree
+    with its own fixture hit, so they never depend on the live baseline rows
+    (empty after HARD-B4) and never touch the real tree.
 A missing ast-grep FAILS under CI (env CI set) and only skips on a dev box.
 """
 
+import contextlib
+import functools
+import io
 import os
 import pathlib
 import shutil
@@ -19,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 LOCAL = REPO / "ci" / "ast-grep-local"
@@ -32,18 +39,37 @@ if not HAVE and os.environ.get("CI"):
         "ast-grep missing in CI: install-linters.sh should have installed it"
     )
 
-TARGET = "src/ngx_http_cache_turbo_match.c"
+TARGET = "src/fixture_b3.c"
+BASE_C = (
+    "static int hit_b3(u_char *p, size_t n, u_char *last)\n"
+    "{\n    return p + n > last;\n}\n"
+)
+HIT_LINE = 3
 
 
 @unittest.skipUnless(
     HAVE, "ast-grep not installed (dev box); CI fails instead of skipping"
 )
 class AstGrepLocal(unittest.TestCase):
-    def _scratch(self):
+    def _scratch(self, text=BASE_C):
+        """Private tree whose only C file holds exactly one known hit."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        shutil.copytree(REPO / "src", pathlib.Path(tmp.name) / "src")
-        return pathlib.Path(tmp.name)
+        root = pathlib.Path(tmp.name)
+        (root / "src").mkdir()
+        (root / TARGET).write_text(text, encoding="utf-8")
+        return root
+
+    def _run_main(self, root, baseline, argv=()):
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(cb, "BASELINE", baseline),
+            mock.patch.object(cb, "scan", functools.partial(cb.scan, repo=root)),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            rc = cb.main(list(argv))
+        return rc, out.getvalue(), err.getvalue()
 
     def test_rule_fixtures(self):
         proc = subprocess.run(
@@ -60,68 +86,129 @@ class AstGrepLocal(unittest.TestCase):
             check=False,
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("2 passed", proc.stdout)
+        # exact count: a bare "2 passed" would also match "12 passed"
+        self.assertRegex(proc.stdout, r"test result: ok\. 2 passed; 0 failed")
 
     def test_src_matches_baseline(self):
         new, stale, moved = cb.diff(cb.load_baseline(), cb.scan())
         self.assertEqual(cb.report(new, stale, moved), [])
 
-    def test_baseline_lists_file_and_line(self):
-        entries = cb.load_baseline()
-        self.assertTrue(entries)
-        for _rule, file, line, _text in entries:
+    def test_baseline_rows_point_at_real_lines(self):
+        # An empty baseline (after HARD-B4) is valid: this loops zero times.
+        for _rule, file, line, _text in cb.load_baseline():
             self.assertTrue((REPO / file).is_file(), file)
             self.assertGreater(line, 0)
 
+    def test_header_only_baseline_loads_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "baseline.tsv"
+            path.write_text(cb.format_baseline([]), encoding="utf-8")
+            self.assertEqual(cb.load_baseline(path), [])
+
+    def test_scratch_fixture_has_one_known_hit(self):
+        hits = cb.scan(repo=self._scratch())
+        self.assertEqual(
+            hits,
+            [("c-ptr-add-bound-overflow", TARGET, HIT_LINE, "p + n > last")],
+        )
+
     def test_new_hit_fails(self):
         root = self._scratch()
-        extra = (
-            "\nstatic int scratch_b3(u_char *p, size_t n, u_char *last)\n"
-            "{\n    return p + n > last;\n}\n"
-        )
+        start = cb.scan(repo=root)
         with (root / TARGET).open("a", encoding="utf-8") as fh:
-            fh.write(extra)
-        new, stale, moved = cb.diff(cb.load_baseline(), cb.scan(repo=root))
+            fh.write(
+                "\nstatic int scratch_b3(u_char *p, size_t n, u_char *last)\n"
+                "{\n    return p + n > last;\n}\n"
+            )
+        new, stale, moved = cb.diff(start, cb.scan(repo=root))
         self.assertEqual([n[0] for n in new], ["c-ptr-add-bound-overflow"])
         self.assertEqual((stale, moved), ([], []))
-        self.assertTrue(
-            any(ln.startswith("NEW") for ln in cb.report(new, stale, moved))
-        )
+        self.assertTrue(report_has(cb.report(new, stale, moved), "NEW"))
 
     def test_moved_hit_reported_as_move(self):
         root = self._scratch()
+        start = cb.scan(repo=root)
         path = root / TARGET
-        path.write_text(
-            "/* shift */\n" + path.read_text(encoding="utf-8"), encoding="utf-8"
-        )
-        new, stale, moved = cb.diff(cb.load_baseline(), cb.scan(repo=root))
+        path.write_text("/* shift */\n" + BASE_C, encoding="utf-8")
+        new, stale, moved = cb.diff(start, cb.scan(repo=root))
         self.assertEqual((new, stale), ([], []))
-        self.assertEqual(len(moved), len(cb.load_baseline()))
-        self.assertTrue(
-            all(ln.startswith("MOVED") for ln in cb.report(new, stale, moved))
-        )
+        self.assertEqual(len(moved), 1)
+        (_, _, old, _), (_, _, now, _) = moved[0]
+        self.assertEqual((old, now), (HIT_LINE, HIT_LINE + 1))
+        lines = cb.report(new, stale, moved)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("MOVED"))
 
     def test_fixed_hit_reported_stale(self):
         root = self._scratch()
-        path = root / TARGET
-        text = path.read_text(encoding="utf-8")
-        fixed = text.replace("val < name + plen", "(size_t) (val - name) < plen")
-        self.assertNotEqual(text, fixed)
-        path.write_text(fixed, encoding="utf-8")
-        new, stale, moved = cb.diff(cb.load_baseline(), cb.scan(repo=root))
+        start = cb.scan(repo=root)
+        fixed = BASE_C.replace("p + n > last", "n > (size_t) (last - p)")
+        self.assertNotEqual(fixed, BASE_C)
+        (root / TARGET).write_text(fixed, encoding="utf-8")
+        new, stale, moved = cb.diff(start, cb.scan(repo=root))
         self.assertEqual((new, moved), ([], []))
         self.assertEqual(len(stale), 1)
         self.assertTrue(report_has(cb.report(new, stale, moved), "STALE"))
 
     def test_safe_form_not_flagged(self):
         root = self._scratch()
+        start = cb.scan(repo=root)
         with (root / TARGET).open("a", encoding="utf-8") as fh:
             fh.write(
                 "\nstatic int safe_b3(u_char *p, size_t n, u_char *last)\n"
                 "{\n    return p <= last && n > (size_t) (last - p);\n}\n"
             )
-        new, stale, moved = cb.diff(cb.load_baseline(), cb.scan(repo=root))
-        self.assertEqual((new, stale, moved), ([], [], []))
+        self.assertEqual(cb.diff(start, cb.scan(repo=root)), ([], [], []))
+
+    def test_scan_fails_on_bad_config(self):
+        root = self._scratch()
+        cfg = root / "cfg"
+        (cfg / "rules").mkdir(parents=True)
+        (cfg / "sgconfig.yml").write_text("ruleDirs:\n  - rules\n", encoding="utf-8")
+        (cfg / "rules" / "broken.yml").write_text("rule: [broken\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "rc="):
+            cb.scan(repo=root, config=cfg / "sgconfig.yml")
+
+    def test_scan_fails_when_a_c_file_is_skipped(self):
+        root = self._scratch()
+        (root / "src" / "latin1_b3.c").write_bytes(b"/* \xff\xfe */\nint x;\n")
+        with self.assertRaisesRegex(RuntimeError, "not scanned"):
+            cb.scan(repo=root)
+
+    def test_scan_allows_blank_files(self):
+        root = self._scratch()
+        (root / "src" / "empty_b3.c").write_bytes(b"")
+        self.assertEqual(len(cb.scan(repo=root)), 1)
+
+    def test_update_refuses_when_a_file_is_skipped(self):
+        root = self._scratch()
+        (root / "src" / "latin1_b3.c").write_bytes(b"\xff\xfe\n")
+        baseline = root / "baseline.tsv"
+        baseline.write_text(cb.format_baseline([]), encoding="utf-8")
+        before = baseline.read_text(encoding="utf-8")
+        rc, _out, err = self._run_main(root, baseline, ["--update"])
+        self.assertEqual(rc, 2, err)
+        self.assertEqual(baseline.read_text(encoding="utf-8"), before)
+
+    def test_main_exit_codes(self):
+        root = self._scratch()
+        baseline = root / "baseline.tsv"
+        # --update writes the scratch baseline, then the check passes (0)
+        rc, _o, err = self._run_main(root, baseline, ["--update"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._run_main(root, baseline)[0], 0)
+        # drift found by a complete scan -> 1
+        with (root / TARGET).open("a", encoding="utf-8") as fh:
+            fh.write(
+                "\nint x_b3(u_char *p, int n, u_char *end)\n{ return p + n > end; }\n"
+            )
+        self.assertEqual(self._run_main(root, baseline)[0], 1)
+        # cannot run -> 2: missing, unparsable and unwritable baseline
+        self.assertEqual(self._run_main(root, root / "missing.tsv")[0], 2)
+        bad = root / "bad.tsv"
+        bad.write_text("rule-only-no-tabs\n", encoding="utf-8")
+        self.assertEqual(self._run_main(root, bad)[0], 2)
+        self.assertEqual(self._run_main(root, root, ["--update"])[0], 2)
 
 
 def report_has(lines, prefix):

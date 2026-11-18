@@ -12,12 +12,17 @@ Policy (strict, both directions):
 HARD-B4 empties the baseline; until then any src/ edit that shifts a baselined
 line must refresh it with `--update`, which keeps the diff reviewable.
 
-Usage: check_baseline.py [--update]     Exit: 0 match, 1 drift, 2 cannot run.
+Usage: check_baseline.py [--update]
+  Exit: 0 match, 1 drift found by a complete scan, 2 cannot run (ast-grep
+  failed or skipped a src/ C file, baseline unreadable/unparsable/unwritable;
+  --update then leaves baseline.tsv untouched).
 """
 
 import collections
 import json
+import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -28,27 +33,67 @@ BASELINE = HERE / "baseline.tsv"
 HEADER = "# rule\tfile:line\tmatched text (tabs/newlines collapsed)\n"
 
 
+SUMMARY_RE = re.compile(r"scannedFileCount=(\d+),skippedFileCount=(\d+)")
+C_SUFFIXES = (".c", ".h")  # the extensions ast-grep maps to its C language
+
+
+def _is_blank(path):
+    """True for a file ast-grep legitimately skips (no content, so no hits)."""
+    try:
+        return not path.read_bytes().strip()
+    except OSError:
+        return False
+
+
+def _blank_c_files(root):
+    return sum(
+        1
+        for dirpath, _dirs, files in os.walk(root)
+        for name in files
+        if name.endswith(C_SUFFIXES) and _is_blank(pathlib.Path(dirpath, name))
+    )
+
+
 def scan(repo=REPO, config=None, target="src"):
-    """Return sorted [(rule, file, line, text)] for `target` under `repo`."""
+    """Return sorted [(rule, file, line, text)] for `target` under `repo`.
+
+    Raises RuntimeError unless the scan provably covered every C file:
+    ast-grep exits 0 for warning-severity hits (1 only for error severity,
+    6/8 for a bad config/rule), prints a JSON array, and skips unreadable,
+    non-UTF-8 or oversized files silently, so the summary's skippedFileCount
+    must not exceed the number of blank files (which have no hits to miss).
+    """
     exe = shutil.which("ast-grep")
     if exe is None:
         raise RuntimeError("ast-grep not found on PATH")
     cfg = config or HERE / "sgconfig.yml"
     proc = subprocess.run(
-        [exe, "scan", "-c", str(cfg), "--json=compact", target],
+        [exe, "scan", "-c", str(cfg), "--json=compact", "--inspect", "summary", target],
         cwd=repo,
         capture_output=True,
         text=True,
         check=False,
     )
-    # rc 0 = clean, 1 = an error-severity hit; these rules are warnings, so
-    # anything else (or unparsable output) is "could not run", not a verdict.
-    if proc.returncode not in (0, 1):
+    # These rules are warnings: a successful scan exits 0 whatever it finds.
+    if proc.returncode != 0:
         raise RuntimeError(f"ast-grep scan rc={proc.returncode}: {proc.stderr[-400:]}")
     try:
-        hits = json.loads(proc.stdout or "[]")
+        hits = json.loads(proc.stdout)
     except ValueError as exc:
         raise RuntimeError(f"unparsable ast-grep output: {exc}") from exc
+    if not isinstance(hits, list):
+        raise RuntimeError("ast-grep output is not a JSON array")  # noqa: TRY004
+    summary = SUMMARY_RE.search(proc.stderr)
+    if summary is None:
+        raise RuntimeError("ast-grep printed no scan summary; coverage unknown")
+    skipped = int(summary.group(2))
+    blank = _blank_c_files(pathlib.Path(repo) / target)
+    if skipped > blank:
+        raise RuntimeError(
+            f"ast-grep skipped {skipped} C file(s) but only {blank} are blank: "
+            "an unreadable, non-UTF-8 or oversized file under "
+            f"{target}/ was not scanned"
+        )
     out = []
     for h in hits:
         text = " ".join(h["text"].split())
@@ -56,9 +101,9 @@ def scan(repo=REPO, config=None, target="src"):
     return sorted(out)
 
 
-def load_baseline(path=BASELINE):
+def load_baseline(path=None):
     entries = []
-    for raw in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+    for raw in pathlib.Path(path or BASELINE).read_text(encoding="utf-8").splitlines():
         if not raw.strip() or raw.startswith("#"):
             continue
         rule, loc, text = raw.split("\t", 2)
@@ -104,14 +149,15 @@ def report(new, stale, moved):
 def main(argv):
     try:
         actual = scan()
-    except RuntimeError as exc:
+        if "--update" in argv:
+            BASELINE.write_text(format_baseline(actual), encoding="utf-8")
+            print(f"baseline updated: {len(actual)} hit(s)")
+            return 0
+        baseline = load_baseline()
+    except (RuntimeError, OSError, ValueError) as exc:
         print(f"check_baseline: cannot run: {exc}", file=sys.stderr)
         return 2
-    if "--update" in argv:
-        BASELINE.write_text(format_baseline(actual), encoding="utf-8")
-        print(f"baseline updated: {len(actual)} hit(s)")
-        return 0
-    new, stale, moved = diff(load_baseline(), actual)
+    new, stale, moved = diff(baseline, actual)
     lines = report(new, stale, moved)
     if lines:
         print("\n".join(lines), file=sys.stderr)
