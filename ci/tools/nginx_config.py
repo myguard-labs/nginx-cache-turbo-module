@@ -79,6 +79,14 @@ PORT_OFFSETS: dict[str, int] = {
     "abort_proxy": 33,
     # BP-C1: test_fault_alloc_countdown() runs its own one-worker nginx here.
     "fault_alloc": 9,
+    # HARD-L2: areas/hostile_l2.py runs its own one-worker node, origin and
+    # scripted Redis/memcached peers.  The harvest peer is Redis only: its
+    # blob is also a valid memcached value (CTRL-MC-PLANTED-FRESH).
+    "hostile_l2_node": 34,
+    "hostile_l2_redis": 35,
+    "hostile_l2_memcached": 36,
+    "hostile_l2_harvest": 37,
+    "hostile_l2_origin": 39,
 }
 
 
@@ -120,179 +128,9 @@ def strip_fault_directives(conf: str) -> str:
     return _FAULT_DIRECTIVE.sub("", conf)
 
 
-def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
-                 origin_port: int, workers: int,
-                 redis_port: int | None = None,
-                 redis_auth_port: int | None = None,
-                 redis_password: str | None = None,
-                 redis_tls_port: int | None = None,
-                 redis_tls_ca: str | None = None,
-                 memcached_port: int | None = None,
-                 fault_injection: bool = False,
-                 sr_off: bool = False,
-                 redis_tls_untrusted_port: int | None = None,
-                 redis_tls_expired_port: int | None = None) -> str:
-    """Build the generated nginx.conf for the test server.
-
-    !! ASCII ONLY -- everything returned here, INCLUDING COMMENTS, is written
-    with encoding="ascii" (see Nginx.write_config). A single non-ASCII byte
-    anywhere in this function (a stray arrow, dash, or warning sign pasted into
-    a location comment) raises UnicodeEncodeError before a single test runs, and
-    the traceback points at write_text, not at the comment you added. Use "!!",
-    "->" and plain hyphens.
-    """
-    load = f"load_module {module};\n" if module else ""
-
-    # S8 reload arm: the SAME zone (srz) with the directive flipped to `off`.
-    # Written into the conf only for the post-reload pass, so a real
-    # `nginx -s reload` hands the already-PROTECTED nodes in the surviving zone
-    # to a worker whose effective protected_pct is now 0. See
-    # test_s8_reload_on_to_off_drains_protected.
-    sr_directive = ("cache_turbo_scan_resistant off;" if sr_off
-                    else "cache_turbo_scan_resistant on;")
-
-    # DSN auth+db (v5): a backend reached via a full redis://user:pass@host/db
-    # DSN, and a plain SELECT-db (no auth) backend on the main instance.
-    dsn_loc = ""
-    if redis_auth_port is not None:
-        dsn_loc += f"""
-        # full DSN: AUTH (password) + SELECT db 2, two-reply preamble
-        location /l2auth/ {{
-            cache_turbo       main;
-            cache_turbo_key   $uri;
-            cache_turbo_valid 30s;
-            cache_turbo_redis redis://:{redis_password}@127.0.0.1:{redis_auth_port}/2;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # AUTH+SELECT DSN with a keepalive pool (v15 + v5 combined): a pooled
-        # reused connection must skip the AUTH/SELECT preamble entirely (it was
-        # already authenticated + SELECTed when first opened). See
-        # test_l2_keepalive_no_auth_replay.
-        location /l2authka/ {{
-            cache_turbo       main;
-            cache_turbo_key   $uri;
-            cache_turbo_valid 30s;
-            cache_turbo_redis redis://:{redis_password}@127.0.0.1:{redis_auth_port}/2 keepalive=4 keepalive_timeout=30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-"""
-    if redis_port is not None:
-        dsn_loc += f"""
-        # SELECT-only preamble (db 1, no auth) on the main instance
-        location /l2db/ {{
-            cache_turbo       main;
-            cache_turbo_key   $uri;
-            cache_turbo_valid 30s;
-            cache_turbo_redis 127.0.0.1:{redis_port} db=1;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-"""
-    if redis_tls_port is not None:
-        dsn_loc += f"""
-        # rediss:// TLS, verifying the server cert against our test CA
-        location /l2tls/ {{
-            cache_turbo       main;
-            cache_turbo_key   $uri;
-            cache_turbo_valid 30s;
-            cache_turbo_redis rediss://127.0.0.1:{redis_tls_port}/0 tls_ca={redis_tls_ca} tls_name=localhost;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # v15-2: TLS keepalive pool -- idle TLS conns cached + reused across ops
-        # (handshake + AUTH/SELECT skipped on reuse over the persistent channel).
-        location /l2tlska/ {{
-            cache_turbo       main;
-            cache_turbo_key   $uri;
-            cache_turbo_valid 30s;
-            cache_turbo_redis rediss://127.0.0.1:{redis_tls_port}/0 tls_ca={redis_tls_ca} tls_name=localhost keepalive=4 keepalive_timeout=30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-"""
-    if redis_tls_untrusted_port is not None:
-        # AUD-TLS1: nginx is told to trust the SAME CA as /l2tls/ (redis_tls_ca),
-        # but this backend's cert is signed by a DIFFERENT CA. With a working
-        # SSL_CTX_set_verify(PEER) the handshake must fail chain verification;
-        # the L2 write-through must never reach this server.
-        dsn_loc += f"""
-        # rediss:// TLS, server cert signed by an UNTRUSTED CA (AUD-TLS1)
-        location /l2tlsuntrusted/ {{
-            cache_turbo       main;
-            cache_turbo_key   $uri;
-            cache_turbo_valid 30s;
-            cache_turbo_redis rediss://127.0.0.1:{redis_tls_untrusted_port}/0 tls_ca={redis_tls_ca} tls_name=localhost;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # S231-L2-BACKOFF (TLS follow-up): same untrusted-CA backend as
-        # /l2tlsuntrusted/ above, but with connect_backoff armed. Every
-        # request's TLS handshake fails cert verification -- a TERMINAL
-        # handshake failure, not a TCP connect refusal -- so this proves the
-        # backoff also arms off the TLS path, not just a plain-TCP connect()
-        # error. cache_turbo_lock off for the same reason as /l2backoff/: one
-        # L2 attempt per request, exact counter deltas.
-        location /l2tlsbackoff/ {{
-            cache_turbo       main;
-            cache_turbo_key   $uri;
-            cache_turbo_valid 1s;
-            cache_turbo_lock  off;
-            cache_turbo_redis rediss://127.0.0.1:{redis_tls_untrusted_port}/0 tls_ca={redis_tls_ca} tls_name=localhost prefix=ctbotls: connect_backoff=5000ms;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-"""
-    if redis_tls_expired_port is not None:
-        # Same trusted CA as /l2tls/ (chain trust is fine), but the leaf cert's
-        # own validity window is already expired. Must also be rejected.
-        dsn_loc += f"""
-        # rediss:// TLS, server cert EXPIRED (chain-trusted CA) (AUD-TLS1)
-        location /l2tlsexpired/ {{
-            cache_turbo       main;
-            cache_turbo_key   $uri;
-            cache_turbo_valid 30s;
-            cache_turbo_redis rediss://127.0.0.1:{redis_tls_expired_port}/0 tls_ca={redis_tls_ca} tls_name=localhost;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-"""
-
-    # SK-A2: the surrogate-key locations that carry NO cache_turbo_redis are
-    # emitted unconditionally. They used to sit inside redis_loc, so a run
-    # without --redis-server dropped them while run_all() still called their
-    # tests -- the "works without an L2 tag index" claim was exactly the case
-    # that never ran. /skoff/ stays in redis_loc (it needs Redis to consume the
-    # tag and suppress the COR-0 "no effect" warning).
-    sk_loc = f"""
-        # cache_turbo_surrogate_key: emit the tag list downstream as a
-        # Surrogate-Key header for a fronting CDN. Deliberately NO cache_turbo_redis
-        # here -- the emit must work without an L2 tag index. SK-A1: BOTH the MISS
-        # and every later HIT carry the header, because a CDN POP that lost its own
-        # copy refills from our HIT and would otherwise cache an untagged object.
-        location /sk/ {{
-            cache_turbo          main;
-            cache_turbo_key      $uri;
-            cache_turbo_valid    30s;
-            cache_turbo_tag      "blog news blog";
-            cache_turbo_surrogate_key on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # surrogate_key with the tag value from a query arg (upstream-controlled
-        # stand-in) so the cap/dedup carries into the emitted header.
-        location /skcap/ {{
-            cache_turbo          main;
-            cache_turbo_key      $uri;
-            cache_turbo_valid    30s;
-            cache_turbo_tag      $arg_t;
-            cache_turbo_surrogate_key on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-"""
-
-    # L2 (v2b): a location wired to a Redis backend. Scoped to /l2/ only so the
-    # L1-only tests (purge, eviction, ...) are unaffected. Emitted only when a
-    # RedisServer is running, so the no-redis path still config-tests.
-    redis_loc = ""
-    if redis_port is not None:
-        redis_loc = f"""
+def _redis_loc_00(origin_port, redis_port) -> str:
+    """Literal text of the L2 redis location block (part 0)."""
+    return f"""
         # L2: write-through on store + sync fill on L1 miss
         location /l2/ {{
             cache_turbo          main;
@@ -512,7 +350,12 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # L2 keepalive pool (v15): idle Redis connections cached per worker and
+"""
+
+
+def _redis_loc_01(origin_port, redis_port) -> str:
+    """Literal text of the L2 redis location block (part 1)."""
+    return f"""        # L2 keepalive pool (v15): idle Redis connections cached per worker and
         # reused across ops, instead of connect()+close per op. As of the
         # per-fingerprint pool (v16), each distinct connection profile gets its
         # OWN bucket, cap and timeout -- so this plain location's keepalive value
@@ -754,7 +597,12 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # SILENT-INDEX-DROP option (a): the L9 purge-by-tag index write
+"""
+
+
+def _redis_loc_02(origin_port, redis_port) -> str:
+    """Literal text of the L2 redis location block (part 2)."""
+    return f"""        # SILENT-INDEX-DROP option (a): the L9 purge-by-tag index write
         # (tag_add/tag_add_many for cache_turbo_tag) shares the exact same
         # fire-and-forget failure mode as the COR-5(b) variant-index SADD
         # above -- redis_launch() refuses silently, but until now the
@@ -974,7 +822,12 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             deny all;
         }}
 
-        # Literal Redis glob metacharacters in a prefix must stay literal during
+"""
+
+
+def _redis_loc_03(origin_port, port, redis_port) -> str:
+    """Literal text of the L2 redis location block (part 3)."""
+    return f"""        # Literal Redis glob metacharacters in a prefix must stay literal during
         # SCAN-based all-purge; only the module-appended final '*' is a wildcard.
         location = /_cache_l2glob {{
             cache_turbo_admin    main;
@@ -1215,7 +1068,12 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        location /brkil2off/ {{
+"""
+
+
+def _redis_loc_04(origin_port, port, redis_port) -> str:
+    """Literal text of the L2 redis location block (part 4)."""
+    return f"""        location /brkil2off/ {{
             cache_turbo                    brkil2z;
             cache_turbo_key                $uri;
             cache_turbo_valid               1s;   # see /brkil2on/
@@ -1308,247 +1166,10 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
         }}
 """
 
-    # L2 memcached (v13): a location wired to the memcached backend instead of
-    # Redis. Emitted only when a MemcachedServer is running; scoped to /mc/ so it
-    # never disturbs the Redis or L1-only locations. Distinct prefix (mc:) so its
-    # keys can't collide with the Redis suite's ct: namespace.
-    mc_loc = ""
-    if memcached_port is not None:
-        mc_loc = f"""
-        # L2 memcached: write-through on store + sync fill on L1 miss
-        location /mc/ {{
-            cache_turbo            main;
-            cache_turbo_key        $uri;
-            cache_turbo_valid      30s;
-            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mc: timeout=250ms;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
 
-        # L2 memcached with a keepalive pool (D-O1): idle pooled conns must carry
-        # a close-on-readable handler. When the memcached server drops an idle
-        # pooled conn, epoll wakes c->read; a NULL handler there SIGSEGVs the
-        # worker. Exercised by test_mc_keepalive_server_close_survives.
-        location /mcka/ {{
-            cache_turbo            main;
-            cache_turbo_key        $uri;
-            cache_turbo_valid      30s;
-            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mck: timeout=250ms keepalive=4 keepalive_timeout=30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # MC-A2: SAME memcached peer as /mcka/ but keepalive explicitly 0. The
-        # documented contract is a fresh connection per op; before the fix
-        # mc_connect looked the pool up by peer address only, so this location
-        # borrowed (and, because ka_save does check zero, then CLOSED) sockets
-        # /mcka/ had pooled -- draining another location's pool. Exercised by
-        # test_mc_keepalive_zero_does_not_drain_pool.
-        location /mcka0/ {{
-            cache_turbo            main;
-            cache_turbo_key        $uri;
-            cache_turbo_valid      30s;
-            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mck0: timeout=250ms keepalive=0;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # Short idle timeout (D-O1): a pooled conn left idle past 1s must be
-        # dropped by mc_ka_close_handler's ev->timedout branch, not leak/crash.
-        # Exercised by test_mc_keepalive_idle_timeout_drops.
-        location /mckashort/ {{
-            cache_turbo            main;
-            cache_turbo_key        $uri;
-            cache_turbo_valid      30s;
-            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mcks: timeout=250ms keepalive=4 keepalive_timeout=1s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # D-O2: a keepalive location pointed at a DELIBERATELY MISBEHAVING fake
-        # memcached (PORT_OFFSETS["mc_dirty_reply"], stood up only by
-        # test_mc_dirty_reply_not_pooled on the PRIMARY instance). The address is
-        # derived from memcached_port, not from this instance's own `port`: a
-        # second nginx (test_l2_memcached_cross_instance_fill's instance B) runs
-        # on a different port but must still point at the one fake memcached.
-        # A reply that does not frame cleanly at
-        # a boundary (trailing junk past END/STORED, a server error, a timeout)
-        # must NOT be returned to the pool -- the connection is closed instead, so
-        # a reuse never resumes mid-reply. Same keepalive size as /mcka/.
-        location /mcdirty/ {{
-            cache_turbo            main;
-            cache_turbo_key        $uri;
-            cache_turbo_valid      30s;
-            cache_turbo_memcached  127.0.0.1:{memcached_port + PORT_OFFSETS["mc_dirty_reply"] - PORT_OFFSETS["memcached"]} prefix=mcd: timeout=250ms keepalive=4 keepalive_timeout=30s;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # memcached-backed admin: a single-key purge here must also delete the
-        # entry from memcached (not just drop L1).
-        location = /_cache_mc {{
-            cache_turbo_admin      main;
-            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mc: timeout=250ms;
-            allow 127.0.0.1;
-            deny all;
-        }}
-
-        # S231-L2-BACKOFF, memcached side. Same dead-peer/cache_turbo_lock off
-        # shape as /l2backoff/ above (redis_dead offset -- never bound, plain
-        # TCP refuse works identically for either driver's connect()).
-        location /mcbackoff/ {{
-            cache_turbo            main;
-            cache_turbo_key        $uri;
-            cache_turbo_valid      1s;
-            cache_turbo_lock       off;
-            cache_turbo_memcached  127.0.0.1:{port + PORT_OFFSETS["redis_dead"]} prefix=mcbo: timeout=250ms connect_backoff=5000ms;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # A peer on this port accepts and reads the GET, then closes without a
-        # reply. A successful local send must not clear the connection's
-        # unproven state: the read-side EOF must arm connect_backoff. no_store
-        # prevents the response body from becoming a normal cached entry.
-        location /mcdrop/ {{
-            cache_turbo            main;
-            cache_turbo_key        $uri;
-            cache_turbo_valid      1s;
-            cache_turbo_lock       off;
-            cache_turbo_no_store   $arg_private;
-            cache_turbo_memcached  127.0.0.1:{port + PORT_OFFSETS["mc_drop_reply"]} prefix=mcdrop: timeout=250ms connect_backoff=5000ms;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-"""
-
-    # Backend-inheritance regression (precedence bug FIXED 2026-06-12): a parent
-    # location naming cache_turbo_memcached (memcached=1) enclosing a child that
-    # names cache_turbo_redis. The child MUST drive its own address with the Redis
-    # backend, not inherit the parent's memcached=1 (the merge would otherwise
-    # select the memcached driver for a redis:// address). Needs BOTH L2 servers.
-    mcinh_loc = ""
-    if memcached_port is not None and redis_port is not None:
-        mcinh_loc = f"""
-        location /mcinh/ {{
-            cache_turbo            main;
-            cache_turbo_key        $uri;
-            cache_turbo_valid      30s;
-            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mc: timeout=250ms;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-
-            # child overrides the parent's memcached backend with Redis
-            location /mcinh/child/ {{
-                cache_turbo_redis  127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
-                proxy_pass http://127.0.0.1:{origin_port}/;
-            }}
-        }}
-"""
-    mc_loc += mcinh_loc
-
-    fault_loc = ""
-    if fault_injection:
-        fault_loc = f"""
-        # CI-only allocation fault injection. These directives are compiled only
-        # by ci/tools/ci-build.sh and are absent from production/package builds.
-        location /allocfail/ {{
-            cache_turbo                         main;
-            cache_turbo_key                     $uri;
-            cache_turbo_valid                   30s;
-            cache_turbo_test_restore_alloc_fail on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        location /allocfailst/ {{
-            cache_turbo                         main;
-            cache_turbo_key                     $uri;
-            cache_turbo_valid                   301 30s;
-            cache_turbo_test_restore_alloc_fail on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        location /allocfailsie/ {{
-            cache_turbo                         main;
-            cache_turbo_key                     $uri;
-            cache_turbo_valid                   1s;
-            cache_turbo_stale_mult              1;
-            cache_turbo_test_restore_alloc_fail on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # CI-only: force the body filter onto the file-backed delegate path
-        # (the sendfile-abort branch) deterministically, without depending on
-        # directio/O_DIRECT fs alignment. Nothing must ever store here.
-        location /forcefile/ {{
-            cache_turbo                    main;
-            cache_turbo_key                $uri;
-            cache_turbo_valid              30s;
-            cache_turbo_test_force_file_buf on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # AUD-STORE-ERR-STUB: force the body filter's l1->store() to fail
-        # deterministically, so a cold-miss winner's stub cleanup path is
-        # reachable without depending on real slab exhaustion timing.
-        #
-        # lock_ttl is LONG (30s) on purpose: the leaked stub must still hold a
-        # LIVE lease when the second request arrives, or claim() adopts the
-        # expired stub instead of parking on it and the test stops
-        # discriminating (see test_store_failure_cleans_up_cold_stub). The
-        # oracle is the lock_waits counter, so nothing here waits out a
-        # timeout -- lock_timeout stays short to bound the buggy-build park.
-        location /storefail/ {{
-            cache_turbo                  storefailz;
-            cache_turbo_key              $uri;
-            cache_turbo_valid            30s;
-            cache_turbo_lock_ttl         30s;
-            cache_turbo_lock_timeout     2s;
-            cache_turbo_test_store_fail  on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # AUD-STORE-ERR-STUB: admin endpoint for /storefail/'s private zone
-        # (storefailz), same reasoning as /_cache_s71 -- /_cache is bound to
-        # `main` and would read a lock_waits counter this zone never writes,
-        # and (unlike s71z) `main` is never quiescent: it is shared by 166
-        # other locations, so an exact-equality assert against it is
-        # order-dependent on whatever else in the suite happens to park in
-        # cold_wait() between this test's two samples.
-        location = /_cache_storefail {{
-            cache_turbo_admin    storefailz;
-            allow 127.0.0.1;
-            deny all;
-        }}
-
-        # S231-SIE-MIDBODY: same short fresh/stale window + "sieserve" marker
-        # convention as /sieserve/ so a warmed key gets a serve-on-error
-        # snapshot armed (sie_armed), but the fault fires in the BODY filter
-        # instead of driving the origin to a real 5xx -- cache_turbo_test_
-        # midbody_abort treats the first arriving body buffer as a mid-body
-        # origin death regardless of what status the origin actually sent.
-        # This is the header-filter trigger's blind spot: that trigger only
-        # ever sees r->headers_out.status, and a mid-body death arrives with
-        # headers already serialised as a normal 200. Drives
-        # test_sie_midbody_rescue.
-        location /midbody/ {{
-            cache_turbo                  main;
-            cache_turbo_key              $uri;
-            cache_turbo_valid            1s;
-            cache_turbo_stale_mult       1;
-            cache_turbo_keep_stale       off;
-            cache_turbo_test_midbody_abort on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # S231-SIE-MIDBODY negative control: identical fault directive, but
-        # NO stale-if-error window ever gets armed (no "sieserve" marker in
-        # the key, so sie_armed stays 0 for every request). Proves the fault
-        # cannot fabricate a body out of nothing -- with nothing armed the
-        # rescue's own `ctx->sie_armed` guard must refuse it and the
-        # (truncated-by-the-fault) response must pass through unchanged.
-        location /midbodycold/ {{
-            cache_turbo                  main;
-            cache_turbo_key              $uri;
-            cache_turbo_valid            30s;
-            cache_turbo_test_midbody_abort on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-"""
-
-    conf = f"""{load}worker_processes {workers};
+def _conf_00(load, root, workers) -> str:
+    """Literal text of the generated nginx.conf (part 0)."""
+    return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
 error_log {root}/logs/error.log {_errlog_level()};
 thread_pool cache_turbo_warm threads=1 max_queue=64;
@@ -1809,7 +1430,12 @@ http {{
     cache_turbo_zone name=l2neglifez 1m;
     cache_turbo_zone name=l2negmuz 1m;
 
-    # BRK-RA1: private zones for the breaker_retry_after auto-track
+"""
+
+
+def _conf_01(dsn_loc, fault_loc, mc_loc, origin_port, port, redis_loc, root, sk_loc) -> str:
+    """Literal text of the generated nginx.conf (part 1)."""
+    return f"""    # BRK-RA1: private zones for the breaker_retry_after auto-track
     # regression pin. TWO zones, not one shared by /ra1/ and /ra1exp/ --
     # breaker STATE is per-zone (same O4.4-d reasoning as the policy-warn
     # block), so tripping /ra1/'s breaker OPEN would leave /ra1exp/'s own
@@ -2035,7 +1661,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # P5-8 DEFAULT-OFF control. `cache_turbo_backend none` so NO veto arm is
+"""
+
+
+def _conf_02(origin_port) -> str:
+    """Literal text of the generated nginx.conf (part 2)."""
+    return f"""        # P5-8 DEFAULT-OFF control. `cache_turbo_backend none` so NO veto arm is
         # armed, and NO cache_turbo_ignore_set_cookie. Nothing here refuses the
         # store except the compiled-in default of the directive itself, so a
         # relax that shipped enabled-by-default would turn this location's
@@ -2275,7 +1906,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # PURGE method (v14): `PURGE /pg/x` drops that entry from L1 (+L2)
+"""
+
+
+def _conf_03(origin_port) -> str:
+    """Literal text of the generated nginx.conf (part 3)."""
+    return f"""        # PURGE method (v14): `PURGE /pg/x` drops that entry from L1 (+L2)
         location /pg/ {{
             cache_turbo       main;
             cache_turbo_key   $uri;
@@ -2498,7 +2134,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # RFC-2 stale-if-error serve-on-error (CTB4). Short fresh (1s, stale_mult
+"""
+
+
+def _conf_04(origin_port) -> str:
+    """Literal text of the generated nginx.conf (part 4)."""
+    return f"""        # RFC-2 stale-if-error serve-on-error (CTB4). Short fresh (1s, stale_mult
         # 1 -> 1s stale window, fully expired by ~1.3s). The origin emits
         # stale-if-error=30 ONLY when the request suffix carries the "sieserve"
         # marker (proxy_pass strips the /sieserve/ prefix), so a /sieserve/sieserve-*
@@ -2754,7 +2395,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # Negative control for /breakeron/: identical apart from
+"""
+
+
+def _conf_05(origin_port) -> str:
+    """Literal text of the generated nginx.conf (part 5)."""
+    return f"""        # Negative control for /breakeron/: identical apart from
         # `cache_turbo_breaker off`. threshold/window/open are still set (an
         # operator who left the breaker off but configured the tuning knobs)
         # -- if breaker_enable were not an independent gate at the arming call
@@ -2993,7 +2639,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # S231-NOCACHE-OUTAGE negative control: identical shape to /s231nc/ but
+"""
+
+
+def _conf_06(origin_port) -> str:
+    """Literal text of the generated nginx.conf (part 6)."""
+    return f"""        # S231-NOCACHE-OUTAGE negative control: identical shape to /s231nc/ but
         # on its OWN zone (s231nccz) that is NEVER tripped -- proves the fix
         # only kicks in while the breaker is actually OPEN, not unconditionally.
         # Drives test_nocache_breaker_closed_still_revalidates. Also carries
@@ -3224,7 +2875,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        location = /_cache_o45hit {{
+"""
+
+
+def _conf_07(origin_port) -> str:
+    """Literal text of the generated nginx.conf (part 7)."""
+    return f"""        location = /_cache_o45hit {{
             cache_turbo_admin    o45hitz;
             allow 127.0.0.1;
             deny all;
@@ -3444,7 +3100,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # suppress off (default): the variable is always 0, so the wiring is a
+"""
+
+
+def _conf_08(origin_port) -> str:
+    """Literal text of the generated nginx.conf (part 8)."""
+    return f"""        # suppress off (default): the variable is always 0, so the wiring is a
         # safe no-op until opted in.
         location /nosup/ {{
             cache_turbo            main;
@@ -3744,7 +3405,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # A NAMED preset must pull in ONLY its own rules. `wordpress` here must
+"""
+
+
+def _conf_09(origin_port) -> str:
+    """Literal text of the generated nginx.conf (part 9)."""
+    return f"""        # A NAMED preset must pull in ONLY its own rules. `wordpress` here must
         # not react to /login, /user, /session, /index.php or another preset's
         # cookies -- those are other backends' surfaces and are perfectly
         # cacheable pages on a WordPress site. (This location used to be
@@ -4025,7 +3691,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # ---- invision -----------------------------------------------------
+"""
+
+
+def _conf_10(origin_port) -> str:
+    """Literal text of the generated nginx.conf (part 10)."""
+    return f"""        # ---- invision -----------------------------------------------------
         # Cookie/arg rules are path-independent, so a prefixed location
         # exercises them. $uri key for the same attribution reason as /vbull/.
         location /ips/ {{
@@ -4245,7 +3916,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # S231-EVICT-BLIND: private tiny zone (evblindz, 64k) + own breaker
+"""
+
+
+def _conf_11(origin_port, sr_directive) -> str:
+    """Literal text of the generated nginx.conf (part 11)."""
+    return f"""        # S231-EVICT-BLIND: private tiny zone (evblindz, 64k) + own breaker
         # (threshold=1, same trip shape as /s71brk/). proxy_pass is the bare
         # origin root (not /sieserve/) so callers choose per-key whether the
         # upstream response carries a stale-if-error window: /evblind/sieserve/*
@@ -4475,7 +4151,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # C3: same shape as /av/ above, but on the isolated c3vmz zone -- see
+"""
+
+
+def _conf_12(origin_port) -> str:
+    """Literal text of the generated nginx.conf (part 12)."""
+    return f"""        # C3: same shape as /av/ above, but on the isolated c3vmz zone -- see
         # that zone's own comment for why the marker-presence-counter tests
         # cannot share /av/'s `main` zone. cache_turbo_key is a fixed literal
         # (query args only, not $request_uri) purely as a stable, short base
@@ -4721,7 +4402,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # live autotune (v4-3). /at/ + /atc/ share zone "at": a window of slow
+"""
+
+
+def _conf_13(origin_port) -> str:
+    """Literal text of the generated nginx.conf (part 13)."""
+    return f"""        # live autotune (v4-3). /at/ + /atc/ share zone "at": a window of slow
         # misses drives the zone's beta verdict up; /at/ is balanced (band
         # [500,2000]) so it shows the verdict, /atc/ is conservative (band
         # [500,1000]) so it shows the SAME verdict re-clamped -- proving the
@@ -4946,19 +4632,463 @@ http {{
             deny all;
         }}
 
-        # C3: stats + purge endpoint for c3vmz, so the marker-presence-counter
+"""
+
+
+def _conf_14() -> str:
+    """Literal text of the generated nginx.conf (part 14)."""
+    return """        # C3: stats + purge endpoint for c3vmz, so the marker-presence-counter
         # tests read `markers` for the zone they actually store into, not
         # `main`'s (shared by every other auto-Vary test in this suite).
         # Unconditional (no cache_turbo_redis) on purpose -- these tests run
         # in every lane, not only the redis one.
-        location = /_cache_c3vm {{
+        location = /_cache_c3vm {
             cache_turbo_admin    c3vmz;
             allow 127.0.0.1;
             deny all;
-        }}
-    }}
-}}
+        }
+    }
+}
 """
+
+
+def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
+                 origin_port: int, workers: int,
+                 redis_port: int | None = None,
+                 redis_auth_port: int | None = None,
+                 redis_password: str | None = None,
+                 redis_tls_port: int | None = None,
+                 redis_tls_ca: str | None = None,
+                 memcached_port: int | None = None,
+                 fault_injection: bool = False,
+                 sr_off: bool = False,
+                 redis_tls_untrusted_port: int | None = None,
+                 redis_tls_expired_port: int | None = None) -> str:
+    """Build the generated nginx.conf for the test server.
+
+    !! ASCII ONLY -- everything returned here, INCLUDING COMMENTS, is written
+    with encoding="ascii" (see Nginx.write_config). A single non-ASCII byte
+    anywhere in this function (a stray arrow, dash, or warning sign pasted into
+    a location comment) raises UnicodeEncodeError before a single test runs, and
+    the traceback points at write_text, not at the comment you added. Use "!!",
+    "->" and plain hyphens.
+    """
+    load = f"load_module {module};\n" if module else ""
+
+    # S8 reload arm: the SAME zone (srz) with the directive flipped to `off`.
+    # Written into the conf only for the post-reload pass, so a real
+    # `nginx -s reload` hands the already-PROTECTED nodes in the surviving zone
+    # to a worker whose effective protected_pct is now 0. See
+    # test_s8_reload_on_to_off_drains_protected.
+    sr_directive = ("cache_turbo_scan_resistant off;" if sr_off
+                    else "cache_turbo_scan_resistant on;")
+
+    # DSN auth+db (v5): a backend reached via a full redis://user:pass@host/db
+    # DSN, and a plain SELECT-db (no auth) backend on the main instance.
+    dsn_loc = ""
+    if redis_auth_port is not None:
+        dsn_loc += f"""
+        # full DSN: AUTH (password) + SELECT db 2, two-reply preamble
+        location /l2auth/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis redis://:{redis_password}@127.0.0.1:{redis_auth_port}/2;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # AUTH+SELECT DSN with a keepalive pool (v15 + v5 combined): a pooled
+        # reused connection must skip the AUTH/SELECT preamble entirely (it was
+        # already authenticated + SELECTed when first opened). See
+        # test_l2_keepalive_no_auth_replay.
+        location /l2authka/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis redis://:{redis_password}@127.0.0.1:{redis_auth_port}/2 keepalive=4 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+    if redis_port is not None:
+        dsn_loc += f"""
+        # SELECT-only preamble (db 1, no auth) on the main instance
+        location /l2db/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis 127.0.0.1:{redis_port} db=1;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+    if redis_tls_port is not None:
+        dsn_loc += f"""
+        # rediss:// TLS, verifying the server cert against our test CA
+        location /l2tls/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis rediss://127.0.0.1:{redis_tls_port}/0 tls_ca={redis_tls_ca} tls_name=localhost;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # v15-2: TLS keepalive pool -- idle TLS conns cached + reused across ops
+        # (handshake + AUTH/SELECT skipped on reuse over the persistent channel).
+        location /l2tlska/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis rediss://127.0.0.1:{redis_tls_port}/0 tls_ca={redis_tls_ca} tls_name=localhost keepalive=4 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+    if redis_tls_untrusted_port is not None:
+        # AUD-TLS1: nginx is told to trust the SAME CA as /l2tls/ (redis_tls_ca),
+        # but this backend's cert is signed by a DIFFERENT CA. With a working
+        # SSL_CTX_set_verify(PEER) the handshake must fail chain verification;
+        # the L2 write-through must never reach this server.
+        dsn_loc += f"""
+        # rediss:// TLS, server cert signed by an UNTRUSTED CA (AUD-TLS1)
+        location /l2tlsuntrusted/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis rediss://127.0.0.1:{redis_tls_untrusted_port}/0 tls_ca={redis_tls_ca} tls_name=localhost;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S231-L2-BACKOFF (TLS follow-up): same untrusted-CA backend as
+        # /l2tlsuntrusted/ above, but with connect_backoff armed. Every
+        # request's TLS handshake fails cert verification -- a TERMINAL
+        # handshake failure, not a TCP connect refusal -- so this proves the
+        # backoff also arms off the TLS path, not just a plain-TCP connect()
+        # error. cache_turbo_lock off for the same reason as /l2backoff/: one
+        # L2 attempt per request, exact counter deltas.
+        location /l2tlsbackoff/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 1s;
+            cache_turbo_lock  off;
+            cache_turbo_redis rediss://127.0.0.1:{redis_tls_untrusted_port}/0 tls_ca={redis_tls_ca} tls_name=localhost prefix=ctbotls: connect_backoff=5000ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+    if redis_tls_expired_port is not None:
+        # Same trusted CA as /l2tls/ (chain trust is fine), but the leaf cert's
+        # own validity window is already expired. Must also be rejected.
+        dsn_loc += f"""
+        # rediss:// TLS, server cert EXPIRED (chain-trusted CA) (AUD-TLS1)
+        location /l2tlsexpired/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis rediss://127.0.0.1:{redis_tls_expired_port}/0 tls_ca={redis_tls_ca} tls_name=localhost;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+
+    # SK-A2: the surrogate-key locations that carry NO cache_turbo_redis are
+    # emitted unconditionally. They used to sit inside redis_loc, so a run
+    # without --redis-server dropped them while run_all() still called their
+    # tests -- the "works without an L2 tag index" claim was exactly the case
+    # that never ran. /skoff/ stays in redis_loc (it needs Redis to consume the
+    # tag and suppress the COR-0 "no effect" warning).
+    sk_loc = f"""
+        # cache_turbo_surrogate_key: emit the tag list downstream as a
+        # Surrogate-Key header for a fronting CDN. Deliberately NO cache_turbo_redis
+        # here -- the emit must work without an L2 tag index. SK-A1: BOTH the MISS
+        # and every later HIT carry the header, because a CDN POP that lost its own
+        # copy refills from our HIT and would otherwise cache an untagged object.
+        location /sk/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_tag      "blog news blog";
+            cache_turbo_surrogate_key on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # surrogate_key with the tag value from a query arg (upstream-controlled
+        # stand-in) so the cap/dedup carries into the emitted header.
+        location /skcap/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_tag      $arg_t;
+            cache_turbo_surrogate_key on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+
+    # L2 (v2b): a location wired to a Redis backend. Scoped to /l2/ only so the
+    # L1-only tests (purge, eviction, ...) are unaffected. Emitted only when a
+    # RedisServer is running, so the no-redis path still config-tests.
+    redis_loc = ""
+    if redis_port is not None:
+        redis_loc = "".join((
+            _redis_loc_00(origin_port=origin_port, redis_port=redis_port),
+            _redis_loc_01(origin_port=origin_port, redis_port=redis_port),
+            _redis_loc_02(origin_port=origin_port, redis_port=redis_port),
+            _redis_loc_03(origin_port=origin_port, port=port, redis_port=redis_port),
+            _redis_loc_04(origin_port=origin_port, port=port, redis_port=redis_port),
+        ))
+
+    # L2 memcached (v13): a location wired to the memcached backend instead of
+    # Redis. Emitted only when a MemcachedServer is running; scoped to /mc/ so it
+    # never disturbs the Redis or L1-only locations. Distinct prefix (mc:) so its
+    # keys can't collide with the Redis suite's ct: namespace.
+    mc_loc = ""
+    if memcached_port is not None:
+        mc_loc = f"""
+        # L2 memcached: write-through on store + sync fill on L1 miss
+        location /mc/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mc: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # L2 memcached with a keepalive pool (D-O1): idle pooled conns must carry
+        # a close-on-readable handler. When the memcached server drops an idle
+        # pooled conn, epoll wakes c->read; a NULL handler there SIGSEGVs the
+        # worker. Exercised by test_mc_keepalive_server_close_survives.
+        location /mcka/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mck: timeout=250ms keepalive=4 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # MC-A2: SAME memcached peer as /mcka/ but keepalive explicitly 0. The
+        # documented contract is a fresh connection per op; before the fix
+        # mc_connect looked the pool up by peer address only, so this location
+        # borrowed (and, because ka_save does check zero, then CLOSED) sockets
+        # /mcka/ had pooled -- draining another location's pool. Exercised by
+        # test_mc_keepalive_zero_does_not_drain_pool.
+        location /mcka0/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mck0: timeout=250ms keepalive=0;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Short idle timeout (D-O1): a pooled conn left idle past 1s must be
+        # dropped by mc_ka_close_handler's ev->timedout branch, not leak/crash.
+        # Exercised by test_mc_keepalive_idle_timeout_drops.
+        location /mckashort/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mcks: timeout=250ms keepalive=4 keepalive_timeout=1s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # D-O2: a keepalive location pointed at a DELIBERATELY MISBEHAVING fake
+        # memcached (PORT_OFFSETS["mc_dirty_reply"], stood up only by
+        # test_mc_dirty_reply_not_pooled on the PRIMARY instance). The address is
+        # derived from memcached_port, not from this instance's own `port`: a
+        # second nginx (test_l2_memcached_cross_instance_fill's instance B) runs
+        # on a different port but must still point at the one fake memcached.
+        # A reply that does not frame cleanly at
+        # a boundary (trailing junk past END/STORED, a server error, a timeout)
+        # must NOT be returned to the pool -- the connection is closed instead, so
+        # a reuse never resumes mid-reply. Same keepalive size as /mcka/.
+        location /mcdirty/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port + PORT_OFFSETS["mc_dirty_reply"] - PORT_OFFSETS["memcached"]} prefix=mcd: timeout=250ms keepalive=4 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # memcached-backed admin: a single-key purge here must also delete the
+        # entry from memcached (not just drop L1).
+        location = /_cache_mc {{
+            cache_turbo_admin      main;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mc: timeout=250ms;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # S231-L2-BACKOFF, memcached side. Same dead-peer/cache_turbo_lock off
+        # shape as /l2backoff/ above (redis_dead offset -- never bound, plain
+        # TCP refuse works identically for either driver's connect()).
+        location /mcbackoff/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      1s;
+            cache_turbo_lock       off;
+            cache_turbo_memcached  127.0.0.1:{port + PORT_OFFSETS["redis_dead"]} prefix=mcbo: timeout=250ms connect_backoff=5000ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # A peer on this port accepts and reads the GET, then closes without a
+        # reply. A successful local send must not clear the connection's
+        # unproven state: the read-side EOF must arm connect_backoff. no_store
+        # prevents the response body from becoming a normal cached entry.
+        location /mcdrop/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      1s;
+            cache_turbo_lock       off;
+            cache_turbo_no_store   $arg_private;
+            cache_turbo_memcached  127.0.0.1:{port + PORT_OFFSETS["mc_drop_reply"]} prefix=mcdrop: timeout=250ms connect_backoff=5000ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+
+    # Backend-inheritance regression (precedence bug FIXED 2026-06-12): a parent
+    # location naming cache_turbo_memcached (memcached=1) enclosing a child that
+    # names cache_turbo_redis. The child MUST drive its own address with the Redis
+    # backend, not inherit the parent's memcached=1 (the merge would otherwise
+    # select the memcached driver for a redis:// address). Needs BOTH L2 servers.
+    mcinh_loc = ""
+    if memcached_port is not None and redis_port is not None:
+        mcinh_loc = f"""
+        location /mcinh/ {{
+            cache_turbo            main;
+            cache_turbo_key        $uri;
+            cache_turbo_valid      30s;
+            cache_turbo_memcached  127.0.0.1:{memcached_port} prefix=mc: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+
+            # child overrides the parent's memcached backend with Redis
+            location /mcinh/child/ {{
+                cache_turbo_redis  127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+                proxy_pass http://127.0.0.1:{origin_port}/;
+            }}
+        }}
+"""
+    mc_loc += mcinh_loc
+
+    fault_loc = ""
+    if fault_injection:
+        fault_loc = f"""
+        # CI-only allocation fault injection. These directives are compiled only
+        # by ci/tools/ci-build.sh and are absent from production/package builds.
+        location /allocfail/ {{
+            cache_turbo                         main;
+            cache_turbo_key                     $uri;
+            cache_turbo_valid                   30s;
+            cache_turbo_test_restore_alloc_fail on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location /allocfailst/ {{
+            cache_turbo                         main;
+            cache_turbo_key                     $uri;
+            cache_turbo_valid                   301 30s;
+            cache_turbo_test_restore_alloc_fail on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        location /allocfailsie/ {{
+            cache_turbo                         main;
+            cache_turbo_key                     $uri;
+            cache_turbo_valid                   1s;
+            cache_turbo_stale_mult              1;
+            cache_turbo_test_restore_alloc_fail on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # CI-only: force the body filter onto the file-backed delegate path
+        # (the sendfile-abort branch) deterministically, without depending on
+        # directio/O_DIRECT fs alignment. Nothing must ever store here.
+        location /forcefile/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid              30s;
+            cache_turbo_test_force_file_buf on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # AUD-STORE-ERR-STUB: force the body filter's l1->store() to fail
+        # deterministically, so a cold-miss winner's stub cleanup path is
+        # reachable without depending on real slab exhaustion timing.
+        #
+        # lock_ttl is LONG (30s) on purpose: the leaked stub must still hold a
+        # LIVE lease when the second request arrives, or claim() adopts the
+        # expired stub instead of parking on it and the test stops
+        # discriminating (see test_store_failure_cleans_up_cold_stub). The
+        # oracle is the lock_waits counter, so nothing here waits out a
+        # timeout -- lock_timeout stays short to bound the buggy-build park.
+        location /storefail/ {{
+            cache_turbo                  storefailz;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            30s;
+            cache_turbo_lock_ttl         30s;
+            cache_turbo_lock_timeout     2s;
+            cache_turbo_test_store_fail  on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # AUD-STORE-ERR-STUB: admin endpoint for /storefail/'s private zone
+        # (storefailz), same reasoning as /_cache_s71 -- /_cache is bound to
+        # `main` and would read a lock_waits counter this zone never writes,
+        # and (unlike s71z) `main` is never quiescent: it is shared by 166
+        # other locations, so an exact-equality assert against it is
+        # order-dependent on whatever else in the suite happens to park in
+        # cold_wait() between this test's two samples.
+        location = /_cache_storefail {{
+            cache_turbo_admin    storefailz;
+            allow 127.0.0.1;
+            deny all;
+        }}
+
+        # S231-SIE-MIDBODY: same short fresh/stale window + "sieserve" marker
+        # convention as /sieserve/ so a warmed key gets a serve-on-error
+        # snapshot armed (sie_armed), but the fault fires in the BODY filter
+        # instead of driving the origin to a real 5xx -- cache_turbo_test_
+        # midbody_abort treats the first arriving body buffer as a mid-body
+        # origin death regardless of what status the origin actually sent.
+        # This is the header-filter trigger's blind spot: that trigger only
+        # ever sees r->headers_out.status, and a mid-body death arrives with
+        # headers already serialised as a normal 200. Drives
+        # test_sie_midbody_rescue.
+        location /midbody/ {{
+            cache_turbo                  main;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            1s;
+            cache_turbo_stale_mult       1;
+            cache_turbo_keep_stale       off;
+            cache_turbo_test_midbody_abort on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # S231-SIE-MIDBODY negative control: identical fault directive, but
+        # NO stale-if-error window ever gets armed (no "sieserve" marker in
+        # the key, so sie_armed stays 0 for every request). Proves the fault
+        # cannot fabricate a body out of nothing -- with nothing armed the
+        # rescue's own `ctx->sie_armed` guard must refuse it and the
+        # (truncated-by-the-fault) response must pass through unchanged.
+        location /midbodycold/ {{
+            cache_turbo                  main;
+            cache_turbo_key              $uri;
+            cache_turbo_valid            30s;
+            cache_turbo_test_midbody_abort on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+
+    conf = "".join((
+        _conf_00(load=load, root=root, workers=workers),
+        _conf_01(dsn_loc=dsn_loc, fault_loc=fault_loc, mc_loc=mc_loc, origin_port=origin_port, port=port, redis_loc=redis_loc, root=root, sk_loc=sk_loc),
+        _conf_02(origin_port=origin_port),
+        _conf_03(origin_port=origin_port),
+        _conf_04(origin_port=origin_port),
+        _conf_05(origin_port=origin_port),
+        _conf_06(origin_port=origin_port),
+        _conf_07(origin_port=origin_port),
+        _conf_08(origin_port=origin_port),
+        _conf_09(origin_port=origin_port),
+        _conf_10(origin_port=origin_port),
+        _conf_11(origin_port=origin_port, sr_directive=sr_directive),
+        _conf_12(origin_port=origin_port),
+        _conf_13(origin_port=origin_port),
+        _conf_14(),
+    ))
     if not fault_injection:
         conf = strip_fault_directives(conf)
     return conf

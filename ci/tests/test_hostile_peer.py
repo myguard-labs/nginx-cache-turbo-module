@@ -107,6 +107,27 @@ def test_send_chunk_boundaries() -> None:
     assert one.sent == [reply]
 
 
+def test_late_unsolicited_bytes_after_delay() -> None:
+    rec = _RecSock()
+    p = Peer([[]])
+    t0 = time.monotonic()
+    assert p._send(rec, Step(reply=b"+OK\r\n", late=b"$-1\r\n",  # type: ignore[arg-type]
+                             late_delay=0.15))
+    assert time.monotonic() - t0 >= 0.15
+    assert rec.sent == [b"+OK\r\n", b"$-1\r\n"]   # reply first, late separately
+    none = _RecSock()
+    assert p._send(none, Step(reply=b"+OK\r\n"))     # type: ignore[arg-type]
+    assert none.sent == [b"+OK\r\n"]                 # no late write by default
+    with pytest.raises(ValueError):
+        Step(late=b"x", late_delay=-1)
+    with Peer([[Step(reply=b"+OK\r\n", late=b":1\r\n", late_delay=0.1)]]) as q, \
+            dial(q) as s:
+        s.sendall(resp(b"SET", b"k", b"v"))
+        s.settimeout(3)
+        assert s.recv(64) == b"+OK\r\n"
+        assert s.recv(64) == b":1\r\n"
+
+
 def test_negative_data_length_rejected() -> None:
     rd = hp._Reader(None)                                  # type: ignore[arg-type]
     rd.buf = b"abc"
