@@ -24,7 +24,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 LOCAL = REPO / "ci" / "ast-grep-local"
 sys.path.insert(0, str(LOCAL))
 
-import check_baseline as cb
+import check_baseline as cb  # pyright: ignore[reportMissingImports]
 
 HAVE = shutil.which("ast-grep") is not None
 if not HAVE and os.environ.get("CI"):
