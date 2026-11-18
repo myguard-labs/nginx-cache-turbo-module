@@ -1,0 +1,11 @@
+# Project-owned ast-grep config (NOT generated). ci/ast-grep/ is rewritten by
+# the superrepo's tools/vendor-astgrep-rules.py, which also unlinks orphan files
+# under ci/ast-grep/rules/, so project-specific rules live here instead.
+# Run:  ast-grep test --skip-snapshot-tests -c ci/ast-grep-local/sgconfig.yml
+#       ast-grep scan -c ci/ast-grep-local/sgconfig.yml src
+# The baseline gate is ci/tests/test_astgrep_local_baseline.py.
+# ruleDirs/testConfigs resolve relative to THIS FILE's directory.
+ruleDirs:
+  - rules
+testConfigs:
+  - testDir: rule-tests

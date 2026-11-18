@@ -1,0 +1,47 @@
+id: c-ptr-add-bound-overflow
+language: c
+severity: warning
+message: >-
+  Pointer-overflow bounds check: `p + n` is formed before it is compared
+  (against a buffer end). When n is a length parsed from input, p + n can wrap or move past
+  one-past-the-end, which is undefined behavior, and the check can pass.
+  Compare the length against the remaining space instead.
+note: >-
+  For `p + n > last`, write `n > (size_t) (last - p)` (after establishing
+  p <= last). Keep the original comparison's equality behavior: `p + n >= last`
+  becomes `n >= (size_t) (last - p)`, `p + n < last` becomes
+  `n < (size_t) (last - p)`, and a reversed operand order flips accordingly. A
+  literal n, such as `p + 1 < last` or `p + (1) < last`, cannot be attacker-sized
+  and is not flagged. ast-grep has no types, so this is a name heuristic; a
+  genuinely safe hit is rewritten anyway (HARD-B4), not suppressed. Companion
+  rule: c-ptr-add-len-bound-overflow. This rule keys on the bound being named like a buffer end (last, end,
+  limit, eob, *_end, *_last).
+  A site matching both rules (e.g. `p + len > end`) is reported once per rule, so the
+  baseline holds two rows for it; this is intended, each rule gates independently.
+rule:
+  any:
+    - pattern: $P + $N > $B
+    - pattern: ($P + $N) > $B
+    - pattern: $B > $P + $N
+    - pattern: $B > ($P + $N)
+    - pattern: $P + $N >= $B
+    - pattern: ($P + $N) >= $B
+    - pattern: $B >= $P + $N
+    - pattern: $B >= ($P + $N)
+    - pattern: $P + $N < $B
+    - pattern: ($P + $N) < $B
+    - pattern: $B < $P + $N
+    - pattern: $B < ($P + $N)
+    - pattern: $P + $N <= $B
+    - pattern: ($P + $N) <= $B
+    - pattern: $B <= $P + $N
+    - pattern: $B <= ($P + $N)
+constraints:
+  N:
+    not:
+      any:
+        - kind: number_literal
+        # redundant parentheses around a literal: `p + (1) < last`
+        - regex: '^[(\s]+(0[xX][0-9a-fA-F]+|[0-9]+)[uUlL]*[)\s]+$'
+  B:
+    regex: '(^|[._>])(last|end|limit|eob)$|_(last|end)$'
