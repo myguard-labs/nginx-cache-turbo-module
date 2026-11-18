@@ -22,6 +22,7 @@ regressions/
   fuzz_blob/
   fuzz_cache_control/
   fuzz_vary/
+  fuzz_cookie_args/
 ```
 
 Every target must hold at least one unit; the replay step FAILS on an empty

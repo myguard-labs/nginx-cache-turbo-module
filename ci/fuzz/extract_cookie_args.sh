@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+#
+# Slice the verbatim Cookie-index / Cookie-AC / query-argparse code out of the
+# shipped sources into generated_cookie_args.inc, in this order:
+#
+#   ../../src/ngx_http_cache_turbo_module.h  (type blocks, verbatim)
+#     ngx_http_cache_turbo_cookie_ac_node_t / _cookie_ac_t
+#     ngx_http_cache_turbo_cookie_pair_t / _cookie_index_t
+#   ../../src/ngx_http_cache_turbo_match.c
+#     NGX_HTTP_CACHE_TURBO_ARGS_MAX + argspan_t / argparse_t typedef block
+#     cookie_index_add()          - helper of index_parse_one
+#     cookie_index_parse_one()    - request Cookie header -> name/value index
+#     cookie_ac_scan_one()        - Aho-Corasick scan of one Cookie value
+#     hexval(), qs_first_mangled() - helpers of argparse_build
+#     argparse_tail_count()       - exact remaining-span count
+#     argparse_build()            - query string -> span array
+#
+# Function definitions are `static <type>` (or bare `<type>` for the exported
+# hexval) on one line, the name on the next, closing on a bare `}` in column 1
+# (nginx style). No hand-maintained copy: if a function, typedef or the
+# ARGS_MAX define vanishes or is not exactly one definition, fail closed (exit
+# nonzero, no .inc left behind).
+
+set -euo pipefail
+
+FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC="$FUZZ_DIR/../../src/ngx_http_cache_turbo_match.c"
+HDR="$FUZZ_DIR/../../src/ngx_http_cache_turbo_module.h"
+OUT="$FUZZ_DIR/generated_cookie_args.inc"
+TYPES="cookie_ac_node_t cookie_ac_t cookie_pair_t cookie_index_t"
+FUNCS="cookie_index_add cookie_index_parse_one cookie_ac_scan_one hexval qs_first_mangled argparse_tail_count argparse_build"
+
+for f in "$SRC" "$HDR"; do
+    if [ ! -f "$f" ]; then
+        echo "✗ cannot find $f" >&2
+        rm -f "$OUT"
+        exit 1
+    fi
+done
+
+fail() {
+    echo "✗ failed to extract the Cookie/args code from $SRC" >&2
+    echo "  ($1; source layout changed? update extract_cookie_args.sh)" >&2
+    rm -f "$OUT" "$OUT.part"
+    exit 1
+}
+
+: > "$OUT"
+
+# Anonymous `typedef struct { ... } NAME;` blocks from the module header.
+for t in $TYPES; do
+    awk -v want="} ngx_http_cache_turbo_${t};" '
+        /^typedef struct \{$/ { buf = $0 ORS; next }
+        buf != "" {
+            buf = buf $0 ORS
+            if ($0 == want) { printf "%s\n", buf; buf = "" }
+            else if ($0 ~ /^\} /) { buf = "" }
+        }
+    ' "$HDR" > "$OUT.part"
+    n=$(grep -c "^} ngx_http_cache_turbo_${t};" "$OUT.part" || true)
+    if [ "$n" -ne 1 ]; then
+        fail "ngx_http_cache_turbo_${t}: expected exactly one typedef block, got $n"
+    fi
+    cat "$OUT.part" >> "$OUT"
+done
+
+# ARGS_MAX define plus the argspan_t / argparse_t typedef blocks.
+awk '
+    /^#define NGX_HTTP_CACHE_TURBO_ARGS_MAX / { capture = 1 }
+    capture { print }
+    capture && $0 == "} ngx_http_cache_turbo_argparse_t;" { capture = 0; print "" }
+' "$SRC" > "$OUT.part"
+if [ "$(grep -c '^#define NGX_HTTP_CACHE_TURBO_ARGS_MAX ' "$OUT.part" || true)" -ne 1 ] \
+    || [ "$(grep -c '^} ngx_http_cache_turbo_argparse_t;' "$OUT.part" || true)" -ne 1 ]; then
+    fail "ARGS_MAX define / argparse_t typedef block not found exactly once"
+fi
+cat "$OUT.part" >> "$OUT"
+
+for f in $FUNCS; do
+    awk -v want="ngx_http_cache_turbo_${f}(" '
+        capture {
+            print
+            if ($0 == "}") { capture = 0; print "" }
+            next
+        }
+        pending && index($0, want) == 1 {
+            capture = 1; pending = 0; printf "%s", buf; print; next
+        }
+        /^(static )?[a-z_][a-z_0-9 ]*$/ { pending = 1; buf = $0 ORS; next }
+        { pending = 0; buf = "" }
+    ' "$SRC" > "$OUT.part"
+    n=$(grep -c "^ngx_http_cache_turbo_${f}(" "$OUT.part" || true)
+    if [ "$n" -ne 1 ] || [ "$(tail -n2 "$OUT.part" | head -n1)" != "}" ]; then
+        fail "ngx_http_cache_turbo_${f}: expected exactly one complete definition, got $n"
+    fi
+    cat "$OUT.part" >> "$OUT"
+done
+rm -f "$OUT.part"
+
+LINES=$(wc -l < "$OUT")
+echo "✓ extracted cookie_index/cookie_ac/argparse code — $LINES lines -> $OUT"

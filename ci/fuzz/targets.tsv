@@ -6,3 +6,4 @@ fuzz_auto_classify	fuzz_auto_classify.c	corpus_auto	-	extract_auto_classify.sh
 fuzz_blob	fuzz_blob.c	corpus_blob	-	extract_blob.sh
 fuzz_cache_control	fuzz_cache_control.c	corpus_cache_control	fuzz_cache_control.dict	extract_cache_control.sh
 fuzz_vary	fuzz_vary.c	corpus_vary	fuzz_vary.dict	extract_vary.sh
+fuzz_cookie_args	fuzz_cookie_args.c	corpus_cookie_args	fuzz_cookie_args.dict	extract_cookie_args.sh

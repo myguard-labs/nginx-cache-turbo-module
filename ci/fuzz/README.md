@@ -52,6 +52,44 @@ its own `extract_*.sh` slicer (no hand-maintained copy):
   model plus a fail-closed property (a non-ignored token outside the four
   whitelisted axes must leave `nocache` set and `bits` 0).
 
+- **`fuzz_cookie_args`** → the client Cookie index and query-string parsers in
+  `match.c`: `cookie_index_parse_one` (+ its `cookie_index_add` helper),
+  `cookie_ac_scan_one`, `argparse_tail_count` and `argparse_build` (+ `hexval`,
+  `qs_first_mangled`). Inputs are exact-sized, non-NUL-terminated Cookie header
+  values (`;` without a space, empty names, `=` inside values, quoted values,
+  duplicates, 4096 crumbs) and query strings (`&&`, bare `=`, truncated
+  `%`-escapes, `+`, 10000 args). Bug classes: an OOB read at/over the end of a
+  value, a write past the span array / pair array if the counting walk and the
+  recording walk disagree, and a Cookie/arg mis-split. Sliced by
+  `extract_cookie_args.sh` (verbatim type blocks from `module.h` plus the
+  functions from `match.c`; fails closed if any one is missing) into
+  `generated_cookie_args.inc`; shim is `ngx_shim_cookie_args.h` (a recording
+  pool whose allocations are exact heap blocks); corpus is
+  `corpus_cookie_args/`. Oracle: ASan/UBSan plus independent reference models,
+  and a bound oracle - `argparse_tail_count` equals the reference count, the
+  recorded span count never exceeds the computed capacity and an overflowed
+  array is allocated at exactly `capacity * sizeof(span)`. Layout: byte 0 flags
+  (failing pool, empty needle, NULL automaton, NULL data), byte 1 needle mask,
+  byte 2 tail-offset selector, then `0xFF`-separated sections (query string,
+  then up to 8 Cookie header values). The 10000-arg and 4096-crumb seeds exceed
+  libFuzzer's default 4096-byte limit, which it raises to the largest seed.
+
+### Function ownership (match.c auto-classify FUZZ-EXTRACT block)
+
+`fuzz_auto_classify` compiles match.c with `NGX_HTTP_CACHE_TURBO_FUZZ_SHIM_AUTO`
+defined, which compiles OUT every `!FUZZ_SHIM_AUTO` function and compiles IN the
+legacy per-pair predicate path. Each function below is actively driven by exactly
+one target; the other target either never compiles it or only reaches it as an
+unasserted feeder.
+
+| function | owner | note |
+|---|---|---|
+| `cookie_index_add`, `cookie_index_parse_one` | `fuzz_cookie_args` | `!FUZZ_SHIM_AUTO`: not compiled into `fuzz_auto_classify` |
+| `cookie_ac_scan_one` | `fuzz_cookie_args` | `!FUZZ_SHIM_AUTO`: not compiled into `fuzz_auto_classify` |
+| `argparse_tail_count`, `argparse_build` (+ `hexval`, `qs_first_mangled`) | `fuzz_cookie_args` | always compiled, so `fuzz_auto_classify` also runs them as the front half of `auto_skip` with no assertion on their output; the span/size bound oracle lives only here |
+| `cookie_pred_one_next_pair`, `cookie_pred_one_split` (+ `_dispatch`, `cookie_pred`) | `fuzz_auto_classify` | `FUZZ_SHIM_AUTO`-only; driven through `auto_skip` over the preset predicate rows, so NOT sliced into `fuzz_cookie_args` |
+| `cookie_byteset_build`, `cookie_contains`, `cookie_has`, `qs_eq`, `arg_match`, `uri_prefix`, `auto_skip`, preset registry | `fuzz_auto_classify` | unchanged |
+
 ## Target registry
 
 `targets.tsv` is the single list of fuzz targets (tab-separated, header row,
