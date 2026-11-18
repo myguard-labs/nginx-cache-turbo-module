@@ -1,0 +1,18 @@
+# libFuzzer dictionary for the origin Vary classifier (fuzz_vary). Whitespace
+# and the 0xFF field-line separator are HEX-escaped.
+star="*"
+cookie="Cookie"
+authorization="Authorization"
+ae="Accept-Encoding"
+ua="User-Agent"
+al="Accept-Language"
+origin="Origin"
+accept="Accept"
+custom="X-Custom"
+cookie_lc="cookie"
+comma=","
+comma_sp=",\x20"
+sp="\x20"
+tab="\x09"
+nul="\x00"
+line_sep="\xff"

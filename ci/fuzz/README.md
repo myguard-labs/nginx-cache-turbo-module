@@ -40,6 +40,17 @@ its own `extract_*.sh` slicer (no hand-maintained copy):
   deltas, NUL/CTL/obs-text, 1000 directives/lines). Oracle: an independent
   reference model in the harness; `-1` is the only negative result and a delta
   saturates at `NGX_MAX_TIME_T_VALUE`.
+- **`fuzz_vary`** → the origin `Vary` classifier:
+  `classify_vary_next_token` (comma/whitespace tokeniser),
+  `classify_vary_classify_token` (per-axis verdict) and `vary_ignore_match`
+  (`cache_turbo_vary_ignore` lookup), driven in the shipped caller's loop shape.
+  Bug classes: an OOB read over the end of an exact-sized, non-NUL-terminated
+  value and a fail-open verdict. Sliced by `extract_vary.sh` into
+  `generated_vary.inc`; shim is `ngx_shim_vary.h`; corpus is `corpus_vary/`
+  (`*`, empty tokens, comma/whitespace runs, case variants, 1000 tokens,
+  over-long names, NUL, ignore-list modes). Oracle: an independent reference
+  model plus a fail-closed property (a non-ignored token outside the four
+  whitelisted axes must leave `nocache` set and `bits` 0).
 
 ## Target registry
 

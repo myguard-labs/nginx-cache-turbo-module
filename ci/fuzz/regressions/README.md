@@ -21,6 +21,7 @@ regressions/
   fuzz_auto_classify/
   fuzz_blob/
   fuzz_cache_control/
+  fuzz_vary/
 ```
 
 Every target must hold at least one unit; the replay step FAILS on an empty
