@@ -1,4 +1,4 @@
-# sync-sha: 9d4df4bb2df750d9a370003cb9978d6b368befd38b45b3447702817413dcc8af
+# sync-sha: 92fd1c3aa58e2f659ab3adaa78d5624afd75cd8b124d683c8ac5fa9e425a422c
 name: Static
 
 # Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
@@ -223,6 +223,14 @@ jobs:
           AST_GREP_ESSENTIALS: ${{ github.workspace }}/.essentials
           LINT_ONLY: nginx astgrep astgrep-essentials sh python perl yaml spelling semgrep-pin ci-runners ci-ports ci-cadence ci-secrets sync-stamp docs-drift shm-lock stripe-seam atomic-ordering carve-init suite-docs resume-order park-contract
         run: ci/linter/run-all.sh
+      # checksec is needed by ci/tests/test_check_hardening.py and by the
+      # hardened-build check below; check-hardening.sh fails (never skips) without it.
+      - name: Install checksec
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y checksec
+          checksec --version | head -1
       - name: Python unit tests (ci/tests)
         # ci/tests/*.py (breadcrumb guard, abort-fixture accounting, pre-commit
         # selector) were run by no workflow. A venv keeps pytest off the system
@@ -555,6 +563,39 @@ jobs:
           #
           # pipefail likewise: without it `tee` supplies the status.
           ci/linter/run-semgrep.sh "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log
+      # Hardened build (HARD-B1): the module and nginx built the way a hardened
+      # distro package is (ci-build.sh `hardened` flavor), a runtime smoke on
+      # that exact .so, then ci/tools/check-hardening.sh (readelf + checksec)
+      # asserts full RELRO, canary, NX, FORTIFY (*_chk symbols present), no RWX
+      # segment and no executable stack. The build lives under RUNNER_TEMP so
+      # the .build/ auto-discovery of the unit suite never picks it up. Port
+      # band 19456 is shared with the testkit stage below; steps are sequential.
+      # The negative controls (plain, no-now, no-checksec) run in ci/tests.
+      - name: Build hardened module and run runtime smoke
+        if: ${{ inputs.code }}
+        env:
+          TEST_BASE_PORT: 19456
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/hardened-build"
+          for p in $(seq "$TEST_BASE_PORT" $((TEST_BASE_PORT + 63))); do
+            fuser -k -TERM "${p}/tcp" 2>/dev/null || true
+          done
+          BUILD_ROOT="$root" bash ci/tools/ci-build.sh nginx "$NGINX_VERSION" hardened
+          objs="$root/nginx-${NGINX_VERSION}/objs"
+          python3 ci/tools/run_named.py \
+            --nginx-binary "$objs/nginx" \
+            --module "$objs/ngx_http_cache_turbo_module.so" \
+            --port "$TEST_BASE_PORT" \
+            --fault-injection \
+            test_miss_then_hit test_post_passthrough_uncached \
+            test_surrogate_key_emit_on_miss_and_hit
+      - name: Check hardening properties of the hardened module
+        if: ${{ inputs.code }}
+        run: |
+          set -euo pipefail
+          bash ci/tools/check-hardening.sh \
+            "$RUNNER_TEMP/hardened-build/nginx-${NGINX_VERSION}/objs/ngx_http_cache_turbo_module.so"
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

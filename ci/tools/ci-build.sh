@@ -4,7 +4,7 @@
 #   ci-build.sh <flavor> <version> <mode>
 #     flavor : nginx | angie         (default nginx)
 #     version: upstream version      (default 1.31.1)
-#     mode   : debug | nginx | asan | module | coverage | profile
+#     mode   : debug | nginx | asan | module | coverage | profile | hardened
 #              debug    - debug build + module (default)
 #              nginx    - release-ish build + module
 #              asan     - static --add-module build with ASan+UBSan (no .so)
@@ -27,6 +27,13 @@
 #                         (unlike `nginx` mode's -O1), so the profile reflects
 #                         the shipped code path, not a slower unoptimized one.
 #                         See ci/tools/perf-profile.sh.
+#              hardened - dynamic module + binary built the way a hardened
+#                         distro package is: dpkg-buildflags hardening=+all
+#                         plus FORTIFY_SOURCE=3, stack-clash, full CET and
+#                         -Werror=format-security, linked relro+now. Checked
+#                         by ci/tools/check-hardening.sh. CT_HARDEN_DROP is a
+#                         space list of exact flag words removed from that set;
+#                         it exists ONLY for the check's negative controls.
 #
 # No hiredis: cache-turbo's L2 Redis driver is native nginx, so the build has
 # no -lhiredis dependency (see memory/.../cache-turbo-module-design.md).
@@ -193,6 +200,37 @@ case "$MODE" in
         LD_OPT="-flto=auto"
         WITH_DEBUG=""
         WITH_HTTP2=""
+        ;;
+    hardened)
+        # dpkg-buildflags supplies the distro baseline (-O2, stack protector,
+        # relro/now, ...). Its CPPFLAGS carry _FORTIFY_SOURCE=2 and -Wdate-time;
+        # only fortify is taken, upgraded to 3 (-U first: a bare redefinition
+        # is a warning and nginx core builds with -Werror). Every flag the task
+        # requires is stated explicitly so a dpkg-buildflags that omits one
+        # (e.g. -fcf-protection off amd64) cannot silently weaken the build.
+        # Module and core objects share these flags, like the distro build.
+        # x86-only: -fcf-protection=full is rejected by non-x86 gcc, so this
+        # mode fails loudly on arm64 rather than building a weaker binary.
+        command -v dpkg-buildflags >/dev/null 2>&1 || {
+            echo "hardened mode needs dpkg-buildflags (dpkg-dev)" >&2; exit 2; }
+        export DEB_BUILD_MAINT_OPTIONS="hardening=+all"
+        h_cc="$(dpkg-buildflags --get CFLAGS) -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -fstack-clash-protection -fcf-protection=full -Werror=format-security -O2"
+        h_ld="$(dpkg-buildflags --get LDFLAGS) -Wl,-z,relro -Wl,-z,now"
+        harden_filter() {
+            local w d out=""
+            for w in $1; do
+                for d in ${CT_HARDEN_DROP:-}; do
+                    [ "$w" = "$d" ] && continue 2
+                done
+                out="${out:+$out }$w"
+            done
+            printf '%s' "$out"
+        }
+        h_cc="$(harden_filter "$h_cc")"
+        h_ld="$(harden_filter "$h_ld")"
+        CC_OPT="$TEST_OPT $h_cc"
+        LD_OPT="$h_ld"
+        WITH_DEBUG=""
         ;;
     profile)
         # -O2 to match a real release build (bench.sh's `nginx` mode is only
