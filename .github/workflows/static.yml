@@ -1,4 +1,4 @@
-# sync-sha: 92fd1c3aa58e2f659ab3adaa78d5624afd75cd8b124d683c8ac5fa9e425a422c
+# sync-sha: 21eae32e853ed80c7430e7ce7a7bc48a7f0e70f14ced8fc2ba10e382381a0a98
 name: Static
 
 # Lane L-static (CI-L5): lint, validation, security scanners, fuzz regression
@@ -438,7 +438,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential ccache curl eatmydata flawfinder clang-tidy \
+          sudo apt-get install -y build-essential ccache clang curl eatmydata flawfinder clang-tidy \
             libpcre2-dev libssl-dev mold python3 python3-pip pipx zlib1g-dev
           # semgrep: isolate via pipx (PEP 668 blocks a bare pip3 install into the
           # system Python on the Ubuntu 24.04 self-hosted runner). Fall back to a
@@ -458,6 +458,7 @@ jobs:
           bash ci/tools/test-analysis-controls.sh
           python3 ci/tests/unit/test_compile_capture.py
           python3 ci/tests/unit/test_fanalyzer_gate.py
+          python3 ci/tests/unit/test_warning_baseline_gate.py
       - name: gitleaks
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -542,6 +543,21 @@ jobs:
           set -o pipefail
           python3 ci/tools/fanalyzer_gate.py "$GITHUB_WORKSPACE" compile_commands.json \
             ci/tools/fanalyzer-baseline.json 2>&1 | tee fanalyzer.log
+      # Warning baseline (HARD-B2): the eight parser files recompiled with the
+      # recorded build argv under gcc AND clang plus -Wconversion
+      # -Wsign-conversion -Wshadow -Wvla -Wimplicit-fallthrough -Wcast-qual.
+      # Any warning not in ci/tools/warning-baseline.json fails; a fixed one
+      # passes and says so. Baseline keys carry no line numbers. Regenerate (on
+      # the runner image, warning sets are compiler-version specific):
+      #   python3 ci/tools/warning_baseline_gate.py --update . \
+      #     compile_commands.json ci/tools/warning-baseline.json
+      - name: Parser-file warning baseline (gcc + clang)
+        if: ${{ inputs.code }}
+        run: |
+          set -o pipefail
+          python3 ci/tools/warning_baseline_gate.py "$GITHUB_WORKSPACE" \
+            compile_commands.json ci/tools/warning-baseline.json 2>&1 \
+            | tee warning-baseline.log
       - name: semgrep (gate on >=WARNING)
         run: |
           set -euo pipefail
@@ -605,6 +621,7 @@ jobs:
             ${{ github.workspace }}/flawfinder.log
             ${{ github.workspace }}/clang-tidy.log
             ${{ github.workspace }}/fanalyzer.log
+            ${{ github.workspace }}/warning-baseline.log
             ${{ github.workspace }}/semgrep.log
           retention-days: 14
 

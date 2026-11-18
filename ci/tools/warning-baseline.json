@@ -1,0 +1,364 @@
+{
+ "compilers": {
+  "gcc": {
+   "version": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+   "major": 13
+  },
+  "clang": {
+   "version": "Ubuntu clang version 18.1.3 (1ubuntu1)",
+   "major": 18
+  }
+ },
+ "per_file_counts": {
+  "gcc": {
+   "src/ngx_http_cache_turbo_redis.c": 15,
+   "src/ngx_http_cache_turbo_memcached.c": 2,
+   "src/ngx_http_cache_turbo_blob.c": 0,
+   "src/ngx_http_cache_turbo_match.c": 6,
+   "src/ngx_http_cache_turbo_vary.c": 4,
+   "src/ngx_http_cache_turbo_purge.c": 6,
+   "src/ngx_http_cache_turbo_admin.c": 13,
+   "src/ngx_http_cache_turbo_filters.c": 7
+  },
+  "clang": {
+   "src/ngx_http_cache_turbo_redis.c": 19,
+   "src/ngx_http_cache_turbo_memcached.c": 2,
+   "src/ngx_http_cache_turbo_blob.c": 0,
+   "src/ngx_http_cache_turbo_match.c": 6,
+   "src/ngx_http_cache_turbo_vary.c": 4,
+   "src/ngx_http_cache_turbo_purge.c": 6,
+   "src/ngx_http_cache_turbo_admin.c": 13,
+   "src/ngx_http_cache_turbo_filters.c": 9
+  }
+ },
+ "entries": [
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_admin.c",
+   "source": "src/ngx_http_cache_turbo_admin.c",
+   "option": "-Wcast-qual",
+   "message": "cast from 'volatile struct ngx_cycle_s *' to 'struct ngx_cycle_s *' drops volatile qualifier",
+   "count": 1
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_admin.c",
+   "source": "src/ngx_http_cache_turbo_admin.c",
+   "option": "-Wsign-conversion",
+   "message": "implicit conversion changes signedness: 'long' to 'size_t' (aka 'unsigned long')",
+   "count": 9
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_admin.c",
+   "source": "src/ngx_http_cache_turbo_admin.c",
+   "option": "-Wsign-conversion",
+   "message": "implicit conversion changes signedness: 'ngx_int_t' (aka 'long') to 'ngx_uint_t' (aka 'unsigned long')",
+   "count": 2
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_admin.c",
+   "source": "src/ngx_http_cache_turbo_admin.c",
+   "option": "-Wsign-conversion",
+   "message": "implicit conversion changes signedness: 'ngx_uint_t' (aka 'unsigned long') to 'ngx_int_t' (aka 'long')",
+   "count": 1
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_filters.c",
+   "source": "src/ngx_http_cache_turbo_filters.c",
+   "option": "-Wcast-qual",
+   "message": "cast from 'const char *' to 'unsigned char *' drops const qualifier",
+   "count": 1
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_filters.c",
+   "source": "src/ngx_http_cache_turbo_filters.c",
+   "option": "-Wcast-qual",
+   "message": "cast from 'const unsigned char *' to 'unsigned char *' drops const qualifier",
+   "count": 3
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_filters.c",
+   "source": "src/ngx_http_cache_turbo_filters.c",
+   "option": "-Wcast-qual",
+   "message": "cast from 'volatile ngx_time_t *' to 'ngx_time_t *' drops volatile qualifier",
+   "count": 1
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_filters.c",
+   "source": "src/ngx_http_cache_turbo_filters.c",
+   "option": "-Wshorten-64-to-32",
+   "message": "implicit conversion loses integer precision: 'ngx_uint_t' (aka 'unsigned long') to 'unsigned int'",
+   "count": 1
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_filters.c",
+   "source": "src/ngx_http_cache_turbo_filters.c",
+   "option": "-Wsign-conversion",
+   "message": "implicit conversion changes signedness: 'time_t' (aka 'long') to 'ngx_uint_t' (aka 'unsigned long')",
+   "count": 1
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_filters.c",
+   "source": "src/ngx_http_cache_turbo_filters.c",
+   "option": "-Wsign-conversion",
+   "message": "operand of ? changes signedness: 'off_t' (aka 'long') to 'size_t' (aka 'unsigned long')",
+   "count": 2
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_match.c",
+   "source": "src/ngx_http_cache_turbo_match.c",
+   "option": "-Wcast-qual",
+   "message": "cast from 'const char *' to 'unsigned char *' drops const qualifier",
+   "count": 6
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_memcached.c",
+   "source": "src/ngx_http_cache_turbo_memcached.c",
+   "option": "-Wsign-conversion",
+   "message": "implicit conversion changes signedness: 'long' to 'size_t' (aka 'unsigned long')",
+   "count": 2
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_purge.c",
+   "source": "src/ngx_http_cache_turbo_purge.c",
+   "option": "-Wshadow",
+   "message": "declaration shadows a local variable",
+   "count": 2
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_purge.c",
+   "source": "src/ngx_http_cache_turbo_purge.c",
+   "option": "-Wsign-conversion",
+   "message": "implicit conversion changes signedness: 'long' to 'size_t' (aka 'unsigned long')",
+   "count": 4
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_redis.c",
+   "source": "src/ngx_http_cache_turbo_redis.c",
+   "option": "-Wshorten-64-to-32",
+   "message": "implicit conversion loses integer precision: 'ngx_msec_t' (aka 'unsigned long') to '__useconds_t' (aka 'unsigned int')",
+   "count": 3
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_redis.c",
+   "source": "src/ngx_http_cache_turbo_redis.c",
+   "option": "-Wshorten-64-to-32",
+   "message": "implicit conversion loses integer precision: 'ngx_uint_t' (aka 'unsigned long') to 'unsigned int'",
+   "count": 1
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_redis.c",
+   "source": "src/ngx_http_cache_turbo_redis.c",
+   "option": "-Wsign-conversion",
+   "message": "implicit conversion changes signedness: 'long' to 'size_t' (aka 'unsigned long')",
+   "count": 13
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_redis.c",
+   "source": "src/ngx_http_cache_turbo_redis.c",
+   "option": "-Wsign-conversion",
+   "message": "implicit conversion changes signedness: 'ngx_atomic_int_t' (aka 'long') to 'ngx_atomic_uint_t' (aka 'unsigned long')",
+   "count": 1
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_redis.c",
+   "source": "src/ngx_http_cache_turbo_redis.c",
+   "option": "-Wsign-conversion",
+   "message": "implicit conversion changes signedness: 'ngx_int_t' (aka 'long') to 'unsigned long'",
+   "count": 1
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_vary.c",
+   "source": "src/ngx_http_cache_turbo_vary.c",
+   "option": "-Wcast-qual",
+   "message": "cast from 'const char *' to 'unsigned char *' drops const qualifier",
+   "count": 2
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_vary.c",
+   "source": "src/ngx_http_cache_turbo_vary.c",
+   "option": "-Wshorten-64-to-32",
+   "message": "implicit conversion loses integer precision: 'size_t' (aka 'unsigned long') to 'unsigned int'",
+   "count": 1
+  },
+  {
+   "compiler": "clang",
+   "file": "src/ngx_http_cache_turbo_vary.c",
+   "source": "src/ngx_http_cache_turbo_vary.c",
+   "option": "-Wsign-conversion",
+   "message": "implicit conversion changes signedness: 'long' to 'size_t' (aka 'unsigned long')",
+   "count": 1
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_admin.c",
+   "source": "src/ngx_http_cache_turbo_admin.c",
+   "option": "-Wcast-qual",
+   "message": "cast discards 'volatile' qualifier from pointer target type",
+   "count": 1
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_admin.c",
+   "source": "src/ngx_http_cache_turbo_admin.c",
+   "option": "-Wsign-conversion",
+   "message": "conversion to 'ngx_int_t' {aka 'long int'} from 'ngx_uint_t' {aka 'long unsigned int'} may change the sign of the result",
+   "count": 1
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_admin.c",
+   "source": "src/ngx_http_cache_turbo_admin.c",
+   "option": "-Wsign-conversion",
+   "message": "conversion to 'ngx_uint_t' {aka 'long unsigned int'} from 'ngx_int_t' {aka 'long int'} may change the sign of the result",
+   "count": 2
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_admin.c",
+   "source": "src/ngx_http_cache_turbo_admin.c",
+   "option": "-Wsign-conversion",
+   "message": "conversion to 'size_t' {aka 'long unsigned int'} from 'long int' may change the sign of the result",
+   "count": 9
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_filters.c",
+   "source": "src/ngx_http_cache_turbo_filters.c",
+   "option": "-Wcast-qual",
+   "message": "cast discards 'const' qualifier from pointer target type",
+   "count": 4
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_filters.c",
+   "source": "src/ngx_http_cache_turbo_filters.c",
+   "option": "-Wconversion",
+   "message": "conversion from 'int' to 'unsigned char:1' may change value",
+   "count": 1
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_filters.c",
+   "source": "src/ngx_http_cache_turbo_filters.c",
+   "option": "-Wconversion",
+   "message": "conversion from 'ngx_uint_t' {aka 'long unsigned int'} to 'unsigned char:2' may change value",
+   "count": 1
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_filters.c",
+   "source": "src/ngx_http_cache_turbo_filters.c",
+   "option": "-Wsign-conversion",
+   "message": "conversion to 'long unsigned int' from 'time_t' {aka 'long int'} may change the sign of the result",
+   "count": 1
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_match.c",
+   "source": "src/ngx_http_cache_turbo_match.c",
+   "option": "-Wcast-qual",
+   "message": "cast discards 'const' qualifier from pointer target type",
+   "count": 6
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_memcached.c",
+   "source": "src/ngx_http_cache_turbo_memcached.c",
+   "option": "-Wsign-conversion",
+   "message": "conversion to 'size_t' {aka 'long unsigned int'} from 'long int' may change the sign of the result",
+   "count": 2
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_purge.c",
+   "source": "src/ngx_http_cache_turbo_purge.c",
+   "option": "-Wshadow",
+   "message": "declaration of 'rdata' shadows a previous local",
+   "count": 1
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_purge.c",
+   "source": "src/ngx_http_cache_turbo_purge.c",
+   "option": "-Wshadow",
+   "message": "declaration of 'resume' shadows a previous local",
+   "count": 1
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_purge.c",
+   "source": "src/ngx_http_cache_turbo_purge.c",
+   "option": "-Wsign-conversion",
+   "message": "conversion to 'size_t' {aka 'long unsigned int'} from 'long int' may change the sign of the result",
+   "count": 4
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_redis.c",
+   "source": "src/ngx_http_cache_turbo_redis.c",
+   "option": "-Wconversion",
+   "message": "conversion from 'ngx_uint_t' {aka 'long unsigned int'} to 'unsigned char:1' may change value",
+   "count": 1
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_redis.c",
+   "source": "src/ngx_http_cache_turbo_redis.c",
+   "option": "-Wsign-conversion",
+   "message": "conversion to 'long unsigned int' from 'ngx_int_t' {aka 'long int'} may change the sign of the result",
+   "count": 1
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_redis.c",
+   "source": "src/ngx_http_cache_turbo_redis.c",
+   "option": "-Wsign-conversion",
+   "message": "conversion to 'size_t' {aka 'long unsigned int'} from 'long int' may change the sign of the result",
+   "count": 13
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_vary.c",
+   "source": "src/ngx_http_cache_turbo_vary.c",
+   "option": "-Wcast-qual",
+   "message": "cast discards 'const' qualifier from pointer target type",
+   "count": 2
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_vary.c",
+   "source": "src/ngx_http_cache_turbo_vary.c",
+   "option": "-Wconversion",
+   "message": "conversion from 'size_t' {aka 'long unsigned int'} to 'unsigned int:28' may change value",
+   "count": 1
+  },
+  {
+   "compiler": "gcc",
+   "file": "src/ngx_http_cache_turbo_vary.c",
+   "source": "src/ngx_http_cache_turbo_vary.c",
+   "option": "-Wsign-conversion",
+   "message": "conversion to 'size_t' {aka 'long unsigned int'} from 'long int' may change the sign of the result",
+   "count": 1
+  }
+ ]
+}
