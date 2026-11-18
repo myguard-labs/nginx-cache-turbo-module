@@ -101,6 +101,7 @@ ci/tests/unit/blob_fixtures
 ci/tests/unit/auto_classify_fixtures
 ci/tests/unit/resp_parser_fixtures
 ci/fuzz/generated_parser.inc
+ci/fuzz/generated_redis_readers.inc
 ci/fuzz/generated_norm_args.inc
 ci/fuzz/generated_cache_control.inc
 ci/fuzz/generated_vary.inc

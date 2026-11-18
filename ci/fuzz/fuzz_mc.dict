@@ -13,3 +13,6 @@ bytes="\x203\x0d\x0a"
 cas="\x20123\x0d\x0a"
 zero="0"
 big="9999999999"
+# Streaming split mode: the value trailer a segment cut most often lands in.
+trailer="\x0d\x0aEND\x0d\x0a"
+server_error="SERVER_ERROR"

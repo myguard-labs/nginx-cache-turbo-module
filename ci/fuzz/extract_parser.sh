@@ -127,3 +127,8 @@ fi
 
 LINES=$(wc -l < "$OUT")
 echo "✓ extracted redis_parse() + _parse_scan() + _frame() + _frame_scan() — $LINES lines -> $OUT"
+
+# The AUTH/SELECT preamble and lock reply readers (fuzz_resp_parser blocks 6-7)
+# have their own slicer; run it here so this registry slicer keeps producing
+# everything fuzz_resp_parser.c includes.
+bash "$FUZZ_DIR/extract_redis_readers.sh"
