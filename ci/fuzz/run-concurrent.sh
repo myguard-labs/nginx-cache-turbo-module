@@ -39,8 +39,8 @@ if [ "$#" -eq 0 ]; then
     # is resolved from this script, so the working directory still only has to
     # hold the binaries and corpora.
     spec_out="$("$(dirname "${BASH_SOURCE[0]}")/targets.sh" specs all)" || exit 2
+    [ -n "$spec_out" ] || { echo "no fuzz targets in registry" >&2; exit 2; }
     mapfile -t specs <<<"$spec_out"
-    [ "${#specs[@]}" -gt 0 ] || { echo "no fuzz targets in registry" >&2; exit 2; }
     set -- "${specs[@]}"
 fi
 
