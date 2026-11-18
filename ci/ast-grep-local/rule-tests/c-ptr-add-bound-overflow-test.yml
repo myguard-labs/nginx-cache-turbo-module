@@ -1,0 +1,20 @@
+id: c-ptr-add-bound-overflow
+valid:
+  # Safe subtraction form: no pointer sum is ever formed.
+  - 'if (n > (size_t) (last - p)) { return -1; }'
+  - 'if (n > (size_t) (end - p)) { return -1; }'
+  # Literal offset cannot be attacker-sized.
+  - 'if (p + 1 < last) { p++; }'
+  - 'if (crlf + 1 >= end) { return -1; }'
+  # Not a bounds comparison against an end pointer.
+  - 'if (now < created + ttl) { return 0; }'
+  - 'p = (end < last) ? end : last;'
+invalid:
+  - 'if (p + n > last) { return -1; }'
+  - 'if (p + n >= last) { return -1; }'
+  - 'if (p + n <= end) { use(p, n); }'
+  - 'if (p + n < end) { use(p, n); }'
+  - 'if ((p + n) > last) { return -1; }'
+  - 'if (last < p + n) { return -1; }'
+  - 'if (end >= p + n) { use(p, n); }'
+  - 'if (b->pos + n > b->last) { return -1; }'

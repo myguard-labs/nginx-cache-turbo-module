@@ -1,0 +1,35 @@
+id: c-ptr-add-len-bound-overflow
+language: c
+severity: warning
+message: >-
+  Pointer-overflow bounds check: `p + n` is formed before it is compared
+  (n is length-named). When n is a length parsed from input, p + n can wrap or move past
+  one-past-the-end, which is undefined behavior, and the check can pass.
+  Compare the length against the remaining space instead.
+note: >-
+  Write `n > (size_t) (last - p)` (after establishing p <= last). A literal n,
+  such as `p + 1 < last`, cannot be attacker-sized and is not flagged. ast-grep
+  has no types, so this is a name heuristic; a genuinely safe hit is rewritten
+  anyway (HARD-B4), not suppressed. Companion rule: c-ptr-add-bound-overflow. This one keys on n being named
+  like a length (an identifier ending in len, size, length or nbytes).
+rule:
+  any:
+    - pattern: $P + $N > $B
+    - pattern: ($P + $N) > $B
+    - pattern: $B > $P + $N
+    - pattern: $B > ($P + $N)
+    - pattern: $P + $N >= $B
+    - pattern: ($P + $N) >= $B
+    - pattern: $B >= $P + $N
+    - pattern: $B >= ($P + $N)
+    - pattern: $P + $N < $B
+    - pattern: ($P + $N) < $B
+    - pattern: $B < $P + $N
+    - pattern: $B < ($P + $N)
+    - pattern: $P + $N <= $B
+    - pattern: ($P + $N) <= $B
+    - pattern: $B <= $P + $N
+    - pattern: $B <= ($P + $N)
+constraints:
+  N:
+    regex: '(^|[._>])\w*(len|size|length|nbytes)$'

@@ -1,0 +1,4 @@
+# rule	file:line	matched text (tabs/newlines collapsed)
+c-ptr-add-len-bound-overflow	src/ngx_http_cache_turbo_match.c:549	val < name + plen
+c-ptr-add-len-bound-overflow	src/ngx_http_cache_turbo_match.c:796	v < pair + plen
+c-ptr-add-len-bound-overflow	src/ngx_http_cache_turbo_match.c:919	v < pair + plen

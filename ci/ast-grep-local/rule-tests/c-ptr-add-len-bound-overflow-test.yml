@@ -1,0 +1,12 @@
+id: c-ptr-add-len-bound-overflow
+valid:
+  - 'if (plen > (size_t) (end - pair)) { return -1; }'
+  - 'if (v < pair + 1) { v++; }'
+  - 'if (now < created + ttl) { return 0; }'
+  - 'if (total + NGX_ALIGNMENT > NGX_MAX_SIZE_T_VALUE - meta_len) { return -1; }'
+invalid:
+  - 'while (v < pair + plen) { v++; }'
+  - 'if (p + len > q) { return -1; }'
+  - 'if (q < p + vlen) { return -1; }'
+  - 'if ((p + body_size) <= q) { use(p); }'
+  - 'if (q >= (p + hdr->len)) { use(p); }'
