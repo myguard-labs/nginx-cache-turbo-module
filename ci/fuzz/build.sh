@@ -3,8 +3,8 @@
 # Build the cache-turbo libFuzzer targets.
 # Usage: ci/fuzz/build.sh [output-dir-or-binary]
 #
-#   - no arg      : build both targets into ci/fuzz/
-#   - a directory : build both targets into that dir
+#   - no arg      : build every registered target into ci/fuzz/
+#   - a directory : build every registered target into that dir
 #   - a file path : build ONLY the RESP-reply target to that path
 #                   (back-compat for the CI step that passes an explicit
 #                   fuzz_resp_parser output name)
@@ -48,24 +48,27 @@ build_auto_classify_empty_smoke() {
     echo "✓ built auto-classify empty-cookie smoke: $out"
 }
 
+# Target list comes from the registry (ci/fuzz/targets.tsv); targets.sh validates
+# every row (missing source/corpus/dict/extractor fails naming the row).
+# shellcheck source=ci/fuzz/targets.sh
+. "$FUZZ_DIR/targets.sh"
+ROWS="$(targets_rows)" || { echo "❌ fuzz target registry invalid" >&2; exit 1; }
+
 ARG="${1:-}"
 if [ -n "$ARG" ] && [ ! -d "$ARG" ]; then
     # Explicit single-file output path -> RESP-reply target only (CI compat).
-    bash "$FUZZ_DIR/extract_parser.sh"
-    build_one fuzz_resp_parser.c "$ARG"
+    while IFS=$'\t' read -r name src _corpus _dict extract; do
+        [ "$name" = fuzz_resp_parser ] || continue
+        bash "$FUZZ_DIR/$extract"
+        build_one "$src" "$ARG"
+    done <<<"$ROWS"
 else
     DIR="${ARG:-$FUZZ_DIR}"
-    bash "$FUZZ_DIR/extract_parser.sh"
-    build_one fuzz_resp_parser.c "$DIR/fuzz_resp_parser"
-    bash "$FUZZ_DIR/extract_norm_args.sh"
-    build_one fuzz_norm_args.c "$DIR/fuzz_norm_args"
-    bash "$FUZZ_DIR/extract_mc_parser.sh"
-    build_one fuzz_mc_parser.c "$DIR/fuzz_mc_parser"
-    bash "$FUZZ_DIR/extract_auto_classify.sh"
-    build_one fuzz_auto_classify.c "$DIR/fuzz_auto_classify"
+    while IFS=$'\t' read -r name src _corpus _dict extract; do
+        bash "$FUZZ_DIR/$extract"
+        build_one "$src" "$DIR/$name"
+    done <<<"$ROWS"
     build_auto_classify_empty_smoke "$DIR/auto_classify_empty_smoke"
-    bash "$FUZZ_DIR/extract_blob.sh"
-    build_one fuzz_blob.c "$DIR/fuzz_blob"
     # Deterministic per-primitive fixture binary from the SAME source: no
     # libFuzzer engine, its own main(). This is what the unit gate runs, so the
     # AUD-HDR1 fixtures are checked on every PR, not only in the fuzz job.

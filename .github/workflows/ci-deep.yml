@@ -1,4 +1,4 @@
-# sync-sha: 38bbb80554585240ef66b9f5a7fd259074ffa0f9abd7151ead43f2f44d98e411
+# sync-sha: dd13e18208a6e4c622628baa22af28caa989a5fade976081434e4282f51d78d6
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -394,7 +394,12 @@ jobs:
           # waits on all of them and fails on a non-zero exit or any crash-/
           # leak-/timeout-/oom- artifact (written as ci/fuzz/crash-<bin>-*,
           # which the upload step below globs). Logs: ci/fuzz/fuzz-logs/.
-          bash run-concurrent.sh fuzz_resp_parser:corpus:fuzz.dict fuzz_norm_args:corpus_norm_args: fuzz_mc_parser:corpus_mc:fuzz_mc.dict
+          # Targets come from the registry ci/fuzz/targets.tsv: lane a runs the
+          # first half of its rows, lane b the rest, so a new row is always fuzzed.
+          specs="$(bash targets.sh specs a)"
+          [ -n "$specs" ] || { echo "::error::no fuzz targets for lane a"; exit 1; }
+          mapfile -t specs <<<"$specs"
+          bash run-concurrent.sh "${specs[@]}"
 
         id: fuzz_a_06
         env:
@@ -760,7 +765,12 @@ jobs:
           # waits on all of them and fails on a non-zero exit or any crash-/
           # leak-/timeout-/oom- artifact (written as ci/fuzz/crash-<bin>-*,
           # which the upload step below globs). Logs: ci/fuzz/fuzz-logs/.
-          bash run-concurrent.sh fuzz_auto_classify:corpus_auto: fuzz_blob:corpus_blob:
+          # Targets come from the registry ci/fuzz/targets.tsv: lane a runs the
+          # first half of its rows, lane b the rest, so a new row is always fuzzed.
+          specs="$(bash targets.sh specs b)"
+          [ -n "$specs" ] || { echo "::error::no fuzz targets for lane b"; exit 1; }
+          mapfile -t specs <<<"$specs"
+          bash run-concurrent.sh "${specs[@]}"
 
         id: fuzz_b_06
         env:

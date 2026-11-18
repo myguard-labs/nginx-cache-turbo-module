@@ -241,7 +241,8 @@ area_ok() {
 fuzz_replay() {
     local fz="$ROOT/ci/fuzz" t rc=0 files
     bash "$fz/build.sh" "$PCT_TMP" >/dev/null || return 1
-    for t in fuzz_resp_parser fuzz_norm_args fuzz_mc_parser fuzz_auto_classify fuzz_blob; do
+    # Target list: registry ci/fuzz/targets.tsv (validated by build.sh above).
+    for t in $(bash "$fz/targets.sh" names); do
         # shellcheck disable=SC2207
         files=($(find "$fz/regressions/$t" -maxdepth 1 -type f ! -name README.md 2>/dev/null))
         if [ "${#files[@]}" -eq 0 ]; then echo "fuzz replay: $t: no regressions"; continue; fi

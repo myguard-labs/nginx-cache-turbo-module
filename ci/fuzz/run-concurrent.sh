@@ -3,7 +3,7 @@
 # Run the long libFuzzer budget for several targets concurrently.
 #
 # Usage: ci/fuzz/run-concurrent.sh [target:corpus:dict ...]
-#   With no argument the five production targets run. A spec is
+#   With no argument every registry target runs. A spec is
 #   <binary>:<corpus-dir>:<dict-or-empty>, resolved relative to the working
 #   directory (CI runs it from ci/fuzz/).
 #
@@ -35,11 +35,13 @@ LOGDIR="${FUZZ_LOGDIR:-fuzz-logs}"
 MERGE="${FUZZ_MERGE:-1}"
 
 if [ "$#" -eq 0 ]; then
-    set -- fuzz_resp_parser:corpus:fuzz.dict \
-           fuzz_norm_args:corpus_norm_args: \
-           fuzz_mc_parser:corpus_mc:fuzz_mc.dict \
-           fuzz_auto_classify:corpus_auto: \
-           fuzz_blob:corpus_blob:
+    # Default: every registered target (ci/fuzz/targets.tsv). The registry path
+    # is resolved from this script, so the working directory still only has to
+    # hold the binaries and corpora.
+    spec_out="$("$(dirname "${BASH_SOURCE[0]}")/targets.sh" specs all)" || exit 2
+    mapfile -t specs <<<"$spec_out"
+    [ "${#specs[@]}" -gt 0 ] || { echo "no fuzz targets in registry" >&2; exit 2; }
+    set -- "${specs[@]}"
 fi
 
 mkdir -p "$LOGDIR"

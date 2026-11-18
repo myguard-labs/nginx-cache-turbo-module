@@ -52,7 +52,7 @@
     },
     {
       "name": "Fuzz targets concurrently",
-      "sha256": "4f725088dd537e691f841925908a531fc2e3c989e4d8743309d0a9dd4c78b0a1"
+      "sha256": "8167d1fa5ebca4cafbbb25605f61fba4e46bc0179446cd3b739e26f06ea13b0c"
     },
     {
       "name": "Upload crash artifacts",
@@ -124,7 +124,7 @@
     },
     {
       "name": "Fuzz targets concurrently",
-      "sha256": "4f725088dd537e691f841925908a531fc2e3c989e4d8743309d0a9dd4c78b0a1"
+      "sha256": "bb04788e6f1e5dc543edddd6217a29988d9152a9e013c953b587a187807b4230"
     },
     {
       "name": "Upload crash artifacts",

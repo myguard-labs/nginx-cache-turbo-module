@@ -335,14 +335,12 @@ class DeepLanes(unittest.TestCase):
             WORKFLOW["concurrency"],
             {"group": "ci-deep-${{ github.ref }}", "cancel-in-progress": False},
         )
-        for lane, targets in {
-            "D-fuzz-a": [
-                "fuzz_resp_parser:corpus:fuzz.dict",
-                "fuzz_norm_args:corpus_norm_args:",
-                "fuzz_mc_parser:corpus_mc:fuzz_mc.dict",
-            ],
-            "D-fuzz-b": ["fuzz_auto_classify:corpus_auto:", "fuzz_blob:corpus_blob:"],
-        }.items():
+        registry = subprocess.run(
+            ["bash", str(ROOT / "ci/fuzz/targets.sh"), "specs", "all"],
+            check=True, capture_output=True, text=True,
+        ).stdout.split()
+        half = (len(registry) + 1) // 2
+        for lane, part in {"D-fuzz-a": "a", "D-fuzz-b": "b"}.items():
             job = WORKFLOW["jobs"][lane]
             self.assertEqual(
                 job["timeout-minutes"],
@@ -353,8 +351,15 @@ class DeepLanes(unittest.TestCase):
                 for s in job["steps"]
                 if s["name"].endswith("Fuzz targets concurrently")
             )
+            # The lane derives its targets from the registry: no hard-coded list.
+            self.assertIn("targets.sh specs " + part, step["run"])
+            self.assertNotIn("fuzz_resp_parser", step["run"])
             self.assertEqual(
-                step["run"].split("bash run-concurrent.sh ")[1].strip().split(), targets
+                {"a": registry[:half], "b": registry[half:]}[part],
+                subprocess.run(
+                    ["bash", str(ROOT / "ci/fuzz/targets.sh"), "specs", part],
+                    check=True, capture_output=True, text=True,
+                ).stdout.split(),
             )
             self.assertEqual(step["env"]["FUZZ_JOBS"], "3")
 

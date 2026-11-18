@@ -1,8 +1,8 @@
 # Fuzzing
 
 Coverage-guided (libFuzzer) fuzzing of the module's attacker-controlled
-parsers. Four targets, each built from the SHIPPED source by its own
-`extract_*.sh` slicer (no hand-maintained copy):
+parsers. Registered targets (see below), each built from the SHIPPED source by
+its own `extract_*.sh` slicer (no hand-maintained copy):
 
 - **`fuzz_resp_parser`** → the three Redis (RESP) reply parsers (below).
 - **`fuzz_mc_parser`** → `ngx_http_cache_turbo_mc_parse()` (v13), the memcached
@@ -28,6 +28,19 @@ parsers. Four targets, each built from the SHIPPED source by its own
   `Cookie` header / request URI / args. Bug classes: OOB reads in the cookie
   substring / value-predicate scans and the URI/arg matchers. Sliced by
   `extract_auto_classify.sh` into `generated_auto_classify.inc`.
+
+## Target registry
+
+`targets.tsv` is the single list of fuzz targets (tab-separated, header row,
+columns `name source corpus dict extract`; `dict` is `-` when none). `build.sh`,
+`run-concurrent.sh` (no-arg default), `ci/tools/precommit-tests.sh`, the PR
+regression/60s steps in `static.yml` and both Deep fuzz lanes read it through
+`targets.sh`, so a new target needs one registry row (plus its harness, slicer
+and corpus) and is built, replayed on every PR and long-fuzzed in Deep. Deep
+lane `a` runs the first half of the rows (rounded up), lane `b` the rest.
+`targets.sh validate` fails naming the first bad row (missing source, corpus,
+dict or slicer, wrong column count, empty/duplicate name); it is covered by
+`ci/tests/test_fuzz_targets_registry.py`.
 
 ## RESP reply parsers
 
