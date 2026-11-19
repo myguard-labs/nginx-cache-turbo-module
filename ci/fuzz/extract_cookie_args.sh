@@ -27,6 +27,8 @@ FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$FUZZ_DIR/../../src/ngx_http_cache_turbo_match.c"
 HDR="$FUZZ_DIR/../../src/ngx_http_cache_turbo_module.h"
 OUT="$FUZZ_DIR/generated_cookie_args.inc"
+# shellcheck source=ci/fuzz/atomic_out.sh
+. "$FUZZ_DIR/atomic_out.sh"
 TYPES="cookie_ac_node_t cookie_ac_t cookie_pair_t cookie_index_t"
 FUNCS="cookie_index_add cookie_index_parse_one cookie_ac_scan_one hexval qs_first_mangled argparse_tail_count argparse_build"
 
@@ -41,11 +43,12 @@ done
 fail() {
     echo "✗ failed to extract the Cookie/args code from $SRC" >&2
     echo "  ($1; source layout changed? update extract_cookie_args.sh)" >&2
-    rm -f "$OUT" "$OUT.part"
+    rm -f "$OUT"
     exit 1
 }
 
-: > "$OUT"
+fuzz_atomic_begin
+: > "$TMP_OUT"
 
 # Anonymous `typedef struct { ... } NAME;` blocks, each exactly once.
 slice_typedef() {
@@ -57,12 +60,12 @@ slice_typedef() {
             if ($0 == want) { printf "%s\n", buf; buf = "" }
             else if ($0 ~ /^\} /) { buf = "" }
         }
-    ' "$file" > "$OUT.part"
-    n=$(grep -c "^} ngx_http_cache_turbo_${t};" "$OUT.part" || true)
+    ' "$file" > "$TMP_PART"
+    n=$(grep -c "^} ngx_http_cache_turbo_${t};" "$TMP_PART" || true)
     if [ "$n" -ne 1 ]; then
         fail "ngx_http_cache_turbo_${t}: expected exactly one typedef block in $(basename "$file"), got $n"
     fi
-    cat "$OUT.part" >> "$OUT"
+    cat "$TMP_PART" >> "$TMP_OUT"
 }
 
 # Type blocks from the module header.
@@ -72,11 +75,11 @@ done
 
 # ARGS_MAX define (one line, needed by argparse_t), then argspan_t before
 # argparse_t, each validated on its own so a reordered source cannot drop one.
-grep '^#define NGX_HTTP_CACHE_TURBO_ARGS_MAX ' "$SRC" > "$OUT.part" || true
-if [ "$(wc -l < "$OUT.part")" -ne 1 ] || grep -q '\\$' "$OUT.part"; then
+grep '^#define NGX_HTTP_CACHE_TURBO_ARGS_MAX ' "$SRC" > "$TMP_PART" || true
+if [ "$(wc -l < "$TMP_PART")" -ne 1 ] || grep -q '\\$' "$TMP_PART"; then
     fail "ARGS_MAX define not found exactly once as a single line"
 fi
-{ cat "$OUT.part"; echo; } >> "$OUT"
+{ cat "$TMP_PART"; echo; } >> "$TMP_OUT"
 slice_typedef "$SRC" argspan_t
 slice_typedef "$SRC" argparse_t
 
@@ -96,16 +99,17 @@ for f in $FUNCS; do
         }
         /^(static )?[a-z_][a-z_0-9 ]*$/ { pending = 1; buf = $0 ORS; next }
         { pending = 0; buf = "" }
-    ' "$SRC" > "$OUT.part" || {
+    ' "$SRC" > "$TMP_PART" || {
         fail "ngx_http_cache_turbo_${f}: slice reached the next top-level declaration before the closing brace"
     }
-    n=$(grep -c "^ngx_http_cache_turbo_${f}(" "$OUT.part" || true)
-    if [ "$n" -ne 1 ] || [ "$(tail -n2 "$OUT.part" | head -n1)" != "}" ]; then
+    n=$(grep -c "^ngx_http_cache_turbo_${f}(" "$TMP_PART" || true)
+    if [ "$n" -ne 1 ] || [ "$(tail -n2 "$TMP_PART" | head -n1)" != "}" ]; then
         fail "ngx_http_cache_turbo_${f}: expected exactly one complete definition, got $n"
     fi
-    cat "$OUT.part" >> "$OUT"
+    cat "$TMP_PART" >> "$TMP_OUT"
 done
-rm -f "$OUT.part"
+rm -f "$TMP_PART"
 
-LINES=$(wc -l < "$OUT")
+LINES=$(wc -l < "$TMP_OUT")
+fuzz_atomic_publish
 echo "✓ extracted cookie_index/cookie_ac/argparse code — $LINES lines -> $OUT"

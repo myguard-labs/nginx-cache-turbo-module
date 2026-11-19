@@ -30,6 +30,8 @@ FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_MODULE="$FUZZ_DIR/../../src/ngx_http_cache_turbo_module.c"
 SRC_VARY="$FUZZ_DIR/../../src/ngx_http_cache_turbo_vary.c"
 OUT="$FUZZ_DIR/generated_norm_args.inc"
+# shellcheck source=ci/fuzz/atomic_out.sh
+. "$FUZZ_DIR/atomic_out.sh"
 
 if [ ! -f "$SRC_MODULE" ]; then
     echo "✗ cannot find $SRC_MODULE" >&2
@@ -44,6 +46,7 @@ fi
 # line; normalized_args_variable (module.c, still static) opens with
 # `static ngx_int_t`. Both close on a bare `}` in column 1 (nginx style).
 # Match on the definition line that follows the return-type line.
+fuzz_atomic_begin
 awk '
     /^ngx_int_t$/ { pending = 1; buf = $0 ORS; next }
     pending && /^ngx_http_cache_turbo_tok_cmp\(/ {
@@ -54,7 +57,7 @@ awk '
         print
         if ($0 == "}") { capture = 0 }
     }
-' "$SRC_VARY" > "$OUT"
+' "$SRC_VARY" > "$TMP_OUT"
 
 awk '
     /^static ngx_int_t$/ { pending = 1; buf = $0 ORS; next }
@@ -66,16 +69,17 @@ awk '
         print
         if ($0 == "}") { capture = 0 }
     }
-' "$SRC_MODULE" >> "$OUT"
+' "$SRC_MODULE" >> "$TMP_OUT"
 
-if ! grep -q 'ngx_http_cache_turbo_tok_cmp' "$OUT" \
-   || ! grep -q 'ngx_http_cache_turbo_normalized_args_variable' "$OUT" \
-   || [ "$(tail -n1 "$OUT")" != "}" ]; then
+if ! grep -q 'ngx_http_cache_turbo_tok_cmp' "$TMP_OUT" \
+   || ! grep -q 'ngx_http_cache_turbo_normalized_args_variable' "$TMP_OUT" \
+   || [ "$(tail -n1 "$TMP_OUT")" != "}" ]; then
     echo "✗ failed to extract the normaliser from $SRC_MODULE / $SRC_VARY" >&2
     echo "  (source layout changed? update extract_norm_args.sh)" >&2
     rm -f "$OUT"
     exit 1
 fi
 
-LINES=$(wc -l < "$OUT")
+LINES=$(wc -l < "$TMP_OUT")
+fuzz_atomic_publish
 echo "✓ extracted tok_cmp() + normalized_args_variable() — $LINES lines -> $OUT"
