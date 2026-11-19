@@ -1,6 +1,9 @@
 """Self-tests: every primitive of ci/tools/hostile_peer.py."""
 
+import contextlib
 import socket
+import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -381,3 +384,145 @@ def test_responder_mismatch_index_is_command_ordinal() -> None:
             s.sendall(resp(b"GET", b"k"))
             s.recv(16)
         assert [m[0] for m in p.mismatches] == [1]
+
+
+# --------------------------------------------------------------------------- #
+# TLS wrapper (HARD-L4)
+# --------------------------------------------------------------------------- #
+
+HELLO = b"\x16\x03\x01\x00\x05hello"     # a TLS handshake record (0x16...)
+
+
+@pytest.fixture(scope="module")
+def tls_paths(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
+    d = tmp_path_factory.mktemp("tls")
+    key, crt = d / "k.pem", d / "c.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", str(key), "-out", str(crt), "-days", "1",
+                    "-subj", "/CN=localhost"], check=True, timeout=30,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {"cert": str(crt), "key": str(key)}
+
+
+def tls_peer(paths: dict[str, str], script: list[Step] | None = None,
+             **tls_kw: object) -> Peer:
+    ctx = None
+    if tls_kw.get("hello", hp.H_SERVE) == hp.H_SERVE:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(paths["cert"], paths["key"])
+    return Peer([script or []], tls=hp.Tls(ctx=ctx, **tls_kw))  # type: ignore[arg-type]
+
+
+def tls_dial(peer: Peer, paths: dict[str, str]) -> ssl.SSLSocket:
+    cctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    cctx.load_verify_locations(paths["cert"])
+    cctx.check_hostname = False
+    raw = socket.create_connection(("127.0.0.1", peer.port), 3)
+    raw.settimeout(3)
+    return cctx.wrap_socket(raw)
+
+
+@contextlib.contextmanager
+def tls_pair(paths: dict[str, str], script: list[Step]):
+    with tls_peer(paths, script) as p, tls_dial(p, paths) as c:
+        yield c
+
+
+def test_tls_serve_records_handshake_and_decrypted_commands(
+        tls_paths: dict[str, str]) -> None:
+    with tls_peer(tls_paths,
+                  [Step(expect=b"GET k", reply=b"$-1\r\n")]) as p:
+        with tls_dial(p, tls_paths) as c:
+            c.sendall(resp(b"GET", b"k"))
+            assert c.recv(64) == b"$-1\r\n"
+        assert p.wait_for_closed(1)
+        (rec,) = p.connections
+        assert rec.handshaked and rec.hello_seen and not rec.plaintext
+        assert [x.line for x in rec.commands] == [b"GET k"]
+        assert p.mismatches == []
+
+
+def test_tls_plaintext_client_recorded_and_never_served(
+        tls_paths: dict[str, str]) -> None:
+    with tls_peer(tls_paths, [Step(reply=b"+OK\r\n")]) as p:
+        with dial(p) as s:
+            s.sendall(resp(b"GET", b"k"))
+            assert recv_all(s) == b""
+        assert p.wait_for_closed(1)
+        (rec,) = p.connections
+        assert rec.plaintext.startswith(b"*2\r\n") and not rec.handshaked
+        assert not rec.hello_seen and rec.commands == []
+
+
+def test_tls_hello_stall_holds_open_until_client_closes(
+        tls_paths: dict[str, str]) -> None:
+    with tls_peer(tls_paths, hello=hp.H_STALL) as p:
+        with dial(p) as s:
+            s.sendall(HELLO)
+            s.settimeout(0.3)
+            with pytest.raises(TimeoutError):
+                s.recv(16)                  # never answered
+            assert p.connections[0].closed is None
+        assert p.wait_for_closed(1)
+        assert p.connections[0].hello_seen and not p.connections[0].handshaked
+
+
+def test_tls_hello_plaintext_reply_alert_close_rst(
+        tls_paths: dict[str, str]) -> None:
+    cases = [({"hello": hp.H_PLAINTEXT, "hello_reply": b"$-1\r\n"},
+              b"$-1\r\n"),
+             ({"hello": hp.H_ALERT}, hp.ALERT_HANDSHAKE_FAILURE),
+             ({"hello": hp.H_CLOSE}, b""),
+             ({"hello": hp.H_RST}, b"<RST>")]
+    for kw, want in cases:
+        with tls_peer(tls_paths, **kw) as p:     # type: ignore[arg-type]
+            with dial(p) as s:
+                s.sendall(HELLO)
+                assert recv_all(s) == want, kw
+            assert p.wait_for_closed(1)
+            assert p.connections[0].hello_seen
+
+
+def test_tls_endings_close_notify_vs_truncation_vs_raw_alert(
+        tls_paths: dict[str, str]) -> None:
+    half = b"$40\r\nHL2"
+    # close_notify: the client sees a clean TLS EOF after the partial reply.
+    with tls_pair(tls_paths, [Step(reply=half, then=hp.CLOSE_NOTIFY)]) as c:
+        c.sendall(resp(b"GET", b"k"))
+        assert c.recv(64) == half
+        assert c.recv(64) == b""
+    # bare FIN: no close_notify, a strict client sees the truncation.
+    with tls_pair(tls_paths, [Step(reply=half, then=hp.CLOSE)]) as c:
+        c.suppress_ragged_eofs = False  # pyright: ignore[reportAttributeAccessIssue]
+        c.sendall(resp(b"GET", b"k"))
+        assert c.recv(64) == half
+        with pytest.raises(ssl.SSLEOFError):
+            c.recv(64)
+    # plaintext alert record in the encrypted stream: undecryptable.
+    with tls_pair(tls_paths, [Step(reply=half, then=hp.RAW_ALERT)]) as c:
+        c.sendall(resp(b"GET", b"k"))
+        assert c.recv(64) == half
+        with pytest.raises(ssl.SSLError):
+            c.recv(64)
+
+
+def test_tls_failed_handshake_recorded_and_closed(
+        tls_paths: dict[str, str]) -> None:
+    with tls_peer(tls_paths) as p:
+        with dial(p) as s:
+            s.sendall(HELLO + b"x" * 40)      # a TLS record, not a ClientHello
+            recv_all(s)
+        assert p.wait_for_closed(1)
+        (rec,) = p.connections
+        assert rec.hello_seen and not rec.handshaked and rec.tls_error
+
+
+def test_tls_construction_rejected() -> None:
+    with pytest.raises(ValueError):
+        hp.Tls(hello="bogus")
+    with pytest.raises(ValueError):
+        hp.Tls(hello=hp.H_SERVE)             # serve needs a context
+    with pytest.raises(ValueError):
+        Step(then="bogus")
+    Step(then=hp.CLOSE_NOTIFY)
+    Step(then=hp.RAW_ALERT)
