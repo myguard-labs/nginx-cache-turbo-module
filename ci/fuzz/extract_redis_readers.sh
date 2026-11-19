@@ -25,13 +25,16 @@ FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${FUZZ_REDIS_READERS_SRC:-$FUZZ_DIR/../../src/ngx_http_cache_turbo_redis.c}"
 SHIM="$FUZZ_DIR/ngx_shim.h"
 OUT="${FUZZ_REDIS_READERS_OUT:-$FUZZ_DIR/generated_redis_readers.inc}"
+# shellcheck source=ci/fuzz/atomic_out.sh
+. "$FUZZ_DIR/atomic_out.sh"
 
-# Fail closed from the first line: drop any .inc from an earlier run so no
-# failure path (missing source, recv[] drift, bad slice) leaves a stale slice.
-rm -f "$OUT" "$OUT.part"
-
+# Fail closed: every failure path below drops any .inc from an earlier run so
+# none (missing source, recv[] drift, bad slice) leaves a stale slice. A
+# successful run replaces it atomically instead of removing it up front, so a
+# concurrent reader never sees a missing or partial include.
 if [ ! -f "$SRC" ]; then
     echo "✗ cannot find $SRC" >&2
+    rm -f "$OUT"
     exit 1
 fi
 
@@ -43,22 +46,25 @@ recv_decl() {
 }
 if ! got=$(recv_decl "$SRC") || [ -z "$got" ]; then
     echo "✗ op->recv[] scratch not found in $SRC (update extract_redis_readers.sh)" >&2
+    rm -f "$OUT"
     exit 1
 fi
 if ! shim=$(recv_decl "$SHIM") || [ -z "$shim" ]; then
     echo "✗ op->recv[] scratch not found in shim $SHIM (update ci/fuzz/ngx_shim.h)" >&2
+    rm -f "$OUT"
     exit 1
 fi
 if [ "$got" != "$shim" ]; then
     echo "✗ op->recv[] drifted: source=$got shim=$shim" >&2
     echo "  update ci/fuzz/ngx_shim.h to match src/ngx_http_cache_turbo_redis.c" >&2
+    rm -f "$OUT"
     exit 1
 fi
 
 fail() {
     echo "✗ failed to extract $1 from $SRC" >&2
     echo "  (source layout changed? update extract_redis_readers.sh)" >&2
-    rm -f "$OUT" "$OUT.part"
+    rm -f "$OUT"
     exit 1
 }
 
@@ -68,7 +74,8 @@ fail() {
 # the bare `static void` line. Each reader is sliced and validated on its own:
 # exactly one definition, closing on its own bare `}`, never running into
 # another top-level declaration first.
-: > "$OUT"
+fuzz_atomic_begin
+: > "$TMP_OUT"
 for fn in read_preamble read_lock; do
     name="ngx_http_cache_turbo_redis_${fn}("
     awk -v want="$name" '
@@ -84,17 +91,18 @@ for fn in read_preamble read_lock; do
             print
             if ($0 == "}") { capture = 0 }
         }
-    ' "$SRC" > "$OUT.part" || fail "$name (slice reached the next top-level declaration before its closing brace)"
-    n=$(grep -c "^ngx_http_cache_turbo_redis_${fn}[(]" "$OUT.part" || true)
+    ' "$SRC" > "$TMP_PART" || fail "$name (slice reached the next top-level declaration before its closing brace)"
+    n=$(grep -c "^ngx_http_cache_turbo_redis_${fn}[(]" "$TMP_PART" || true)
     if [ "$n" -ne 1 ]; then
         fail "$name (expected exactly one definition, got $n)"
     fi
-    if [ "$(tail -n1 "$OUT.part")" != "}" ]; then
+    if [ "$(tail -n1 "$TMP_PART")" != "}" ]; then
         fail "$name (slice does not end on a closing brace)"
     fi
-    cat "$OUT.part" >> "$OUT"
+    cat "$TMP_PART" >> "$TMP_OUT"
 done
-rm -f "$OUT.part"
+rm -f "$TMP_PART"
 
-LINES=$(wc -l < "$OUT")
+LINES=$(wc -l < "$TMP_OUT")
+fuzz_atomic_publish
 echo "✓ extracted redis read_preamble() + read_lock() — $LINES lines -> $OUT"

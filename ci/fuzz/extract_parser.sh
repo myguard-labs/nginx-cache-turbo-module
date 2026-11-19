@@ -28,6 +28,8 @@ FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$FUZZ_DIR/../../src/ngx_http_cache_turbo_redis.c"
 SHIM="$FUZZ_DIR/ngx_shim.h"
 OUT="$FUZZ_DIR/generated_parser.inc"
+# shellcheck source=ci/fuzz/atomic_out.sh
+. "$FUZZ_DIR/atomic_out.sh"
 
 if [ ! -f "$SRC" ]; then
     echo "✗ cannot find $SRC" >&2
@@ -70,7 +72,8 @@ check_define NGX_HTTP_CACHE_TURBO_REDIS_FRAME_MAX_DEPTH
 # _frame() is directly recursive: its body calls itself before the definition is
 # complete, so the slice needs a prototype up front. Emitted here rather than in
 # ngx_shim.h so it stays adjacent to the extraction that requires it.
-cat > "$OUT" <<'PROTO'
+fuzz_atomic_begin
+cat > "$TMP_OUT" <<'PROTO'
 /* forward declaration — ngx_http_cache_turbo_redis_frame() is recursive */
 static ngx_int_t ngx_http_cache_turbo_redis_frame(u_char *p, u_char *end,
     ngx_uint_t depth, u_char **next);
@@ -96,7 +99,7 @@ awk '
         print
         if ($0 == "}") { capture = 0 }
     }
-' "$SRC" >> "$OUT"
+' "$SRC" >> "$TMP_OUT"
 
 # --- sanity: all three must be present and the file must end on a closing brace.
 for fn in \
@@ -112,20 +115,21 @@ do
     # Anchored at column 0: this matches the DEFINITION line only. A bare -F
     # match would also hit the forward declaration this script emits for
     # _frame(), turning a failed body slice into a silent pass.
-    if ! grep -qE "^${fn//(/\\(}" "$OUT"; then
+    if ! grep -qE "^${fn//(/\\(}" "$TMP_OUT"; then
         echo "✗ failed to extract $fn from $SRC" >&2
         echo "  (source layout changed? update extract_parser.sh)" >&2
         rm -f "$OUT"
         exit 1
     fi
 done
-if [ "$(tail -n1 "$OUT")" != "}" ]; then
+if [ "$(tail -n1 "$TMP_OUT")" != "}" ]; then
     echo "✗ generated_parser.inc does not end on a closing brace (bad slice)" >&2
     rm -f "$OUT"
     exit 1
 fi
 
-LINES=$(wc -l < "$OUT")
+LINES=$(wc -l < "$TMP_OUT")
+fuzz_atomic_publish
 echo "✓ extracted redis_parse() + _parse_scan() + _frame() + _frame_scan() — $LINES lines -> $OUT"
 
 # The AUTH/SELECT preamble and lock reply readers (fuzz_resp_parser blocks 6-7)

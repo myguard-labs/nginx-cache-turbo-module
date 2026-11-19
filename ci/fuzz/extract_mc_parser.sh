@@ -16,6 +16,8 @@ FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$FUZZ_DIR/../../src/ngx_http_cache_turbo_memcached.c"
 SHIM="$FUZZ_DIR/ngx_shim_mc.h"
 OUT="$FUZZ_DIR/generated_mc_parser.inc"
+# shellcheck source=ci/fuzz/atomic_out.sh
+. "$FUZZ_DIR/atomic_out.sh"
 
 if [ ! -f "$SRC" ]; then
     echo "✗ cannot find $SRC" >&2
@@ -43,6 +45,7 @@ fi
 # --- slice the single parser body. It opens with a bare `static ngx_int_t` line
 # immediately followed by its `ngx_http_cache_turbo_mc_parse(` definition line,
 # and closes with a bare `}` in column 0 (nginx style).
+fuzz_atomic_begin
 awk '
     /^static ngx_int_t$/ { pending = 1; buf = $0 ORS; next }
     pending && /^ngx_http_cache_turbo_mc_parse\(/ {
@@ -53,19 +56,20 @@ awk '
         print
         if ($0 == "}") { capture = 0 }
     }
-' "$SRC" > "$OUT"
+' "$SRC" > "$TMP_OUT"
 
-if ! grep -qF 'ngx_http_cache_turbo_mc_parse(' "$OUT"; then
+if ! grep -qF 'ngx_http_cache_turbo_mc_parse(' "$TMP_OUT"; then
     echo "✗ failed to extract ngx_http_cache_turbo_mc_parse from $SRC" >&2
     echo "  (source layout changed? update extract_mc_parser.sh)" >&2
     rm -f "$OUT"
     exit 1
 fi
-if [ "$(tail -n1 "$OUT")" != "}" ]; then
+if [ "$(tail -n1 "$TMP_OUT")" != "}" ]; then
     echo "✗ generated_mc_parser.inc does not end on a closing brace (bad slice)" >&2
     rm -f "$OUT"
     exit 1
 fi
 
-LINES=$(wc -l < "$OUT")
+LINES=$(wc -l < "$TMP_OUT")
+fuzz_atomic_publish
 echo "✓ extracted mc_parse() — $LINES lines -> $OUT"

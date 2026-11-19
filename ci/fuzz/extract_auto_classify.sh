@@ -29,6 +29,8 @@ FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$FUZZ_DIR/../../src/ngx_http_cache_turbo_match.c"
 SRC_PRESETS="$FUZZ_DIR/../../src/ngx_http_cache_turbo_presets.c"
 OUT="$FUZZ_DIR/generated_auto_classify.inc"
+# shellcheck source=ci/fuzz/atomic_out.sh
+. "$FUZZ_DIR/atomic_out.sh"
 
 if [ ! -f "$SRC" ]; then
     echo "✗ cannot find $SRC" >&2
@@ -48,10 +50,11 @@ slice() {
     ' "$1"
 }
 
-slice "$SRC_PRESETS" > "$OUT"
-slice "$SRC" >> "$OUT"
+fuzz_atomic_begin
+slice "$SRC_PRESETS" > "$TMP_OUT"
+slice "$SRC" >> "$TMP_OUT"
 
-if ! grep -qF 'ngx_http_cache_turbo_presets[]' "$OUT"; then
+if ! grep -qF 'ngx_http_cache_turbo_presets[]' "$TMP_OUT"; then
     echo "✗ failed to extract ngx_http_cache_turbo_presets[] from $SRC_PRESETS" \
          "(markers moved?)" >&2
     rm -f "$OUT"
@@ -65,12 +68,13 @@ required_helpers=(
     ngx_http_cache_turbo_auto_skip
 )
 for helper in "${required_helpers[@]}"; do
-    if ! grep -qF "$helper(" "$OUT"; then
+    if ! grep -qF "$helper(" "$TMP_OUT"; then
         echo "✗ failed to extract $helper from $SRC (markers moved?)" >&2
         rm -f "$OUT"
         exit 1
     fi
 done
 
-LINES=$(wc -l < "$OUT")
+LINES=$(wc -l < "$TMP_OUT")
+fuzz_atomic_publish
 echo "✓ extracted auto-classify block — $LINES lines -> $OUT"

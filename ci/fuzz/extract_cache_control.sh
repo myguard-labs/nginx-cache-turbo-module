@@ -20,6 +20,8 @@ set -euo pipefail
 FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$FUZZ_DIR/../../src/ngx_http_cache_turbo_module.c"
 OUT="$FUZZ_DIR/generated_cache_control.inc"
+# shellcheck source=ci/fuzz/atomic_out.sh
+. "$FUZZ_DIR/atomic_out.sh"
 FUNCS="cc_token cc_has cc_parse_delta cc_delta cc_delta_all"
 
 if [ ! -f "$SRC" ]; then
@@ -34,7 +36,8 @@ fail() {
     exit 1
 }
 
-: > "$OUT"
+fuzz_atomic_begin
+: > "$TMP_OUT"
 for f in $FUNCS; do
     awk -v want="ngx_http_cache_turbo_${f}(" '
         # An open capture must close on a bare "}". A top-level declaration
@@ -50,18 +53,18 @@ for f in $FUNCS; do
             print
             if ($0 == "}") { capture = 0; print "" }
         }
-    ' "$SRC" > "$OUT.part" || {
-        rm -f "$OUT.part"
+    ' "$SRC" > "$TMP_PART" || {
+        rm -f "$TMP_PART"
         fail "ngx_http_cache_turbo_${f}: slice reached the next top-level declaration before the closing brace"
     }
-    n=$(grep -c "^ngx_http_cache_turbo_${f}(" "$OUT.part" || true)
-    if [ "$n" -ne 1 ] || [ "$(tail -n2 "$OUT.part" | head -n1)" != "}" ]; then
-        rm -f "$OUT.part"
+    n=$(grep -c "^ngx_http_cache_turbo_${f}(" "$TMP_PART" || true)
+    if [ "$n" -ne 1 ] || [ "$(tail -n2 "$TMP_PART" | head -n1)" != "}" ]; then
+        rm -f "$TMP_PART"
         fail "ngx_http_cache_turbo_${f}: expected exactly one complete definition, got $n"
     fi
-    cat "$OUT.part" >> "$OUT"
-    rm -f "$OUT.part"
+    cat "$TMP_PART" >> "$TMP_OUT"
 done
 
-LINES=$(wc -l < "$OUT")
+LINES=$(wc -l < "$TMP_OUT")
+fuzz_atomic_publish
 echo "✓ extracted cc_token/has/parse_delta/delta/delta_all — $LINES lines -> $OUT"
