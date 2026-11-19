@@ -55,6 +55,37 @@ def test_known_red_rows_name_real_cases_and_props() -> None:
             assert props and props <= set(hh.PROPS), cid
     assert hh.known_red(False) == hh.HTTP_KNOWN_RED
     assert set(hh.known_red(True)) >= set(hh.HTTP_KNOWN_RED_UBSAN)
+    for cid, props in hh.HTTP_KNOWN_RED_UBSAN_SINGLE.items():
+        assert cid in hh.HTTP_KNOWN_RED_UBSAN, cid
+        assert hh.HTTP_KNOWN_RED_UBSAN[cid] < props <= set(hh.PROPS), cid
+
+
+SINGLE_FAIL = {"P4-victim", "P7-sanitizer"}
+
+
+def test_single_process_variant_classifies_known_red() -> None:
+    known = hh.known_red(True, True)
+    assert hh.classify("HR-HTTP10-NOHOST", SINGLE_FAIL, known) == "known-red"
+    assert hh.classify("HR-HTTP10-NOHOST", {"P7-sanitizer"},
+                       known) == "known-red"
+    assert hh.classify("HR-HTTP10-NOHOST", set(), known) == "xpass"
+    assert hh.classify("HR-HTTP10-NOHOST", SINGLE_FAIL | {"P3-own-key"},
+                       known) == "known-red-drift"
+
+
+def test_single_process_set_on_multi_worker_is_drift() -> None:
+    known = hh.known_red(True, False)
+    assert hh.classify("HR-HTTP10-NOHOST", SINGLE_FAIL,
+                       known) == "known-red-drift"
+    assert hh.classify("HR-HTTP10-NOHOST", {"P7-sanitizer"},
+                       known) == "known-red"
+
+
+def test_plain_build_has_no_known_red_row() -> None:
+    for single in (False, True):
+        known = hh.known_red(False, single)
+        assert "HR-HTTP10-NOHOST" not in known
+        assert hh.classify("HR-HTTP10-NOHOST", set(), known) == "green"
 
 
 @pytest.mark.parametrize("text,want", [

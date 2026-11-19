@@ -59,7 +59,9 @@ CTRL-HR-CLEAN proves a clean request passes every property.
 Known defects live in HTTP_KNOWN_RED with the properties they fail; such a
 case does not fail the run, a known-red case that passes (xpass) does.
 HTTP_KNOWN_RED_UBSAN rows apply only when ``nginx -V`` shows
-``-fsanitize=...undefined`` (the defect is invisible on a plain build).  Red
+``-fsanitize=...undefined`` (the defect is invisible on a plain build);
+HTTP_KNOWN_RED_UBSAN_SINGLE widens a row for --single-process, where the
+halt takes the whole server down and the victim fails too.  Red
 cases and traces: memory/labs/nginx-cache-turbo-module/
 hard-l2-evidence-20261118.md, section HARD-R1 (HARD-R3 input).
 
@@ -298,8 +300,23 @@ HTTP_KNOWN_RED_UBSAN: dict[str, frozenset[str]] = {
 }
 
 
-def known_red(ubsan: bool) -> dict[str, frozenset[str]]:
-    return {**HTTP_KNOWN_RED, **(HTTP_KNOWN_RED_UBSAN if ubsan else {})}
+# Single-process variant (master_process off): the UBSan halt kills the whole
+# server, so the same-connection victim fails too (P4-victim).  These rows
+# replace the HTTP_KNOWN_RED_UBSAN row only in single-process mode; the
+# multi-worker expectation stays narrow, so P4-victim there is drift.
+HTTP_KNOWN_RED_UBSAN_SINGLE: dict[str, frozenset[str]] = {
+    "HR-HTTP10-NOHOST": frozenset({"P7-sanitizer", "P4-victim"}),
+}
+
+
+def known_red(ubsan: bool,
+              single_process: bool = False) -> dict[str, frozenset[str]]:
+    if not ubsan:
+        return dict(HTTP_KNOWN_RED)
+    rows = {**HTTP_KNOWN_RED_UBSAN}
+    if single_process:
+        rows.update(HTTP_KNOWN_RED_UBSAN_SINGLE)
+    return {**HTTP_KNOWN_RED, **rows}
 
 
 def sanitizers_of(version_text: str) -> frozenset[str]:
@@ -751,7 +768,7 @@ def run_matrix(ng: Nginx, only: set[str] | None = None) -> list[Result]:
     unknown = sorted((only or set()) - set(ids))
     if unknown:
         raise ValueError(f"HOSTILE_HTTP_ONLY: unknown case id(s) {unknown}")
-    known = known_red(ubsan_build(ng.binary))
+    known = known_red(ubsan_build(ng.binary), ng.single_process)
     rig = _Rig(ng)
     rig.start()
     results: list[Result] = []
