@@ -113,3 +113,4 @@ ci/tests/unit/test_vary_marker_fastpath.c	none	ut vary_marker_fastpath -
 ci/tools/ci-gate-verdict.py|ci/tests/test_ci_gate_verdict.py|.github/workflows/ci.yml	none	python3 ci/tests/test_ci_gate_verdict.py
 ci/tests/test_fault_gate.py|ci/tools/fault_only_tests.py|ci/tools/lint-fault-gate.py	none	python3 ci/tests/test_fault_gate.py
 ci/tools/check-hardening.sh|ci/tests/test_check_hardening.py	none	python3 ci/tests/test_check_hardening.py
+ci/tools/perf_matrix_stats.py|ci/tools/perf-matrix.sh|ci/tests/test_perf_matrix_stats.py	none	python3 ci/tests/test_perf_matrix_stats.py
