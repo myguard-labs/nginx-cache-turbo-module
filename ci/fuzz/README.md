@@ -197,7 +197,10 @@ complete replies keeps its value; entries named `NN_stream_*` carry a prefix.
   ASan-poisons `recv[]` past `recv_len`, so a read beyond the received bytes is a
   use-after-poison report. Each runs whole-buffer and segmented; the preamble
   verdict must not depend on segmentation, and the lock verdict is compared only
-  when `R` is exactly one framed reply.
+  when `R` is exactly one framed reply. Control flag bits for these two blocks:
+  bit 0 = two preamble replies, bit 1 = unconnected op, bit 2 = late-EOF peer
+  schedule for the split run (the first `recv()` after the last byte returns
+  `NGX_AGAIN`, EOF only on a later wake; default is EOF in the same wake).
 
 `extract_redis_readers.sh` (called by `extract_parser.sh`) fails closed when
 either reader is renamed or reshaped, or when the `recv[]` size drifts from the

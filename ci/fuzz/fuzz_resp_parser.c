@@ -584,9 +584,13 @@ static u_char  resp_reader_bufs[2];    /* stand-ins for preamble / command */
  * NULL. The event loop is modelled as: invoke the handler, and when it returns
  * without a verdict (its recv() said NGX_AGAIN), open the next segment and
  * invoke it again. After the last byte recv() reports EOF, which both readers
- * treat as a failure. The reply scratch recv[] lives in a heap op and every
- * byte at or past recv_len is ASan-poisoned (ngx_fuzz_wire_recv), so a reader
- * that scans past what it received is reported.
+ * treat as a failure: in the same wake (eof_late 0) or, with eof_late 1, after
+ * one extra wake whose recv() says NGX_AGAIN first (see ngx_fuzz_wire_t). The
+ * reply scratch recv[] lives in a heap op and every byte at or past recv_len
+ * is ASan-poisoned (ngx_fuzz_wire_recv), so a reader that scans past what it
+ * received is reported. The "EOF reached, still no verdict" trap fires when a
+ * wake saw EOF (late schedule) or consumed the last byte (early schedule)
+ * without deciding.
  *
  * Asserted per drive, all straight from the reader contracts: exactly one
  * terminal outcome; a completed preamble has switched to the real command
@@ -598,7 +602,7 @@ static u_char  resp_reader_bufs[2];    /* stand-ins for preamble / command */
 static void
 drive_reader(unsigned lock, const u_char *r, size_t len,
     const ngx_fuzz_stream_t *s, ngx_uint_t nreplies, unsigned unconnected,
-    resp_reader_out_t *out)
+    unsigned eof_late, resp_reader_out_t *out)
 {
     ngx_http_cache_turbo_loc_conf_t   clcf = { 1024 * 1024 };
     ngx_http_cache_turbo_redis_op_t  *op;
@@ -629,6 +633,10 @@ drive_reader(unsigned lock, const u_char *r, size_t len,
     w.len = len;
     w.pos = 0;
     w.chunk_end = 0;
+    w.eof_late = eof_late;
+    w.wake = 0;
+    w.again_wake = 0;
+    w.eof_hit = 0;
     rev.data = &c;
     c.data = op;
     c.recv = ngx_fuzz_wire_recv;
@@ -638,9 +646,10 @@ drive_reader(unsigned lock, const u_char *r, size_t len,
     memset(&ngx_fuzz_rec, 0, sizeof(ngx_fuzz_rec));
 
     for (step = 0; ; step++) {
-        if (step > len + 1) {
+        if (step > len + 1 + eof_late) {
             __builtin_trap();              /* reader stopped making progress */
         }
+        w.wake = step;
         w.chunk_end = s != NULL && w.pos < len
                       ? ngx_fuzz_stream_end(s, step, w.pos) : len;
 
@@ -655,7 +664,7 @@ drive_reader(unsigned lock, const u_char *r, size_t len,
         if (done) {
             break;
         }
-        if (w.pos >= len) {
+        if (w.eof_hit || (!eof_late && w.pos >= len)) {
             __builtin_trap();              /* EOF reached, still no verdict */
         }
     }
@@ -716,15 +725,20 @@ check_readers_whole(const u_char *buf, size_t size)
 {
     resp_reader_out_t  out;
 
-    drive_reader(0, buf, size, NULL, 1, 1, &out);
-    drive_reader(0, buf, size, NULL, 2, 0, &out);
-    drive_reader(1, buf, size, NULL, 0, 1, &out);
+    drive_reader(0, buf, size, NULL, 1, 1, 0, &out);
+    drive_reader(0, buf, size, NULL, 2, 0, 0, &out);
+    drive_reader(1, buf, size, NULL, 0, 1, 0, &out);
 }
 
 
 /* Blocks 6s-7s: the readers under the fuzzer's segmentation. Control flags
  * (fuzz_stream.h bits 4-7): bit 0 = two preamble replies instead of one,
- * bit 1 = op unconnected (exercises the S231 backoff clear).
+ * bit 1 = op unconnected (exercises the S231 backoff clear), bit 2 = late-EOF
+ * peer schedule for the split run (NGX_AGAIN after the last segment, EOF only
+ * on a later wake); bit 3 is unused. The prefix and whole references always
+ * use the early-EOF schedule: they are the schedule-independent baseline that
+ * oracles (a)-(c) were written against, and (a)-(c) held unchanged for the
+ * late split run under replay of the whole corpus.
  *
  * Differential oracle, again only what holds:
  *
@@ -738,28 +752,34 @@ check_readers_whole(const u_char *buf, size_t size)
  *   (c) the lock verdict is segmentation-independent only when the whole
  *       reply is exactly one framed reply that fits recv[]: with trailing
  *       bytes, a cut right after the first reply legitimately decides before
- *       the trailer arrives (read_lock frames per recv()). */
+ *       the trailer arrives (read_lock frames per recv()).
+ *
+ * No separate early-vs-late oracle: the prefix and whole references always
+ * run the early-EOF schedule, so (a)-(c) already compare the late split run
+ * against it, and a standing both-schedules run on every input would make
+ * bit 2 redundant. */
 static void
 check_stream_readers(const ngx_fuzz_stream_t *s)
 {
     resp_reader_out_t  split, prefix, whole;
     ngx_uint_t         nreplies;
-    unsigned           lock, unconnected;
+    unsigned           lock, unconnected, eof_late;
 
     nreplies = (s->flags & 1) ? 2 : 1;
     unconnected = (s->flags >> 1) & 1;
+    eof_late = (s->flags >> 2) & 1;
 
     for (lock = 0; lock < 2; lock++) {
-        drive_reader(lock, s->reply, s->len, s, nreplies, unconnected, &split);
+        drive_reader(lock, s->reply, s->len, s, nreplies, unconnected,
+                     eof_late, &split);
         if (split.verdict == RESP_FUZZ_OOM) {
             return;                        /* delivered/clean are unwritten */
         }
         drive_reader(lock, s->reply, split.delivered, NULL, nreplies,
-                     unconnected, &prefix);
-        drive_reader(lock, s->reply, s->len, NULL, nreplies, unconnected,
+                     unconnected, 0, &prefix);
+        drive_reader(lock, s->reply, s->len, NULL, nreplies, unconnected, 0,
                      &whole);
-        if (split.verdict == RESP_FUZZ_OOM || prefix.verdict == RESP_FUZZ_OOM
-            || whole.verdict == RESP_FUZZ_OOM)
+        if (prefix.verdict == RESP_FUZZ_OOM || whole.verdict == RESP_FUZZ_OOM)
         {
             return;
         }
