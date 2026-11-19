@@ -43,6 +43,9 @@ Every case is judged on the same six properties (PROPS):
               line exceeds 2 KiB or echoes the hostile payload marker, and no
               crit/alert/emerg line appears.
 
+A case whose armed command never reaches the peer did not exercise its fault:
+it fails H-fired (outside PROPS), which no KNOWN_RED row can waive.
+
 Known defects are recorded in KNOWN_RED with the properties they fail; such a
 case does not fail the run.  A known-red case that passes (XPASS), or fails a
 property outside its declared set, fails the run.  HARD-L3 fixes a defect and
@@ -52,8 +55,11 @@ memory/labs/nginx-cache-turbo-module/hard-l2-evidence-20261118.md.
 CTRL-PLANTED-FRESH is the oracle's negative control: it serves a body that
 nginx itself stored for the same key (harvested from a second zone) as a
 perfectly valid GET reply, so the module rightly serves it as an L2 hit; P1
-MUST report it.  If it does not, the body-hash oracle cannot tell planted from
-origin bodies and the whole matrix fails.  CTRL-MC-PLANTED-FRESH does the same
+MUST report it.  The control counts only if nginx really served the planted
+body (HTTP 200, the exact harvested body, an L2 hit counted) and nothing but
+P1/P2 failed; a 500, or a hit that also trips an unrelated property, is
+control-broken.  If P1 does not fire, the body-hash oracle cannot tell planted
+from origin bodies and the whole matrix fails.  CTRL-MC-PLANTED-FRESH does the same
 over memcached (a well-formed VALUE reply), which also proves the harvested
 blob is a valid memcached value, so a memcached case that differs from it in
 one header field (key, flags, bytes) tests exactly that field.
@@ -66,6 +72,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import http.client
 import http.server
 import json
 import os
@@ -141,6 +148,11 @@ class Case:
     # "any" (the faulted page itself was valid; either answer is honest).
     admin: str = "ok"
     note: str = ""
+    # Clean-framing cases whose reply nginx must ACCEPT (not reject): the
+    # faulted connection must carry a later command (the same request's L2
+    # store on the pooled connection).  A parser that rejects the reply closes
+    # the connection, so the store goes out on another one.
+    expect_reuse: bool = False
 
 
 @dataclass
@@ -150,6 +162,7 @@ class Result:
     latency: float = 0.0
     close_after: float | None = None
     verdict: str = ""
+    planted_served: bool | None = None
     log: list[str] = field(default_factory=list)
     wire: list[str] = field(default_factory=list)
 
@@ -342,7 +355,8 @@ def _mc_get_cases() -> list[Case]:
              needs_planted=True,
              note="a valid hit followed by an unsolicited END"),
         Case("MCGET-CRLF-SPLIT", f, _s(b"END\r\n", chunk=4, delay=0.05),
-             expect_close=False, note="valid miss, LF in a second read"),
+             expect_close=False, expect_reuse=True,
+             note="valid miss, LF in a second read; must be accepted"),
         Case("MCGET-DRIP", f, lambda p: hp.Step(
             reply=b"VALUE %s 0 40\r\n" % p.key, chunk=1, delay=DRIP_S)),
         Case("MCGET-CLOSE-MID", f, lambda p: hp.Step(
@@ -471,13 +485,23 @@ KNOWN_RED: dict[str, frozenset[str]] = {
 CONTROL_IDS = frozenset({"CTRL-PLANTED-FRESH", "CTRL-MC-PLANTED-FRESH"})
 
 
+HARNESS_PROP = "H-fired"   # the armed command never arrived: not waivable
+CONTROL_EXPECTED = frozenset({"P1-origin", "P2-no-l1"})
+
+
 def classify(case_id: str, failed: set[str] | frozenset[str],
-             known: dict[str, frozenset[str]] | None = None) -> str:
+             known: dict[str, frozenset[str]] | None = None,
+             planted_served: bool | None = None) -> str:
     """green | known-red | control-ok are acceptable; red | xpass |
-    known-red-drift | control-broken fail the matrix."""
+    known-red-drift | control-broken | harness-fail fail the matrix.
+    `planted_served` (controls only) says nginx served the planted body."""
     known = KNOWN_RED if known is None else known
+    if HARNESS_PROP in failed:
+        return "harness-fail"
     if case_id in CONTROL_IDS:
-        return "control-ok" if "P1-origin" in failed else "control-broken"
+        ok = ("P1-origin" in failed and planted_served is True
+              and set(failed) <= CONTROL_EXPECTED)
+        return "control-ok" if ok else "control-broken"
     if case_id in known:
         if not failed:
             return "xpass"
@@ -607,13 +631,20 @@ def _benign(cmd: hp.Command) -> hp.Step:
     return hp.Step(reply=b":1\r\n")
 
 
+@dataclass(frozen=True)
+class _Fire:
+    """The armed command and the moment it arrived, published as ONE record
+    so a reader never sees the command with a zero timestamp."""
+    cmd: hp.Command
+    at: float
+
+
 @dataclass
 class _Armed:
     family: str
     key: str
     step: hp.Step
-    fired: hp.Command | None = None
-    fired_at: float = 0.0
+    fire: _Fire | None = None
 
 
 class _Rig:
@@ -649,12 +680,19 @@ class _Rig:
         self.restarts = 0
 
     def start(self) -> None:
-        self.redis.start()
-        self.mc.start()
-        self.harvest.start()
-        self.node.write_config()
-        self.node.config_test()
-        self.node.start()
+        try:
+            self.redis.start()
+            self.mc.start()
+            self.harvest.start()
+            self.node.write_config()
+            self.node.config_test()
+            self.node.start()
+        except BaseException:
+            # Partial startup (a busy port, a config error): release what
+            # already listens and re-raise the ORIGINAL error.
+            with contextlib.suppress(Exception):
+                self.stop()
+            raise
 
     def stop(self) -> None:
         try:
@@ -664,6 +702,10 @@ class _Rig:
             self.mc.stop()
             self.harvest.stop()
             self.origin.stop()
+
+    def worker_pids(self) -> frozenset[int]:
+        p = self.node.process
+        return descendants(p.pid) if p is not None else frozenset()
 
     def alive(self) -> bool:
         p = self.node.process
@@ -680,9 +722,8 @@ class _Rig:
                  benign: Callable[[hp.Command], hp.Step]) -> hp.Step:
         with self.lock:
             a = self.armed
-            if a is not None and a.fired is None and _targets(a, cmd):
-                a.fired = cmd
-                a.fired_at = time.monotonic()
+            if a is not None and a.fire is None and _targets(a, cmd):
+                a.fire = _Fire(cmd, time.monotonic())
                 return a.step
         return benign(cmd)
 
@@ -792,8 +833,77 @@ def _own_flow(case: Case, key: str, cmd: hp.Command) -> bool:
 def _admin_request(rig: _Rig, case: Case, key: str,
                    bound: float) -> tuple[int, str, dict]:
     q = {"del": f"key={key}", "scan": "all=1", "sscan": f"tag={key}"}
-    return fetch(rig.node.port, f"/_hla?{q[case.family]}", method="POST",
-                 timeout=bound + 5.0)
+    return safe_fetch(rig.node.port, f"/_hla?{q[case.family]}",
+                      method="POST", timeout=bound + 5.0)
+
+
+def descendants(pid: int) -> frozenset[int]:
+    """Every live descendant of `pid` (the master's workers, also behind a
+    wrapper), from /proc ppid links."""
+    parent: dict[int, int] = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat", encoding="ascii",
+                      errors="replace") as fh:
+                # "pid (comm) state ppid ...": comm may hold spaces/parens.
+                parent[int(d)] = int(fh.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    found: set[int] = set()
+    todo = [pid]
+    while todo:
+        cur = todo.pop()
+        for child, ppid in parent.items():
+            if ppid == cur and child not in found:
+                found.add(child)
+                todo.append(child)
+    return frozenset(found)
+
+
+def worker_loss(before: frozenset[int], after: frozenset[int]) -> frozenset[int]:
+    """Processes of the node that were there at the start of the case and are
+    gone now (a worker that exited -- signal or not -- and was respawned)."""
+    return before - after
+
+
+def safe_fetch(port: int, path: str, **kw) -> tuple[int, str, dict]:
+    """fetch() that reports a dropped connection as status 0 so the case is
+    judged (P1/P2/P4 fail on it) instead of aborting the matrix."""
+    try:
+        return fetch(port, path, **kw)
+    except (OSError, http.client.HTTPException) as exc:
+        return 0, f"<transport error {type(exc).__name__}: {exc}>", {}
+
+
+def control_served(status: int, body: str, planted_body: str | None,
+                   hits_delta: int) -> bool:
+    """A control only counts when nginx served the exact harvested body as an
+    L2 hit."""
+    return (status == 200 and planted_body is not None
+            and body == planted_body and hits_delta >= 1)
+
+
+def probe_wire_problem(cmds: list[hp.Command], probe_wire: bytes,
+                       fault_conn: int | None,
+                       expect_close: bool) -> str | None:
+    """The fresh-key probe must have looked its key up in L2 (a wire record);
+    when the faulted connection was to be closed, on ANOTHER connection."""
+    looks = [c for c in cmds if len(c.args) >= 2
+             and c.args[0].upper() == b"GET" and c.args[1] == probe_wire]
+    if not looks:
+        return "probe never looked its key up in L2 (no wire record)"
+    if expect_close and fault_conn is not None and all(
+            c.conn == fault_conn for c in looks):
+        return f"probe lookup rode the faulted conn {fault_conn}"
+    return None
+
+
+def validate_only(only: set[str] | None, ids: list[str]) -> None:
+    unknown = sorted((only or set()) - set(ids))
+    if unknown:
+        raise ValueError(f"HOSTILE_L2_ONLY: unknown case id(s) {unknown}")
 
 
 def _run_case(rig: _Rig, case: Case, planted: Planted | None,
@@ -817,6 +927,7 @@ def _run_case(rig: _Rig, case: Case, planted: Planted | None,
     hits0 = _admin_stat(rig.node, "l2_hits", "/_hl")
     log0 = _errlog_window_start(rig.node)
     san0 = _sanitizer_count(rig)
+    workers0 = rig.worker_pids()
     n_before = peer.accepted
     assert planted is not None or not case.needs_planted
     step = case.step(dataclasses.replace(
@@ -836,7 +947,7 @@ def _run_case(rig: _Rig, case: Case, planted: Planted | None,
             fail["P1-origin"] = (f"admin reply status={st} want="
                                  f"{case.admin} body={body[:120]!r}")
     else:
-        st, body, hdrs = fetch(rig.node.port, path, timeout=bound + 5.0)
+        st, body, hdrs = safe_fetch(rig.node.port, path, timeout=bound + 5.0)
         res.latency = time.monotonic() - t0
         # P1: the origin body, byte for byte, and no cache serve.
         bodies = rig.origin.bodies(path)
@@ -846,25 +957,27 @@ def _run_case(rig: _Rig, case: Case, planted: Planted | None,
                                  f"origin_bodies={len(bodies)}")
     # The L2 store (SET) is issued after the response: wait for the fault.
     deadline = time.monotonic() + bound
-    while armed.fired is None and time.monotonic() < deadline:
+    while armed.fire is None and time.monotonic() < deadline:
         time.sleep(0.01)
-    if armed.fired is None:
-        fail["P4-closed"] = "armed command never sent (wire sequence changed)"
+    fire = armed.fire          # one record: command and timestamp together
+    if fire is None:
+        # The fault never ran: a harness failure no KNOWN_RED row can waive.
+        fail[HARNESS_PROP] = "armed command never sent (wire sequence changed)"
 
     # P4/P5: the faulted connection is closed within the bound.
-    if armed.fired is not None:
-        conn = armed.fired.conn
+    if fire is not None:
+        conn = fire.cmd.conn
 
         def closed() -> bool:
             return peer.connections[conn].closed is not None
 
         if case.expect_close:
-            deadline = armed.fired_at + bound
+            deadline = fire.at + bound
             while not closed() and time.monotonic() < deadline:
                 time.sleep(0.02)
         rec = peer.connections[conn]
         if rec.closed is not None:
-            res.close_after = max(0.0, rec.closed - armed.fired_at)
+            res.close_after = max(0.0, rec.closed - fire.at)
         if case.expect_close and rec.closed is None:
             fail["P4-closed"] = (f"faulted conn {conn} still open "
                                  f"{bound:.2f}s after the fault")
@@ -873,7 +986,7 @@ def _run_case(rig: _Rig, case: Case, planted: Planted | None,
     # purged key's next request is a fresh origin fetch (SSCAN: an origin
     # body; which entries a hostile page purges is the peer's choice).
     n_bodies = len(rig.origin.bodies(path))
-    st2, body2, hdrs2 = fetch(rig.node.port, path, timeout=bound + 5.0)
+    st2, body2, hdrs2 = safe_fetch(rig.node.port, path, timeout=bound + 5.0)
     bodies = rig.origin.bodies(path)
     if admin:
         fresh = (len(bodies) > n_bodies and body2 == bodies[-1]
@@ -891,23 +1004,36 @@ def _run_case(rig: _Rig, case: Case, planted: Planted | None,
 
     # P4 desync half: a fresh-key probe gets its own origin body, on a
     # connection other than the faulted one.
-    stp, bodyp, hdrsp = fetch(rig.node.port, probe_path, timeout=bound + 5.0)
+    stp, bodyp, hdrsp = safe_fetch(rig.node.port, probe_path,
+                                   timeout=bound + 5.0)
     pb = rig.origin.bodies(probe_path)
     if stp != 200 or not pb or bodyp != pb[-1] or "x-cache" in hdrsp:
         fail["P4-closed"] = (f"probe desync: status={stp} "
                              f"x-cache={hdrsp.get('x-cache')} "
                              f"body={bodyp[:80]!r}")
-    if armed.fired is not None:
-        cmds = peer.connections[armed.fired.conn].commands
-        idx = next(i for i, c in enumerate(cmds) if c is armed.fired)
+    problem = probe_wire_problem(peer.commands(), _wire(probe_key),
+                                 fire.cmd.conn if fire else None,
+                                 case.expect_close)
+    if problem and "P4-closed" not in fail:
+        fail["P4-closed"] = problem
+    if fire is not None:
+        cmds = peer.connections[fire.cmd.conn].commands
+        idx = next(i for i, c in enumerate(cmds) if c is fire.cmd)
         later = [c for c in cmds[idx + 1:] if not _own_flow(case, key, c)]
         if case.expect_close and later:
-            fail["P4-closed"] = (f"conn {armed.fired.conn} reused after the "
+            fail["P4-closed"] = (f"conn {fire.cmd.conn} reused after the "
                                  f"fault: {[c.line[:40] for c in later]}")
+        if case.expect_reuse and not cmds[idx + 1:]:
+            fail["P4-closed"] = (f"conn {fire.cmd.conn}: reply was not "
+                                 "accepted (no later command on it)")
 
     hits1 = _admin_stat(rig.node, "l2_hits", "/_hl")
     if hits1 != hits0:
         fail.setdefault("P2-no-l1", f"l2_hits moved {hits0}->{hits1}")
+    if case.id in CONTROL_IDS:
+        harvest = rig.origin.bodies(f"/h/harvest?k={key}")
+        res.planted_served = control_served(
+            st, body, harvest[-1] if harvest else None, hits1 - hits0)
 
     # P5: latency bounded by the configured timeout.
     worst = max(res.latency, res.close_after or 0.0)
@@ -920,6 +1046,11 @@ def _run_case(rig: _Rig, case: Case, planted: Planted | None,
         fail["P3-sanitizer"] = "new sanitizer report"
     if not rig.alive():
         fail["P3-sanitizer"] = "nginx died"
+    else:
+        lost = worker_loss(workers0, rig.worker_pids())
+        if lost:
+            fail["P3-sanitizer"] = (f"worker process(es) {sorted(lost)} "
+                                    "exited during the case")
 
     # P6: error-log rate and shape.
     lines = _log_from(rig, log0)
@@ -945,8 +1076,9 @@ def _run_case(rig: _Rig, case: Case, planted: Planted | None,
 
 
 def run_matrix(ng: Nginx, only: set[str] | None = None) -> list[Result]:
+    validate_only(only, [c.id for c in build_cases()])
     rig = _Rig(ng)
-    rig.start()
+    rig.start()          # cleans up after itself when startup fails midway
     results: list[Result] = []
     try:
         for case in build_cases():
@@ -959,7 +1091,8 @@ def run_matrix(ng: Nginx, only: set[str] | None = None) -> list[Result]:
                                   other=rig.harvest_blob(tag + "-other"),
                                   probe=rig.harvest_blob(tag + "-probe"))
             res = _run_case(rig, case, planted, tag)
-            res.verdict = classify(case.id, set(res.failed))
+            res.verdict = classify(case.id, set(res.failed),
+                                   planted_served=res.planted_served)
             results.append(res)
             print(f"  hostile-l2 {res.verdict:<15} {case.id:<24} "
                   f"lat={res.latency:.3f}s close={res.close_after} "
@@ -994,6 +1127,7 @@ def test_hostile_l2_matrix(ng: Nginx) -> None:
             json.dump({"summary": summary, "cases": [
                 {"id": r.id, "verdict": r.verdict, "latency": r.latency,
                  "close_after": r.close_after, "failed": r.failed,
+                 "planted_served": r.planted_served,
                  "log": r.log, "wire": r.wire}
                 for r in results]}, fh, indent=1, sort_keys=True)
     if only is None:
