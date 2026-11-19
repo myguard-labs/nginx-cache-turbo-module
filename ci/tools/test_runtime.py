@@ -31,6 +31,7 @@ from areas.hostile_http import *
 from areas.hostile_http2 import *
 from areas.hostile_l2 import *
 from areas.hostile_l2_tls import *
+from areas.hostile_origin import *
 from areas.http import *
 from areas.l2 import *
 from areas.policy import *
@@ -409,6 +410,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_hostile_http_matrix(ng)                            # HARD-R1
     test_hostile_http2_matrix(ng)                           # HARD-R2
     test_hostile_bounds_matrix(ng)                          # HARD-R4
+    if redis is not None:
+        test_hostile_origin_replay_matrix(ng, redis)        # HARD-O1
     test_keep_stale_no_reaper_lru_only_reclaim(ng, origin)  # S2.3 no-reaper contract
     test_5xx_never_overwrites_cached_body(ng, origin)       # O6/S3.1 5xx-never-clobbers
     test_5xx_cta_bypass_never_overwrites_cached_body(ng, origin)  # AUD-5XX-CTA
