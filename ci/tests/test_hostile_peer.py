@@ -90,9 +90,22 @@ def test_chunking_with_per_chunk_delay() -> None:
 class _RecSock:
     def __init__(self) -> None:
         self.sent: list[bytes] = []
+        self.at: list[float] = []
 
     def sendall(self, b: bytes) -> None:
         self.sent.append(bytes(b))
+        self.at.append(time.monotonic())
+
+
+def recv_n(s: socket.socket, n: int) -> bytes:
+    """Read exactly n bytes of the stream (a recv may return part of a reply
+    or several replies at once)."""
+    buf = b""
+    while len(buf) < n:
+        d = s.recv(n - len(buf))
+        assert d, f"EOF after {len(buf)} of {n} bytes"
+        buf += d
+    return buf
 
 
 def test_send_chunk_boundaries() -> None:
@@ -110,11 +123,11 @@ def test_send_chunk_boundaries() -> None:
 def test_late_unsolicited_bytes_after_delay() -> None:
     rec = _RecSock()
     p = Peer([[]])
-    t0 = time.monotonic()
     assert p._send(rec, Step(reply=b"+OK\r\n", late=b"$-1\r\n",  # type: ignore[arg-type]
                              late_delay=0.15))
-    assert time.monotonic() - t0 >= 0.15
     assert rec.sent == [b"+OK\r\n", b"$-1\r\n"]   # reply first, late separately
+    # The delay sits BETWEEN the two writes (not before the first one).
+    assert rec.at[1] - rec.at[0] >= 0.15
     none = _RecSock()
     assert p._send(none, Step(reply=b"+OK\r\n"))     # type: ignore[arg-type]
     assert none.sent == [b"+OK\r\n"]                 # no late write by default
@@ -124,8 +137,21 @@ def test_late_unsolicited_bytes_after_delay() -> None:
             dial(q) as s:
         s.sendall(resp(b"SET", b"k", b"v"))
         s.settimeout(3)
-        assert s.recv(64) == b"+OK\r\n"
-        assert s.recv(64) == b":1\r\n"
+        # Stream read: a recv may return both replies, or part of the first.
+        assert recv_n(s, 9) == b"+OK\r\n:1\r\n"
+
+
+def test_late_gap_check_catches_a_delay_before_the_first_write() -> None:
+    """Negative control: the total-elapsed assertion the test used to make
+    passes for a sender that sleeps 150 ms and then writes both replies back
+    to back; the inter-write gap check does not."""
+    reg = _RecSock()
+    t0 = time.monotonic()
+    time.sleep(0.15)                      # regressed: delay before reply 1
+    reg.sendall(b"+OK\r\n")
+    reg.sendall(b"$-1\r\n")
+    assert time.monotonic() - t0 >= 0.15           # old oracle: passes
+    assert reg.at[1] - reg.at[0] < 0.15            # new oracle: fails it
 
 
 def test_negative_data_length_rejected() -> None:
