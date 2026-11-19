@@ -52,6 +52,8 @@ ci/tools/areas/hostile_http2.py	build	@area hostile_http2
 ci/tools/areas/hostile_http2.py|ci/tests/test_hostile_http2.py	none	python3 -m pytest -q ci/tests/test_hostile_http2.py
 ci/tools/areas/hostile_bounds.py	build	@area hostile_bounds
 ci/tools/areas/hostile_bounds.py|ci/tests/test_hostile_bounds.py	none	python3 -m pytest -q ci/tests/test_hostile_bounds.py
+ci/tools/areas/hostile_origin.py	build	@area hostile_origin
+ci/tools/areas/hostile_origin.py|ci/tests/test_hostile_origin.py	none	python3 -m pytest -q ci/tests/test_hostile_origin.py
 ci/tools/areas/l2.py	build	@area l2
 ci/tools/areas/policy.py	build	@area policy
 ci/tools/areas/tune.py	build	@area tune
