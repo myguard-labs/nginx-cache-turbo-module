@@ -27,6 +27,16 @@ Which script a connection gets: ``scripts`` is a list of scripts (connection
 Alternatively ``responder(Command) -> Step | None`` answers every command
 (``None`` means the ``on_exhausted`` action); it is how a replay is built.
 
+TLS: ``tls=Tls(ctx=..., hello=...)`` wraps every accepted connection.  The
+first byte is peeked: a non-TLS client is recorded (``ConnRecord.plaintext``)
+and closed.  Otherwise ``hello`` says what happens to the ClientHello: serve a
+real handshake and then the script (commands arrive decrypted), or stall,
+answer in plaintext, answer with a fatal alert, FIN or RST.  After a handshake
+a Step ends the connection with ``then=CLOSE`` (a bare FIN: no close_notify),
+``CLOSE_NOTIFY`` (an orderly close_notify) or ``RAW_ALERT`` (a plaintext fatal
+alert record in the encrypted stream; Python's ssl cannot forge an encrypted
+one).
+
 Where it listens: ``port=0`` (default) takes an ephemeral port; a caller in a
 CI port band passes its own.  ``unix_path`` listens on a unix socket instead.
 """
@@ -36,6 +46,7 @@ from __future__ import annotations
 import contextlib
 import os
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -46,8 +57,25 @@ NONE = "none"          # keep the connection open for the next command
 CLOSE = "close"        # orderly close (FIN) after the reply
 RST = "rst"            # abortive close (RST) after the reply
 HALF_CLOSE = "half_close"  # shutdown(SHUT_WR) after the reply, keep reading
+CLOSE_NOTIFY = "close_notify"  # TLS: orderly close_notify alert, then FIN
+RAW_ALERT = "raw_alert"    # TLS: plaintext fatal alert record, then FIN
 
-_THENS = (NONE, CLOSE, RST, HALF_CLOSE)
+# CLOSE on a TLS connection is a TCP FIN with NO close_notify (a truncation);
+# RST likewise.  A plaintext fatal handshake_failure alert record (level 2,
+# description 40): what a TLS server answers a ClientHello it rejects, and, sent
+# on an established connection, a record the peer cannot decrypt.
+ALERT_HANDSHAKE_FAILURE = b"\x15\x03\x03\x00\x02\x02\x28"
+
+_THENS = (NONE, CLOSE, RST, HALF_CLOSE, CLOSE_NOTIFY, RAW_ALERT)
+
+# TLS ``hello`` modes: what the peer does with an incoming ClientHello.
+H_SERVE = "serve"          # complete a real handshake, then speak the script
+H_STALL = "stall"          # read the ClientHello, never answer, hold open
+H_PLAINTEXT = "plaintext"  # answer the ClientHello with ``hello_reply`` bytes
+H_ALERT = "alert"          # answer with a fatal handshake_failure alert
+H_CLOSE = "close"          # FIN with no reply
+H_RST = "rst"              # RST with no reply
+_HELLOS = (H_SERVE, H_STALL, H_PLAINTEXT, H_ALERT, H_CLOSE, H_RST)
 
 
 @dataclass(frozen=True)
@@ -67,6 +95,25 @@ class Step:
             raise ValueError(f"bad then={self.then!r}")
         if self.chunk < 0 or self.delay < 0 or self.late_delay < 0:
             raise ValueError("chunk, delay and late_delay must be >= 0")
+
+
+@dataclass(frozen=True)
+class Tls:
+    """Serve TLS: ``ctx`` is the server-side context (certificate) used when
+    ``hello == H_SERVE``; the other hello modes never complete a handshake.
+    Every accepted connection first has its first byte peeked: anything but a
+    TLS handshake record (0x16) is a plaintext client and is recorded in
+    ``ConnRecord.plaintext`` and closed, never served."""
+    ctx: ssl.SSLContext | None = None
+    hello: str = H_SERVE
+    hello_reply: bytes = b""
+    handshake_timeout: float = 5.0
+
+    def __post_init__(self) -> None:
+        if self.hello not in _HELLOS:
+            raise ValueError(f"bad hello={self.hello!r}")
+        if self.hello == H_SERVE and self.ctx is None:
+            raise ValueError("hello=serve needs an SSL context")
 
 
 @dataclass(frozen=True)
@@ -90,6 +137,10 @@ class ConnRecord:
     opened: float
     closed: float | None = None
     commands: list[Command] = field(default_factory=list)
+    handshaked: bool = False     # TLS peer: a handshake completed
+    plaintext: bytes = b""       # TLS peer: first bytes of a non-TLS client
+    tls_error: str = ""          # TLS peer: why the handshake failed
+    hello_seen: bool = False     # TLS peer: a ClientHello record arrived
 
 
 Script = Sequence[Step]
@@ -177,7 +228,7 @@ class Peer:
                  responder: Callable[[Command], Step | None] | None = None,
                  proto: str = "redis", host: str = "127.0.0.1", port: int = 0,
                  unix_path: str | None = None,
-                 on_exhausted: str = CLOSE) -> None:
+                 on_exhausted: str = CLOSE, tls: Tls | None = None) -> None:
         if proto not in ("redis", "memcached"):
             raise ValueError(f"bad proto {proto!r}")
         if on_exhausted not in (CLOSE, RST, NONE):
@@ -191,6 +242,7 @@ class Peer:
         self.port = port
         self.unix_path = unix_path
         self.on_exhausted = on_exhausted
+        self.tls = tls
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._records: list[ConnRecord] = []
@@ -257,7 +309,9 @@ class Peer:
     def connections(self) -> list[ConnRecord]:
         with self._lock:
             return [ConnRecord(r.index, r.peer, r.opened, r.closed,
-                               list(r.commands)) for r in self._records]
+                               list(r.commands), r.handshaked, r.plaintext,
+                               r.tls_error, r.hello_seen)
+                    for r in self._records]
 
     @property
     def accepted(self) -> int:
@@ -332,7 +386,69 @@ class Peer:
         assert s is not None
         return s[min(index, len(s) - 1)]
 
+    def _tls_accept(self, conn: socket.socket,
+                    rec: ConnRecord) -> socket.socket | None:
+        """TLS front door: classify the client, run the hello mode.  Returns
+        the wrapped connection to serve the script on, or None when the
+        connection is finished (or never became TLS)."""
+        tls = self.tls
+        assert tls is not None
+        conn.settimeout(tls.handshake_timeout)
+        first = conn.recv(1, socket.MSG_PEEK)
+        if not first:
+            return None
+        if first[0] != 0x16:
+            with self._cond:
+                rec.plaintext = conn.recv(4096)
+                self._cond.notify_all()
+            return None
+        with self._cond:
+            rec.hello_seen = True
+            self._cond.notify_all()
+        if tls.hello == H_STALL:
+            conn.recv(65536)
+            self._hold(conn)
+            return None
+        if tls.hello != H_SERVE:
+            conn.recv(65536)
+            if tls.hello == H_PLAINTEXT:
+                conn.sendall(tls.hello_reply)
+            elif tls.hello == H_ALERT:
+                conn.sendall(ALERT_HANDSHAKE_FAILURE)
+            self._finish(conn, RST if tls.hello == H_RST else CLOSE)
+            return None
+        assert tls.ctx is not None
+        wrapped = tls.ctx.wrap_socket(conn, server_side=True,
+                                      do_handshake_on_connect=False)
+        with self._cond:
+            self._socks.discard(conn)
+            self._socks.add(wrapped)
+        try:
+            wrapped.do_handshake()
+        except (ssl.SSLError, OSError) as exc:
+            with self._cond:
+                rec.tls_error = f"{type(exc).__name__}: {exc}"[:200]
+                self._socks.discard(wrapped)
+                self._cond.notify_all()
+            with contextlib.suppress(OSError):
+                wrapped.close()
+            return None
+        with self._cond:
+            rec.handshaked = True
+            self._cond.notify_all()
+        wrapped.settimeout(None)
+        return wrapped
+
     def _serve(self, conn: socket.socket, rec: ConnRecord) -> None:
+        if self.tls is not None:
+            try:
+                served = self._tls_accept(conn, rec)
+            except (OSError, ValueError):
+                served = None
+            if served is None:
+                self._end(conn, rec)
+                return
+            conn = served
         rd = _Reader(conn)
         read = _read_redis if self.proto == "redis" else _read_memcached
         script: Script | None = None
@@ -380,15 +496,18 @@ class Peer:
             with self._cond:
                 self._errors.append(exc)
         finally:
-            with self._cond:
-                if rec.closed is None:
-                    rec.closed = time.monotonic()
-                self._socks.discard(conn)
-                self._cond.notify_all()
-            try:
-                conn.close()
-            except OSError:
-                pass
+            self._end(conn, rec)
+
+    def _end(self, conn: socket.socket, rec: ConnRecord) -> None:
+        with self._cond:
+            if rec.closed is None:
+                rec.closed = time.monotonic()
+            self._socks.discard(conn)
+            self._cond.notify_all()
+        try:
+            conn.close()
+        except OSError:
+            pass
 
     def _send(self, conn: socket.socket, step: Step) -> bool:
         data = step.reply
@@ -429,6 +548,24 @@ class Peer:
                 pass
         elif how == CLOSE:
             try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        elif how == CLOSE_NOTIFY:
+            try:
+                if isinstance(conn, ssl.SSLSocket):
+                    conn.unwrap()           # sends close_notify
+            except (OSError, ValueError):
+                pass
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        elif how == RAW_ALERT:
+            try:
+                # The base-class send bypasses the TLS layer: the record goes
+                # out as plaintext bytes in the middle of the encrypted stream.
+                socket.socket.sendall(conn, ALERT_HANDSHAKE_FAILURE)
                 conn.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
