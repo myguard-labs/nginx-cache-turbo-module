@@ -70,6 +70,10 @@ Properties:
   B-linear     bytes on the MISS and on the HIT grow at most linearly.
   H-det        two HIT repeats at the same size count the same bytes.
   H-bytes      on a debug build every clean request produced malloc lines.
+  H-baseline   the plain-proxy / plain-return baselines answered 2xx (a 502
+               baseline is a broken rig, so its bytes are not subtracted).
+  H-settle     every measured request's pool was destroyed (connection and
+               request pool) before the settle deadline.
   P7-sanitizer no sanitizer report, no crit/alert/emerg log line, nginx and
                its worker alive.
 
@@ -126,7 +130,7 @@ URI_LINE = HDR_BUF - 2    # longest request line nginx accepts (see hostile_http
 URI_BASE = 64             # clean-baseline request line length
 
 PROPS = ("B-served", "B-cap", "B-linear", "P7-sanitizer")
-HARNESS_PROPS = ("H-det", "H-bytes")
+HARNESS_PROPS = ("H-det", "H-bytes", "H-baseline", "H-settle")
 
 # Per-location arg cap (None: directive absent -> compiled-in default).
 LOC_ARGS_DEFAULT = "ba"
@@ -375,6 +379,7 @@ class Req:
     mallocs: int = 0
     destroys: int = 0
     ms: float = 0.0
+    settled: bool = True           # False: pool destroys <2 at the deadline
 
 
 @dataclass
@@ -409,6 +414,17 @@ def judge(case: Case, base: Point, pts: Sequence[Point],
             fail.setdefault("B-served",
                             f"n={p.n} repeat status={p.hit.status} "
                             f"cache={p.hit.cache or '-'}")
+        if p.hit2.status != 200 or p.hit2.cache != "HIT":
+            fail.setdefault("B-served",
+                            f"n={p.n} second repeat status={p.hit2.status} "
+                            f"cache={p.hit2.cache or '-'}")
+        # A non-2xx plain baseline is a broken rig whether or not bytes are
+        # judged (a 502 from the plain proxy location).
+        for name, b in (("plain proxy", p.plain_proxy),
+                        ("plain return", p.plain_return)):
+            if not 200 <= b.status < 300:
+                fail["H-baseline"] = (f"n={p.n}: {name} baseline status="
+                                      f"{b.status}")
     if case.kind == "args":
         cap = case.expect_cap if case.expect_cap is not None else case.cap
         assert cap is not None
@@ -425,6 +441,13 @@ def judge(case: Case, base: Point, pts: Sequence[Point],
         [(p.n, p.stored) for p in pts], (base.n, base.stored))
     if not bytes_ok:
         j.bytes_note = f"byte verdict skipped: {reason}"
+        return j
+    for p in (base, *pts):
+        for name in ("miss", "hit", "hit2", "plain_proxy", "plain_return"):
+            if not getattr(p, name).settled:
+                fail["H-settle"] = (f"n={p.n}: {name} request pool not "
+                                    "destroyed before the settle deadline")
+    if "H-settle" in fail or "H-baseline" in fail:
         return j
     for p in (base, *pts):
         if p.miss.mallocs == 0 or p.hit.mallocs == 0:
@@ -609,7 +632,10 @@ def _request(rig: _Rig, raw: bytes, bytes_ok: bool, scale: float) -> Req:
         while True:
             lines = rig.log_from(off)
             r.destroys = pool_destroys(lines, r.conn)
-            if r.destroys >= 2 or time.monotonic() > deadline:
+            if r.destroys >= 2:
+                break
+            if time.monotonic() > deadline:
+                r.settled = False
                 break
             time.sleep(0.02)
         r.bytes, r.mallocs = alloc_bytes(lines, r.conn)

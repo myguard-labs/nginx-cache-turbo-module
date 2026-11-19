@@ -5,7 +5,9 @@ run by CTRL-BOUNDS-CAP-LOWERED (a lowered cap judged as the 10000 cap must
 fail B-cap)."""
 
 import sys
+import types
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -273,6 +275,104 @@ def test_judge_skips_bytes_but_keeps_the_cap_check() -> None:
     j = hb.judge(case, base, pts, False, "no debug log")
     assert set(j.failed) == {"B-cap"} and "no debug log" in j.bytes_note
     assert "hit" not in j.shapes
+
+
+def _flat(case_id: str = "COOKIE-ONE-LINE-4096"):
+    case = BY[case_id]
+    base, pts = series(case, lambda n: 0)
+    return case, base, pts
+
+
+@pytest.mark.parametrize("bytes_ok", [True, False])
+@pytest.mark.parametrize(("status", "cache"), [
+    (200, "MISS"), (200, ""), (502, "HIT"), (400, "")])
+def test_judge_second_repeat_must_be_a_served_hit(
+        bytes_ok: bool, status: int, cache: str) -> None:
+    case, base, pts = _flat()
+    pts[1].hit2 = req(cache, "", 1100, status=status)
+    # keep H-det quiet so the served check alone is observed
+    pts[1].hit.bytes = pts[1].hit2.bytes
+    j = hb.judge(case, base, pts, bytes_ok, "x")
+    assert "B-served" in j.failed and "second repeat" in j.failed["B-served"]
+    base.hit2 = req("MISS", "", 1100)
+    assert "B-served" in hb.judge(case, base, pts, bytes_ok, "x").failed
+
+
+@pytest.mark.parametrize("bytes_ok", [True, False])
+def test_judge_good_second_repeat_is_not_flagged(bytes_ok: bool) -> None:
+    case, base, pts = _flat()
+    assert hb.judge(case, base, pts, bytes_ok, "x").failed == {}
+
+
+@pytest.mark.parametrize("bytes_ok", [True, False])
+@pytest.mark.parametrize("which", ["plain_proxy", "plain_return"])
+@pytest.mark.parametrize("status", [0, 199, 300, 404, 502])
+def test_judge_non_2xx_baseline_is_a_harness_failure(
+        bytes_ok: bool, which: str, status: int) -> None:
+    case, base, pts = _flat()
+    setattr(pts[0], which, req("", "", 1000, status=status))
+    j = hb.judge(case, base, pts, bytes_ok, "x")
+    assert set(j.failed) == {"H-baseline"}, j.failed
+    assert hb.classify(case.id, set(j.failed)) == "harness-fail"
+
+
+@pytest.mark.parametrize("bytes_ok", [True, False])
+@pytest.mark.parametrize("status", [200, 204, 299])
+def test_judge_2xx_baseline_is_accepted(bytes_ok: bool, status: int) -> None:
+    case, base, pts = _flat()
+    base.plain_proxy = req("", "", 1000, status=status)
+    pts[2].plain_return = req("", "", 1000, status=status)
+    assert hb.judge(case, base, pts, bytes_ok, "x").failed == {}
+
+
+@pytest.mark.parametrize("which", ["miss", "hit", "hit2", "plain_proxy",
+                                   "plain_return"])
+def test_judge_unsettled_request_is_a_harness_failure(which: str) -> None:
+    case, base, pts = _flat()
+    getattr(pts[1], which).settled = False
+    j = hb.judge(case, base, pts, True)
+    assert set(j.failed) == {"H-settle"}, j.failed
+    assert "hit" not in j.shapes
+    assert hb.classify(case.id, set(j.failed)) == "harness-fail"
+
+
+def test_judge_settled_boundary_and_skip() -> None:
+    case, base, pts = _flat()
+    assert hb.Req().settled is True            # default: settled
+    assert hb.judge(case, base, pts, True).failed == {}
+    # bytes skipped: nothing was waited for, an unsettled flag is not judged
+    pts[0].miss.settled = False
+    assert hb.judge(case, base, pts, False, "x").failed == {}
+
+
+def test_request_settle_deadline_marks_unsettled(monkeypatch) -> None:
+    """_request: <2 pool destroys at the deadline -> settled False; 2 -> True."""
+
+    resp = types.SimpleNamespace(status=200, headers={"x-b-conn": "7"})
+
+    class FakeConn:
+        def __init__(self, port): pass
+        def send(self, raw): pass
+        def response(self, t): return resp
+        def quiet(self, t): pass
+        def close(self): pass
+
+    class FakeRig:
+        node = types.SimpleNamespace(port=1)
+        def __init__(self, n): self.n = n
+        def log_from(self, off):
+            return ["*7 malloc: 0A:10"] + ["*7 free: 0A, unused: 0"] * self.n
+
+    def rig(n: int) -> hb._Rig:
+        return cast(hb._Rig, FakeRig(n))
+
+    monkeypatch.setattr(hb.hh, "Conn", FakeConn)
+    monkeypatch.setattr(hb, "_errlog_window_start", lambda node: 0)
+    monkeypatch.setattr(hb, "DESTROY_WAIT_S", 0.0)
+    assert hb._request(rig(1), b"", True, 1.0).settled is False
+    assert hb._request(rig(2), b"", True, 1.0).settled is True
+    # bytes skipped: never waits, never unsettled
+    assert hb._request(rig(0), b"", False, 1.0).settled is True
 
 
 # --- classifier -------------------------------------------------------------
