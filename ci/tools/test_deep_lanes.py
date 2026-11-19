@@ -5,7 +5,9 @@
 
 Inventory hashes cover original commands, step environments, actions and inputs.
 Only lane wiring (paths, resolved matrix values and the registry-derived fuzz
-partition) and comments in the fuzz step normalize away. --baseline proves the manifest against a pre-regroup workflow.
+partition) and comments in the fuzz step normalize away. The manifest is checked
+against the current --workflow; after an intentional workflow edit, regenerate it
+from that same workflow with --write-inventory.
 The local runner models GitHub outcome guards; it does not run runtime checks.
 """
 
@@ -46,20 +48,19 @@ PARSER = argparse.ArgumentParser(description=__doc__)
 PARSER.add_argument(
     "--workflow", type=Path, default=ROOT / ".github/workflows/ci-deep.yml"
 )
-PARSER.add_argument("--baseline", type=Path)
 PARSER.add_argument("--write-inventory", type=Path)
 ARGS, REST = PARSER.parse_known_args()
 WORKFLOW = yaml.safe_load(ARGS.workflow.read_text(encoding="utf-8"))
 MANIFEST = ROOT / "ci/tools/deep-check-inventory.json"
 
 
-def protected(step, group, original_env=None):
+def protected(step, group):
     """Canonicalize only the documented lane-wiring substitutions."""
     data = {
         key: step[key] for key in ("run", "uses", "with", "env", "shell") if key in step
     }
     data = json.loads(json.dumps(data))
-    env = {**(original_env or {}), **data.get("env", {})}
+    env = dict(data.get("env", {}))
     for key in ("TEST_BASE_PORT", "BUILD_ROOT", "FUZZ_JOBS"):
         env.pop(key, None)
     if env:
@@ -107,39 +108,22 @@ def protected(step, group, original_env=None):
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
-def inventory(document, original=False):
+def inventory(document):
     records = {}
     for lane, groups in LANES.items():
         for group in groups:
-            if original:
-                source = (
-                    "build-flavors"
-                    if group.startswith("compat-")
-                    else "fuzz"
-                    if group.startswith("fuzz-")
-                    else group
+            steps = [
+                s
+                for s in document["jobs"][lane]["steps"]
+                if s["name"].startswith(group + " / ")
+                and not s["name"].endswith(
+                    ("Isolate build outputs", "Reset previous check environment")
                 )
-                job = document["jobs"][source]
-                steps = [
-                    s
-                    for s in job["steps"]
-                    if s["name"] not in ("Checkout module", "Notify Discord on failure")
-                ]
-                env = job.get("env", {})
-            else:
-                steps = [
-                    s
-                    for s in document["jobs"][lane]["steps"]
-                    if s["name"].startswith(group + " / ")
-                    and not s["name"].endswith(
-                        ("Isolate build outputs", "Reset previous check environment")
-                    )
-                ]
-                env = None
+            ]
             records[group] = [
                 {
                     "name": s["name"].split(" / ", 1)[-1],
-                    "sha256": protected(s, group, env),
+                    "sha256": protected(s, group),
                 }
                 for s in steps
             ]
@@ -281,13 +265,6 @@ class DeepLanes(unittest.TestCase):
     def test_original_inventory(self):
         expected = json.loads(MANIFEST.read_text(encoding="utf-8"))
         self.assertEqual(inventory(WORKFLOW), expected)
-        if ARGS.baseline:
-            self.assertEqual(
-                inventory(
-                    yaml.safe_load(ARGS.baseline.read_text(encoding="utf-8")), True
-                ),
-                expected,
-            )
 
     def test_soak_uses_full_allocation_sweep(self):
         step = next(
@@ -352,7 +329,10 @@ class DeepLanes(unittest.TestCase):
         def specs(part):
             return subprocess.run(
                 ["bash", str(ROOT / "ci/fuzz/targets.sh"), "specs", part],
-                check=True, capture_output=True, text=True, env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
             ).stdout.split()
 
         registry = specs("all")
@@ -371,7 +351,9 @@ class DeepLanes(unittest.TestCase):
                 {"a": registry[:half], "b": registry[half:]}[part], specs(part)
             )
             self.assertEqual(step["env"]["FUZZ_JOBS"], "3")
-            self.assert_fuzz_timeout(job, len(specs(part)), int(step["env"]["FUZZ_JOBS"]))
+            self.assert_fuzz_timeout(
+                job, len(specs(part)), int(step["env"]["FUZZ_JOBS"])
+            )
 
     def assert_fuzz_timeout(self, job, targets, jobs):
         """Each lane fits ceil(targets/jobs) sequential waves of the full per-target
@@ -388,7 +370,8 @@ class DeepLanes(unittest.TestCase):
         for seconds in (3600, 3601, 14400):
             limit = long_limit if seconds > threshold else short_limit
             self.assertGreaterEqual(
-                limit, waves * seconds / 60 + overhead,
+                limit,
+                waves * seconds / 60 + overhead,
                 f"{waves} wave(s) of {seconds}s do not fit {limit}m",
             )
         # An unset input (schedule) resolves to the short limit and 3600s.
@@ -407,7 +390,10 @@ class DeepLanes(unittest.TestCase):
             )
             expected = subprocess.run(
                 ["bash", str(fuzz / "targets.sh"), "specs", part],
-                check=True, capture_output=True, text=True, env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
             ).stdout.split()
             with self.subTest(lane=lane), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
@@ -421,8 +407,11 @@ class DeepLanes(unittest.TestCase):
                 )
                 result = subprocess.run(
                     ["bash", "-e", "-c", step["run"]],
-                    cwd=work, env={**env, "RECORD": str(record)},
-                    text=True, capture_output=True, check=False,
+                    cwd=work,
+                    env={**env, "RECORD": str(record)},
+                    text=True,
+                    capture_output=True,
+                    check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(record.read_text(encoding="utf-8").split(), expected)
@@ -432,9 +421,14 @@ class DeepLanes(unittest.TestCase):
                 result = subprocess.run(
                     ["bash", "-e", "-c", step["run"]],
                     cwd=work,
-                    env={**env, "RECORD": str(record),
-                         "FUZZ_TARGETS_TSV": str(work / "missing.tsv")},
-                    text=True, capture_output=True, check=False,
+                    env={
+                        **env,
+                        "RECORD": str(record),
+                        "FUZZ_TARGETS_TSV": str(work / "missing.tsv"),
+                    },
+                    text=True,
+                    capture_output=True,
+                    check=False,
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(record.exists(), "runner ran with no target list")
@@ -442,7 +436,11 @@ class DeepLanes(unittest.TestCase):
     def test_fuzz_manifest_digests_match(self):
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
         digest = {
-            g: next(r["sha256"] for r in manifest[g] if r["name"] == "Fuzz targets concurrently")
+            g: next(
+                r["sha256"]
+                for r in manifest[g]
+                if r["name"] == "Fuzz targets concurrently"
+            )
             for g in ("fuzz-a", "fuzz-b")
         }
         self.assertEqual(digest["fuzz-a"], digest["fuzz-b"])
@@ -764,13 +762,9 @@ class DeepLanes(unittest.TestCase):
 
 if __name__ == "__main__":
     if ARGS.write_inventory:
-        if ARGS.baseline is None:
-            PARSER.error("--write-inventory needs --baseline")
         ARGS.write_inventory.write_text(
             json.dumps(
-                inventory(
-                    yaml.safe_load(ARGS.baseline.read_text(encoding="utf-8")), True
-                ),
+                inventory(WORKFLOW),
                 indent=2,
             )
             + "\n",
