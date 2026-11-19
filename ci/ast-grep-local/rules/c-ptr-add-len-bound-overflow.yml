@@ -21,26 +21,118 @@ note: >-
   pointer subtraction does not apply: rewrite `off + len > size` as
   `off > size || len > size - off` (the offset guard stops `size - off` from
   wrapping; an exact fit stays valid).
+  Widened forms (HARD-B3-FOLLOWUP): a length-named right-hand addend of a sum
+  (also a left-nested one, up to three levels) is flagged: scaled (`p + 2 * len`,
+  `p + n * size`, `p + len * 2`, `p + (len * 2)`), nested with a trailing
+  constant (`p + len + 2 > end`, `(p + len) + 1 > q`) and with a sum on both
+  sides (`lo + 1 < p + len`). The literal-only side (`lo + 1`) is never the
+  flagged offset, and an all-literal chain (`p + 1 + 2 > last`) is not flagged.
+  Not flagged by design (none were flagged before either): a length-named left
+  operand (`len + p > q`), a length-named operand inside a parenthesized
+  sub-sum (`p + (len + 1) > q`) and a chain nested deeper than three levels.
+  The rule is structural (kind, operator and field relations; the sum nesting
+  is unrolled to three levels) rather than a `$P + $N` pattern list, because
+  an `any` of patterns binds the first matching branch and so missed two-sided
+  sums.
   A site matching both rules (e.g. `p + len > end`) is reported once per rule, so the
   baseline holds two rows for it; this is intended, each rule gates independently.
-rule:
-  any:
-    - pattern: $P + $N > $B
-    - pattern: ($P + $N) > $B
-    - pattern: $B > $P + $N
-    - pattern: $B > ($P + $N)
-    - pattern: $P + $N >= $B
-    - pattern: ($P + $N) >= $B
-    - pattern: $B >= $P + $N
-    - pattern: $B >= ($P + $N)
-    - pattern: $P + $N < $B
-    - pattern: ($P + $N) < $B
-    - pattern: $B < $P + $N
-    - pattern: $B < ($P + $N)
-    - pattern: $P + $N <= $B
-    - pattern: ($P + $N) <= $B
-    - pattern: $B <= $P + $N
-    - pattern: $B <= ($P + $N)
-constraints:
-  N:
+utils:
+  lenlike0:
     regex: '(^[(\s]*|[._>])\w*(len|size|length|nbytes)[\s)]*$'
+  scaled:
+    all:
+      - kind: binary_expression
+      - has:
+          field: operator
+          regex: '^\*$'
+      - any:
+          - has:
+              field: left
+              matches: lenlike0
+          - has:
+              field: right
+              matches: lenlike0
+  lenlike:
+    any:
+      - matches: lenlike0
+      - matches: scaled
+      - all:
+          - kind: parenthesized_expression
+          - has:
+              any:
+                - matches: lenlike0
+                - matches: scaled
+  off0:
+    all:
+      - kind: binary_expression
+      - has:
+          field: operator
+          regex: '^\+$'
+      - any:
+          - has:
+              field: right
+              matches: lenlike
+  off1:
+    all:
+      - kind: binary_expression
+      - has:
+          field: operator
+          regex: '^\+$'
+      - any:
+          - has:
+              field: right
+              matches: lenlike
+          - has:
+              field: left
+              matches: off0
+          - has:
+              field: left
+              kind: parenthesized_expression
+              has:
+                matches: off0
+  off2:
+    all:
+      - kind: binary_expression
+      - has:
+          field: operator
+          regex: '^\+$'
+      - any:
+          - has:
+              field: right
+              matches: lenlike
+          - has:
+              field: left
+              matches: off1
+          - has:
+              field: left
+              kind: parenthesized_expression
+              has:
+                matches: off1
+  sumside:
+    any:
+      - matches: off2
+      - all:
+          - kind: parenthesized_expression
+          - has:
+              matches: off2
+rule:
+  all:
+    - kind: binary_expression
+    - has:
+        field: operator
+        regex: '^(<|>|<=|>=)$'
+    - any:
+        - all:
+            - has:
+                field: left
+                matches: sumside
+            - has:
+                field: right
+                regex: '(?s).'
+        - all:
+            - has:
+                field: right
+                matches: sumside
+            - has:
+                field: left
+                regex: '(?s).'
