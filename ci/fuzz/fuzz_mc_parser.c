@@ -126,7 +126,10 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
      * parser on every NGX_AGAIN with the SAME op, op->rbuf grown by fill() and
      * op->rlen advanced by one recv(). The fuzzer chooses the cuts through a
      * control prefix that is NOT part of the reply (layout and rationale in
-     * fuzz_stream.h; no flag bits are used here). */
+     * fuzz_stream.h; no flag bits are used here: this block feeds
+     * ngx_http_cache_turbo_mc_parse() directly with no c->recv() transport,
+     * so there is no EOF/NGX_AGAIN order to schedule; that order lives in the
+     * unsliced src driver). */
     {
         ngx_fuzz_stream_t  s;
 

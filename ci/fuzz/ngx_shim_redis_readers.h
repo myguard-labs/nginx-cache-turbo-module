@@ -58,12 +58,25 @@ struct ngx_event_s {
 
 /* The scripted transport behind c->recv(): chunk boundaries are offsets into
  * `reply`. `chunk_end` is where the chunk being handed out stops; the driver
- * advances it between handler invocations. */
+ * advances it between handler invocations.
+ *
+ * Two peer schedules for the end of the reply, selected by `eof_late`:
+ *   0  (default) early EOF: once pos >= len every recv() returns 0, so the
+ *      recv() that follows the final bytes sees EOF in the SAME handler wake.
+ *   1  late EOF: the first recv() at pos >= len returns NGX_AGAIN (buffer
+ *      poisoned, as for a spent segment); only a recv() in a LATER wake
+ *      returns 0. The driver bumps `wake` before each handler invocation.
+ * `again_wake` (wake + 1 of the late NGX_AGAIN, 0 = not yet issued) and
+ * `eof_hit` (a recv() has returned 0) are driver-visible bookkeeping. */
 typedef struct {
     const u_char  *reply;
     size_t         len;
     size_t         pos;
     size_t         chunk_end;
+    unsigned       eof_late;
+    size_t         wake;
+    size_t         again_wake;
+    unsigned       eof_hit;
 } ngx_fuzz_wire_t;
 
 struct ngx_connection_s {
@@ -164,6 +177,13 @@ ngx_fuzz_wire_recv(ngx_connection_t *c, u_char *buf, size_t size)
     ngx_fuzz_unpoison(buf, size);
 
     if (w->pos >= w->len) {
+        if (w->eof_late && (w->again_wake == 0 || w->again_wake == w->wake + 1))
+        {
+            w->again_wake = w->wake + 1;
+            ngx_fuzz_poison(buf, size);
+            return NGX_AGAIN;          /* peer idle; EOF comes on a later wake */
+        }
+        w->eof_hit = 1;
         n = 0;                         /* EOF: the peer has said everything */
 
     } else if (w->pos >= w->chunk_end) {
