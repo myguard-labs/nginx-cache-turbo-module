@@ -9,6 +9,13 @@ valid:
   - 'if (p + (1) < last) { p++; }'
   - 'if (p + ( (1) ) < last) { p++; }'
   - 'if (p + ((0x10)) <= end) { p++; }'
+  # All-literal sums (also nested or two-sided) cannot be attacker-sized.
+  - 'if (p + 1 + 2 > last) { return -1; }'
+  - 'if (p + (1) + (2) > last) { return -1; }'
+  - 'if (lo + 1 < hi + 2) { return -1; }'
+  - 'if (lo + 1 < p + 2) { return -1; }'
+  # Two-sided sum with no end-named bound is not this rule's heuristic.
+  - 'if (base + off <= p + n) { return -1; }'
   # Not a bounds comparison against an end pointer.
   - 'if (now < created + ttl) { return 0; }'
   - 'p = (end < last) ? end : last;'
@@ -23,3 +30,15 @@ invalid:
   - 'if (b->pos + n > b->last) { return -1; }'
   - 'if (p + (n) > last) { return -1; }'
   - 'if (p + (1 + n) >= last) { return -1; }'
+  # nested sum with a trailing constant (R5-K1): (p + n) + 1
+  - 'if (p + n + 1 > last) { return -1; }'
+  - 'if (p + n + 2 >= end) { return -1; }'
+  - 'if (last < p + n + 1) { return -1; }'
+  - 'if ((p + n) + 1 > last) { return -1; }'
+  - 'if (p + n + 1 + 2 > last) { return -1; }'
+  # scaled offsets
+  - 'if (p + 2 * n > last) { return -1; }'
+  - 'if (p + n * size > end) { return -1; }'
+  # additions on both sides: the bound side carries the end pointer
+  - 'if (p + n <= end + 1) { return -1; }'
+  - 'if (b->last + 1 >= p + n) { return -1; }'

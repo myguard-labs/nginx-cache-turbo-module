@@ -16,32 +16,116 @@ note: >-
   genuinely safe hit is rewritten anyway (HARD-B4), not suppressed. Companion
   rule: c-ptr-add-len-bound-overflow. This rule keys on the bound being named like a buffer end (last, end,
   limit, eob, *_end, *_last).
+  Widened forms (HARD-B3-FOLLOWUP): a sum nested on the left with a trailing
+  constant (`p + n + 1 > last`, `(p + n) + 1 > last`), a scaled offset
+  (`p + 2 * n > last`) and a comparison with a sum on both sides where the end
+  pointer sits inside a sum (`p + n <= end + 1`) are flagged. An all-literal
+  chain (`p + 1 + 2 > last`) is not. Not flagged: a parenthesized or
+  deeper-nested bound sum (`p + n <= (end + 1)`) and a chain nested deeper than
+  three levels. A two-sided sum with no end-named bound
+  (`base + off <= p + n`) is not this rule's heuristic; the companion rule
+  covers it when the offset is length-named. The rule is structural (kind,
+  operator and field relations; the sum nesting is unrolled to three levels)
+  rather than a `$P + $N` pattern list, because an `any` of patterns binds the
+  first matching branch and so missed two-sided sums.
   A site matching both rules (e.g. `p + len > end`) is reported once per rule, so the
   baseline holds two rows for it; this is intended, each rule gates independently.
+utils:
+  lit:
+    any:
+      - kind: number_literal
+      # redundant parentheses around a literal: `p + (1) < last`
+      - regex: '^[(\s]+(0[xX][0-9a-fA-F]+|[0-9]+)[uUlL]*[)\s]+$'
+  off0:
+    all:
+      - kind: binary_expression
+      - has:
+          field: operator
+          regex: '^\+$'
+      - any:
+          - has:
+              field: right
+              not:
+                matches: lit
+  off1:
+    all:
+      - kind: binary_expression
+      - has:
+          field: operator
+          regex: '^\+$'
+      - any:
+          - has:
+              field: right
+              not:
+                matches: lit
+          - has:
+              field: left
+              matches: off0
+          - has:
+              field: left
+              kind: parenthesized_expression
+              has:
+                matches: off0
+  off2:
+    all:
+      - kind: binary_expression
+      - has:
+          field: operator
+          regex: '^\+$'
+      - any:
+          - has:
+              field: right
+              not:
+                matches: lit
+          - has:
+              field: left
+              matches: off1
+          - has:
+              field: left
+              kind: parenthesized_expression
+              has:
+                matches: off1
+  sumside:
+    any:
+      - matches: off2
+      - all:
+          - kind: parenthesized_expression
+          - has:
+              matches: off2
+  boundside:
+    any:
+      - regex: '(^|[._>])(last|end|limit|eob)$|_(last|end)$'
+      # the end pointer inside a sum: `p + n <= end + 1`
+      - all:
+          - kind: binary_expression
+          - has:
+              field: operator
+              regex: '^\+$'
+          - any:
+              - has:
+                  field: left
+                  regex: '(^|[._>])(last|end|limit|eob)$|_(last|end)$'
+              - has:
+                  field: right
+                  regex: '(^|[._>])(last|end|limit|eob)$|_(last|end)$'
 rule:
-  any:
-    - pattern: $P + $N > $B
-    - pattern: ($P + $N) > $B
-    - pattern: $B > $P + $N
-    - pattern: $B > ($P + $N)
-    - pattern: $P + $N >= $B
-    - pattern: ($P + $N) >= $B
-    - pattern: $B >= $P + $N
-    - pattern: $B >= ($P + $N)
-    - pattern: $P + $N < $B
-    - pattern: ($P + $N) < $B
-    - pattern: $B < $P + $N
-    - pattern: $B < ($P + $N)
-    - pattern: $P + $N <= $B
-    - pattern: ($P + $N) <= $B
-    - pattern: $B <= $P + $N
-    - pattern: $B <= ($P + $N)
-constraints:
-  N:
-    not:
-      any:
-        - kind: number_literal
-        # redundant parentheses around a literal: `p + (1) < last`
-        - regex: '^[(\s]+(0[xX][0-9a-fA-F]+|[0-9]+)[uUlL]*[)\s]+$'
-  B:
-    regex: '(^|[._>])(last|end|limit|eob)$|_(last|end)$'
+  all:
+    - kind: binary_expression
+    - has:
+        field: operator
+        regex: '^(<|>|<=|>=)$'
+    - any:
+        - all:
+            - has:
+                field: left
+                matches: sumside
+            - has:
+                field: right
+                matches: boundside
+        - all:
+            - has:
+                field: right
+                matches: sumside
+            - has:
+                field: left
+                matches: boundside

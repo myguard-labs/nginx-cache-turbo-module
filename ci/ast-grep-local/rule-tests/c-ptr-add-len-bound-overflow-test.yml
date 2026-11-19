@@ -3,6 +3,12 @@ valid:
   - 'if (plen > (size_t) (end - pair)) { return -1; }'
   - 'if (v < pair + 1) { v++; }'
   - 'if (p + (1) > q) { return -1; }'
+  # All-literal sums, plain two-sided sums and scaled non-length offsets.
+  - 'if (p + 1 + 2 > last) { return -1; }'
+  - 'if (lo + 1 < hi + 2) { return -1; }'
+  - 'if (lo + 1 < p + 2) { return -1; }'
+  - 'if (p + n + 1 > last) { return -1; }'
+  - 'if (p + 2 * n > q) { return -1; }'
   - 'if (now < created + ttl) { return 0; }'
   - 'if (total + NGX_ALIGNMENT > NGX_MAX_SIZE_T_VALUE - meta_len) { return -1; }'
 invalid:
@@ -16,3 +22,20 @@ invalid:
   - 'if (q < (p + (hdr->len))) { return -1; }'
   # the bound is unconstrained by design: integer bounds match too
   - 'if (off + len > size) { return -1; }'
+  # additions on both sides of the comparison
+  - 'if (lo + 1 < p + len) { return -1; }'
+  - 'if (p + len > lo + 1) { return -1; }'
+  - 'if (base + off <= p + hdr->len) { return -1; }'
+  - 'if (lo + 1 < (p + len)) { return -1; }'
+  # scaled length forms
+  - 'if (p + 2 * len > q) { return -1; }'
+  - 'if (p + n * size > q) { return -1; }'
+  - 'if (p + len * 2 > end) { return -1; }'
+  - 'if (p + (len * 2) > end) { return -1; }'
+  - 'if (q < p + 2 * hdr->len) { return -1; }'
+  # nested sums with a trailing constant (R5-K1)
+  - 'if (p + len + 2 > end) { return -1; }'
+  - 'if (p + len + 2 > q) { return -1; }'
+  - 'if (q < p + len + 2) { return -1; }'
+  - 'if ((p + len) + 1 > q) { return -1; }'
+  - 'if (p + len + 1 + 2 > q) { return -1; }'
