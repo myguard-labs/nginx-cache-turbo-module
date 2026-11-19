@@ -37,7 +37,7 @@ class CallerOutcomeTests(unittest.TestCase):
             with mock.patch.multiple(runtime, **stubs):
                 runtime.run_all(types.SimpleNamespace(fault_injection=bits[-1]), object(), *refs)
             self.assertEqual(runtime._expected_roots(source, config), seen)
-        self.assertEqual(len(full), 590)
+        self.assertEqual(len(full), 591)
 
     def test_manifest_rejects_unsupported_inactive_branch(self):
         source = b"def run_all():\n    if redis is not None:\n        arbitrary()\n"
