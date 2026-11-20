@@ -1,6 +1,7 @@
 """Check the Build runtime command transports the outcome directory."""
 
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -14,6 +15,56 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class WorkflowOutcomeTest(unittest.TestCase):
+    def test_asan_preserves_capture_with_finite_existing_job_bound(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/asan.yml').read_text())
+        checked = 0
+        for job in workflow['jobs'].values():
+            for step in job.get('steps', []):
+                command = step.get('run', '')
+                if 'ci-hang-guard.sh 2700' in command:
+                    checked += 1
+                    args = shlex.split(command, comments=True)
+                    self.assertEqual(args[:4], ['CT_HANG_HARD_SECONDS=3000', 'bash',
+                                                'ci/tools/ci-hang-guard.sh', '2700'])
+                    if job is workflow['jobs']['asan-single']:
+                        self.assertEqual(job['timeout-minutes'], 60)
+        self.assertEqual(checked, 2)
+
+    def test_multi_worker_budget_covers_all_steps(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/asan.yml').read_text())
+        job = workflow['jobs']['asan-multi']
+        steps = job['steps']
+        guard = next(i for i, step in enumerate(steps)
+                     if 'ci-hang-guard.sh 2700' in step.get('run', ''))
+        upload = next(step for step in steps[guard + 1:]
+                      if step.get('name') == 'Upload hang-capture artifacts (multi-worker)')
+        self.assertEqual(upload['if'], 'always()')
+        # Every executable step outside the guarded command must have a bound.
+        other_steps = steps[:guard] + steps[guard + 1:]
+        self.assertTrue(all(isinstance(step.get('timeout-minutes'), int)
+                            and step['timeout-minutes'] > 0 for step in other_steps))
+        setup_and_after = sum(step['timeout-minutes'] for step in other_steps)
+        self.assertEqual(setup_and_after, 42)
+        # Five minutes covers runner setup, action post steps and overhead.
+        self.assertGreaterEqual(job['timeout-minutes'], setup_and_after + 50 + 5)
+
+    def test_build_capture_preserves_measured_healthy_and_diagnostic_margins(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/build-test.yml').read_text())
+        step = next(step for step in workflow['jobs']['build']['steps']
+                    if step.get('name') == 'Run runtime suite')
+        args = shlex.split(step['run'], comments=True)
+        hard = int(args[0].split('=', 1)[1])
+        soft = float(args[3])
+        self.assertEqual(hard, 780)
+        # Five qualified 588-test runs on 2026-11-17: max healthy step 761s.
+        # The observed capture bound was 7.342588s, rounded up to eight.
+        healthy_max = 761
+        capture_window = math.ceil(7.342588)
+        cleanup_at = hard - 2 * min(2., hard / 5)  # Owner reserves TERM/KILL grace.
+        self.assertGreater(soft, healthy_max, 'capture overlaps a measured healthy run')
+        self.assertGreaterEqual(cleanup_at - soft, capture_window,
+                                'capture loses its measured diagnostic window')
+
     def test_build_runtime_outcome_and_status(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/build-test.yml').read_text())
         steps = workflow['jobs']['build']['steps']
@@ -23,7 +74,8 @@ class WorkflowOutcomeTest(unittest.TestCase):
         self.assertIn('set -o pipefail', command)
         self.assertIn('--outcome-dir "$GITHUB_WORKSPACE/ci-hang-artifacts"', command)
         args = shlex.split(command, comments=True)
-        self.assertEqual(args[:3], ['bash', 'ci/tools/ci-hang-guard.sh', '2100'])
+        self.assertEqual(args[:3], ['CT_HANG_HARD_SECONDS=780', 'bash',
+                                    'ci/tools/ci-hang-guard.sh'])
         with tempfile.TemporaryDirectory(prefix='workflow outcome ') as tmp:
             workspace = Path(tmp)
             tools_dir = workspace / 'ci/tools'
@@ -35,6 +87,8 @@ class WorkflowOutcomeTest(unittest.TestCase):
             producer.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
+if pathlib.Path(args[0]).name == 'ci_child_observer.py':
+    os.execv(sys.executable, [sys.executable, *args])
 assert args[0] == 'ci/tools/test_runtime.py'
 assert args.count('--outcome-dir') == 1
 parent = args[args.index('--outcome-dir') + 1]
