@@ -114,11 +114,12 @@ def observe(conn: h2.H2Conn, sid: int, expect: str) -> dict:
         "status": stream.status,
         "rst": stream.rst,
         "goaway": conn.goaway,
+        "eof": conn.eof,
         "ended": stream.ended,
         "body_hex": stream.body.hex(),
     }
     if expect == "order":
-        ok = stream.rst == 1 and conn.goaway is None
+        ok = stream.rst == 1 and conn.goaway is None and not conn.eof
     elif expect == "ok":
         ok = (
             stream.status == 200
@@ -126,6 +127,7 @@ def observe(conn: h2.H2Conn, sid: int, expect: str) -> dict:
             and stream.body == b"ok\n"
             and stream.rst is None
             and conn.goaway is None
+            and not conn.eof
         )
     else:
         ok = stream.rst is not None or stream.status >= 400

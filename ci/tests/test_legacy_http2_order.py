@@ -224,20 +224,25 @@ def test_runtime_control_inventory():
 
 
 @pytest.mark.parametrize(
-    "rst,goaway,expect,want",
+    "rst,goaway,eof,expect,want",
     [
-        (1, None, "order", True),
-        (None, None, "order", False),
-        (2, None, "order", False),
-        (1, 1, "order", False),
-        (None, None, "ok", True),
-        (1, None, "ok", False),
+        (1, None, False, "order", True),
+        (1, None, True, "order", False),
+        (None, None, False, "order", False),
+        (2, None, False, "order", False),
+        (1, 1, False, "order", False),
+        (None, None, False, "ok", True),
+        (None, None, True, "ok", False),
+        (1, None, False, "ok", False),
     ],
 )
-def test_order_oracle_requires_stream_protocol_error(rst, goaway, expect, want):
+def test_order_oracle_requires_open_stream_protocol_error(
+    rst, goaway, eof, expect, want
+):
     stream = checker.h2.Stream(status=200, body=b"ok\n", ended=True, rst=rst)
     connection = SimpleNamespace(
         goaway=goaway,
+        eof=eof,
         wait=lambda _sid, _bound: stream,
         quiet=lambda _bound: None,
     )
@@ -246,12 +251,27 @@ def test_order_oracle_requires_stream_protocol_error(rst, goaway, expect, want):
 
 def test_order_oracle_observes_delayed_connection_error():
     stream = checker.h2.Stream(ended=True, rst=1)
-    connection = SimpleNamespace(goaway=None, wait=lambda _sid, _bound: stream)
+    connection = SimpleNamespace(
+        goaway=None, eof=False, wait=lambda _sid, _bound: stream
+    )
 
     def delayed_goaway(_bound):
         connection.goaway = 1
 
     connection.quiet = delayed_goaway
+    assert checker.observe(connection, 1, "order")["pass"] is False
+
+
+def test_order_oracle_observes_delayed_connection_close():
+    stream = checker.h2.Stream(ended=True, rst=1)
+    connection = SimpleNamespace(
+        goaway=None, eof=False, wait=lambda _sid, _bound: stream
+    )
+
+    def delayed_eof(_bound):
+        connection.eof = True
+
+    connection.quiet = delayed_eof
     assert checker.observe(connection, 1, "order")["pass"] is False
 
 

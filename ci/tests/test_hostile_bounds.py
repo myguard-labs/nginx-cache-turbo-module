@@ -122,10 +122,12 @@ def test_debug_alloc_available() -> None:
     ("nginx version: nginx/1.29.8", True),
     ("nginx version: nginx/1.31.3", True),
     ("nginx version: nginx/1.29", False),
-    ("angie version: Angie/1.7.0", False),
-    ("angie version: Angie/1.8.0", True),
-    ("angie version: Angie/1.12.1", True),
-    ("angie version: Angie/1.12", False),
+    ("Angie version: Angie/1.7.0", False),
+    ("Angie version: Angie/1.8.0", True),
+    ("Angie version: Angie/1.12.1", True),
+    ("Angie version: Angie/1.12", False),
+    ("Angie version: Angie/1.8.0\nnginx version: nginx/1.27.3", True),
+    ("Angie version: Angie/1.7.0\nnginx version: nginx/1.29.8", False),
 ])
 def test_supports_max_headers_boundary(version: str, supported: bool) -> None:
     assert hb.supports_max_headers(version) is supported

@@ -230,8 +230,8 @@ def debug_alloc_available(version_text: str) -> tuple[bool, str]:
 def supports_max_headers(version_text: str) -> bool:
     """Whether the server has the max_headers directive and its default cap."""
     boundaries = (
+        (r"Angie version: Angie/(\d+)\.(\d+)\.(\d+)", ANGIE_MAX_HEADERS_SINCE),
         (r"nginx version: nginx/(\d+)\.(\d+)\.(\d+)", NGINX_MAX_HEADERS_SINCE),
-        (r"angie version: Angie/(\d+)\.(\d+)\.(\d+)", ANGIE_MAX_HEADERS_SINCE),
     )
     for pattern, boundary in boundaries:
         match = re.search(pattern, version_text)
