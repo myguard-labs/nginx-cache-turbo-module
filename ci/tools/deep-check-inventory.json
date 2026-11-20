@@ -272,7 +272,7 @@
     },
     {
       "name": "Install build and runtime dependencies",
-      "sha256": "0f801638f0278437db596e21ca0b825e006f7e4e72565f26921fd7d4ddb7af92"
+      "sha256": "33e1ff8dc9601e8e852366729f3890a8998ee04dadd1be756ea0ff2a9102de55"
     },
     {
       "name": "Restore build caches",
@@ -292,7 +292,7 @@
     },
     {
       "name": "Run runtime suite against legacy nginx",
-      "sha256": "ec181125767047b911c30445df4f46feecbd652d0612897e0d2c4ad98cf426f4"
+      "sha256": "efe7e3392a4d27561ac5a9e6a16b740307272922ae38c152ba5bf3e1da87a0a5"
     }
   ],
   "memcheck": [

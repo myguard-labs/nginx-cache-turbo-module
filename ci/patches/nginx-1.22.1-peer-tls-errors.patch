@@ -1,0 +1,17 @@
+--- a/src/event/ngx_event_openssl.c
++++ b/src/event/ngx_event_openssl.c
+@@ -3359,6 +3359,14 @@
+             || n == SSL_R_NO_CIPHERS_SPECIFIED                       /*  183 */
+             || n == SSL_R_NO_COMPRESSION_SPECIFIED                   /*  187 */
+             || n == SSL_R_NO_SHARED_CIPHER                           /*  193 */
++#ifdef SSL_R_PACKET_LENGTH_TOO_LONG
++            || (n == SSL_R_PACKET_LENGTH_TOO_LONG
++                && ERR_GET_LIB(ERR_peek_error()) == ERR_LIB_SSL)
++#endif
++#ifdef SSL_R_BAD_RECORD_TYPE
++            || (n == SSL_R_BAD_RECORD_TYPE
++                && ERR_GET_LIB(ERR_peek_error()) == ERR_LIB_SSL)
++#endif
+             || n == SSL_R_RECORD_LENGTH_MISMATCH                     /*  213 */
+ #ifdef SSL_R_CLIENTHELLO_TLSEXT
+             || n == SSL_R_CLIENTHELLO_TLSEXT                         /*  226 */
