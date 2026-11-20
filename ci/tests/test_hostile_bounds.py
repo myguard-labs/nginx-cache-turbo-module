@@ -116,6 +116,23 @@ def test_debug_alloc_available() -> None:
     assert not no_pal[0] and "NGX_DEBUG_PALLOC" in no_pal[1]
 
 
+@pytest.mark.parametrize(("version", "supported"), [
+    ("nginx version: nginx/1.22.1", False),
+    ("nginx version: nginx/1.29.7", False),
+    ("nginx version: nginx/1.29.8", True),
+    ("nginx version: nginx/1.31.3", True),
+    ("nginx version: nginx/1.29", False),
+    ("Angie version: Angie/1.7.0", False),
+    ("Angie version: Angie/1.8.0", True),
+    ("Angie version: Angie/1.12.1", True),
+    ("Angie version: Angie/1.12", False),
+    ("Angie version: Angie/1.8.0\nnginx version: nginx/1.27.3", True),
+    ("Angie version: Angie/1.7.0\nnginx version: nginx/1.29.8", False),
+])
+def test_supports_max_headers_boundary(version: str, supported: bool) -> None:
+    assert hb.supports_max_headers(version) is supported
+
+
 # --- cases and builders -----------------------------------------------------
 
 def test_case_table() -> None:
@@ -171,15 +188,24 @@ def test_each_size_gets_its_own_key_and_plain_locations_mirror_the_shape() -> No
 
 
 def test_config_carries_the_caps_and_buffers() -> None:
-    text = hb._config("/r", 1, None, 2, "debug_alloc")
+    text = hb._config("/r", 1, None, 2, "debug_alloc", True)
     assert "error_log /r/logs/error.log debug_alloc;" in text
-    assert f"max_headers {hb.MAX_HEADERS};" in text
+    assert text.count(f"max_headers {hb.MAX_HEADERS};") == 2
     assert f"large_client_header_buffers 4 {hb.HDR_BUF};" in text
     assert "cache_turbo_normalize_max_args 10000;" in text
     assert "cache_turbo_normalize_max_args 1000;" in text
     assert "cache_turbo_normalize_max_args 0;" in text
     assert text.count("cache_turbo_normalize_max_args") == 3  # default has none
     assert hb.MAX_HEADERS > 4096 + 3
+
+
+def test_config_omits_only_unsupported_max_headers() -> None:
+    modern = hb._config("/r", 1, None, 2, "debug_alloc", True)
+    legacy = hb._config("/r", 1, None, 2, "debug_alloc", False)
+    directive = f"        max_headers {hb.MAX_HEADERS};\n"
+    assert modern.count(directive) == 2
+    assert legacy == modern.replace(directive, "")
+    assert "COOKIE-LINES-4096" in {case.id for case in hb.build_cases()}
 
 
 # --- oracle -----------------------------------------------------------------

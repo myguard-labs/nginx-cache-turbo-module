@@ -1,4 +1,4 @@
-# sync-sha: a84051813ecbe7c0e15756ac2425bd40ccb86b17d72b0c6c88d86370b76455f6
+# sync-sha: fae8bc295b44f33237b476de321b88f5dcadb2071d592773bef029ad42a9362f
 name: CI Deep
 
 # Exhaustive dynamic analysis — monthly cron + on-demand only, NEVER on PR.
@@ -1425,7 +1425,9 @@ jobs:
       - name: legacy-runtime / Install build and runtime dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold redis-server memcached zlib1g-dev
+          sudo apt-get install -y \
+            build-essential ccache curl eatmydata libpcre2-dev libssl-dev mold patch \
+            redis-server memcached zlib1g-dev
 
         id: legacy_runtime_02
         env:
@@ -1491,6 +1493,8 @@ jobs:
       - name: legacy-runtime / Run runtime suite against legacy nginx
         run: |
           B="${BUILD_ROOT}/nginx-${LEGACY_NGINX_VERSION}/objs"
+          python3 ci/tools/check_legacy_http2_order.py \
+            --nginx-binary "$B/nginx" --port "$TEST_BASE_PORT"
           python3 ci/tools/test_runtime.py \
             --fault-injection \
             --port "$TEST_BASE_PORT" \

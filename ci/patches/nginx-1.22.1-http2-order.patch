@@ -1,0 +1,30 @@
+--- a/src/http/v2/ngx_http_v2.c
++++ b/src/http/v2/ngx_http_v2.c
+@@ -1805,0 +1806,23 @@
++    /*
++     * Stream-owned, initially zero: once a regular field is decoded, no
++     * later pseudo-header is valid, even across CONTINUATION frames.
++     * Record it before ignored fields and cookie/header special handling.
++     */
++    if (header->name.data[0] != ':') {
++        h2c->state.stream->regular_header = 1;
++
++    } else if (h2c->state.stream->regular_header) {
++        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
++                      "client sent out of order pseudo-header");
++
++        if (ngx_http_v2_terminate_stream(h2c, h2c->state.stream,
++                                         NGX_HTTP_V2_PROTOCOL_ERROR)
++            == NGX_ERROR)
++        {
++            return ngx_http_v2_connection_error(h2c,
++                                                NGX_HTTP_V2_INTERNAL_ERROR);
++        }
++
++        goto error;
++    }
++
+--- a/src/http/v2/ngx_http_v2.h
++++ b/src/http/v2/ngx_http_v2.h
+@@ -219,0 +220 @@
++    unsigned                         regular_header:1;

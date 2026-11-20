@@ -1,11 +1,13 @@
 """cache-turbo runtime tests -- request resource bounds on the lookup path
 under nginx-legal hostile inputs (HARD-R4).
 
-Inputs nginx itself accepts (``client_header_buffer_size``,
-``large_client_header_buffers`` and ``max_headers`` (default 1000 lines:
-"client sent too many header lines") are raised so 4096 Cookie lines are
-legal; ``HDR_BUF`` is the buffer size; a 4xx from
-nginx's own limits is not the module's path and fails the case):
+Inputs nginx itself accepts (``client_header_buffer_size`` and
+``large_client_header_buffers`` are raised; ``max_headers`` is also raised on
+nginx 1.29.8+ and Angie 1.8.0+, where that directive and its default 1000-line
+limit exist) so 4096 Cookie lines are legal. Earlier releases have no
+header-count limit, so the unsupported directive is omitted and the same cases
+still run; ``HDR_BUF`` is the buffer size. A 4xx from nginx's own limits is not
+the module's path and fails the case):
 
   args    10000 query args, on locations keyed ``$host$uri
           $cache_turbo_normalized_args`` with ``cache_turbo_normalize_max_args``
@@ -123,6 +125,8 @@ READ_S = 5.0              # per-response read bound (sanitizer-scaled)
 SETTLE_S = 0.05
 DESTROY_WAIT_S = 5.0      # wait for the connection's pool destruction lines
 MAX_HEADERS = 8192        # nginx `max_headers` (default 1000 header lines)
+NGINX_MAX_HEADERS_SINCE = (1, 29, 8)
+ANGIE_MAX_HEADERS_SINCE = (1, 8, 0)
 DEFAULT_CAP = 64          # cache_turbo_normalize_max_args compiled-in default
 GROWTH_TOL = 1.5          # per-unit bytes may rise/fall by this factor
 FLAT_BYTES = 1024         # growth under this is "flat" (constant overhead)
@@ -221,6 +225,19 @@ def debug_alloc_available(version_text: str) -> tuple[bool, str]:
                        "allocations are not logged, so the byte count "
                        "is not exact")
     return True, ""
+
+
+def supports_max_headers(version_text: str) -> bool:
+    """Whether the server has the max_headers directive and its default cap."""
+    boundaries = (
+        (r"Angie version: Angie/(\d+)\.(\d+)\.(\d+)", ANGIE_MAX_HEADERS_SINCE),
+        (r"nginx version: nginx/(\d+)\.(\d+)\.(\d+)", NGINX_MAX_HEADERS_SINCE),
+    )
+    for pattern, boundary in boundaries:
+        match = re.search(pattern, version_text)
+        if match is not None:
+            return tuple(int(part) for part in match.groups()) >= boundary
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -496,8 +513,11 @@ class Result:
 # Harness: one-worker nginx with an in-process origin server block.
 # --------------------------------------------------------------------------- #
 
-def _config(root, port: int, module, origin: int, level: str) -> str:
+def _config(root, port: int, module, origin: int, level: str,
+            has_max_headers: bool) -> str:
     load = f"load_module {module};\n" if module else ""
+    max_headers = (f"        max_headers {MAX_HEADERS};\n"
+                   if has_max_headers else "")
     common = (f"cache_turbo {ZONE}; cache_turbo_valid 60s; "
               "cache_turbo_lock off; "
               "add_header X-CT-Status $cache_turbo_status always; "
@@ -523,8 +543,7 @@ http {{
     }}
     server {{
         listen 127.0.0.1:{origin};
-        max_headers {MAX_HEADERS};
-        client_header_buffer_size {HDR_BUF};
+{max_headers}        client_header_buffer_size {HDR_BUF};
         large_client_header_buffers 4 {HDR_BUF};
         location / {{
             add_header Cache-Control "max-age=60";
@@ -535,8 +554,7 @@ http {{
     server {{
         listen 127.0.0.1:{port};
         server_name {HOST};
-        max_headers {MAX_HEADERS};
-        location = {ADMIN} {{ cache_turbo_admin {ZONE}; }}
+{max_headers}        location = {ADMIN} {{ cache_turbo_admin {ZONE}; }}
         location /{LOC_ARGS_DEFAULT}/ {{ {nkey} {common} }}
         location /{LOC_ARGS_10000}/ {{ {nkey} cache_turbo_normalize_max_args 10000; {common} }}
         location /{LOC_ARGS_1000}/ {{ {nkey} cache_turbo_normalize_max_args 1000; {common} }}
@@ -558,7 +576,7 @@ http {{
 
 
 class _Rig:
-    def __init__(self, ng: Nginx, level: str) -> None:
+    def __init__(self, ng: Nginx, level: str, has_max_headers: bool) -> None:
         base = ng.port
         origin_port = base + PORT_OFFSETS["hostile_l2_origin"]
         self.tmp = ng.root.parent / "hostile-bounds"
@@ -566,7 +584,7 @@ class _Rig:
                           base + PORT_OFFSETS["hostile_l2_node"],
                           origin_port, ng.runner_raw, ng.single_process)
         text = _config(self.tmp, self.node.port, ng.module, origin_port,
-                       level)
+                       level, has_max_headers)
 
         def write_config(sr_off: bool = False) -> None:
             del sr_off
@@ -739,7 +757,8 @@ def run_matrix(ng: Nginx, only: set[str] | None = None) -> list[Result]:
     proc = subprocess.run([str(ng.binary), "-V"], capture_output=True,
                           text=True, timeout=30, check=False)
     bytes_ok, reason = debug_alloc_available(proc.stdout + proc.stderr)
-    rig = _Rig(ng, "debug_alloc" if bytes_ok else "info")
+    rig = _Rig(ng, "debug_alloc" if bytes_ok else "info",
+               supports_max_headers(proc.stdout + proc.stderr))
     rig.start()
     results: list[Result] = []
     try:

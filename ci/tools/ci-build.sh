@@ -81,6 +81,14 @@ if [ ! -d "$ROOT/$DIR" ]; then
     tar -xzf "$ROOT/${DIR}.tar.gz" -C "$ROOT"
 fi
 
+# Only the disposable legacy CI build needs these core corrections. Both
+# helpers reject source drift and safely recognize an already-patched cache.
+if [ "$FLAVOR" = nginx ] && [ "$VERSION" = 1.22.1 ]; then
+    python3 "$MODULE_DIR/ci/tools/legacy_tls_errors.py" "$ROOT/$DIR"
+    python3 "$MODULE_DIR/ci/tools/check_legacy_tls_errors.py" "$ROOT/$DIR"
+    python3 "$MODULE_DIR/ci/tools/legacy_http2_order.py" "$ROOT/$DIR"
+fi
+
 # ccache: cache object compiles across CI runs (50-80% compile cut on a warm
 # cache). Auto-detected on PATH so a local build without ccache still works.
 # nginx honors --with-cc; the base build uses the default `cc`, the asan/coverage
