@@ -252,13 +252,20 @@ def run_owned(command, env, on_start, *, soft=None, hard=600., capture=None):
     if caller != os.getppid():
         os.close(caller_fd)
         return {"status": 125, "code": None, "reason": "caller changed"}
-    parent_wire, child_wire = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        parent_wire, child_wire = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    except OSError:
+        os.close(caller_fd)
+        return {"status": 125, "code": None, "reason": "ownership setup failed"}
     previous = {}
     owner_pid = None
     result = {"status": 125, "code": None, "reason": "owner lost"}
     requested = []
     try:
-        owner_pid = os.fork()
+        try:
+            owner_pid = os.fork()
+        except OSError:
+            return {"status": 125, "code": None, "reason": "ownership setup failed"}
         if owner_pid == 0:
             parent_wire.close()
             try:

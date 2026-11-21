@@ -55,7 +55,7 @@ class HangCaptureTests(unittest.TestCase):
         (directory / "cmdline").write_bytes(
             b"nginx: master process nginx -p /rewritten-prefix -c nginx.conf\0")
 
-    def capture(self, *, passive=False):
+    def capture(self, *, passive=False, hard=301):
         artifacts = self.root / 'artifacts'
         stderr = io.StringIO()
         descriptors = {}
@@ -73,7 +73,8 @@ class HangCaptureTests(unittest.TestCase):
                                   side_effect=lambda fd, sig: signals.append((fd, sig))), \
                 mock.patch.object(diagnostics.time, 'sleep'), \
                 mock.patch.dict(os.environ, PATH=str(self.bindir) + ':' + os.environ['PATH'],
-                                CT_HANG_QUIT='0' if passive else '1'), \
+                                CT_HANG_QUIT='0' if passive else '1',
+                                CT_HANG_HARD_SECONDS=str(hard)), \
                 contextlib.redirect_stderr(stderr):
             diagnostics.capture(100, artifacts, 1)
         self.signals = signals
@@ -153,7 +154,7 @@ class HangCaptureTests(unittest.TestCase):
             with mock.patch.object(diagnostics, 'capture',
                                    side_effect=lambda root, directory, soft:
                                    original(root, directory, 768)):
-                self.capture(passive=True)
+                self.capture(passive=True, hard=780)
         self.assertEqual(len(allowances), 2)
         self.assertLessEqual(sum(allowances), 7.5)
         self.assertEqual(self.signals, [])
@@ -182,11 +183,120 @@ class HangCaptureTests(unittest.TestCase):
             self.capture()
         self.assertEqual(self.signals, [])
 
+    def test_changed_ancestor_identity_rejects_unchanged_nginx_child(self):
+        original = diagnostics.process_stat
+        calls = 0
+
+        def replaced(path):
+            nonlocal calls
+            parent, start = original(path)
+            if path.parent.name == '100':
+                calls += 1
+                if calls > 1:
+                    start = 'reused-parent'
+            return parent, start
+
+        with mock.patch.object(diagnostics, 'process_stat', side_effect=replaced), \
+                mock.patch.object(diagnostics.subprocess, 'run') as debugger:
+            self.capture()
+        debugger.assert_not_called()
+        self.assertEqual(self.signals, [])
+
+    def test_missing_or_exited_ancestor_rejects_nginx_child(self):
+        for missing in (False, True):
+            descriptors = []
+
+            def pin(_pid, descriptors=descriptors):
+                fd = os.open('/dev/null', os.O_RDONLY)
+                descriptors.append(fd)
+                return fd
+
+            if missing:
+                (self.proc / '100/stat').unlink()
+            with self.subTest(missing=missing), \
+                    mock.patch.object(diagnostics, 'PROC', self.proc), \
+                    mock.patch.object(diagnostics.os, 'pidfd_open', side_effect=pin), \
+                    mock.patch.object(diagnostics.select, 'select',
+                                      side_effect=lambda fds, *_args: (fds, [], [])):
+                self.assertEqual(diagnostics.discover(100), [])
+            for fd in descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+
+    def test_debugger_rechecks_start_identity_immediately_before_launch(self):
+        original = diagnostics.process_stat
+        calls = 0
+
+        def replaced(path):
+            nonlocal calls
+            parent, start = original(path)
+            if path.parent.name == '101':
+                calls += 1
+                # Snapshot, discovery recheck, pre-budget identity, launch recheck.
+                if calls == 4:
+                    start = 'reused-before-gdb'
+            return parent, start
+
+        with mock.patch.object(diagnostics, 'process_stat', side_effect=replaced), \
+                mock.patch.object(diagnostics.subprocess, 'run') as debugger:
+            _, artifacts = self.capture(passive=True)
+        debugger.assert_not_called()
+        self.assertIn('process identity changed',
+                      (artifacts / 'gdb-nginx-101.txt').read_text())
+
+    def test_rotation_during_debugger_preserves_selected_log_inode(self):
+        opened = []
+        original = diagnostics.error_logs
+
+        def logs(processes):
+            streams = original(processes)
+            opened.extend(streams)
+            return streams
+
+        def debugger(*_args, **_kwargs):
+            self.owned.rename(self.owned.with_suffix('.old'))
+            self.owned.write_text('replacement log\n')
+
+        with mock.patch.object(diagnostics, 'error_logs', side_effect=logs), \
+                mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger):
+            _, artifacts = self.capture(passive=True)
+        self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n')
+        self.assertTrue(opened)
+        self.assertTrue(all(stream.closed for stream in opened))
+
+    def test_log_read_failures_release_open_descriptors(self):
+        (self.proc / '101/fd/5').symlink_to(self.owned)
+        original_open = Path.open
+        original_stat = os.fstat
+        for error in (PermissionError, KeyboardInterrupt):
+            opened = []
+
+            def open_file(path, *args, opened=opened, **kwargs):
+                stream = original_open(path, *args, **kwargs)
+                opened.append(stream)
+                return stream
+
+            def stat(fd, error=error, opened=opened):
+                if error is PermissionError or len(opened) == 2:
+                    raise error('controlled log read failure')
+                return original_stat(fd)
+
+            with self.subTest(error=error), \
+                    mock.patch.object(diagnostics, 'PROC', self.proc), \
+                    mock.patch.object(Path, 'open', open_file), \
+                    mock.patch.object(diagnostics.os, 'fstat', side_effect=stat):
+                if error is PermissionError:
+                    self.assertEqual(diagnostics.error_logs([(101, -1)]), [])
+                else:
+                    with self.assertRaises(KeyboardInterrupt):
+                        diagnostics.error_logs([(101, -1)])
+            self.assertTrue(opened)
+            self.assertTrue(all(stream.closed for stream in opened))
+
     def test_exit_during_debugger_never_falls_back_to_numeric_signal(self):
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
         fd = os.pidfd_open(child.pid)
-        self.addCleanup(lambda: child.poll() is None and child.kill())
-        self.addCleanup(child.wait)
+        self.addCleanup(self.stop_child, child)
 
         def debugger(*_args, **_kwargs):
             signal.pidfd_send_signal(fd, signal.SIGKILL)
@@ -197,10 +307,33 @@ class HangCaptureTests(unittest.TestCase):
                 mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger), \
                 mock.patch.object(diagnostics.time, 'sleep'), \
                 mock.patch.object(diagnostics.os, 'kill') as numeric_kill, \
-                mock.patch.dict(os.environ, CT_HANG_QUIT='1'):
+                mock.patch.dict(os.environ, CT_HANG_QUIT='1', CT_HANG_HARD_SECONDS='301'):
             diagnostics.capture(100, self.root / 'real-exit', 1)
             numeric_kill.assert_not_called()
         self.assertIsNotNone(child.returncode)
+
+    @staticmethod
+    def stop_child(child):
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+    def test_child_cleanup_kills_before_bounded_wait(self):
+        for status in (None, 0):
+            with self.subTest(status=status):
+                child = mock.Mock()
+                child.poll.return_value = status
+                self.stop_child(child)
+                expected = [mock.call.poll()]
+                if status is None:
+                    expected.append(mock.call.kill())
+                self.assertEqual(child.mock_calls, expected + [mock.call.wait(timeout=5)])
+
+    def test_capture_helper_ignores_ambient_hard_deadline(self):
+        with mock.patch.dict(os.environ, CT_HANG_HARD_SECONDS='1'):
+            _, artifacts = self.capture(passive=True)
+        self.assertEqual((artifacts / 'gdb-nginx-101.txt').read_text(),
+                         'fixture backtrace\n')
 
 
 if __name__ == "__main__":

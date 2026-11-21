@@ -41,11 +41,23 @@ def discover(root):
     try:
         for pid in sorted(owned & snapshot.keys()):
             fd = None
+            ancestors = []
             try:
                 fd = os.pidfd_open(pid)
                 path = PROC / str(pid)
                 if (process_stat(path / 'stat') != snapshot[pid]
                         or (path / 'comm').read_text(encoding='ascii').strip() != 'nginx'):
+                    continue
+                parent = pid
+                while parent != root:
+                    parent = snapshot[parent][0]
+                    if parent not in snapshot:
+                        raise ValueError('missing ancestry identity')
+                    ancestor = os.pidfd_open(parent)
+                    ancestors.append(ancestor)
+                    if process_stat(PROC / str(parent) / 'stat') != snapshot[parent]:
+                        raise ValueError('changed ancestry identity')
+                if any(select.select([ancestor], [], [], 0)[0] for ancestor in ancestors):
                     continue
                 selected.append((pid, fd))
                 fd = None  # Ownership transfers to the returned record.
@@ -54,6 +66,8 @@ def discover(root):
             finally:
                 if fd is not None:
                     os.close(fd)
+                for ancestor in ancestors:
+                    os.close(ancestor)
         nginx = {pid for pid, _ in selected}
         return sorted(selected, key=lambda item: (snapshot[item[0]][0] not in nginx, item[0]))
     except BaseException:
@@ -63,16 +77,30 @@ def discover(root):
 
 
 def error_logs(processes):
-    logs = set()
-    for pid, _ in processes:
-        for descriptor in (PROC / str(pid) / 'fd').glob('*'):
-            try:
-                path = descriptor.resolve(strict=True)
-                if path.name == 'error.log' and path.is_file():
-                    logs.add(path)
-            except OSError:
-                continue
-    return sorted(logs)
+    logs = {}
+    try:
+        for pid, _ in processes:
+            for descriptor in sorted((PROC / str(pid) / 'fd').glob('*')):
+                stream = None
+                try:
+                    path = descriptor.resolve(strict=True)
+                    if path.name == 'error.log' and path.is_file():
+                        stream = descriptor.open('rb')
+                        identity = os.fstat(stream.fileno())
+                        key = (identity.st_dev, identity.st_ino)
+                        if key not in logs:
+                            logs[key] = stream
+                            stream = None
+                except OSError:
+                    continue
+                finally:
+                    if stream is not None:
+                        stream.close()
+        return list(logs.values())
+    except BaseException:
+        for stream in logs.values():
+            stream.close()
+        raise
 
 
 def capture(root, directory, soft):
@@ -86,10 +114,11 @@ def capture(root, directory, soft):
         except OSError:
             pass
     processes = discover(root)
+    logs = []
     try:
         if not processes:
             print(f'ci-hang-guard: no nginx under pid {root}', file=sys.stderr)
-        logs = error_logs(processes)  # Resolve descriptors before shutdown.
+        logs = error_logs(processes)  # Retain the selected inodes across rotation/shutdown.
         shutdown = os.environ.get('CT_HANG_QUIT', '1') != '0'
         hard = float(os.environ.get('CT_HANG_HARD_SECONDS', str(float(soft) + 300)))
         # Reserve the owner's TERM/KILL windows, optional dump tail, and a
@@ -100,6 +129,10 @@ def capture(root, directory, soft):
         for index, (pid, fd) in enumerate(processes):
             if select.select([fd], [], [], 0)[0]:
                 continue
+            try:
+                identity = process_stat(PROC / str(pid) / 'stat')
+            except (OSError, ValueError, IndexError):
+                continue
             allowance = min(10., max(0., until - time.monotonic()) / (len(processes) - index))
             print(f'ci-hang-guard: gdb pid={pid}', file=sys.stderr)
             with (directory / f'gdb-nginx-{pid}.txt').open('w') as stream:
@@ -107,6 +140,13 @@ def capture(root, directory, soft):
                     stream.write('debugger skipped: capture budget exhausted\n')
                     continue
                 try:
+                    # GDB accepts only numeric PIDs. Recheck the retained pidfd
+                    # and start identity immediately before launch; PID reuse
+                    # during sudo/timeout/GDB startup remains a residual window.
+                    if (select.select([fd], [], [], 0)[0]
+                            or process_stat(PROC / str(pid) / 'stat') != identity):
+                        stream.write('debugger skipped: process identity changed\n')
+                        continue
                     # timeout runs at gdb's privilege and --foreground retains
                     # the capture group. Killing only a sudo leader is not a
                     # cleanup mechanism for its privileged debugger child.
@@ -133,12 +173,15 @@ def capture(root, directory, soft):
                 except OSError as error:
                     print(f'ci-hang-guard: SIGQUIT unavailable pid={pid}: {error}', file=sys.stderr)
             time.sleep(5)
-        for index, path in enumerate(logs, 1):
+        for index, source in enumerate(logs, 1):
             try:
-                shutil.copyfile(path, directory / f'error-{index}.log')
+                with (directory / f'error-{index}.log').open('wb') as target:
+                    shutil.copyfileobj(source, target)
             except OSError:
                 pass
     finally:
+        for source in logs:
+            source.close()
         for _, fd in processes:
             os.close(fd)
 

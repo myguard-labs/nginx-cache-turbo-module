@@ -16,6 +16,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 GUARD = ROOT / "ci/tools/ci-hang-guard.sh"
 sys.path.insert(0, str(ROOT / "ci/tools"))
+import ci_child_observer as observer
 import ci_guard_lifecycle as lifecycle
 
 FIXTURE = r"""
@@ -277,7 +278,8 @@ class GuardLifecycleTests(unittest.TestCase):
         capture_script = (
             'import json,os,pathlib,sys,time; '
             'pathlib.Path(sys.argv[1]).write_text(json.dumps('
-            '{"pid":os.getpid(),"group":os.getpgrp(),"parent":os.getppid(),'
+            '{"pid":os.getpid(),"start":pathlib.Path("/proc/self/stat").read_text()'
+            '.rsplit(") ",1)[1].split()[19],"group":os.getpgrp(),"parent":os.getppid(),'
             '"command_group":os.getpgid(int(sys.argv[2]))})); time.sleep(60)')
         result = lifecycle.run_owned(
             [sys.executable, '-c', FIXTURE, str(identity), 'stubborn'], None, lambda pid: None,
@@ -286,7 +288,7 @@ class GuardLifecycleTests(unittest.TestCase):
         ids = json.loads(identity.read_text())
         diagnostic = json.loads(capture_file.read_text())
         self.pin_fixture(ids)
-        self.pin(diagnostic['pid'])
+        self.pin(diagnostic['pid'], diagnostic['start'])
         self.assertEqual(result['status'], 124)
         self.assertEqual(result['code'], -signal.SIGKILL)
         self.assertEqual(diagnostic['parent'], ids['owner'])
@@ -294,7 +296,12 @@ class GuardLifecycleTests(unittest.TestCase):
         self.assertEqual(diagnostic['group'], diagnostic['pid'])
         self.assertNotEqual(diagnostic['group'], diagnostic['command_group'])
         self.gone(ids)
-        self.assertFalse(Path('/proc/' + str(diagnostic['pid'])).exists())
+        try:
+            current = Path('/proc/' + str(diagnostic['pid']) + '/stat').read_text()
+        except FileNotFoundError:
+            current = None
+        self.assertTrue(current is None or current.rsplit(') ', 1)[1].split()[19]
+                        != diagnostic['start'], 'owned diagnostic survived cleanup')
 
     def test_owner_sigkill_fails_closed_without_cleanup_claim(self):
         guard, ids, log = self.start()
@@ -444,6 +451,45 @@ class GuardLifecycleTests(unittest.TestCase):
             result = lifecycle.run_owned(['never-start'], None, lambda pid: None)
         self.assertEqual(result['reason'], 'caller changed')
         self.assertEqual(result['status'], 125)
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+
+    def test_ownership_setup_failures_close_descriptors_and_report_unknown(self):
+        for operation in ('socketpair', 'fork'):
+            caller = os.pidfd_open(os.getpid())
+            sockets = []
+            original = lifecycle.socket.socketpair
+
+            def socketpair(*args, operation=operation, original=original, sockets=sockets):
+                if operation == 'socketpair':
+                    raise OSError('controlled socketpair failure')
+                pair = original(*args)
+                sockets.extend(pair)
+                return pair
+
+            with self.subTest(operation=operation), \
+                    mock.patch.object(lifecycle.os, 'pidfd_open', return_value=caller), \
+                    mock.patch.object(lifecycle.socket, 'socketpair', side_effect=socketpair), \
+                    mock.patch.object(lifecycle.os, 'fork',
+                                      side_effect=OSError('controlled fork failure')) as fork, \
+                    mock.patch.object(observer, '_report') as report:
+                status = observer.observe(self.directory, ['never-start'])
+            self.assertEqual(status, 125)
+            self.assertIn('TERMINATION UNKNOWN', report.call_args.args[0])
+            self.assertIn('ownership setup failed', report.call_args.args[0])
+            self.assertFalse(list(self.directory.glob('termination-*/termination.json')))
+            self.assertEqual(fork.call_count, int(operation == 'fork'))
+            self.assertTrue(all(sock.fileno() == -1 for sock in sockets))
+            with self.assertRaises(OSError):
+                os.fstat(caller)
+
+    def test_pin_rejects_changed_diagnostic_start_before_cleanup(self):
+        fd = os.open('/dev/null', os.O_RDONLY)
+        with mock.patch.object(lifecycle.os, 'pidfd_open', return_value=fd), \
+                mock.patch.object(Path, 'read_text', return_value='1 (fixture) S ' +
+                                  '0 ' * 19 + 'replacement'):
+            self.pin(12345, 'original')
+        self.assertNotIn(12345, self.handles)
         with self.assertRaises(OSError):
             os.fstat(fd)
 

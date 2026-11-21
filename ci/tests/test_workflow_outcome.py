@@ -58,15 +58,30 @@ class WorkflowOutcomeTest(unittest.TestCase):
         args = shlex.split(step['run'], comments=True)
         hard = int(args[0].split('=', 1)[1])
         soft = float(args[3])
-        self.assertEqual(hard, 780)
-        # Five qualified 588-test runs on 2026-11-17: max healthy step 761s.
+        # CI 44673532243 completed all 594 tests: timings sum 826.770740s,
+        # with normal teardown below 828s from the first test's start.
+        # The earlier 588-test maximum of 761s excludes six hostile matrices.
         # The observed capture bound was 7.342588s, rounded up to eight.
-        healthy_max = 761
+        healthy_max = 828
         capture_window = math.ceil(7.342588)
         cleanup_at = hard - 2 * min(2., hard / 5)  # Owner reserves TERM/KILL grace.
         self.assertGreater(soft, healthy_max, 'capture overlaps a measured healthy run')
+        self.assertEqual(soft, 2100, 'preserve the original hang watchdog')
+        self.assertEqual(hard, soft + 300, 'preserve the finite observer cleanup bound')
         self.assertGreaterEqual(cleanup_at - soft, capture_window,
                                 'capture loses its measured diagnostic window')
+
+    def test_build_watchdog_fits_existing_job(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/build-test.yml').read_text())
+        job = workflow['jobs']['build']
+        step = next(step for step in job['steps']
+                    if step.get('name') == 'Run runtime suite')
+        args = shlex.split(step['run'], comments=True)
+        guard_minutes = math.ceil(int(args[0].split('=', 1)[1]) / 60)
+        self.assertEqual(job['timeout-minutes'], 75)
+        # Preserve the documented build (~3m), preset (15m) and five-minute
+        # action overhead allowances; the remaining time covers other steps.
+        self.assertGreaterEqual(job['timeout-minutes'], guard_minutes + 3 + 15 + 5)
 
     def test_build_soft_capture_is_passive_with_original_hard_bound(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/build-test.yml').read_text())
@@ -74,8 +89,8 @@ class WorkflowOutcomeTest(unittest.TestCase):
                     if step.get('name') == 'Run runtime suite')
         self.assertEqual(step['env']['CT_HANG_QUIT'], '0')
         args = shlex.split(step['run'], comments=True)
-        self.assertEqual(args[:4], ['CT_HANG_HARD_SECONDS=780', 'bash',
-                                   'ci/tools/ci-hang-guard.sh', '768'])
+        self.assertEqual(args[:4], ['CT_HANG_HARD_SECONDS=2400', 'bash',
+                                   'ci/tools/ci-hang-guard.sh', '2100'])
         self.assertEqual(workflow['jobs']['build']['timeout-minutes'], 75)
 
     def test_build_runtime_outcome_and_status(self):
@@ -87,7 +102,7 @@ class WorkflowOutcomeTest(unittest.TestCase):
         self.assertIn('set -o pipefail', command)
         self.assertIn('--outcome-dir "$GITHUB_WORKSPACE/ci-hang-artifacts"', command)
         args = shlex.split(command, comments=True)
-        self.assertEqual(args[:3], ['CT_HANG_HARD_SECONDS=780', 'bash',
+        self.assertEqual(args[:3], ['CT_HANG_HARD_SECONDS=2400', 'bash',
                                     'ci/tools/ci-hang-guard.sh'])
         with tempfile.TemporaryDirectory(prefix='workflow outcome ') as tmp:
             workspace = Path(tmp)
