@@ -16,6 +16,7 @@ from unittest import mock
 REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "ci/tools"))
 import ci_child_observer as observer
+import ci_guard_lifecycle as lifecycle
 
 IDENTITY = {"run_id": "a" * 32, "observer_pid": 12, "child_pid": 34}
 
@@ -145,6 +146,30 @@ class TerminationTests(unittest.TestCase):
                 self.assertIn("TERMINATION UNKNOWN", output.getvalue())
                 self.assertFalse(list(pathlib.Path(directory).glob("*/termination.json")))
 
+    def test_signal_and_incomplete_cleanup_preserve_unknown_failure(self):
+        run_owned = observer.run_owned
+        drain = lifecycle._drain
+
+        def incomplete(*args):
+            drain(*args)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            def run(command, env, on_start, sig=sig, **kwargs):
+                def started(pid):
+                    on_start(pid)
+                    os.kill(os.getpid(), sig)
+                return run_owned(command, env, started, **kwargs)
+
+            with self.subTest(signal=sig), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(observer, 'run_owned', side_effect=run), \
+                    mock.patch.object(lifecycle, '_drain', side_effect=incomplete), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                status = observer.observe(directory, [sys.executable, '-c', 'pass'], hard=1)
+                self.assertFalse(list(pathlib.Path(directory).glob('*/termination.json')))
+            self.assertEqual(status, 125)
+            self.assertIn('TERMINATION UNKNOWN', output.getvalue())
+            self.assertIn('reason=cleanup incomplete', output.getvalue())
+
     def test_report_io_error_preserves_command_status(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch("builtins.print", side_effect=BrokenPipeError()):
@@ -154,7 +179,7 @@ class TerminationTests(unittest.TestCase):
     def test_start_failure_and_cli_usage(self):
         with tempfile.TemporaryDirectory() as directory:
             for error, code in ((FileNotFoundError(), 127), (PermissionError(), 126)):
-                with mock.patch.object(observer.subprocess, "Popen", side_effect=error), \
+                with mock.patch("ci_guard_lifecycle.subprocess.Popen", side_effect=error), \
                         contextlib.redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(observer.observe(directory, ["missing"]), code)
                 self.assertIn("UNKNOWN", output.getvalue())

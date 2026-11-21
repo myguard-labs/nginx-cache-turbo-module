@@ -1,5 +1,5 @@
 #!/bin/sh
-# ci-hang-guard.sh — run a command with a soft watchdog that, on hang, captures a
+# ci-hang-guard.sh — own a command with a finite deadline and early capture of a
 # gdb all-thread backtrace + a SIGQUIT debug dump of the nginx process(es) THIS run
 # spawned, before the outer job timeout kills the runner with no evidence.
 #
@@ -15,12 +15,20 @@
 # at the wrapped command, so a NEIGHBOURING job on a shared self-hosted runner never
 # leaks its backtraces/logs into this artifact (CWE-200).
 #
+# CT_HANG_HARD_SECONDS selects a finite hard bound (default: soft + 300s).
+# The Python owner reserves escalation/reaping time within this bound.
 # Usage: ci/tools/ci-hang-guard.sh <soft_timeout_s> <artifact_dir> -- <cmd...>
 set -eu
 
-SOFT="$1"; shift
+# Exec preserves guard PID/signals. Python owns lifecycle even when observation
+# is disabled; this shell is re-entered only as an isolated diagnostic child.
+if [ "${1:-}" != "--capture" ]; then
+    exec python3 "$(dirname "$(readlink -f "$0")")/ci_child_observer.py" --guard "$@"
+fi
+shift
+CMD_PID="$1"; shift
 ARTDIR="$1"; shift
-[ "$1" = "--" ] && shift
+SOFT="$1"; shift
 mkdir -p "$ARTDIR"
 
 # gdb needs to attach: on a hosted runner with ptrace_scope=1 a same-uid attach is
@@ -67,6 +75,7 @@ nginx_pids_under() {
         [ -r "/proc/$p/comm" ] || continue
         [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "nginx" ] && echo "$p"
     done
+    return 0
 }
 
 # Is $1 an nginx master? The master's cmdline carries the "-p"/"-c" arguments it
@@ -83,102 +92,80 @@ nginx_role() {
     echo master
 }
 
-# Run the real command in the background; watch its wall time.
-# Observation is opt-in; the original command path remains unchanged otherwise.
-if [ "${CT_OUTCOME_OBSERVE:-}" = "1" ]; then
-    python3 "$(dirname "$0")/ci_child_observer.py" "$ARTDIR" -- "$@" &
-else
-    "$@" &
-fi
-CMD_PID=$!
-
-captured=0
-elapsed=0
-while kill -0 "$CMD_PID" 2>/dev/null; do
-    sleep 5
-    elapsed=$((elapsed + 5))
-    if [ "$elapsed" -ge "$SOFT" ] && [ "$captured" -eq 0 ]; then
-        captured=1
-        echo "ci-hang-guard: soft timeout ${SOFT}s hit — capturing nginx state" >&2
-        # Name the test that never finished: the Python harness writes the
-        # current test to CT_TEST_BREADCRUMB on enter and "DONE <test>" on exit,
-        # so on a hang this file holds the culprit (see test_runtime.py).
-        if [ -n "${CT_TEST_BREADCRUMB:-}" ] && [ -r "$CT_TEST_BREADCRUMB" ]; then
-            cp "$CT_TEST_BREADCRUMB" "$ARTDIR/hanging-test.txt" 2>/dev/null || true
-            echo "ci-hang-guard: current test = $(cat "$CT_TEST_BREADCRUMB")" >&2
-        fi
-        pids=$(nginx_pids_under "$CMD_PID")
-        [ -z "$pids" ] && echo "ci-hang-guard: no nginx under pid $CMD_PID" >&2
-
-        # Split master from workers. The WORKER backtraces are the evidence: a
-        # master sits in sigsuspend() and never holds an epoll_wait frame, so a
-        # capture of the master alone cannot answer the event-loop question and
-        # reads as a false negative to any epoll_wait-based oracle.
-        masters=""; workers=""
-        for pid in $pids; do
-            case "$(nginx_role "$pid" "$pids")" in
-                worker) workers="$workers $pid" ;;
-                *)      masters="$masters $pid" ;;
+# Resolve only error logs already opened by these owned nginx processes.
+# Linux setproctitle rewrites argv, so a NUL-delimited "-p" is not reliable.
+nginx_error_logs() {
+    for _log_pid in $1; do
+        for _log_fd in /proc/"$_log_pid"/fd/*; do
+            _log_path=$(readlink -f "$_log_fd" 2>/dev/null) || continue
+            case "$_log_path" in
+                */error.log) [ -f "$_log_path" ] && printf '%s\n' "$_log_path" ;;
             esac
         done
-        echo "ci-hang-guard: masters=[$masters] workers=[$workers]" >&2
+    done
+    return 0
+}
 
-        # Record the -p prefix from the MASTER, which is the process actually
-        # exec'd with the argument vector, and which outlives the workers here.
-        # (cwd is unreliable — nginx may chdir to /.) error.log = <prefix>/logs.
-        roots=""
-        for pid in $masters; do
-            root=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
-                   | awk 'p{print;exit} $0=="-p"{p=1}')
-            [ -n "$root" ] && [ -d "$root" ] && roots="$roots $root"
-        done
-        # Fall back to a worker's inherited cmdline if the master vanished.
-        if [ -z "$roots" ]; then
-            for pid in $workers; do
-                root=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
-                       | awk 'p{print;exit} $0=="-p"{p=1}')
-                [ -n "$root" ] && [ -d "$root" ] && { roots="$roots $root"; break; }
-            done
-        fi
-        echo "ci-hang-guard: prefix roots=[$roots]" >&2
+echo "ci-hang-guard: soft timeout ${SOFT}s hit — capturing nginx state" >&2
+# Name the test that never finished: the Python harness writes the
+# current test to CT_TEST_BREADCRUMB on enter and "DONE <test>" on exit,
+# so on a hang this file holds the culprit (see test_runtime.py).
+if [ -n "${CT_TEST_BREADCRUMB:-}" ] && [ -r "$CT_TEST_BREADCRUMB" ]; then
+    cp "$CT_TEST_BREADCRUMB" "$ARTDIR/hanging-test.txt" 2>/dev/null || true
+    echo "ci-hang-guard: current test = $(cat "$CT_TEST_BREADCRUMB")" >&2
+fi
+pids=$(nginx_pids_under "$CMD_PID")
+[ -z "$pids" ] && echo "ci-hang-guard: no nginx under pid $CMD_PID" >&2
 
-        # PHASE 1 — attach to every process BEFORE signalling anything. SIGQUIT on
-        # the master is a GRACEFUL SHUTDOWN: it terminates the workers too. The
-        # previous interleaved loop QUIT the master first (lowest PID) and then
-        # found every worker already reaped, capturing "ptrace: No such process"
-        # instead of the backtraces. Workers first, master last, no signals yet.
-        for pid in $workers $masters; do
-            echo "ci-hang-guard: gdb pid=$pid" >&2
-            # -batch (NOT -batch-silent): -batch-silent suppresses the command output
-            # (info threads / bt / print) that is the whole point of the capture.
-            $GDB -batch -p "$pid" \
-                -ex "set pagination off" \
-                -ex "info threads" \
-                -ex "thread apply all bt full" \
-                -ex "print ngx_cycle->free_connection_n" \
-                -ex "print ngx_cycle->connection_n" \
-                -ex "detach" -ex "quit" \
-                > "$ARTDIR/gdb-nginx-$pid.txt" 2>&1 || true
-        done
+# Split master from workers. The WORKER backtraces are the evidence: a
+# master sits in sigsuspend() and never holds an epoll_wait frame, so a
+# capture of the master alone cannot answer the event-loop question and
+# reads as a false negative to any epoll_wait-based oracle.
+masters=""; workers=""
+for pid in $pids; do
+    case "$(nginx_role "$pid" "$pids")" in
+        worker) workers="$workers $pid" ;;
+        *)      masters="$masters $pid" ;;
+    esac
+done
+echo "ci-hang-guard: masters=[$masters] workers=[$workers]" >&2
 
-        # PHASE 2 — only now signal. SIGQUIT makes a --with-debug nginx log its
-        # posted-request / connection state. Workers first so each dumps its own
-        # state before the master's graceful shutdown can reap it.
-        for pid in $workers $masters; do
-            echo "ci-hang-guard: SIGQUIT pid=$pid" >&2
-            kill -QUIT "$pid" 2>/dev/null || true
-        done
-        sleep 5
-        # Snapshot logs from ONLY our nginx' own prefix dirs (recorded above), so no
-        # neighbouring job's /tmp logs are collected (CWE-200).
-        n=0
-        for root in $roots; do
-            n=$((n + 1))
-            find "$root" -maxdepth 4 -name error.log 2>/dev/null | while read -r f; do
-                cp "$f" "$ARTDIR/error-$n.log" 2>/dev/null || true
-            done
-        done
-    fi
+# Record paths before SIGQUIT can close their descriptors; preserve spaces and
+# deduplicate the log shared by master/workers. Never search neighbouring roots.
+logs=$(nginx_error_logs "$pids" | sort -u)
+echo "ci-hang-guard: error logs=[$logs]" >&2
+
+# PHASE 1 — attach to every process BEFORE signalling anything. SIGQUIT on
+# the master is a GRACEFUL SHUTDOWN: it terminates the workers too. The
+# previous interleaved loop QUIT the master first (lowest PID) and then
+# found every worker already reaped, capturing "ptrace: No such process"
+# instead of the backtraces. Workers first, master last, no signals yet.
+for pid in $workers $masters; do
+    echo "ci-hang-guard: gdb pid=$pid" >&2
+    # -batch (NOT -batch-silent): -batch-silent suppresses the command output
+    # (info threads / bt / print) that is the whole point of the capture.
+    $GDB -batch -p "$pid" \
+        -ex "set pagination off" \
+        -ex "info threads" \
+        -ex "thread apply all bt full" \
+        -ex "print ngx_cycle->free_connection_n" \
+        -ex "print ngx_cycle->connection_n" \
+        -ex "detach" -ex "quit" \
+        > "$ARTDIR/gdb-nginx-$pid.txt" 2>&1 || true
 done
 
-wait "$CMD_PID"
+# PHASE 2 — only now signal. SIGQUIT makes a --with-debug nginx log its
+# posted-request / connection state. Workers first so each dumps its own
+# state before the master's graceful shutdown can reap it.
+for pid in $workers $masters; do
+    echo "ci-hang-guard: SIGQUIT pid=$pid" >&2
+    kill -QUIT "$pid" 2>/dev/null || true
+done
+sleep 5
+# Snapshot only paths obtained from our nginx descriptors before signalling.
+n=0
+printf '%s\n' "$logs" | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    n=$((n + 1))
+    cp -- "$f" "$ARTDIR/error-$n.log" 2>/dev/null || true
+done
