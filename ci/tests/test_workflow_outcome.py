@@ -68,6 +68,16 @@ class WorkflowOutcomeTest(unittest.TestCase):
         self.assertGreaterEqual(cleanup_at - soft, capture_window,
                                 'capture loses its measured diagnostic window')
 
+    def test_build_soft_capture_is_passive_with_original_hard_bound(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/build-test.yml').read_text())
+        step = next(step for step in workflow['jobs']['build']['steps']
+                    if step.get('name') == 'Run runtime suite')
+        self.assertEqual(step['env']['CT_HANG_QUIT'], '0')
+        args = shlex.split(step['run'], comments=True)
+        self.assertEqual(args[:4], ['CT_HANG_HARD_SECONDS=780', 'bash',
+                                   'ci/tools/ci-hang-guard.sh', '768'])
+        self.assertEqual(workflow['jobs']['build']['timeout-minutes'], 75)
+
     def test_build_runtime_outcome_and_status(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/build-test.yml').read_text())
         steps = workflow['jobs']['build']['steps']

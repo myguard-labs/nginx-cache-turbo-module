@@ -1,4 +1,4 @@
-# sync-sha: 75ebc9f465cfcc46203f99fa899c52b32ac306e04698b7b9b8a0a3209c3face8
+# sync-sha: 400eb293bbe8c2f51c2d09ce00e38eb05f5b0ae9f987109c5f3e4459e48f859c
 name: Build & Test
 
 # Lane L-build (CI-L3). One job, sequential, no artifact hop: build, unit
@@ -190,6 +190,8 @@ jobs:
 
       - name: Run runtime suite
         # CI-L10d runtime budget: capture at 768s and stop/reap by 780s.
+        # Soft capture is passive: an advancing suite must not lose nginx to
+        # diagnostic SIGQUIT. The 780s acceptance bound still fails closed.
         # The hard bound includes TERM/KILL/reaping; capture runs separately so
         # a blocked debugger cannot extend it. Runtime budget failures stay red.
         #
@@ -210,6 +212,7 @@ jobs:
           # it to hanging-test.txt so the backtrace is labelled with the culprit.
           CT_TEST_BREADCRUMB: ${{ github.workspace }}/ci-hang-artifacts/current-test.txt
           CT_OUTCOME_OBSERVE: "1"
+          CT_HANG_QUIT: "0"
         run: |
           # Enforce the re-baselined CI-L10d runtime budget within the existing job.
           CT_HANG_HARD_SECONDS=780 bash ci/tools/ci-hang-guard.sh 768 "$GITHUB_WORKSPACE/ci-hang-artifacts" -- \

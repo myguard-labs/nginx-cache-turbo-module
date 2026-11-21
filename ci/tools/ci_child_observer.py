@@ -15,6 +15,7 @@ A killed observer cannot publish completion. Owner/host SIGKILL and kernel
 uninterruptible waits remain outside the guarantee; missing evidence is UNKNOWN.
 """
 
+import argparse
 import json
 import os
 import pathlib
@@ -122,10 +123,30 @@ def main():
                        soft=soft, hard=hard,
                        capture=lambda pid: ["sh", str(guard), "--capture", str(pid),
                                             directory, str(soft)])
-    if len(sys.argv) < 4 or sys.argv[2] != "--":
-        print("usage: ci_child_observer.py artifact_dir -- command [args...]", file=sys.stderr)
+    parser = argparse.ArgumentParser(
+        description="Observe a command with bounded cleanup and a finite deadline.",
+        epilog="Use --hard-seconds for commands needing more than the default 600s; "
+               "TERM/KILL cleanup reserves up to four seconds inside that bound.")
+    parser.add_argument('--hard-seconds', type=float, default=600.)
+    parser.add_argument('artifact_dir')
+    try:
+        if '--' not in sys.argv[1:]:
+            if '--help' in sys.argv[1:] or '-h' in sys.argv[1:]:
+                parser.parse_args(sys.argv[1:])
+            parser.error("expected artifact_dir -- command [args...]")
+        separator = sys.argv.index('--')
+        args = parser.parse_args(sys.argv[1:separator])
+        command = sys.argv[separator + 1:]
+        validate_deadlines(None, args.hard_seconds)
+        if not command:
+            parser.error("missing command")
+    except ValueError as error:
+        parser.print_usage(sys.stderr)
+        print(f"{parser.prog}: error: {error}", file=sys.stderr)
         return 2
-    return observe(sys.argv[1], sys.argv[3:])
+    except SystemExit as error:
+        return error.code
+    return observe(args.artifact_dir, command, hard=args.hard_seconds)
 
 
 if __name__ == "__main__":

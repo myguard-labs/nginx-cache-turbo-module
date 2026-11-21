@@ -82,11 +82,16 @@ def _adopted(anchors, sig):
             continue
         # A direct unreaped child cannot have its PID reused under this owner.
         try:
+            waited, _ = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                continue
             fd = os.pidfd_open(pid)
             try:
-                signal.pidfd_send_signal(fd, sig)
-                waited, _ = os.waitpid(pid, os.WNOHANG)
-                pending |= waited == 0
+                try:
+                    signal.pidfd_send_signal(fd, sig)
+                finally:
+                    waited, _ = os.waitpid(pid, os.WNOHANG)
+                    pending |= waited == 0
             finally:
                 os.close(fd)
         except OSError as error:
@@ -112,7 +117,12 @@ def _drain(processes, grace, deadline):
     # Keep every anchor (even a zombie) until both group signals are finished.
     for sig in (signal.SIGTERM, signal.SIGKILL):
         for process in processes:
-            process.send(sig)
+            try:
+                process.send(sig)
+            except OSError as error:
+                failed = True
+                if not hasattr(process, 'cleanup_error'):
+                    process.cleanup_error = f"{type(error).__name__}: {error}"
         end = min(deadline, time.monotonic() + grace)
         while True:
             pending = adopted(sig)
@@ -220,6 +230,8 @@ def _owner(wire, caller_fd, command, env, soft, hard, capture):
                     result["status"] = 128 - codes[0] if codes[0] < 0 else codes[0]
             else:
                 result.update(status=125, code=None, reason="cleanup incomplete")
+                result['cleanup_errors'] = [p.cleanup_error for p in processes
+                                            if hasattr(p, 'cleanup_error')]
         try:
             wire.send(json.dumps(result).encode())
         except OSError:

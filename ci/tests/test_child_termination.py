@@ -258,5 +258,26 @@ print(json.dumps({'decision': decision, 'status': str(status), 'pid': os.getpid(
         self.assertIn('--outcome-dir "$GITHUB_WORKSPACE/ci-hang-artifacts"', step)
 
 
+class StandaloneDeadlineTests(unittest.TestCase):
+    def test_default_and_override_are_explicit_finite_bounds(self):
+        for arguments, expected in ((['artifacts', '--', 'command'], 600.),
+                                    (['--hard-seconds', '1800', 'artifacts', '--', 'command'], 1800.)):
+            with self.subTest(arguments=arguments), \
+                    mock.patch.object(sys, 'argv', ['observer', *arguments]), \
+                    mock.patch.object(observer, 'observe', return_value=23) as observe:
+                self.assertEqual(observer.main(), 23)
+                observe.assert_called_once_with('artifacts', ['command'], hard=expected)
+
+    def test_invalid_standalone_deadline_or_missing_command_cannot_launch(self):
+        for arguments in (['--hard-seconds', 'inf', 'artifacts', '--', 'command'],
+                          ['--hard-seconds', '0', 'artifacts', '--', 'command'],
+                          ['artifacts', '--']):
+            with self.subTest(arguments=arguments), \
+                    mock.patch.object(sys, 'argv', ['observer', *arguments]), \
+                    mock.patch.object(observer, 'observe') as observe:
+                self.assertEqual(observer.main(), 2)
+                observe.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
