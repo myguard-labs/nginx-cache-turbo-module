@@ -1,5 +1,12 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Bugfix: a location without an L2 backend and with cache_turbo_lock
+       off no longer refetches a fresh auto-Vary entry from the origin once
+       its Vary marker is older than cache_turbo_vary_marker_revalidate
+       (2s by default). The request was answered as EXPIRED and went to the
+       origin although the entry was still inside cache_turbo_valid. The
+       marker revalidation now arms only when an L2 backend can run it.
+
     *) Change: a single-URI PURGE now answers 503 with
        {"error":"l2 delete not sent"} when its L2 delete of the cached object
        or its stampede lock was dropped before it reached Redis or memcached
