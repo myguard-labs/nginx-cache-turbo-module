@@ -102,8 +102,9 @@ def open_logs(descriptors, logs):
             if (os.path.basename(os.readlink(name, dir_fd=descriptors)) != 'error.log'
                     or not stat.S_ISREG(os.stat(name, dir_fd=descriptors).st_mode)):
                 continue
-            stream = os.fdopen(os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC,
-                                       dir_fd=descriptors), 'rb')
+            # The opener transfers ownership: a rejected fd (a directory) is closed.
+            stream = open(name, 'rb', opener=lambda path, _flags: os.open(
+                path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=descriptors))
             # nginx may reuse the number after readlink; judge the file we opened.
             if os.path.basename(os.readlink(f'{SELF_FD}/{stream.fileno()}')) != 'error.log':
                 continue
@@ -190,12 +191,8 @@ def capture(root, directory, soft):
                 identity = process_stat(PROC / str(pid) / 'stat')
             except (OSError, ValueError, IndexError):
                 continue
-            allowance = min(10., max(0., until - time.monotonic()) / (len(processes) - index))
             print(f'ci-hang-guard: gdb pid={pid}', file=sys.stderr)
             with (directory / f'gdb-nginx-{pid}.txt').open('w') as stream:
-                if allowance <= .25:
-                    stream.write('debugger skipped: capture budget exhausted\n')
-                    continue
                 try:
                     # GDB accepts only numeric PIDs. Recheck the retained pidfd
                     # and start identity immediately before launch; PID reuse
@@ -203,6 +200,11 @@ def capture(root, directory, soft):
                     if (select.select([fd], [], [], 0)[0]
                             or process_stat(PROC / str(pid) / 'stat') != identity):
                         stream.write('debugger skipped: process identity changed\n')
+                        continue
+                    # Measure after preflight, so its latency is charged to the budget.
+                    allowance = min(10., max(0., until - time.monotonic()) / (len(processes) - index))
+                    if allowance <= .25:
+                        stream.write('debugger skipped: capture budget exhausted\n')
                         continue
                     # timeout runs at gdb's privilege and --foreground retains
                     # the capture group. Killing only a sudo leader is not a

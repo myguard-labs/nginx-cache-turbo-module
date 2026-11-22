@@ -184,6 +184,8 @@ class GuardLifecycleTests(unittest.TestCase):
              'print(p.pid,flush=True); time.sleep(60)'),
             'sh', str(GUARD), '10', str(self.directory), '--', sys.executable,
             '-c', FIXTURE, str(identity), 'stubborn'],
+            # Pin the pair as start() does; an ambient hard bound rejects soft=10.
+            env=dict(os.environ, CT_HANG_HARD_SECONDS='20'),
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.processes.append(parent)
         self.pin(parent.pid)
@@ -523,6 +525,22 @@ class GuardLifecycleTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, 'invalid guard deadline'):
                 lifecycle.run_owned(['never-start'], None, lambda pid: None,
                                     soft=soft, hard=hard)
+
+    def test_expired_hard_deadline_does_not_launch(self):
+        # The smallest positive bound rounds start + hard back to start.
+        marker = self.directory / 'expired-should-not-run'
+        started = []
+
+        def on_start(pid):
+            started.append(pid)
+            self.pin(pid)
+
+        result = lifecycle.run_owned(
+            [sys.executable, '-c', 'import pathlib,sys; pathlib.Path(sys.argv[1]).touch()',
+             str(marker)], None, on_start, hard=5e-324)
+        self.assertEqual(started, [], 'command launched after its hard deadline')
+        self.assertEqual(result, {'status': 124, 'code': None, 'reason': 'hard deadline'})
+        self.assertFalse(marker.exists())
 
     def test_invalid_deadline_does_not_launch(self):
         marker = self.directory / 'should-not-run'

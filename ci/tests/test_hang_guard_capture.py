@@ -278,6 +278,13 @@ class HangCaptureTests(unittest.TestCase):
                 opened.append(stream)
                 return stream
 
+            logs = []
+
+            def open_log(name, *args, logs=logs, **kwargs):
+                stream = open(name, *args, **kwargs)
+                logs.append(stream)
+                return stream
+
             calls = []
 
             def stat(fd, error=error, calls=calls):
@@ -291,6 +298,7 @@ class HangCaptureTests(unittest.TestCase):
                     mock.patch.object(diagnostics, 'PROC', self.proc), \
                     mock.patch.object(diagnostics.select, 'select', return_value=([], [], [])), \
                     mock.patch.object(diagnostics.os, 'fdopen', open_file), \
+                    mock.patch.object(diagnostics, 'open', open_log, create=True), \
                     mock.patch.object(diagnostics.os, 'fstat', side_effect=stat):
                 if error is PermissionError:
                     self.assertEqual(diagnostics.error_logs([(101, -1, (100, '101'))]), [])
@@ -298,7 +306,8 @@ class HangCaptureTests(unittest.TestCase):
                     with self.assertRaises(KeyboardInterrupt):
                         diagnostics.error_logs([(101, -1, (100, '101'))])
             self.assertTrue(opened)
-            self.assertTrue(all(stream.closed for stream in opened))
+            self.assertTrue(logs, 'control did not open a log stream')
+            self.assertTrue(all(stream.closed for stream in opened + logs))
 
     def test_reused_pid_after_discovery_cannot_supply_logs(self):
         replacement = self.root / 'replacement/logs/error.log'
@@ -349,6 +358,46 @@ class HangCaptureTests(unittest.TestCase):
                         stream.close()
                 self.assertEqual(contents, [b'owned diagnostic\n'],
                                  'a reused fd number supplied a file other than error.log')
+
+    def test_fd_number_reused_as_directory_releases_opened_descriptor(self):
+        reused = self.proc / '101/fd/4'
+        (self.proc / '101/fd/5').symlink_to(self.owned)
+        original = os.open
+        opened = []
+
+        def reuse(name, *args, **kwargs):
+            if name == '4' and kwargs.get('dir_fd') is not None:
+                # After the regular-file stat, nginx reuses fd 4 for a directory.
+                reused.unlink()
+                reused.symlink_to(self.owned.parent)
+                fd = original(name, *args, **kwargs)
+                status = os.fstat(fd)
+                opened.append((fd, (status.st_dev, status.st_ino)))
+                return fd
+            return original(name, *args, **kwargs)
+
+        def leaked():
+            for fd, key in opened:
+                try:
+                    status = os.fstat(fd)
+                except OSError:
+                    continue
+                if (status.st_dev, status.st_ino) == key:
+                    yield fd
+
+        self.addCleanup(lambda: [os.close(fd) for fd in list(leaked())])
+        with mock.patch.object(diagnostics, 'PROC', self.proc), \
+                mock.patch.object(diagnostics.select, 'select', return_value=([], [], [])), \
+                mock.patch.object(diagnostics.os, 'open', side_effect=reuse):
+            streams = diagnostics.error_logs([(101, -1, (100, '101'))])
+        try:
+            contents = [stream.read() for stream in streams]
+        finally:
+            for stream in streams:
+                stream.close()
+        self.assertEqual(len(opened), 1, 'control did not reuse the number as a directory')
+        self.assertEqual(list(leaked()), [], 'a rejected directory descriptor stayed open')
+        self.assertEqual(contents, [b'owned diagnostic\n'])
 
     def test_real_proc_logs_follow_pinned_identity(self):
         log = self.root / 'real/logs/error.log'
@@ -406,6 +455,40 @@ class HangCaptureTests(unittest.TestCase):
                 self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n')
                 self.assertEqual(len(self.signals), 1)
 
+    def test_debugger_allowance_charges_launch_preflight(self):
+        # Passive capture with owner cleanup at 1008 lets debuggers run until 1007.5.
+        original = diagnostics.process_stat
+        for delay, expected in ((2., [.5]), (2.25, [])):
+            clock = [1005.]
+            allowances = []
+            calls = []
+
+            def slow(path, clock=clock, calls=calls, delay=delay):
+                if path.parent.name == '101':
+                    calls.append(path)
+                    # Snapshot, discovery recheck, pre-budget identity, launch recheck.
+                    if len(calls) == 4:
+                        clock[0] += delay
+                return original(path)
+
+            def debugger(_command, clock=clock, allowances=allowances, **kwargs):
+                allowances.append(kwargs['timeout'])
+                clock[0] += kwargs['timeout']
+
+            with self.subTest(delay=delay), \
+                    mock.patch.object(diagnostics.time, 'monotonic',
+                                      side_effect=lambda c=clock: c[0]), \
+                    mock.patch.object(diagnostics, 'process_stat', side_effect=slow), \
+                    mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger):
+                _, artifacts = self.capture(passive=True, hard=12,
+                                            env={'CT_HANG_CLEANUP_AT': repr(1008.)})
+                self.assertEqual(len(calls), 4, 'control did not delay the launch recheck')
+                self.assertLessEqual(clock[0], 1007.5, 'debugger ran past its snapshot margin')
+                self.assertEqual(allowances, expected)
+                if not expected:
+                    self.assertIn('capture budget exhausted',
+                                  (artifacts / 'gdb-nginx-101.txt').read_text())
+
     def test_invalid_owner_cutoff_uses_hard_deadline_fallback(self):
         for value in ('nan', 'inf', 'bogus', ''):
             clock = [100.]
@@ -437,6 +520,7 @@ class HangCaptureTests(unittest.TestCase):
                 mock.patch.object(diagnostics.time, 'sleep'), \
                 mock.patch.object(diagnostics.os, 'kill') as numeric_kill, \
                 mock.patch.dict(os.environ, CT_HANG_QUIT='1', CT_HANG_HARD_SECONDS='301'):
+            os.environ.pop('CT_HANG_CLEANUP_AT', None)  # An ambient cutoff skips the debugger.
             diagnostics.capture(100, self.root / 'real-exit', 1)
             numeric_kill.assert_not_called()
         self.assertIsNotNone(child.returncode)

@@ -170,6 +170,10 @@ def _owner(wire, caller_fd, command, env, soft, hard, capture):
         # Do not launch if the caller/guard has already died during setup.
         if select.select([wire, caller_fd], [], [], 0)[0]:
             raise OSError("parent unavailable before launch")
+        # A tiny bound can round deadline to start; never launch into cleanup.
+        if time.monotonic() >= deadline - 2 * grace:
+            result.update(status=124, reason="hard deadline")
+            return
         starting = True
         command_process = OwnedProcess(command, env)
         processes.append(command_process)
