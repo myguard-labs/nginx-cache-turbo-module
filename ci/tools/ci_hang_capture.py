@@ -11,6 +11,8 @@ The owner passes its absolute CLOCK_MONOTONIC cleanup instant in
 CT_HANG_CLEANUP_AT; debuggers and the SIGQUIT tail finish before it.
 """
 
+import contextlib
+import errno
 import math
 import os
 import select
@@ -24,6 +26,7 @@ from pathlib import Path
 
 PROC = Path('/proc')
 SELF_FD = '/proc/self/fd'  # Our own descriptors: their targets cannot change.
+TERM_GRACE = .2  # The last part of a debugger allowance: TERM, then KILL.
 
 
 def parse_stat(text):
@@ -39,6 +42,42 @@ def read_at(directory, name):
     fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory)
     with os.fdopen(fd, 'rb') as stream:
         return stream.read().decode('ascii')
+
+
+def exited(fd):
+    """Report whether a pidfd's process exited; poll() has no FD_SETSIZE limit."""
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    events = poller.poll(0)
+    # A closed descriptor raises like select() did; HUP/ERR count as exited.
+    if any(mask & select.POLLNVAL for _, mask in events):
+        raise OSError(errno.EBADF, 'pidfd closed')
+    return bool(events)
+
+
+def debug(command, stream, end):
+    """Run one debugger whose launch and run share the absolute deadline end.
+
+    The last TERM_GRACE seconds stop it: TERM makes the timeout(1) wrapper forward
+    TERM to gdb, KILL it after --kill-after and exit only once gdb is reaped.
+    KILL of the direct child is the fallback. A sudo leader does not relay a
+    signal from its own process group, so under sudo timeout's timer bounds gdb.
+    A launch that ends after end - TERM_GRACE still gets the full grace, so the
+    wrapper can reap gdb: stopping may end TERM_GRACE after launch, inside the
+    snapshot margin that capture() reserves before the owner's cleanup.
+    """
+    with subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT) as process:
+        try:
+            # Popen returns after exec; that launch latency is charged to end.
+            return process.wait(timeout=max(0., end - TERM_GRACE - time.monotonic()))
+        except BaseException as error:
+            if isinstance(error, subprocess.TimeoutExpired):
+                process.terminate()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=TERM_GRACE)
+            process.kill()  # No-op once the wrapper has been reaped.
+            process.wait()
+            raise
 
 
 def discover(root):
@@ -75,7 +114,7 @@ def discover(root):
                     ancestors.append(ancestor)
                     if process_stat(PROC / str(parent) / 'stat') != snapshot[parent]:
                         raise ValueError('changed ancestry identity')
-                if any(select.select([ancestor], [], [], 0)[0] for ancestor in ancestors):
+                if any(exited(ancestor) for ancestor in ancestors):
                     continue
                 selected.append((pid, fd, snapshot[pid]))
                 fd = None  # Ownership transfers to the returned record.
@@ -131,7 +170,7 @@ def error_logs(processes):
                 directory = os.open(PROC / str(pid), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
                 if (parse_stat(read_at(directory, 'stat'))[1] != identity[1]
                         or read_at(directory, 'comm').strip() != 'nginx'
-                        or select.select([fd], [], [], 0)[0]):
+                        or exited(fd)):
                     continue
                 descriptors = os.open('fd', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
                                       dir_fd=directory)
@@ -185,7 +224,7 @@ def capture(root, directory, soft):
         until = cutoff - (5 if shutdown else 0)
         privilege = ['sudo', '-n'] if shutil.which('sudo') else []
         for index, (pid, fd, _) in enumerate(processes):
-            if select.select([fd], [], [], 0)[0]:
+            if exited(fd):
                 continue
             try:
                 identity = process_stat(PROC / str(pid) / 'stat')
@@ -197,27 +236,27 @@ def capture(root, directory, soft):
                     # GDB accepts only numeric PIDs. Recheck the retained pidfd
                     # and start identity immediately before launch; PID reuse
                     # during sudo/timeout/GDB startup remains a residual window.
-                    if (select.select([fd], [], [], 0)[0]
+                    if (exited(fd)
                             or process_stat(PROC / str(pid) / 'stat') != identity):
                         stream.write('debugger skipped: process identity changed\n')
                         continue
                     # Measure after preflight, so its latency is charged to the budget.
-                    allowance = min(10., max(0., until - time.monotonic()) / (len(processes) - index))
+                    now = time.monotonic()
+                    allowance = min(10., max(0., until - now) / (len(processes) - index))
                     if allowance <= .25:
                         stream.write('debugger skipped: capture budget exhausted\n')
                         continue
                     # timeout runs at gdb's privilege and --foreground retains
                     # the capture group. Killing only a sudo leader is not a
                     # cleanup mechanism for its privileged debugger child.
-                    subprocess.run([
+                    debug([
                         *privilege, 'timeout', '--foreground', '--signal=TERM',
                         '--kill-after=0.1s', f'{allowance - .2:.6f}s',
                         'gdb', '-batch', '-p', str(pid), '-ex', 'set pagination off',
                         '-ex', 'info threads', '-ex', 'thread apply all bt full',
                         '-ex', 'print ngx_cycle->free_connection_n',
                         '-ex', 'print ngx_cycle->connection_n', '-ex', 'detach', '-ex', 'quit',
-                    ], stdout=stream, stderr=subprocess.STDOUT, check=False,
-                       timeout=allowance)
+                    ], stream, now + allowance)
                 except subprocess.TimeoutExpired:
                     stream.write('debugger exceeded capture budget\n')
                 except OSError as error:

@@ -48,6 +48,8 @@ class GuardLifecycleTests(unittest.TestCase):
         self.prior = ctypes.c_int()
         self.assertEqual(self.libc.prctl(37, ctypes.byref(self.prior), 0, 0, 0), 0)
         self.assertEqual(self.libc.prctl(36, 1, 0, 0, 0), 0)
+        # Cleanups run after tearDown, and also when setUp or tearDown raises.
+        self.addCleanup(self.libc.prctl, 36, self.prior.value, 0, 0, 0)
         self.tmp = tempfile.TemporaryDirectory(prefix='guard-lifecycle-')
         self.directory = Path(self.tmp.name)
         self.handles = {}
@@ -82,7 +84,6 @@ class GuardLifecycleTests(unittest.TestCase):
             os.close(fd)
         for log in self.logs:
             log.close()
-        self.libc.prctl(36, self.prior.value, 0, 0, 0)
         self.tmp.cleanup()
 
     @staticmethod
@@ -787,9 +788,15 @@ class AdoptedCleanupTests(unittest.TestCase):
 
     def test_adopted_error_still_visits_and_reaps_later_child(self):
         for operation in ('open', 'signal', 'wait', 'close'):
-            def fail(value, *_args, operation=operation, boundary=None):
+            waits = []
+
+            def fail(value, *_args, operation=operation, boundary=None, waits=waits):
                 if value in (202, 1202) and operation == boundary:
                     raise PermissionError('controlled child failure')
+                if boundary == 'wait':
+                    waits.append(value)
+                    # 303 is still running when checked, then reaped after its KILL.
+                    return (303, 0) if waits.count(303) == 2 else (0, 0)
                 return value + 1000 if boundary == 'open' else (0, 0)
 
             with (
@@ -810,7 +817,9 @@ class AdoptedCleanupTests(unittest.TestCase):
                              ([mock.call(303)] if operation == 'wait'
                               else [mock.call(202), mock.call(303)]))
             sent.assert_any_call(1303, signal.SIGKILL)
-            waited.assert_any_call(303, os.WNOHANG)
+            self.assertEqual([call for call in waited.call_args_list if call.args[0] == 303],
+                             [mock.call(303, os.WNOHANG)] * 2,
+                             'the later child was inspected but not reaped after its signal')
             closed.assert_any_call(1303)
             if operation in ('open', 'wait'):
                 self.assertNotIn(mock.call(1202), closed.call_args_list)
@@ -844,6 +853,42 @@ class AdoptedCleanupTests(unittest.TestCase):
         self.assertEqual(owned.send.call_args_list,
                          [mock.call(signal.SIGTERM), mock.call(signal.SIGKILL)])
         owned.reap.assert_called_once_with()
+
+
+class SubreaperRestoreTests(unittest.TestCase):
+    """A failing lifecycle fixture must not leave this worker adopting orphans."""
+
+    def test_fixture_failure_restores_subreaper(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        prior = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(prior), 0, 0, 0), 0)
+        self.addCleanup(libc.prctl, 36, prior.value, 0, 0, 0)
+
+        class Probe(GuardLifecycleTests):
+            def runTest(self):
+                # A fixture that outlives its wait makes tearDown raise early.
+                stuck = mock.Mock()
+                stuck.poll.return_value = None
+                stuck.wait.side_effect = subprocess.TimeoutExpired('controlled fixture', 5)
+                self.processes.append(stuck)
+
+        for phase in ('setUp', 'tearDown'):
+            with self.subTest(phase=phase):
+                self.assertEqual(libc.prctl(36, 0, 0, 0, 0), 0)
+                probe = Probe()
+                result = unittest.TestResult()
+                if phase == 'setUp':
+                    with mock.patch.object(tempfile, 'TemporaryDirectory',
+                                           side_effect=OSError('controlled setup failure')):
+                        probe.run(result)
+                else:
+                    probe.run(result)
+                    probe.tmp.cleanup()
+                self.assertEqual(len(result.errors), 1, result.errors)
+                self.assertIn('controlled', result.errors[0][1])
+                state = ctypes.c_int()
+                self.assertEqual(libc.prctl(37, ctypes.byref(state), 0, 0, 0), 0)
+                self.assertEqual(state.value, 0, phase + ' failure left the subreaper enabled')
 
 
 if __name__ == '__main__':

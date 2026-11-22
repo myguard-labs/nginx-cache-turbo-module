@@ -16,6 +16,9 @@ stubborn/escaped descendants; inability to establish ownership fails closed.
 SIGKILL of the guard is handled by the independent owner. SIGKILL of that owner,
 both processes killed together, uninterruptible kernel waits and host death
 cannot be guaranteed: absent completion stays UNKNOWN, never a cleanup receipt.
+Popen returns only after the command's exec; an exec that stalls (for example
+on a hung filesystem) also holds the owner, so guard death and the hard deadline
+take effect after it returns and the outer job limit bounds the stall.
 This is cooperative CI process cleanup, not containment of hostile fork bombs.
 """
 

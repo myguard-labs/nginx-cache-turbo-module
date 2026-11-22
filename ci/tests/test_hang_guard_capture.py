@@ -1,8 +1,11 @@
 """Exercise the real capture shell against an isolated process-filesystem fixture."""
 
 import contextlib
+import errno
 import io
 import os
+import resource
+import shutil
 import signal
 import subprocess
 import sys
@@ -14,6 +17,41 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'ci/tools'))
 import ci_hang_capture as diagnostics
+
+
+class Debugger:
+    """Popen stand-in: its first wait(timeout) runs the test's debugger model."""
+
+    def __init__(self, model, args, **_kwargs):
+        self.model, self.args, self.returncode = model, args, None
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.model(self.args, timeout=timeout)
+            self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        if self.returncode is None:
+            self.returncode = -signal.SIGKILL
+
+    def terminate(self):
+        if self.returncode is None:
+            self.returncode = -signal.SIGTERM
+
+    # subprocess.run() support keeps launch controls valid for a run() launcher.
+    def communicate(self, _input=None, timeout=None):
+        self.wait(timeout)
+        return None, None
+
+    def poll(self):
+        return self.returncode
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.wait()
 
 
 class HangCaptureTests(unittest.TestCase):
@@ -68,7 +106,7 @@ class HangCaptureTests(unittest.TestCase):
 
         with mock.patch.object(diagnostics, 'PROC', self.proc), \
                 mock.patch.object(diagnostics.os, 'pidfd_open', side_effect=pin), \
-                mock.patch.object(diagnostics.select, 'select', return_value=([], [], [])), \
+                mock.patch.object(diagnostics, 'exited', return_value=False), \
                 mock.patch.object(diagnostics.signal, 'pidfd_send_signal',
                                   side_effect=lambda fd, sig: signals.append((fd, sig))), \
                 mock.patch.object(diagnostics.time, 'sleep', side_effect=sleep), \
@@ -125,9 +163,23 @@ class HangCaptureTests(unittest.TestCase):
         self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n')
         self.assertEqual(self.signals, [], 'passive diagnostics stopped nginx')
 
+    @staticmethod
+    def debugger(model, launch=None):
+        """Patch debugger launch; model(args, timeout=...) simulates one run."""
+        def start(args, **kwargs):
+            if launch is not None:
+                launch()  # Work before Popen returns: fork, exec, sudo startup.
+            return Debugger(model, args, **kwargs)
+        return mock.patch.object(diagnostics.subprocess, 'Popen', side_effect=start)
+
     def test_debugger_timeout_preserves_signal_and_log_snapshot(self):
-        with mock.patch.object(diagnostics.subprocess, 'run',
-                               side_effect=subprocess.TimeoutExpired('gdb', .1)) as debugger:
+        waits = []
+
+        def hung(_args, timeout):
+            waits.append(timeout)
+            raise subprocess.TimeoutExpired('gdb', timeout)
+
+        with self.debugger(hung) as debugger:
             _, artifacts = self.capture()
         self.assertEqual(len(self.signals), 1)
         self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n')
@@ -136,7 +188,8 @@ class HangCaptureTests(unittest.TestCase):
         command = debugger.call_args.args[0]
         self.assertEqual(command[:4], ['sudo', '-n', 'timeout', '--foreground'])
         self.assertIn('--kill-after=0.1s', command)
-        self.assertGreater(debugger.call_args.kwargs['timeout'], 0)
+        self.assertEqual(len(waits), 1)
+        self.assertGreater(waits[0], 0)
 
     def test_all_debuggers_share_remaining_capture_window(self):
         self.process(102, 101, 'nginx')
@@ -144,12 +197,13 @@ class HangCaptureTests(unittest.TestCase):
         allowances = []
 
         def debugger(_command, **kwargs):
-            allowances.append(kwargs['timeout'])
-            clock[0] += kwargs['timeout']
+            # A hung debugger also spends the TERM grace before its deadline.
+            allowances.append(kwargs['timeout'] + diagnostics.TERM_GRACE)
+            clock[0] += allowances[-1]
             raise subprocess.TimeoutExpired('gdb', kwargs['timeout'])
 
         with mock.patch.object(diagnostics.time, 'monotonic', side_effect=lambda: clock[0]), \
-                mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger), \
+                self.debugger(debugger), \
                 mock.patch.dict(os.environ, CT_HANG_HARD_SECONDS='780'):
             # Use the real Build soft value while retaining this fixture's proc.
             original = diagnostics.capture
@@ -199,7 +253,7 @@ class HangCaptureTests(unittest.TestCase):
             return parent, start
 
         with mock.patch.object(diagnostics, 'process_stat', side_effect=replaced), \
-                mock.patch.object(diagnostics.subprocess, 'run') as debugger:
+                mock.patch.object(diagnostics.subprocess, 'Popen') as debugger:
             self.capture()
         debugger.assert_not_called()
         self.assertEqual(self.signals, [])
@@ -218,8 +272,7 @@ class HangCaptureTests(unittest.TestCase):
             with self.subTest(missing=missing), \
                     mock.patch.object(diagnostics, 'PROC', self.proc), \
                     mock.patch.object(diagnostics.os, 'pidfd_open', side_effect=pin), \
-                    mock.patch.object(diagnostics.select, 'select',
-                                      side_effect=lambda fds, *_args: (fds, [], [])):
+                    mock.patch.object(diagnostics, 'exited', return_value=True):
                 self.assertEqual(diagnostics.discover(100), [])
             for fd in descriptors:
                 with self.assertRaises(OSError):
@@ -240,7 +293,7 @@ class HangCaptureTests(unittest.TestCase):
             return parent, start
 
         with mock.patch.object(diagnostics, 'process_stat', side_effect=replaced), \
-                mock.patch.object(diagnostics.subprocess, 'run') as debugger:
+                mock.patch.object(diagnostics.subprocess, 'Popen') as debugger:
             _, artifacts = self.capture(passive=True)
         debugger.assert_not_called()
         self.assertIn('process identity changed',
@@ -260,7 +313,7 @@ class HangCaptureTests(unittest.TestCase):
             self.owned.write_text('replacement log\n')
 
         with mock.patch.object(diagnostics, 'error_logs', side_effect=logs), \
-                mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger):
+                self.debugger(debugger):
             _, artifacts = self.capture(passive=True)
         self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n')
         self.assertTrue(opened)
@@ -296,7 +349,7 @@ class HangCaptureTests(unittest.TestCase):
 
             with self.subTest(error=error), \
                     mock.patch.object(diagnostics, 'PROC', self.proc), \
-                    mock.patch.object(diagnostics.select, 'select', return_value=([], [], [])), \
+                    mock.patch.object(diagnostics, 'exited', return_value=False), \
                     mock.patch.object(diagnostics.os, 'fdopen', open_file), \
                     mock.patch.object(diagnostics, 'open', open_log, create=True), \
                     mock.patch.object(diagnostics.os, 'fstat', side_effect=stat):
@@ -348,7 +401,7 @@ class HangCaptureTests(unittest.TestCase):
 
             with self.subTest(reused_before=call), \
                     mock.patch.object(diagnostics, 'PROC', self.proc), \
-                    mock.patch.object(diagnostics.select, 'select', return_value=([], [], [])), \
+                    mock.patch.object(diagnostics, 'exited', return_value=False), \
                     mock.patch.object(diagnostics.os, call, side_effect=reuse):
                 streams = diagnostics.error_logs([(101, -1, (100, '101'))])
                 try:
@@ -387,7 +440,7 @@ class HangCaptureTests(unittest.TestCase):
 
         self.addCleanup(lambda: [os.close(fd) for fd in list(leaked())])
         with mock.patch.object(diagnostics, 'PROC', self.proc), \
-                mock.patch.object(diagnostics.select, 'select', return_value=([], [], [])), \
+                mock.patch.object(diagnostics, 'exited', return_value=False), \
                 mock.patch.object(diagnostics.os, 'open', side_effect=reuse):
             streams = diagnostics.error_logs([(101, -1, (100, '101'))])
         try:
@@ -438,7 +491,8 @@ class HangCaptureTests(unittest.TestCase):
             allowances = []
 
             def debugger(_command, clock=clock, allowances=allowances, **kwargs):
-                allowances.append(kwargs['timeout'])
+                # The allowance runs from launch to the deadline, TERM grace included.
+                allowances.append(kwargs['timeout'] + diagnostics.TERM_GRACE)
                 clock[0] += kwargs['timeout']
 
             def sleep(seconds, clock=clock):
@@ -448,12 +502,13 @@ class HangCaptureTests(unittest.TestCase):
             with self.subTest(latency=latency), \
                     mock.patch.object(diagnostics.time, 'monotonic',
                                       side_effect=lambda c=clock: c[0]), \
-                    mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger):
+                    self.debugger(debugger):
                 _, artifacts = self.capture(hard=12, sleep=sleep,
                                             env={'CT_HANG_CLEANUP_AT': repr(cutoff)})
                 self.assertLessEqual(clock[0], max(cutoff, owner_start + 1 + latency),
                                      'debugger or SIGQUIT tail passed owner cleanup')
-                self.assertEqual(allowances, [] if allowance is None else [allowance])
+                self.assertEqual([round(value, 6) for value in allowances],
+                                 [] if allowance is None else [allowance])
                 self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n')
                 self.assertEqual(len(self.signals), quits, 'SIGQUIT after the tail cutoff')
 
@@ -474,19 +529,20 @@ class HangCaptureTests(unittest.TestCase):
                 return original(path)
 
             def debugger(_command, clock=clock, allowances=allowances, **kwargs):
-                allowances.append(kwargs['timeout'])
+                # The allowance runs from launch to the deadline, TERM grace included.
+                allowances.append(kwargs['timeout'] + diagnostics.TERM_GRACE)
                 clock[0] += kwargs['timeout']
 
             with self.subTest(delay=delay), \
                     mock.patch.object(diagnostics.time, 'monotonic',
                                       side_effect=lambda c=clock: c[0]), \
                     mock.patch.object(diagnostics, 'process_stat', side_effect=slow), \
-                    mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger):
+                    self.debugger(debugger):
                 _, artifacts = self.capture(passive=True, hard=12,
                                             env={'CT_HANG_CLEANUP_AT': repr(1008.)})
                 self.assertEqual(len(calls), 4, 'control did not delay the launch recheck')
                 self.assertLessEqual(clock[0], 1007.5, 'debugger ran past its snapshot margin')
-                self.assertEqual(allowances, expected)
+                self.assertEqual([round(value, 6) for value in allowances], expected)
                 if not expected:
                     self.assertIn('capture budget exhausted',
                                   (artifacts / 'gdb-nginx-101.txt').read_text())
@@ -497,15 +553,15 @@ class HangCaptureTests(unittest.TestCase):
             allowances = []
 
             def debugger(_command, allowances=allowances, **kwargs):
-                allowances.append(kwargs['timeout'])
+                allowances.append(kwargs['timeout'] + diagnostics.TERM_GRACE)
 
             with self.subTest(value=value), \
                     mock.patch.object(diagnostics.time, 'monotonic',
                                       side_effect=lambda c=clock: c[0]), \
-                    mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger):
+                    self.debugger(debugger):
                 self.capture(passive=True, hard=12, env={'CT_HANG_CLEANUP_AT': value})
             # Standalone budget: 12 - 1 soft - 4 owner reserve - .5 margin.
-            self.assertEqual(allowances, [6.5])
+            self.assertEqual([round(value, 6) for value in allowances], [6.5])
 
     def test_exit_during_debugger_never_falls_back_to_numeric_signal(self):
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
@@ -518,7 +574,7 @@ class HangCaptureTests(unittest.TestCase):
 
         with mock.patch.object(diagnostics, 'discover', return_value=[(child.pid, fd, (1, 'x'))]), \
                 mock.patch.object(diagnostics, 'error_logs', return_value=[]), \
-                mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger), \
+                self.debugger(debugger), \
                 mock.patch.object(diagnostics.time, 'sleep'), \
                 mock.patch.object(diagnostics.os, 'kill') as numeric_kill, \
                 mock.patch.dict(os.environ, CT_HANG_QUIT='1', CT_HANG_HARD_SECONDS='301'):
@@ -549,6 +605,175 @@ class HangCaptureTests(unittest.TestCase):
             _, artifacts = self.capture(passive=True)
         self.assertEqual((artifacts / 'gdb-nginx-101.txt').read_text(),
                          'fixture backtrace\n')
+
+
+    def test_debugger_launch_latency_is_charged_to_its_deadline(self):
+        # Passive capture with owner cleanup at 1008 lets debuggers run until 1007.5.
+        for latency in (0., 1., 2.5):
+            clock = [1005.]
+            waits = []
+
+            def launch(clock=clock, latency=latency):
+                clock[0] += latency
+
+            def hung(_args, timeout, clock=clock, waits=waits):
+                waits.append(timeout)
+                clock[0] += timeout
+                raise subprocess.TimeoutExpired('gdb', timeout)
+
+            with self.subTest(latency=latency), \
+                    mock.patch.object(diagnostics.time, 'monotonic',
+                                      side_effect=lambda c=clock: c[0]), \
+                    self.debugger(hung, launch) as debugger:
+                _, artifacts = self.capture(passive=True, hard=12,
+                                            env={'CT_HANG_CLEANUP_AT': repr(1008.)})
+                self.assertEqual(debugger.call_count, 1)
+                self.assertLessEqual(clock[0], 1007.5,
+                                     'debugger launch ran past its snapshot margin')
+                # The last TERM_GRACE of the 2.5s allowance stops the debugger.
+                self.assertEqual(len(waits), 1)
+                self.assertAlmostEqual(waits[0], max(0., 2.5 - diagnostics.TERM_GRACE - latency))
+                self.assertIn('exceeded capture budget',
+                              (artifacts / 'gdb-nginx-101.txt').read_text())
+                self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n')
+
+    @unittest.skipUnless(shutil.which('timeout'), 'coreutils timeout unavailable')
+    def test_debugger_deadline_reaps_the_wrapped_debugger(self):
+        # A real timeout(1) wrapper: its inner timer outlives the outer deadline.
+        record = self.root / 'debugger.pid'
+        launched = []
+        real = subprocess.Popen
+
+        def start(*args, **kwargs):
+            launched.append(real(*args, **kwargs))
+            return launched[-1]
+
+        command = ['timeout', '--foreground', '--signal=TERM', '--kill-after=0.1s', '30s',
+                   'sh', '-c', 'echo $$ > "$1"; exec sleep 30', 'sh', str(record)]
+        started = diagnostics.time.monotonic()
+        with (self.root / 'gdb.txt').open('w') as stream, \
+                mock.patch.object(diagnostics.subprocess, 'Popen', side_effect=start), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            # TERM at 1.3s leaves a loaded runner time to record the PID.
+            diagnostics.debug(command, stream, started + 1.5)
+        try:
+            survivor = os.pidfd_open(int(record.read_text()))
+        except ProcessLookupError:
+            survivor = None
+        else:
+            self.addCleanup(os.close, survivor)
+            self.addCleanup(signal.pidfd_send_signal, survivor, signal.SIGKILL)
+        self.assertIsNone(survivor, 'the debugger outlived its deadline')
+        self.assertNotEqual(launched[0].returncode, -signal.SIGKILL,
+                            'the wrapper needed the KILL fallback')
+        self.assertLess(diagnostics.time.monotonic() - started, 3)
+
+    def test_debugger_ignoring_term_is_killed_after_grace(self):
+        # A launch past end still gets the whole grace: stopping ends one grace later.
+        real = subprocess.Popen
+        for latency in (0., .4):
+            launched = []
+
+            def start(*args, latency=latency, launched=launched, **kwargs):
+                diagnostics.time.sleep(latency)  # Work before Popen returns.
+                # An ignored disposition survives exec, so TERM can never win a race.
+                previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                try:
+                    launched.append(real(*args, **kwargs))
+                finally:
+                    signal.signal(signal.SIGTERM, previous)
+                return launched[-1]
+
+            started = diagnostics.time.monotonic()
+            with self.subTest(latency=latency), \
+                    (self.root / 'gdb.txt').open('w') as stream, \
+                    mock.patch.object(diagnostics.subprocess, 'Popen', side_effect=start), \
+                    self.assertRaises(subprocess.TimeoutExpired):
+                diagnostics.debug(['sleep', '30'], stream, started + .3)
+            elapsed = diagnostics.time.monotonic() - started
+            self.assertEqual(launched[0].returncode, -signal.SIGKILL)
+            # TERM at max(launch, end - grace); KILL one grace later.
+            stop = max(latency, .3 - diagnostics.TERM_GRACE) + diagnostics.TERM_GRACE
+            self.assertGreaterEqual(elapsed, stop - .05)
+            self.assertLess(elapsed, stop + 2)
+
+    def test_exited_reports_exit_and_closed_descriptor(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(self.stop_child, child)
+        fd = os.pidfd_open(child.pid)
+        try:
+            self.assertFalse(diagnostics.exited(fd))
+            child.kill()
+            child.wait(timeout=5)
+            self.assertTrue(diagnostics.exited(fd))
+        finally:
+            os.close(fd)
+        with self.assertRaises(OSError) as raised:
+            diagnostics.exited(fd)
+        self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_pidfds_above_select_limit_still_select_live_nginx(self):
+        # select() rejects descriptors >= FD_SETSIZE (1024); pidfd checks must not.
+        log = self.root / 'high/logs/error.log'
+        log.parent.mkdir(parents=True)
+        log.write_text('high diagnostic\n')
+        (self.bindir / 'nginx').symlink_to(sys.executable)
+        # A live intermediate parent gives discovery ancestor pidfds to check.
+        parent = subprocess.Popen(
+            [sys.executable, '-c', 'import subprocess,sys; subprocess.Popen(sys.argv[1:]).wait()',
+             str(self.bindir / 'nginx'), '-c',
+             ('import os,sys,time; stream=open(sys.argv[1]); print(os.getpid(), flush=True); '
+              'time.sleep(60)'), str(log)], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop_child, parent)
+        pid = int(parent.stdout.readline())
+        parent.stdout.close()
+        pinned = os.pidfd_open(pid)  # The unreaped child cannot be a reused PID.
+        self.addCleanup(os.close, pinned)
+        self.addCleanup(signal.pidfd_send_signal, pinned, signal.SIGKILL)
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        need = 1100
+        if soft < need:
+            if hard != resource.RLIM_INFINITY and hard < need:
+                self.skipTest(f'RLIMIT_NOFILE hard limit {hard} < {need}')
+            resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        filler = []
+        self.addCleanup(lambda: [os.close(fd) for fd in filler])
+        while not filler or filler[-1] < 1023:
+            filler.append(os.open('/dev/null', os.O_RDONLY))  # Later fds are >= 1024.
+        identity = diagnostics.process_stat(Path('/proc') / str(pid) / 'stat')
+        with self.subTest(site='discovery ancestors'):
+            processes = diagnostics.discover(os.getpid())
+            try:
+                self.assertIn(pid, [item[0] for item in processes])
+                self.assertTrue(all(fd >= 1024 for _, fd, _ in processes))
+            finally:
+                for _, fd, _ in processes:
+                    os.close(fd)
+        with self.subTest(site='log enumeration'):
+            fd = os.pidfd_open(pid)
+            try:
+                self.assertGreaterEqual(fd, 1024)
+                streams = diagnostics.error_logs([(pid, fd, identity)])
+                try:
+                    self.assertEqual([stream.read() for stream in streams], [b'high diagnostic\n'])
+                finally:
+                    for stream in streams:
+                        stream.close()
+            finally:
+                os.close(fd)
+        with self.subTest(site='debugger launch'):
+            launched = []
+            fd = os.pidfd_open(pid)  # capture() closes the records it receives.
+            self.assertGreaterEqual(fd, 1024)
+            with mock.patch.object(diagnostics, 'discover', return_value=[(pid, fd, identity)]), \
+                    self.debugger(lambda args, timeout: launched.append(args)), \
+                    mock.patch.dict(os.environ, CT_HANG_QUIT='0', CT_HANG_HARD_SECONDS='301'), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                os.environ.pop('CT_HANG_CLEANUP_AT', None)
+                diagnostics.capture(os.getpid(), self.root / 'high-fd', 1)
+            self.assertEqual(len(launched), 1, 'a live high-fd target lost its debugger')
+            self.assertEqual((self.root / 'high-fd/error-1.log').read_text(), 'high diagnostic\n')
 
 
 if __name__ == "__main__":
