@@ -164,11 +164,9 @@ class HangCaptureTests(unittest.TestCase):
         self.assertEqual(self.signals, [], 'passive diagnostics stopped nginx')
 
     @staticmethod
-    def debugger(model, launch=None):
+    def debugger(model):
         """Patch debugger launch; model(args, timeout=...) simulates one run."""
         def start(args, **kwargs):
-            if launch is not None:
-                launch()  # Work before Popen returns: fork, exec, sudo startup.
             return Debugger(model, args, **kwargs)
         return mock.patch.object(diagnostics.subprocess, 'Popen', side_effect=start)
 
@@ -609,30 +607,55 @@ class HangCaptureTests(unittest.TestCase):
 
     def test_debugger_launch_latency_is_charged_to_its_deadline(self):
         # Passive capture with owner cleanup at 1008 lets debuggers run until 1007.5.
-        for latency in (0., 1., 2.5):
+        # The debugger ignores TERM, so the post-TERM wait spends its whole grace.
+        # A launch inside the last grace (2.4) or at the deadline (2.5) stops one
+        # grace after launch: the snapshot then uses part of the .5s margin.
+        copy = shutil.copyfileobj
+        for latency in (0., 1., 2.4, 2.5):
             clock = [1005.]
             waits = []
+            snapshots = []
 
-            def launch(clock=clock, latency=latency):
-                clock[0] += latency
+            class Stubborn(Debugger):
+                def wait(self, timeout=None, clock=clock, waits=waits):
+                    if self.returncode is None:
+                        waits.append(timeout)
+                        clock[0] += timeout
+                        raise subprocess.TimeoutExpired('gdb', timeout)
+                    return self.returncode
 
-            def hung(_args, timeout, clock=clock, waits=waits):
-                waits.append(timeout)
-                clock[0] += timeout
-                raise subprocess.TimeoutExpired('gdb', timeout)
+                def terminate(self):
+                    pass  # TERM is ignored; only the KILL fallback ends it.
+
+            def start(args, clock=clock, latency=latency, stubborn=Stubborn, **kwargs):
+                clock[0] += latency  # Work before Popen returns.
+                return stubborn(None, args, **kwargs)
+
+            def snapshot(source, target, clock=clock, snapshots=snapshots):
+                # shutil is shared: count only the error-log snapshot copies.
+                if Path(target.name).name.startswith('error-'):
+                    snapshots.append(clock[0])
+                return copy(source, target)
 
             with self.subTest(latency=latency), \
                     mock.patch.object(diagnostics.time, 'monotonic',
                                       side_effect=lambda c=clock: c[0]), \
-                    self.debugger(hung, launch) as debugger:
+                    mock.patch.object(diagnostics.shutil, 'copyfileobj', side_effect=snapshot), \
+                    mock.patch.object(diagnostics.subprocess, 'Popen',
+                                      side_effect=start) as debugger:
                 _, artifacts = self.capture(passive=True, hard=12,
                                             env={'CT_HANG_CLEANUP_AT': repr(1008.)})
                 self.assertEqual(debugger.call_count, 1)
-                self.assertLessEqual(clock[0], 1007.5,
-                                     'debugger launch ran past its snapshot margin')
-                # The last TERM_GRACE of the 2.5s allowance stops the debugger.
-                self.assertEqual(len(waits), 1)
+                # TERM at max(launch, end - grace), then the whole grace, then KILL.
+                self.assertEqual(len(waits), 2)
                 self.assertAlmostEqual(waits[0], max(0., 2.5 - diagnostics.TERM_GRACE - latency))
+                self.assertAlmostEqual(waits[1], diagnostics.TERM_GRACE)
+                stop = 1005. + max(latency, 2.5 - diagnostics.TERM_GRACE) + diagnostics.TERM_GRACE
+                self.assertEqual(len(snapshots), 1)
+                self.assertAlmostEqual(snapshots[0], stop)
+                self.assertLessEqual(snapshots[0], 1007.5 + diagnostics.TERM_GRACE + 1e-9,
+                                     'debugger stop consumed more than one grace of the margin')
+                self.assertLess(snapshots[0], 1008., 'log snapshot passed owner cleanup')
                 self.assertIn('exceeded capture budget',
                               (artifacts / 'gdb-nginx-101.txt').read_text())
                 self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n')
