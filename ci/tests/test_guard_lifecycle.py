@@ -3,6 +3,7 @@
 import ctypes
 import json
 import os
+import resource
 import signal
 import subprocess
 import sys
@@ -541,6 +542,69 @@ class GuardLifecycleTests(unittest.TestCase):
         self.assertEqual(started, [], 'command launched after its hard deadline')
         self.assertEqual(result, {'status': 124, 'code': None, 'reason': 'hard deadline'})
         self.assertFalse(marker.exists())
+
+    def test_stop_recorded_during_setup_does_not_launch(self):
+        real = ctypes.CDLL(None, use_errno=True)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            marker = self.directory / f'stopped-{sig}-should-not-run'
+            started = []
+
+            def prctl(*args, sig=sig):
+                # Deliver the stop inside the owner's setup, after its handlers exist.
+                os.kill(os.getpid(), sig)
+                return real.prctl(*args)
+
+            def on_start(pid, started=started):
+                started.append(pid)
+                self.pin(pid)
+
+            library = mock.Mock()
+            library.prctl.side_effect = prctl
+            with self.subTest(signal=sig), \
+                    mock.patch.object(lifecycle.ctypes, 'CDLL', return_value=library):
+                result = lifecycle.run_owned(
+                    [sys.executable, '-c', 'import pathlib,sys; pathlib.Path(sys.argv[1]).touch()',
+                     str(marker)], None, on_start, hard=10)
+                self.assertEqual(started, [], 'command launched after a recorded stop')
+                self.assertEqual(result, {'status': 128 + sig, 'code': None,
+                                          'reason': 'owner signal'})
+                self.assertFalse(marker.exists())
+
+    def test_descriptors_above_select_limit_still_own_command(self):
+        # select() rejects descriptors >= FD_SETSIZE (1024); ownership must not.
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        need = 1100
+        if soft < need:
+            if hard != resource.RLIM_INFINITY and hard < need:
+                self.skipTest(f'RLIMIT_NOFILE hard limit {hard} < {need}')
+            resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        filler = []
+        self.addCleanup(lambda: [os.close(fd) for fd in filler])
+        while True:
+            fd = os.open('/dev/null', os.O_RDONLY | os.O_CLOEXEC)
+            filler.append(fd)
+            if fd >= 1023:
+                break  # Every later descriptor is above the select() limit.
+        marker = self.directory / 'high-fd-ran'
+        started = []
+
+        def on_start(pid):
+            started.append(pid)
+            self.pin(pid)
+
+        result = lifecycle.run_owned(
+            [sys.executable, '-c', 'import pathlib,sys; pathlib.Path(sys.argv[1]).touch()',
+             str(marker)], None, on_start, hard=10)
+        self.assertEqual(result, {'status': 0, 'code': 0, 'reason': 'command exit'})
+        self.assertEqual(len(started), 1)
+        self.assertTrue(marker.exists())
+
+    def test_readable_reports_closed_descriptor_as_error(self):
+        fd = os.open('/dev/null', os.O_RDONLY)
+        os.close(fd)
+        with self.assertRaises(OSError):
+            lifecycle._readable(fd)
 
     def test_invalid_deadline_does_not_launch(self):
         marker = self.directory / 'should-not-run'

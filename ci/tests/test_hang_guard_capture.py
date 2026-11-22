@@ -431,7 +431,9 @@ class HangCaptureTests(unittest.TestCase):
     def test_late_capture_tail_ends_before_owner_cleanup(self):
         # soft=1s, hard=12s: owner cleanup starts at owner start + 8s.
         owner_start, cutoff = 1000., 1008.
-        for latency, allowance in ((0., 1.5), (2., None), (9., None)):
+        # The tail cutoff is 1007.5: a capture reaching SIGQUIT at or after it sends none.
+        for latency, allowance, quits in ((0., 1.5, 1), (2., None, 1), (6.4, None, 1),
+                                          (6.5, None, 0), (9., None, 0)):
             clock = [owner_start + 1 + latency]
             allowances = []
 
@@ -453,7 +455,7 @@ class HangCaptureTests(unittest.TestCase):
                                      'debugger or SIGQUIT tail passed owner cleanup')
                 self.assertEqual(allowances, [] if allowance is None else [allowance])
                 self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n')
-                self.assertEqual(len(self.signals), 1)
+                self.assertEqual(len(self.signals), quits, 'SIGQUIT after the tail cutoff')
 
     def test_debugger_allowance_charges_launch_preflight(self):
         # Passive capture with owner cleanup at 1008 lets debuggers run until 1007.5.

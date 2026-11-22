@@ -20,6 +20,7 @@ This is cooperative CI process cleanup, not containment of hostile fork bombs.
 """
 
 import ctypes
+import errno
 import json
 import math
 import os
@@ -66,6 +67,19 @@ class OwnedProcess:
         code = self.child.wait()
         self.reaped = True
         return code
+
+
+def _readable(*objects):
+    """Return the ready objects; poll() has no select() FD_SETSIZE limit."""
+    poller = select.poll()
+    for item in objects:
+        poller.register(item, select.POLLIN)
+    # HUP/ERR are always reported and count as readable, matching select().
+    events = dict(poller.poll(0))
+    if any(mask & select.POLLNVAL for mask in events.values()):
+        raise OSError(errno.EBADF, "owner descriptor closed")
+    return [item for item in objects
+            if (item if isinstance(item, int) else item.fileno()) in events]
 
 
 def _children():
@@ -168,11 +182,15 @@ def _owner(wire, caller_fd, command, env, soft, hard, capture):
         if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
             raise OSError(ctypes.get_errno(), "cannot own orphaned descendants")
         # Do not launch if the caller/guard has already died during setup.
-        if select.select([wire, caller_fd], [], [], 0)[0]:
+        if _readable(wire, caller_fd):
             raise OSError("parent unavailable before launch")
         # A tiny bound can round deadline to start; never launch into cleanup.
         if time.monotonic() >= deadline - 2 * grace:
             result.update(status=124, reason="hard deadline")
+            return
+        # A TERM/INT recorded during setup must not start the command.
+        if stop:
+            result.update(status=128 + stop[0], reason="owner signal")
             return
         starting = True
         command_process = OwnedProcess(command, env)
@@ -181,7 +199,7 @@ def _owner(wire, caller_fd, command, env, soft, hard, capture):
         captured = False
         while True:
             now = time.monotonic()
-            readable = select.select([wire, caller_fd], [], [], 0)[0]
+            readable = _readable(wire, caller_fd)
             if stop:
                 result.update(status=128 + stop[0], reason="owner signal")
                 break

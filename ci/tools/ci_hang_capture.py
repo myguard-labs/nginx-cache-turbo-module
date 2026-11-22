@@ -226,6 +226,11 @@ def capture(root, directory, soft):
         # the discovery identities even if a target exited and its PID was reused.
         if shutdown:
             for pid, fd, _ in processes:
+                # Never start a shutdown after the tail cutoff; owner cleanup follows.
+                if time.monotonic() >= cutoff:
+                    print(f'ci-hang-guard: SIGQUIT skipped pid={pid}: cleanup cutoff passed',
+                          file=sys.stderr)
+                    continue
                 try:
                     signal.pidfd_send_signal(fd, signal.SIGQUIT)
                     print(f'ci-hang-guard: SIGQUIT pid={pid}', file=sys.stderr)
