@@ -665,10 +665,27 @@ class HangCaptureTests(unittest.TestCase):
         # A real timeout(1) wrapper: its inner timer outlives the outer deadline.
         record = self.root / 'debugger.pid'
         launched = []
+        pinned = []
         real = subprocess.Popen
+
+        def kill(fd):
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
         def start(*args, **kwargs):
             launched.append(real(*args, **kwargs))
+            self.addCleanup(self.stop_child, launched[-1])
+            # Pin the debugger while it is alive: nothing signals it before
+            # debug() gets this Popen back, so its recorded PID is not reused.
+            end = diagnostics.time.monotonic() + 5
+            while not record.exists() or not record.read_text().endswith('\n'):
+                self.assertLess(diagnostics.time.monotonic(), end, 'debugger PID not recorded')
+                diagnostics.time.sleep(.01)
+            pinned.append(os.pidfd_open(int(record.read_text())))
+            self.addCleanup(os.close, pinned[-1])
+            self.addCleanup(kill, pinned[-1])
             return launched[-1]
 
         command = ['timeout', '--foreground', '--signal=TERM', '--kill-after=0.1s', '30s',
@@ -677,16 +694,10 @@ class HangCaptureTests(unittest.TestCase):
         with (self.root / 'gdb.txt').open('w') as stream, \
                 mock.patch.object(diagnostics.subprocess, 'Popen', side_effect=start), \
                 self.assertRaises(subprocess.TimeoutExpired):
-            # TERM at 1.3s leaves a loaded runner time to record the PID.
             diagnostics.debug(command, stream, started + 1.5)
-        try:
-            survivor = os.pidfd_open(int(record.read_text()))
-        except ProcessLookupError:
-            survivor = None
-        else:
-            self.addCleanup(os.close, survivor)
-            self.addCleanup(signal.pidfd_send_signal, survivor, signal.SIGKILL)
-        self.assertIsNone(survivor, 'the debugger outlived its deadline')
+        # The wrapper reaps the debugger before exiting; fdinfo Pid -1 means reaped.
+        reaped = Path('/proc/self/fdinfo/' + str(pinned[0])).read_text(encoding='ascii')
+        self.assertIn('Pid:\t-1\n', reaped, 'the debugger outlived its deadline')
         self.assertNotEqual(launched[0].returncode, -signal.SIGKILL,
                             'the wrapper needed the KILL fallback')
         self.assertLess(diagnostics.time.monotonic() - started, 3)

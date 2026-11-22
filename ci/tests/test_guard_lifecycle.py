@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 import resource
+import select
 import signal
 import subprocess
 import sys
@@ -51,10 +52,19 @@ class GuardLifecycleTests(unittest.TestCase):
         # Cleanups run after tearDown, and also when setUp or tearDown raises.
         self.addCleanup(self.libc.prctl, 36, self.prior.value, 0, 0, 0)
         self.tmp = tempfile.TemporaryDirectory(prefix='guard-lifecycle-')
+        self.addCleanup(self.tmp.cleanup)
         self.directory = Path(self.tmp.name)
         self.handles = {}
         self.processes = []
         self.logs = []
+        # Close what the test acquired even when tearDown raises before the end.
+        self.addCleanup(self.release)
+
+    def release(self):
+        for fd in self.handles.values():
+            os.close(fd)
+        for log in self.logs:
+            log.close()
 
     def tearDown(self):
         for fd in self.handles.values():
@@ -80,11 +90,6 @@ class GuardLifecycleTests(unittest.TestCase):
                     pass  # Not adopted yet; its fixture parent is still exiting.
             if pending:
                 time.sleep(.01)
-        for fd in self.handles.values():
-            os.close(fd)
-        for log in self.logs:
-            log.close()
-        self.tmp.cleanup()
 
     @staticmethod
     def reaped_fd(fd):
@@ -464,6 +469,35 @@ class GuardLifecycleTests(unittest.TestCase):
                 expected_reason = 'owner lost' if record is None else 'command exit'
                 self.assertEqual(result['reason'], expected_reason)
 
+    def test_owner_exit_with_signal_packet_unread_keeps_status(self):
+        # Closing with the forwarded packet unread resets the pair (ECONNRESET),
+        # reported before a queued completion record.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            for record in (None, {'status': 125, 'code': 125, 'reason': 'command exit'}):
+                def owner(wire, *_args, record=record):
+                    wire.send(json.dumps({'child': os.getpid()}).encode())
+                    poller = select.poll()
+                    poller.register(wire, select.POLLIN)
+                    poller.poll(5000)  # The signal packet arrived; leave it unread.
+                    if record is not None:
+                        wire.send(json.dumps(record).encode())
+
+                def started(pid, sig=sig):
+                    self.pin(pid)
+                    os.kill(os.getpid(), sig)
+                    # Return only after the owner closed, so the next read sees the reset.
+                    poller = select.poll()
+                    poller.register(self.handles[pid], select.POLLIN)
+                    self.assertTrue(poller.poll(5000), 'owner did not exit')
+
+                with self.subTest(signal=sig, record=record):
+                    with mock.patch.object(lifecycle, '_owner', side_effect=owner):
+                        result = lifecycle.run_owned(['never-started'], None, started, hard=1)
+                    self.assertEqual(result['status'], 125 if record is None else 128 + sig)
+                    self.assertEqual(result['code'], None if record is None else 125)
+                    expected_reason = 'owner lost' if record is None else 'command exit'
+                    self.assertEqual(result['reason'], expected_reason)
+
     def test_owner_setup_failure_does_not_launch(self):
         library = mock.Mock()
         library.prctl.return_value = -1
@@ -694,6 +728,7 @@ class GuardLifecycleTests(unittest.TestCase):
         self.pin(command)  # Outer cleanup still reaps a leaked adoptee on RED.
         inner = type(self)(self._testMethodName)
         inner.setUp()
+        self.addCleanup(inner.doCleanups)  # Its descriptors and directory close there.
         inner.pin(command)
         inner.pin(owner.pid)
         owner_fd = inner.handles[owner.pid]
@@ -889,6 +924,41 @@ class SubreaperRestoreTests(unittest.TestCase):
                 state = ctypes.c_int()
                 self.assertEqual(libc.prctl(37, ctypes.byref(state), 0, 0, 0), 0)
                 self.assertEqual(state.value, 0, phase + ' failure left the subreaper enabled')
+
+    def test_teardown_failure_still_closes_fixture_resources(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(child.wait, 5)
+        self.addCleanup(child.kill)
+
+        class Probe(GuardLifecycleTests):
+            def runTest(self):
+                self.pin(child.pid)
+                self.logs.append((self.directory / 'guard.log').open('w+'))
+                # A fixture that outlives its wait makes tearDown raise early.
+                stuck = mock.Mock()
+                stuck.poll.return_value = None
+                stuck.wait.side_effect = subprocess.TimeoutExpired('controlled fixture', 5)
+                self.processes.append(stuck)
+
+        def pidfd_open(fd):
+            try:
+                return os.readlink('/proc/self/fd/' + str(fd)) == 'anon_inode:[pidfd]'
+            except FileNotFoundError:
+                return False
+
+        probe = Probe()
+        result = unittest.TestResult()
+        probe.run(result)
+        fd, log = probe.handles[child.pid], probe.logs[0]
+        # Release leaks on RED without closing a descriptor reused since.
+        self.addCleanup(lambda: pidfd_open(fd) and os.close(fd))
+        self.addCleanup(log.close)
+        self.addCleanup(probe.tmp.cleanup)
+        self.assertEqual(len(result.errors), 1, result.errors)
+        self.assertIn('controlled', result.errors[0][1])
+        self.assertFalse(pidfd_open(fd), 'teardown failure left a pinned pidfd open')
+        self.assertTrue(log.closed, 'teardown failure left a guard log open')
+        self.assertFalse(Path(probe.tmp.name).exists(), 'teardown failure left the directory')
 
 
 if __name__ == '__main__':

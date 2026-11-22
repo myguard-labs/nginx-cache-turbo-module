@@ -323,7 +323,13 @@ def run_owned(command, env, on_start, *, soft=None, hard=600., capture=None):
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous[sig] = signal.signal(sig, forward)
         while True:
-            data = parent_wire.recv(4096)
+            try:
+                data = parent_wire.recv(4096)
+            except ConnectionResetError:
+                # An owner that exits with a forwarded signal unread resets the
+                # pair. Linux reports the reset once, before any queued record;
+                # read again for that record or EOF (owner lost).
+                continue
             if not data:
                 break
             record = json.loads(data)
