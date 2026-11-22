@@ -320,6 +320,35 @@ class HangCaptureTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     os.fstat(fd)
 
+    def test_non_ascii_wrapper_name_keeps_live_nginx_child(self):
+        # The kernel copies the task name's bytes into /proc/<pid>/stat as is.
+        (self.bindir / 'nginx').symlink_to(sys.executable)
+        for name in ('café'.encode(), b'\xff) x'):
+            with self.subTest(name=name):
+                wrapper = subprocess.Popen(
+                    [sys.executable, '-c',
+                     ('import ctypes,subprocess,sys; '
+                      'ctypes.CDLL(None).prctl(15, bytes.fromhex(sys.argv[1]), 0, 0, 0); '
+                      'subprocess.Popen(sys.argv[2:]).wait()'),
+                     name.hex(), str(self.bindir / 'nginx'), '-c',
+                     'import os,time; print(os.getpid(), flush=True); time.sleep(60)'],
+                    stdout=subprocess.PIPE, text=True)
+                self.addCleanup(self.stop_child, wrapper)
+                pid = int(wrapper.stdout.readline())
+                wrapper.stdout.close()
+                pinned = os.pidfd_open(pid)  # The unreaped child cannot be a reused PID.
+                self.addCleanup(os.close, pinned)
+                self.addCleanup(signal.pidfd_send_signal, pinned, signal.SIGKILL)
+                record = (Path('/proc') / str(wrapper.pid) / 'stat').read_bytes()
+                self.assertIn(b'(' + name + b')', record, 'fixture did not rename the wrapper')
+                processes = diagnostics.discover(os.getpid())
+                try:
+                    self.assertIn(pid, [item[0] for item in processes],
+                                  'non-ASCII wrapper name lost its nginx child')
+                finally:
+                    for _, fd, _ in processes:
+                        os.close(fd)
+
     def test_debugger_rechecks_start_identity_immediately_before_launch(self):
         original = diagnostics.process_stat
         calls = 0

@@ -14,6 +14,7 @@ import time
 import unittest
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -710,6 +711,52 @@ class GuardLifecycleTests(unittest.TestCase):
             result = lifecycle.run_owned([sys.executable, '-c', 'import time; time.sleep(60)'],
                                          None, self.pin, soft=0, hard=hard, capture=capture)
         self.assertFalse(launched.exists(), 'capture launched after the cleanup cutoff')
+        self.assertEqual((result['status'], result['reason']), (124, 'hard deadline'))
+
+    def test_pending_capture_wakes_at_soft_deadline_before_cutoff(self):
+        # Valid pair whose soft deadline sits inside the last 20 ms poll before
+        # cleanup. From the first monitor pass the owner's clock advances only
+        # by its requested sleeps (plus a minimal overrun), so scheduler delay
+        # cannot select either outcome.
+        hard = 1
+        cutoff_after_start = hard - 2 * min(2., hard / 5)
+        soft = cutoff_after_start - .015
+        lifecycle.validate_deadlines(soft, hard)
+        launched = self.directory / 'capture-launched'
+        clock = {'start': None, 'virtual': None, 'passes': 0}
+        real_readable = lifecycle._readable
+
+        def monotonic():
+            if clock['virtual'] is not None:
+                return clock['virtual']
+            now = time.monotonic()
+            if clock['start'] is None:
+                clock['start'] = now  # The owner's first reading is its start.
+            return now
+
+        def sleep(seconds):
+            time.sleep(seconds)  # Real, so drained processes still get to exit.
+            if clock['virtual'] is not None:
+                clock['virtual'] += seconds + 1e-6
+
+        def readable(*objects):
+            clock['passes'] += 1
+            if clock['passes'] == 2:
+                # First monitor pass: 4 ms before soft, 19 ms before cleanup.
+                clock['virtual'] = clock['start'] + cutoff_after_start - .019
+            return real_readable(*objects)
+
+        def capture(_pid):
+            launched.touch()
+            return [sys.executable, '-c', 'pass']
+
+        # Any other clock attribute the owner might use fails instead of mocking.
+        fake_time = SimpleNamespace(monotonic=monotonic, sleep=sleep)
+        with mock.patch.object(lifecycle, '_readable', side_effect=readable), \
+                mock.patch.object(lifecycle, 'time', fake_time):
+            result = lifecycle.run_owned([sys.executable, '-c', 'import time; time.sleep(60)'],
+                                         None, self.pin, soft=soft, hard=hard, capture=capture)
+        self.assertTrue(launched.exists(), 'pending capture slept past its soft deadline')
         self.assertEqual((result['status'], result['reason']), (124, 'hard deadline'))
 
     def test_teardown_reaps_fixture_adopted_after_slow_owner_exit(self):

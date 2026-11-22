@@ -34,19 +34,20 @@ TIMER_EXPIRED = (124, 128 + signal.SIGKILL)
 LOG_TAIL = 16 << 20  # Bytes kept per error log, so one large log cannot starve the rest.
 
 
-def parse_stat(text):
-    fields = text.rsplit(') ', 1)[1].split()
+def parse_stat(record):
+    """Return (parent, start) from stat bytes; the task name may hold any bytes."""
+    fields = record.rsplit(b') ', 1)[1].decode('ascii').split()
     return int(fields[1]), fields[19]
 
 
 def process_stat(path):
-    return parse_stat(path.read_text(encoding='ascii'))
+    return parse_stat(path.read_bytes())
 
 
 def read_at(directory, name):
     fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory)
     with os.fdopen(fd, 'rb') as stream:
-        return stream.read().decode('ascii')
+        return stream.read()
 
 
 def exited(fd):
@@ -205,7 +206,7 @@ def error_logs(processes):
                 # live pidfd prove that it is the discovered one, not a reused PID.
                 directory = os.open(PROC / str(pid), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
                 if (parse_stat(read_at(directory, 'stat'))[1] != identity[1]
-                        or read_at(directory, 'comm').strip() != 'nginx'
+                        or read_at(directory, 'comm').strip() != b'nginx'
                         or exited(fd)):
                     continue
                 descriptors = os.open('fd', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,

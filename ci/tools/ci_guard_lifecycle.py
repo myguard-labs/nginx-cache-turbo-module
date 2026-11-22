@@ -249,7 +249,12 @@ def _owner(wire, caller_fd, command, env, soft, hard, capture):
                         # Diagnostics are best effort; the primary command still
                         # owns its outcome and the original hard deadline.
                         result['capture_error'] = type(error).__name__
-            time.sleep(min(.02, max(0, deadline - 2 * grace - time.monotonic())))
+            # A pending capture wakes at the soft deadline as well as the cutoff;
+            # a pass after the cutoff still selects cleanup first.
+            wake = deadline - 2 * grace
+            if soft is not None and not captured:
+                wake = min(wake, start + soft)
+            time.sleep(min(.02, max(0, wake - time.monotonic())))
     except OSError as error:
         if starting and not processes:
             result.update(status=127 if isinstance(error, FileNotFoundError) else 126,
