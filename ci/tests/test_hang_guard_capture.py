@@ -319,6 +319,37 @@ class HangCaptureTests(unittest.TestCase):
         self.assertEqual(list(artifacts.glob('error-*.log')), [],
                          'a reused numeric PID supplied its error log')
 
+    def test_fd_number_reused_after_readlink_cannot_supply_other_file(self):
+        other = self.owned.with_name('access.log')
+        other.write_text('access record\n')
+        reused = self.proc / '101/fd/4'
+        (self.proc / '101/fd/5').symlink_to(self.owned)
+        # nginx closes error.log and reuses fd 4 after readlink: before the
+        # stat that follows the number, or before the open that follows it.
+        for call in ('stat', 'open'):
+            reused.unlink()
+            reused.symlink_to(self.owned)
+            original = getattr(os, call)
+
+            def reuse(name, *args, original=original, **kwargs):
+                if name == '4' and kwargs.get('dir_fd') is not None:
+                    reused.unlink()
+                    reused.symlink_to(other)
+                return original(name, *args, **kwargs)
+
+            with self.subTest(reused_before=call), \
+                    mock.patch.object(diagnostics, 'PROC', self.proc), \
+                    mock.patch.object(diagnostics.select, 'select', return_value=([], [], [])), \
+                    mock.patch.object(diagnostics.os, call, side_effect=reuse):
+                streams = diagnostics.error_logs([(101, -1, (100, '101'))])
+                try:
+                    contents = [stream.read() for stream in streams]
+                finally:
+                    for stream in streams:
+                        stream.close()
+                self.assertEqual(contents, [b'owned diagnostic\n'],
+                                 'a reused fd number supplied a file other than error.log')
+
     def test_real_proc_logs_follow_pinned_identity(self):
         log = self.root / 'real/logs/error.log'
         log.parent.mkdir(parents=True)

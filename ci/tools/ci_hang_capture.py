@@ -4,6 +4,7 @@ Discovery snapshots ancestry and start times. A pidfd is opened before checking
 that start time again, so a replaced numeric PID cannot authorize signalling.
 Log descriptors are enumerated through a /proc directory descriptor whose start
 identity is rechecked after open, never through a later lookup of the number.
+A log is retained only when the descriptor this process opened names error.log.
 Build can select passive capture with CT_HANG_QUIT=0; its hard deadline remains
 owned by ci_guard_lifecycle, independently of this best-effort diagnostic child.
 The owner passes its absolute CLOCK_MONOTONIC cleanup instant in
@@ -22,6 +23,7 @@ import time
 from pathlib import Path
 
 PROC = Path('/proc')
+SELF_FD = '/proc/self/fd'  # Our own descriptors: their targets cannot change.
 
 
 def parse_stat(text):
@@ -102,6 +104,9 @@ def open_logs(descriptors, logs):
                 continue
             stream = os.fdopen(os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC,
                                        dir_fd=descriptors), 'rb')
+            # nginx may reuse the number after readlink; judge the file we opened.
+            if os.path.basename(os.readlink(f'{SELF_FD}/{stream.fileno()}')) != 'error.log':
+                continue
             status = os.fstat(stream.fileno())
             key = (status.st_dev, status.st_ino)
             if stat.S_ISREG(status.st_mode) and key not in logs:
