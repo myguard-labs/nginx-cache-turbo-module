@@ -190,6 +190,49 @@ class HangCaptureTests(unittest.TestCase):
         self.assertEqual(len(waits), 1)
         self.assertGreater(waits[0], 0)
 
+    def test_inner_timer_expiry_is_recorded(self):
+        # timeout(1) can end gdb just before the outer wait raises TimeoutExpired.
+        for status, marked in ((124, True), (137, True), (0, False), (1, False)):
+            class Exits(Debugger):
+                def wait(self, timeout=None, status=status):
+                    if self.returncode is None:
+                        self.returncode = status
+                    return self.returncode
+
+            def start(args, exits=Exits, **kwargs):
+                return exits(None, args, **kwargs)
+
+            with self.subTest(status=status), \
+                    mock.patch.object(diagnostics.subprocess, 'Popen', side_effect=start):
+                _, artifacts = self.capture(passive=True)
+                output = (artifacts / 'gdb-nginx-101.txt').read_text()
+                self.assertEqual('exceeded capture budget' in output, marked, output)
+                self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n')
+
+    def test_log_snapshot_keeps_a_bounded_tail_of_each_log(self):
+        second = self.root / 'second instance/logs/error.log'
+        second.parent.mkdir(parents=True)
+        second.write_bytes(b'second diagnostic\n')  # Exactly the 18-byte bound.
+        (self.proc / '101/fd/5').symlink_to(second)
+        self.owned.write_bytes(b'x' * 40 + b'owned tail\n')
+        with mock.patch.object(diagnostics, 'LOG_TAIL', 18):
+            _, artifacts = self.capture(passive=True)
+        self.assertEqual((artifacts / 'error-1.log').read_bytes(),
+                         b'ci-hang-guard: first 33 bytes omitted\n' + b'x' * 7 + b'owned tail\n',
+                         'a large log was copied beyond its tail bound')
+        self.assertEqual((artifacts / 'error-2.log').read_bytes(), b'second diagnostic\n',
+                         'a log at the bound lost bytes or gained a marker')
+
+    def test_log_tail_bound_holds_when_the_log_grows_during_copy(self):
+        self.owned.write_bytes(b'0123456789' * 3)
+        target = io.BytesIO()
+        with self.owned.open('rb') as source, \
+                mock.patch.object(diagnostics, 'LOG_TAIL', 10), \
+                mock.patch.object(diagnostics.os, 'fstat',
+                                  return_value=os.stat_result((0,) * 10)):
+            diagnostics.copy_tail(source, target)  # Size 0 at fstat; 30 bytes by copy.
+        self.assertEqual(target.getvalue(), b'0123456789')
+
     def test_all_debuggers_share_remaining_capture_window(self):
         self.process(102, 101, 'nginx')
         clock = [100.]

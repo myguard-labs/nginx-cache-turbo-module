@@ -6,6 +6,7 @@ Log descriptors are enumerated through a /proc directory descriptor whose start
 identity is rechecked after open, never through a later lookup of the number.
 A log is retained only when the descriptor this process opened names error.log,
 or a rotated or deleted error.log, so a rotation during discovery keeps it.
+Each snapshot keeps at most LOG_TAIL bytes from the end of its log.
 Build can select passive capture with CT_HANG_QUIT=0; its hard deadline remains
 owned by ci_guard_lifecycle, independently of this best-effort diagnostic child.
 The owner passes its absolute CLOCK_MONOTONIC cleanup instant in
@@ -28,6 +29,9 @@ from pathlib import Path
 PROC = Path('/proc')
 SELF_FD = '/proc/self/fd'  # Our own descriptors: their targets cannot change.
 TERM_GRACE = .2  # The last part of a debugger allowance: TERM, then KILL.
+# timeout(1) reports its own timer as 124, or 128+KILL after --kill-after.
+TIMER_EXPIRED = (124, 128 + signal.SIGKILL)
+LOG_TAIL = 16 << 20  # Bytes kept per error log, so one large log cannot starve the rest.
 
 
 def parse_stat(text):
@@ -79,6 +83,29 @@ def debug(command, stream, end):
             process.kill()  # No-op once the wrapper has been reaped.
             process.wait()
             raise
+
+
+class _Bounded:
+    """Reader that returns at most limit bytes of the wrapped stream."""
+
+    def __init__(self, stream, limit):
+        self.stream, self.left = stream, limit
+
+    def read(self, size=-1):
+        size = self.left if size < 0 else min(size, self.left)
+        data = self.stream.read(size) if size else b''
+        self.left -= len(data)
+        return data
+
+
+def copy_tail(source, target):
+    """Copy at most LOG_TAIL bytes from the end of source; mark what is omitted."""
+    start = max(0, os.fstat(source.fileno()).st_size - LOG_TAIL)
+    if start:
+        target.write(f'ci-hang-guard: first {start} bytes omitted\n'.encode())
+    source.seek(start)
+    # The limit also bounds a log that keeps growing during the copy.
+    shutil.copyfileobj(_Bounded(source, LOG_TAIL), target)
 
 
 def discover(root):
@@ -265,7 +292,7 @@ def capture(root, directory, soft):
                     # timeout runs at gdb's privilege and --foreground retains
                     # the capture group. Killing only a sudo leader is not a
                     # cleanup mechanism for its privileged debugger child.
-                    debug([
+                    status = debug([
                         *privilege, 'timeout', '--foreground', '--signal=TERM',
                         '--kill-after=0.1s', f'{allowance - .2:.6f}s',
                         'gdb', '-batch', '-p', str(pid), '-ex', 'set pagination off',
@@ -273,6 +300,9 @@ def capture(root, directory, soft):
                         '-ex', 'print ngx_cycle->free_connection_n',
                         '-ex', 'print ngx_cycle->connection_n', '-ex', 'detach', '-ex', 'quit',
                     ], stream, now + allowance)
+                    # The inner timer can end gdb just before our own wait expires.
+                    if status in TIMER_EXPIRED:
+                        stream.write('debugger exceeded capture budget\n')
                 except subprocess.TimeoutExpired:
                     stream.write('debugger exceeded capture budget\n')
                 except OSError as error:
@@ -296,7 +326,7 @@ def capture(root, directory, soft):
         for index, source in enumerate(logs, 1):
             try:
                 with (directory / f'error-{index}.log').open('wb') as target:
-                    shutil.copyfileobj(source, target)
+                    copy_tail(source, target)
             except OSError:
                 pass
     finally:
