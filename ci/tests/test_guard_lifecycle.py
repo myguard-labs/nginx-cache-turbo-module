@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from functools import partial
@@ -63,16 +64,31 @@ class GuardLifecycleTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
             process.wait(timeout=5)
-        for pid, fd in self.handles.items():
-            try:
-                os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
+        # KILL is asynchronous: a pinned child is adopted only after its parent
+        # exits. Retry exact pidfd waits until every pinned identity is reaped.
+        pending = list(self.handles.values())
+        end = time.monotonic() + 5
+        while pending and time.monotonic() < end:
+            for fd in list(pending):
+                try:
+                    if (self.reaped_fd(fd)
+                            or os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)):
+                        pending.remove(fd)
+                except ChildProcessError:
+                    pass  # Not adopted yet; its fixture parent is still exiting.
+            if pending:
+                time.sleep(.01)
+        for fd in self.handles.values():
             os.close(fd)
         for log in self.logs:
             log.close()
         self.libc.prctl(36, self.prior.value, 0, 0, 0)
         self.tmp.cleanup()
+
+    @staticmethod
+    def reaped_fd(fd):
+        # pidfd fdinfo distinguishes a reaped identity from a reused numeric PID.
+        return 'Pid:\t-1\n' in Path('/proc/self/fdinfo/' + str(fd)).read_text(encoding='ascii')
 
     def pin(self, pid, start=None):
         if pid not in self.handles:
@@ -569,6 +585,133 @@ class GuardLifecycleTests(unittest.TestCase):
                 self.assertEqual(result, {'status': 128 + sig, 'code': None,
                                           'reason': 'owner signal'})
                 self.assertFalse(marker.exists())
+
+    def test_guard_signal_forwarded_during_setup_does_not_launch(self):
+        real_readable = lifecycle._readable
+        real_signal = signal.signal
+        guard = os.getpid()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            for caller_dead in (False, True):
+                marker = self.directory / f'forwarded-{sig}-{caller_dead}-should-not-run'
+                started = []
+                sent = []
+                checked = []
+
+                def install(number, handler, sig=sig, sent=sent):
+                    previous = real_signal(number, handler)
+                    # The guard installs its INT forwarder last; then signal it once.
+                    if os.getpid() == guard and number == signal.SIGINT and not sent:
+                        sent.append(number)
+                        os.kill(guard, sig)
+                    return previous
+
+                def readable(*objects, caller_dead=caller_dead, checked=checked):
+                    if not checked:  # The owner's prelaunch check.
+                        checked.append(True)
+                        end = time.monotonic() + 5
+                        while (objects[0] not in real_readable(objects[0])
+                               and time.monotonic() < end):
+                            time.sleep(.005)
+                        ready = real_readable(*objects)
+                        return ready + [objects[1]] if caller_dead else ready
+                    return real_readable(*objects)
+
+                def on_start(pid, started=started):
+                    started.append(pid)
+                    self.pin(pid)
+
+                with self.subTest(signal=sig, caller_dead=caller_dead), \
+                        mock.patch.object(lifecycle.signal, 'signal', side_effect=install), \
+                        mock.patch.object(lifecycle, '_readable', side_effect=readable):
+                    result = lifecycle.run_owned(
+                        [sys.executable, '-c',
+                         'import pathlib,sys; pathlib.Path(sys.argv[1]).touch()',
+                         str(marker)], None, on_start, hard=10)
+                    self.assertEqual(sent, [signal.SIGINT])
+                    self.assertEqual(started, [], 'command launched after a forwarded stop')
+                    # Caller death still wins; only a queued stop packet is a stop.
+                    expected = ({'status': 125, 'code': None, 'reason': 'owner I/O failure'}
+                                if caller_dead else
+                                {'status': 128 + sig, 'code': None, 'reason': 'guard signal'})
+                    self.assertEqual(result, expected)
+                    self.assertFalse(marker.exists())
+
+    def test_missing_child_enumeration_does_not_launch(self):
+        marker = self.directory / 'no-children-should-not-run'
+        started = []
+
+        def on_start(pid):
+            started.append(pid)
+            self.pin(pid)
+
+        with mock.patch.object(lifecycle, '_children',
+                               side_effect=FileNotFoundError('no procfs children')):
+            result = lifecycle.run_owned(
+                [sys.executable, '-c', 'import pathlib,sys; pathlib.Path(sys.argv[1]).touch()',
+                 str(marker)], None, on_start, hard=2)
+        self.assertEqual(started, [], 'command launched without child enumeration')
+        self.assertEqual(result, {'status': 125, 'code': None, 'reason': 'owner I/O failure'})
+        self.assertFalse(marker.exists())
+
+    def test_capture_decision_reads_clock_after_owner_checks(self):
+        real_readable = lifecycle._readable
+        hard = 1
+        cutoff_after_start = hard - 2 * min(2., hard / 5)
+        launched = self.directory / 'capture-launched'
+        calls = []
+
+        def readable(*objects):
+            calls.append(time.monotonic())
+            if len(calls) == 2:
+                # Stall the first monitor pass past cleanup; start precedes calls[0].
+                time.sleep(max(0, calls[0] + cutoff_after_start + .05 - time.monotonic()))
+            return real_readable(*objects)
+
+        def capture(_pid):
+            launched.touch()
+            return [sys.executable, '-c', 'pass']
+
+        with mock.patch.object(lifecycle, '_readable', side_effect=readable):
+            result = lifecycle.run_owned([sys.executable, '-c', 'import time; time.sleep(60)'],
+                                         None, self.pin, soft=0, hard=hard, capture=capture)
+        self.assertFalse(launched.exists(), 'capture launched after the cleanup cutoff')
+        self.assertEqual((result['status'], result['reason']), (124, 'hard deadline'))
+
+    def test_teardown_reaps_fixture_adopted_after_slow_owner_exit(self):
+        # KILL is asynchronous: model an owner that is still exiting when
+        # teardown first waits for its command, which is adopted only later.
+        owner = subprocess.Popen(
+            [sys.executable, '-c',
+             ('import subprocess,sys,time; c=subprocess.Popen([sys.executable,"-c",'
+              '"import time; time.sleep(60)"]); print(c.pid,flush=True); time.sleep(60)')],
+            stdout=subprocess.PIPE, text=True)
+        self.processes.append(owner)
+        command = int(owner.stdout.readline())
+        owner.stdout.close()
+        probe = os.pidfd_open(command)
+        self.addCleanup(os.close, probe)
+        self.pin(command)  # Outer cleanup still reaps a leaked adoptee on RED.
+        inner = type(self)(self._testMethodName)
+        inner.setUp()
+        inner.pin(command)
+        inner.pin(owner.pid)
+        owner_fd = inner.handles[owner.pid]
+        real = signal.pidfd_send_signal
+        timers = []
+
+        def send(fd, sig):
+            if fd != owner_fd:
+                return real(fd, sig)
+            timers.append(threading.Timer(.3, os.kill, (owner.pid, sig)))
+            timers[-1].start()
+            return None
+
+        with mock.patch.object(signal, 'pidfd_send_signal', side_effect=send):
+            inner.tearDown()
+        for timer in timers:
+            timer.join()
+        self.assertEqual(len(timers), 1)
+        self.assertTrue(self.reaped_fd(probe), 'teardown left an adopted fixture unreaped')
 
     def test_descriptors_above_select_limit_still_own_command(self):
         # select() rejects descriptors >= FD_SETSIZE (1024); ownership must not.

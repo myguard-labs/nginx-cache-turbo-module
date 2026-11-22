@@ -181,8 +181,15 @@ def _owner(wire, caller_fd, command, env, soft, hard, capture):
         libc = ctypes.CDLL(None, use_errno=True)
         if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
             raise OSError(ctypes.get_errno(), "cannot own orphaned descendants")
+        _children()  # Cleanup needs procfs child enumeration; fail before launch.
         # Do not launch if the caller/guard has already died during setup.
-        if _readable(wire, caller_fd):
+        ready = _readable(wire, caller_fd)
+        if ready == [wire]:
+            data = wire.recv(1024)
+            if data:  # A TERM/INT forwarded during setup is a stop, not a fault.
+                result.update(status=128 + json.loads(data)["signal"], reason="guard signal")
+                return
+        if ready:
             raise OSError("parent unavailable before launch")
         # A tiny bound can round deadline to start; never launch into cleanup.
         if time.monotonic() >= deadline - 2 * grace:
@@ -198,7 +205,6 @@ def _owner(wire, caller_fd, command, env, soft, hard, capture):
         wire.send(json.dumps({"child": command_process.pid}).encode())
         captured = False
         while True:
-            now = time.monotonic()
             readable = _readable(wire, caller_fd)
             if stop:
                 result.update(status=128 + stop[0], reason="owner signal")
@@ -215,6 +221,7 @@ def _owner(wire, caller_fd, command, env, soft, hard, capture):
                     result.update(status=128 + number, reason="guard signal")
                 break
             command_exited = command_process.exited()
+            now = time.monotonic()  # Decide cleanup/capture after these checks.
             # An already-started capture has a post-signal snapshot tail. Keep
             # its session owned until it finishes or cleanup must start; an
             # ordinary command exit must not truncate that evidence.
