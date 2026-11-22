@@ -2,6 +2,7 @@
 
 import contextlib
 import errno
+import functools
 import io
 import os
 import resource
@@ -297,6 +298,18 @@ class HangCaptureTests(unittest.TestCase):
         self.assertIn('process identity changed',
                       (artifacts / 'gdb-nginx-101.txt').read_text())
 
+    def test_unopenable_debugger_output_keeps_other_targets_and_logs(self):
+        self.process(102, 101, 'nginx')  # Masters sort last, so 102 is debugged first.
+        artifacts = self.root / 'artifacts'
+        (artifacts / 'gdb-nginx-102.txt').mkdir(parents=True)
+        result, artifacts = self.capture(passive=True)
+        self.assertIn('gdb output unavailable pid=102', result.stderr)
+        self.assertEqual((artifacts / 'gdb-nginx-101.txt').read_text(), 'fixture backtrace\n',
+                         'an unopenable output skipped the next debugger')
+        self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n',
+                         'an unopenable output skipped the log snapshot')
+        self.assertTrue((artifacts / 'gdb-nginx-102.txt').is_dir())
+
     def test_rotation_during_debugger_preserves_selected_log_inode(self):
         opened = []
         original = diagnostics.error_logs
@@ -386,29 +399,100 @@ class HangCaptureTests(unittest.TestCase):
         (self.proc / '101/fd/5').symlink_to(self.owned)
         # nginx closes error.log and reuses fd 4 after readlink: before the
         # stat that follows the number, or before the open that follows it.
-        for call in ('stat', 'open'):
+        # 'aba': fd 4 names access.log, error.log during the readlink, and
+        # access.log again before the open.
+        for call in ('stat', 'open', 'aba'):
             reused.unlink()
-            reused.symlink_to(self.owned)
-            original = getattr(os, call)
+            reused.symlink_to(other if call == 'aba' else self.owned)
+            swaps = ({'readlink': self.owned, 'open': other} if call == 'aba'
+                     else {call: other})
+            fired = []
 
-            def reuse(name, *args, original=original, **kwargs):
+            def reuse(name, *args, original, target, fired=fired, **kwargs):
                 if name == '4' and kwargs.get('dir_fd') is not None:
+                    fired.append(original.__name__)
                     reused.unlink()
-                    reused.symlink_to(other)
+                    reused.symlink_to(target)
                 return original(name, *args, **kwargs)
 
             with self.subTest(reused_before=call), \
                     mock.patch.object(diagnostics, 'PROC', self.proc), \
                     mock.patch.object(diagnostics, 'exited', return_value=False), \
-                    mock.patch.object(diagnostics.os, call, side_effect=reuse):
+                    contextlib.ExitStack() as stack:
+                for function, target in swaps.items():
+                    stack.enter_context(mock.patch.object(
+                        diagnostics.os, function, side_effect=functools.partial(
+                            reuse, original=getattr(os, function), target=target)))
                 streams = diagnostics.error_logs([(101, -1, (100, '101'))])
                 try:
                     contents = [stream.read() for stream in streams]
                 finally:
                     for stream in streams:
                         stream.close()
+                self.assertEqual(sorted(fired), sorted(swaps), 'control did not reuse fd 4')
                 self.assertEqual(contents, [b'owned diagnostic\n'],
                                  'a reused fd number supplied a file other than error.log')
+
+    def test_rotation_during_log_discovery_keeps_original_inode(self):
+        rotated = self.owned.with_name('error.log.1')
+        link = self.proc / '101/fd/4'
+        original = os.open
+
+        def rotate():
+            # logrotate renames the file; procfs then names the inode error.log.1,
+            # and nginx later reopens a new error.log on another descriptor.
+            self.owned.rename(rotated)
+            link.unlink()
+            link.symlink_to(rotated)
+            self.owned.write_text('replacement log\n')
+
+        # Rotated before the name check, after it, after the open, or rotated
+        # and then removed after the open (procfs appends " (deleted)").
+        for when in ('already', 'before', 'after', 'deleted'):
+            rotated.unlink(missing_ok=True)
+            self.owned.write_text('owned diagnostic\n')
+            link.unlink()
+            link.symlink_to(self.owned)
+            if when == 'already':
+                rotate()
+            rotations = []
+
+            def opener(name, *args, when=when, rotations=rotations, **kwargs):
+                if name != '4' or kwargs.get('dir_fd') is None:
+                    return original(name, *args, **kwargs)
+                rotations.append(when)
+                if when == 'before':
+                    rotate()
+                fd = original(name, *args, **kwargs)
+                if when in ('after', 'deleted'):
+                    rotate()
+                if when == 'deleted':
+                    rotated.unlink()
+                return fd
+
+            with self.subTest(rotated=when), \
+                    mock.patch.object(diagnostics, 'PROC', self.proc), \
+                    mock.patch.object(diagnostics, 'exited', return_value=False), \
+                    mock.patch.object(diagnostics.os, 'open', side_effect=opener):
+                streams = diagnostics.error_logs([(101, -1, (100, '101'))])
+                try:
+                    contents = [stream.read() for stream in streams]
+                finally:
+                    for stream in streams:
+                        stream.close()
+                self.assertEqual(rotations, [when], 'control did not open the log fd')
+                self.assertEqual(contents, [b'owned diagnostic\n'],
+                                 'a log rotated during discovery was discarded')
+
+    def test_error_log_name_accepts_only_error_log_and_its_rotations(self):
+        for target in ('/l/error.log', '/l/error.log.1', '/l/error.log-20261122',
+                       '/l/error.log.1 (deleted)', '/l/error.log (deleted)'):
+            with self.subTest(target=target):
+                self.assertTrue(diagnostics.error_log_name(target))
+        for target in ('/l/access.log', '/l/error.logger', '/l/error.log1', '/l/xerror.log',
+                       '/l/access.log.1', '/l/error.log (deleted) x', '/error.log/x', ''):
+            with self.subTest(target=target):
+                self.assertFalse(diagnostics.error_log_name(target))
 
     def test_fd_number_reused_as_directory_releases_opened_descriptor(self):
         reused = self.proc / '101/fd/4'

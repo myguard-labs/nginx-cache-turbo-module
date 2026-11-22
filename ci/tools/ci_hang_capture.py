@@ -4,7 +4,8 @@ Discovery snapshots ancestry and start times. A pidfd is opened before checking
 that start time again, so a replaced numeric PID cannot authorize signalling.
 Log descriptors are enumerated through a /proc directory descriptor whose start
 identity is rechecked after open, never through a later lookup of the number.
-A log is retained only when the descriptor this process opened names error.log.
+A log is retained only when the descriptor this process opened names error.log,
+or a rotated or deleted error.log, so a rotation during discovery keeps it.
 Build can select passive capture with CT_HANG_QUIT=0; its hard deadline remains
 owned by ci_guard_lifecycle, independently of this best-effort diagnostic child.
 The owner passes its absolute CLOCK_MONOTONIC cleanup instant in
@@ -133,19 +134,27 @@ def discover(root):
         raise
 
 
+def error_log_name(target):
+    """Whether a descriptor target is error.log, or that file rotated or deleted."""
+    name = os.path.basename(target).removesuffix(' (deleted)')
+    return name == 'error.log' or name.startswith(('error.log.', 'error.log-'))
+
+
 def open_logs(descriptors, logs):
     """Retain unseen regular error.log inodes named by one pinned fd directory."""
     for name in sorted(os.listdir(descriptors)):
         stream = None
         try:
-            if (os.path.basename(os.readlink(name, dir_fd=descriptors)) != 'error.log'
+            if (not error_log_name(os.readlink(name, dir_fd=descriptors))
                     or not stat.S_ISREG(os.stat(name, dir_fd=descriptors).st_mode)):
                 continue
             # The opener transfers ownership: a rejected fd (a directory) is closed.
             stream = open(name, 'rb', opener=lambda path, _flags: os.open(
                 path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=descriptors))
             # nginx may reuse the number after readlink; judge the file we opened.
-            if os.path.basename(os.readlink(f'{SELF_FD}/{stream.fileno()}')) != 'error.log':
+            # Its own name is one observation, so no reuse sequence can pass it;
+            # a rotation renames it to a name that still qualifies.
+            if not error_log_name(os.readlink(f'{SELF_FD}/{stream.fileno()}')):
                 continue
             status = os.fstat(stream.fileno())
             key = (status.st_dev, status.st_ino)
@@ -231,7 +240,14 @@ def capture(root, directory, soft):
             except (OSError, ValueError, IndexError):
                 continue
             print(f'ci-hang-guard: gdb pid={pid}', file=sys.stderr)
-            with (directory / f'gdb-nginx-{pid}.txt').open('w') as stream:
+            try:
+                stream = (directory / f'gdb-nginx-{pid}.txt').open('w')
+            except OSError as error:
+                # One unusable output path must not cost the other targets or logs.
+                print(f'ci-hang-guard: gdb output unavailable pid={pid}: {error}',
+                      file=sys.stderr)
+                continue
+            with stream:
                 try:
                     # GDB accepts only numeric PIDs. Recheck the retained pidfd
                     # and start identity immediately before launch; PID reuse
