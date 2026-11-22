@@ -55,7 +55,7 @@ class HangCaptureTests(unittest.TestCase):
         (directory / "cmdline").write_bytes(
             b"nginx: master process nginx -p /rewritten-prefix -c nginx.conf\0")
 
-    def capture(self, *, passive=False, hard=301):
+    def capture(self, *, passive=False, hard=301, env=(), sleep=None):
         artifacts = self.root / 'artifacts'
         stderr = io.StringIO()
         descriptors = {}
@@ -71,11 +71,13 @@ class HangCaptureTests(unittest.TestCase):
                 mock.patch.object(diagnostics.select, 'select', return_value=([], [], [])), \
                 mock.patch.object(diagnostics.signal, 'pidfd_send_signal',
                                   side_effect=lambda fd, sig: signals.append((fd, sig))), \
-                mock.patch.object(diagnostics.time, 'sleep'), \
+                mock.patch.object(diagnostics.time, 'sleep', side_effect=sleep), \
                 mock.patch.dict(os.environ, PATH=str(self.bindir) + ':' + os.environ['PATH'],
                                 CT_HANG_QUIT='0' if passive else '1',
-                                CT_HANG_HARD_SECONDS=str(hard)), \
+                                CT_HANG_HARD_SECONDS=str(hard), **dict(env)), \
                 contextlib.redirect_stderr(stderr):
+            if 'CT_HANG_CLEANUP_AT' not in dict(env):
+                os.environ.pop('CT_HANG_CLEANUP_AT', None)  # Standalone fallback.
             diagnostics.capture(100, artifacts, 1)
         self.signals = signals
         self.descriptors = descriptors
@@ -266,32 +268,128 @@ class HangCaptureTests(unittest.TestCase):
 
     def test_log_read_failures_release_open_descriptors(self):
         (self.proc / '101/fd/5').symlink_to(self.owned)
-        original_open = Path.open
+        original_open = os.fdopen
         original_stat = os.fstat
         for error in (PermissionError, KeyboardInterrupt):
             opened = []
 
-            def open_file(path, *args, opened=opened, **kwargs):
-                stream = original_open(path, *args, **kwargs)
+            def open_file(fd, *args, opened=opened, **kwargs):
+                stream = original_open(fd, *args, **kwargs)
                 opened.append(stream)
                 return stream
 
-            def stat(fd, error=error, opened=opened):
-                if error is PermissionError or len(opened) == 2:
+            calls = []
+
+            def stat(fd, error=error, calls=calls):
+                # Fail the first log inode check, or the second after one is retained.
+                calls.append(fd)
+                if error is PermissionError or len(calls) == 2:
                     raise error('controlled log read failure')
                 return original_stat(fd)
 
             with self.subTest(error=error), \
                     mock.patch.object(diagnostics, 'PROC', self.proc), \
-                    mock.patch.object(Path, 'open', open_file), \
+                    mock.patch.object(diagnostics.select, 'select', return_value=([], [], [])), \
+                    mock.patch.object(diagnostics.os, 'fdopen', open_file), \
                     mock.patch.object(diagnostics.os, 'fstat', side_effect=stat):
                 if error is PermissionError:
-                    self.assertEqual(diagnostics.error_logs([(101, -1)]), [])
+                    self.assertEqual(diagnostics.error_logs([(101, -1, (100, '101'))]), [])
                 else:
                     with self.assertRaises(KeyboardInterrupt):
-                        diagnostics.error_logs([(101, -1)])
+                        diagnostics.error_logs([(101, -1, (100, '101'))])
             self.assertTrue(opened)
             self.assertTrue(all(stream.closed for stream in opened))
+
+    def test_reused_pid_after_discovery_cannot_supply_logs(self):
+        replacement = self.root / 'replacement/logs/error.log'
+        replacement.parent.mkdir(parents=True)
+        replacement.write_text('replacement diagnostic\n')
+        original = diagnostics.discover
+
+        def reuse(root):
+            processes = original(root)
+            # The discovered nginx is reaped; PID 101 now names another nginx.
+            (self.proc / '101/stat').write_text('101 (nginx) S 100 ' + '0 ' * 17 + 'reused\n')
+            (self.proc / '101/fd/4').unlink()
+            (self.proc / '101/fd/4').symlink_to(replacement)
+            return processes
+
+        with mock.patch.object(diagnostics, 'discover', side_effect=reuse):
+            _, artifacts = self.capture(passive=True)
+        self.assertEqual(list(artifacts.glob('error-*.log')), [],
+                         'a reused numeric PID supplied its error log')
+
+    def test_real_proc_logs_follow_pinned_identity(self):
+        log = self.root / 'real/logs/error.log'
+        log.parent.mkdir(parents=True)
+        log.write_text('real diagnostic\n')
+        # comm comes from the executed name, so this interpreter is a real "nginx".
+        (self.bindir / 'nginx').symlink_to(sys.executable)
+        child = subprocess.Popen(
+            [str(self.bindir / 'nginx'), '-c',
+             'import sys,time; stream=open(sys.argv[1]); print(flush=True); time.sleep(60)',
+             str(log)], stdout=subprocess.PIPE)
+        self.addCleanup(self.stop_child, child)
+        child.stdout.readline()
+        child.stdout.close()
+        processes = diagnostics.discover(child.pid)
+        self.addCleanup(lambda: [os.close(fd) for _, fd, _ in processes])
+        self.assertEqual([pid for pid, _, _ in processes], [child.pid])
+        streams = diagnostics.error_logs(processes)
+        try:
+            self.assertEqual([stream.read() for stream in streams], [b'real diagnostic\n'])
+        finally:
+            for stream in streams:
+                stream.close()
+        # Changed identity and an exited (reaped) process both yield nothing.
+        _, fd, (parent, _) = processes[0]
+        self.assertEqual(diagnostics.error_logs([(child.pid, fd, (parent, 'other'))]), [])
+        child.kill()
+        child.wait(timeout=5)
+        self.assertEqual(diagnostics.error_logs(processes), [])
+
+    def test_late_capture_tail_ends_before_owner_cleanup(self):
+        # soft=1s, hard=12s: owner cleanup starts at owner start + 8s.
+        owner_start, cutoff = 1000., 1008.
+        for latency, allowance in ((0., 1.5), (2., None), (9., None)):
+            clock = [owner_start + 1 + latency]
+            allowances = []
+
+            def debugger(_command, clock=clock, allowances=allowances, **kwargs):
+                allowances.append(kwargs['timeout'])
+                clock[0] += kwargs['timeout']
+
+            def sleep(seconds, clock=clock):
+                self.assertGreaterEqual(seconds, 0)
+                clock[0] += seconds
+
+            with self.subTest(latency=latency), \
+                    mock.patch.object(diagnostics.time, 'monotonic',
+                                      side_effect=lambda c=clock: c[0]), \
+                    mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger):
+                _, artifacts = self.capture(hard=12, sleep=sleep,
+                                            env={'CT_HANG_CLEANUP_AT': repr(cutoff)})
+                self.assertLessEqual(clock[0], max(cutoff, owner_start + 1 + latency),
+                                     'debugger or SIGQUIT tail passed owner cleanup')
+                self.assertEqual(allowances, [] if allowance is None else [allowance])
+                self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n')
+                self.assertEqual(len(self.signals), 1)
+
+    def test_invalid_owner_cutoff_uses_hard_deadline_fallback(self):
+        for value in ('nan', 'inf', 'bogus', ''):
+            clock = [100.]
+            allowances = []
+
+            def debugger(_command, allowances=allowances, **kwargs):
+                allowances.append(kwargs['timeout'])
+
+            with self.subTest(value=value), \
+                    mock.patch.object(diagnostics.time, 'monotonic',
+                                      side_effect=lambda c=clock: c[0]), \
+                    mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger):
+                self.capture(passive=True, hard=12, env={'CT_HANG_CLEANUP_AT': value})
+            # Standalone budget: 12 - 1 soft - 4 owner reserve - .5 margin.
+            self.assertEqual(allowances, [6.5])
 
     def test_exit_during_debugger_never_falls_back_to_numeric_signal(self):
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
@@ -302,7 +400,7 @@ class HangCaptureTests(unittest.TestCase):
             signal.pidfd_send_signal(fd, signal.SIGKILL)
             child.wait()
 
-        with mock.patch.object(diagnostics, 'discover', return_value=[(child.pid, fd)]), \
+        with mock.patch.object(diagnostics, 'discover', return_value=[(child.pid, fd, (1, 'x'))]), \
                 mock.patch.object(diagnostics, 'error_logs', return_value=[]), \
                 mock.patch.object(diagnostics.subprocess, 'run', side_effect=debugger), \
                 mock.patch.object(diagnostics.time, 'sleep'), \

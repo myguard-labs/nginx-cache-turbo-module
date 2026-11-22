@@ -190,7 +190,9 @@ class TerminationTests(unittest.TestCase):
     def test_guard_disabled_and_enabled_paths_preserve_exit(self):
         for enabled in (False, True):
             with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
-                env = dict(os.environ, CT_OUTCOME_OBSERVE="1" if enabled else "0")
+                # Pin a valid pair; an inherited CI hard bound would reject this soft.
+                env = dict(os.environ, CT_OUTCOME_OBSERVE="1" if enabled else "0",
+                           CT_HANG_HARD_SECONDS="1000299")
                 result = subprocess.run(["sh", str(REPO / "ci/tools/ci-hang-guard.sh"),
                                          "999999", directory, "--", sys.executable,
                                          "-c", "raise SystemExit(7)"],

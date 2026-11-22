@@ -2,14 +2,20 @@
 
 Discovery snapshots ancestry and start times. A pidfd is opened before checking
 that start time again, so a replaced numeric PID cannot authorize signalling.
+Log descriptors are enumerated through a /proc directory descriptor whose start
+identity is rechecked after open, never through a later lookup of the number.
 Build can select passive capture with CT_HANG_QUIT=0; its hard deadline remains
 owned by ci_guard_lifecycle, independently of this best-effort diagnostic child.
+The owner passes its absolute CLOCK_MONOTONIC cleanup instant in
+CT_HANG_CLEANUP_AT; debuggers and the SIGQUIT tail finish before it.
 """
 
+import math
 import os
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -18,13 +24,23 @@ from pathlib import Path
 PROC = Path('/proc')
 
 
-def process_stat(path):
-    fields = path.read_text(encoding='ascii').rsplit(') ', 1)[1].split()
+def parse_stat(text):
+    fields = text.rsplit(') ', 1)[1].split()
     return int(fields[1]), fields[19]
 
 
+def process_stat(path):
+    return parse_stat(path.read_text(encoding='ascii'))
+
+
+def read_at(directory, name):
+    fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory)
+    with os.fdopen(fd, 'rb') as stream:
+        return stream.read().decode('ascii')
+
+
 def discover(root):
-    """Return pid/role/pidfd records selected by one checked ancestry snapshot."""
+    """Return pid/pidfd/identity records selected by one checked ancestry snapshot."""
     snapshot = {}
     for path in PROC.glob('[0-9]*/stat'):
         try:
@@ -59,7 +75,7 @@ def discover(root):
                         raise ValueError('changed ancestry identity')
                 if any(select.select([ancestor], [], [], 0)[0] for ancestor in ancestors):
                     continue
-                selected.append((pid, fd))
+                selected.append((pid, fd, snapshot[pid]))
                 fd = None  # Ownership transfers to the returned record.
             except (OSError, ValueError, IndexError):
                 continue
@@ -68,39 +84,75 @@ def discover(root):
                     os.close(fd)
                 for ancestor in ancestors:
                     os.close(ancestor)
-        nginx = {pid for pid, _ in selected}
+        nginx = {pid for pid, _, _ in selected}
         return sorted(selected, key=lambda item: (snapshot[item[0]][0] not in nginx, item[0]))
     except BaseException:
-        for _, fd in selected:
+        for _, fd, _ in selected:
             os.close(fd)
         raise
+
+
+def open_logs(descriptors, logs):
+    """Retain unseen regular error.log inodes named by one pinned fd directory."""
+    for name in sorted(os.listdir(descriptors)):
+        stream = None
+        try:
+            if (os.path.basename(os.readlink(name, dir_fd=descriptors)) != 'error.log'
+                    or not stat.S_ISREG(os.stat(name, dir_fd=descriptors).st_mode)):
+                continue
+            stream = os.fdopen(os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC,
+                                       dir_fd=descriptors), 'rb')
+            status = os.fstat(stream.fileno())
+            key = (status.st_dev, status.st_ino)
+            if stat.S_ISREG(status.st_mode) and key not in logs:
+                logs[key] = stream
+                stream = None
+        except OSError:
+            continue
+        finally:
+            if stream is not None:
+                stream.close()
 
 
 def error_logs(processes):
     logs = {}
     try:
-        for pid, _ in processes:
-            for descriptor in sorted((PROC / str(pid) / 'fd').glob('*')):
-                stream = None
-                try:
-                    path = descriptor.resolve(strict=True)
-                    if path.name == 'error.log' and path.is_file():
-                        stream = descriptor.open('rb')
-                        identity = os.fstat(stream.fileno())
-                        key = (identity.st_dev, identity.st_ino)
-                        if key not in logs:
-                            logs[key] = stream
-                            stream = None
-                except OSError:
+        for pid, fd, identity in processes:
+            directory = descriptors = None
+            try:
+                # This descriptor pins one process. Its start identity, name and
+                # live pidfd prove that it is the discovered one, not a reused PID.
+                directory = os.open(PROC / str(pid), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                if (parse_stat(read_at(directory, 'stat'))[1] != identity[1]
+                        or read_at(directory, 'comm').strip() != 'nginx'
+                        or select.select([fd], [], [], 0)[0]):
                     continue
-                finally:
-                    if stream is not None:
-                        stream.close()
+                descriptors = os.open('fd', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                                      dir_fd=directory)
+                open_logs(descriptors, logs)
+            except (OSError, ValueError, IndexError, UnicodeError):
+                continue
+            finally:
+                for handle in (descriptors, directory):
+                    if handle is not None:
+                        os.close(handle)
         return list(logs.values())
     except BaseException:
         for stream in logs.values():
             stream.close()
         raise
+
+
+def cleanup_cutoff(started, soft):
+    """Return the owner's cleanup instant; standalone use derives it from hard."""
+    try:
+        cutoff = float(os.environ.get('CT_HANG_CLEANUP_AT', 'nan'))
+    except ValueError:
+        cutoff = math.nan  # Malformed owner input selects the standalone bound.
+    if math.isfinite(cutoff):
+        return cutoff
+    hard = float(os.environ.get('CT_HANG_HARD_SECONDS', str(float(soft) + 300)))
+    return started + hard - float(soft) - 2 * min(2., hard / 5)
 
 
 def capture(root, directory, soft):
@@ -120,13 +172,13 @@ def capture(root, directory, soft):
             print(f'ci-hang-guard: no nginx under pid {root}', file=sys.stderr)
         logs = error_logs(processes)  # Retain the selected inodes across rotation/shutdown.
         shutdown = os.environ.get('CT_HANG_QUIT', '1') != '0'
-        hard = float(os.environ.get('CT_HANG_HARD_SECONDS', str(float(soft) + 300)))
-        # Reserve the owner's TERM/KILL windows, optional dump tail, and a
-        # snapshot margin. All debuggers share this one deadline.
-        until = started + max(0., hard - float(soft) - 2 * min(2., hard / 5)
-                              - (5 if shutdown else 0) - .5)
+        # The owner's cleanup instant already reserves its TERM/KILL windows.
+        # Reserve the optional dump tail and a snapshot margin before it. All
+        # debuggers share this one deadline, measured from owner start.
+        cutoff = cleanup_cutoff(started, soft) - .5
+        until = cutoff - (5 if shutdown else 0)
         privilege = ['sudo', '-n'] if shutil.which('sudo') else []
-        for index, (pid, fd) in enumerate(processes):
+        for index, (pid, fd, _) in enumerate(processes):
             if select.select([fd], [], [], 0)[0]:
                 continue
             try:
@@ -166,13 +218,14 @@ def capture(root, directory, soft):
         # Every debugger completes before any shutdown signal. pidfds still name
         # the discovery identities even if a target exited and its PID was reused.
         if shutdown:
-            for pid, fd in processes:
+            for pid, fd, _ in processes:
                 try:
                     signal.pidfd_send_signal(fd, signal.SIGQUIT)
                     print(f'ci-hang-guard: SIGQUIT pid={pid}', file=sys.stderr)
                 except OSError as error:
                     print(f'ci-hang-guard: SIGQUIT unavailable pid={pid}: {error}', file=sys.stderr)
-            time.sleep(5)
+            # A late capture shortens its dump wait; it never passes cleanup.
+            time.sleep(max(0., min(5., cutoff - time.monotonic())))
         for index, source in enumerate(logs, 1):
             try:
                 with (directory / f'error-{index}.log').open('wb') as target:
@@ -182,7 +235,7 @@ def capture(root, directory, soft):
     finally:
         for source in logs:
             source.close()
-        for _, fd in processes:
+        for _, fd, _ in processes:
             os.close(fd)
 
 

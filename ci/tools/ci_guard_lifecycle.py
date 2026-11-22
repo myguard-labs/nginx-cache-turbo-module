@@ -208,7 +208,11 @@ def _owner(wire, caller_fd, command, env, soft, hard, capture):
                 captured = True
                 if capture is not None:
                     try:
-                        processes.append(OwnedProcess(capture(command_process.pid)))
+                        # Pass the absolute CLOCK_MONOTONIC cleanup instant, so
+                        # capture launch latency cannot move its own budget.
+                        processes.append(OwnedProcess(
+                            capture(command_process.pid),
+                            dict(os.environ, CT_HANG_CLEANUP_AT=repr(deadline - 2 * grace))))
                     except OSError as error:
                         # Diagnostics are best effort; the primary command still
                         # owns its outcome and the original hard deadline.

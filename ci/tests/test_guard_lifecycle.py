@@ -272,6 +272,27 @@ class GuardLifecycleTests(unittest.TestCase):
         self.assertEqual(result['status'], 23)
         self.assertEqual(result['code'], 23)
 
+    def test_capture_receives_owner_cleanup_instant(self):
+        record = self.directory / 'capture-clock.json'
+        capture_script = ('import json,os,pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('
+                          'json.dumps([time.monotonic(), os.environ.get("CT_HANG_CLEANUP_AT")]))')
+        soft, hard = .2, 2
+        before = time.monotonic()
+        result = lifecycle.run_owned(
+            [sys.executable, '-c', 'import time; time.sleep(60)'], None, self.pin,
+            soft=soft, hard=hard,
+            capture=lambda pid: [sys.executable, '-c', capture_script, str(record)])
+        after = time.monotonic()
+        self.assertEqual(result['status'], 124)
+        started, cutoff = json.loads(record.read_text())
+        self.assertIsNotNone(cutoff, 'owner did not pass its cleanup instant')
+        reserve = 2 * min(2., hard / 5)
+        # Owner start lies after `before` and at least soft before capture start;
+        # the capture budget therefore cannot absorb its own launch latency.
+        self.assertGreaterEqual(float(cutoff), before + hard - reserve)
+        self.assertLessEqual(float(cutoff), started - soft + hard - reserve)
+        self.assertLessEqual(float(cutoff), after)
+
     def test_blocked_capture_is_isolated_and_cannot_extend_deadline(self):
         identity = self.directory / 'capture-command.json'
         capture_file = self.directory / 'capture.json'
