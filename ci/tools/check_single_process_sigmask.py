@@ -25,6 +25,8 @@ import re
 import sys
 from pathlib import Path
 
+import single_process_sigmask as helper
+
 CYCLE_C = Path("src/os/unix/ngx_process_cycle.c")
 CYCLE_H = Path("src/os/unix/ngx_process_cycle.h")
 EPOLL_C = Path("src/event/modules/ngx_epoll_module.c")
@@ -201,9 +203,20 @@ def _references(root: Path) -> list[Path]:
             if TOKEN in path.read_text(errors="replace")]
 
 
+def _check_anchors(root: Path) -> list[str]:
+    """Each helper edit is patched exactly once: no extra pristine anchor."""
+    problems = []
+    for name, anchor, new in helper.EDITS:
+        state = helper._state((root / name).read_text(), anchor, new)
+        if state != "patched":
+            problems.append(f"{name}: {state} anchor state, expected patched")
+    return problems
+
+
 def check_patched(root: Path) -> list[str]:
     cycle = (root / CYCLE_C).read_text()
-    problems = _check_loop(cycle)
+    problems = _check_anchors(root)
+    problems += _check_loop(cycle)
     problems += _check_globals(cycle, (root / CYCLE_H).read_text())
     problems += _check_wait((root / EPOLL_C).read_text())
     allowed = {root / CYCLE_C, root / CYCLE_H, root / EPOLL_C}

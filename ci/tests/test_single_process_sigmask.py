@@ -355,3 +355,15 @@ def test_pristine_tree_is_still_pristine(tree):
     assert sp.apply(tree) == "applied"
     assert sp.apply(tree) == "already patched"
     assert snapshot(tree) != before
+
+
+@pytest.mark.parametrize("index", range(len(sp.EDITS)))
+def test_check_refuses_extra_anchor_on_patched_tree(tree, index):
+    assert sp.apply(tree) == "applied"
+    assert run_check(tree, "patched").returncode == 0
+    name, anchor, _new = sp.EDITS[index]
+    path = tree / name
+    path.write_text(path.read_text() + "\n/* stray */\n" + anchor)
+    red = run_check(tree, "patched")
+    assert red.returncode == 1
+    assert f"single-process sigmask check: {name}: drift anchor state" in red.stderr
