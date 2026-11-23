@@ -7,8 +7,10 @@ so they exercise the read loops that pair a watched request with its reply:
 no nginx, no Redis. The deadline checks feed a fake anchor.
 """
 
+import ast
 import asyncio
 import contextlib
+import inspect
 import os
 import pathlib
 import sys
@@ -510,6 +512,23 @@ class ClosedWindowCase(unittest.TestCase):
 class LateClosesCase(unittest.TestCase):
     """CT-SHUTDOWN-CLOSE-ORACLE: a missing or late idle-client close fails the
     shutdown arm; the " over" marker comes from the same predicate."""
+
+    def test_close_measurement_uses_park_with_delayed_reload(self):
+        # Park=10, reload=10.15, limit=0.4: 10.52 must fail even
+        # though measuring from reload would incorrectly yield 0.37.
+        tree = ast.parse(inspect.getsource(af.run_shutdown_test))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name)
+                 and node.func.id == "close_since_park"]
+        self.assertEqual(len(calls), 1)
+        timestamps = {"closed_at": 10.52, "parked_at": 10.0, "reloaded_at": 10.15}
+        observed = af.close_since_park(*(timestamps[arg.id] for arg in calls[0].args))
+        self.assertTrue(af.late_closes([observed], 0.4))
+        self.assertEqual(af.late_closes([af.close_since_park(10.39, 10.0)], 0.4), [])
+        self.assertEqual(len(af.late_closes([af.close_since_park(0.4, 0.0)],
+                                            0.4)), 1)
+        self.assertEqual(len(af.late_closes([af.close_since_park(None, 10.0)],
+                                            0.4)), 1)
 
     def test_under_limit_is_clean(self):
         self.assertEqual(af.late_closes([0.2, 0.21], 0.4), [])

@@ -1488,14 +1488,13 @@ def test_auto_vary_stale_marker_reachable(ng: Nginx, origin: Origin) -> None:
     # this test exists to prove is the deterministic post-sleep check below.
     assert h1.get("x-cache") in ("HIT", "STALE"), \
         f"second should be served from cache, got {h1.get('x-cache')}"
-    hits_before = origin.hits_for("/m?v=ua")
     time.sleep(1.3)                          # past the 1s fresh TTL (TTL+0.3), inside stale
     _, _, h2 = fetch(ng.port, p, headers=mob)
+    # STALE proves cached delivery; an origin fallback has no cache header.
+    # A legitimate background refresh can increment the origin count already.
     assert h2.get("x-cache") == "STALE", \
         ("a stale-but-serveable variant must stay reachable via its stale marker, "
          f"got X-Cache={h2.get('x-cache')} (base-key fallback missed to origin)")
-    assert origin.hits_for("/m?v=ua") == hits_before, \
-        "stale variant serve must not reach origin synchronously"
 
 
 def test_206_never_cached(ng: Nginx, origin: Origin) -> None:

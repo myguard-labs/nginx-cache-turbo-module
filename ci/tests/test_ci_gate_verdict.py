@@ -78,5 +78,51 @@ class Workflow(unittest.TestCase):
         self.assertRegex(body, r"if:\s*\$\{\{\s*always\(\)\s*\}\}")
 
 
+def asan_matches(path):
+    """Run the changes job's own ASan alternation (grep -E) over one path."""
+    text = CI_YML.read_text()
+    m = re.search(r"grep -qE '([^']*)' <<< \"\$changed\"; then\n\s*echo \"asan=true\"", text)
+    if m is None:
+        raise AssertionError("ci.yml ASan path filter not found")
+    return subprocess.run(["grep", "-qE", m.group(1)], input=path + "\n",
+                          text=True, check=False).returncode == 0
+
+
+def guard_modules():
+    """ci-hang-guard.sh's exec targets plus their local ci/tools imports."""
+    tools = REPO / "ci" / "tools"
+    pending = re.findall(r"/(ci_[a-z_]+\.py)\"", (tools / "ci-hang-guard.sh").read_text())
+    found = set()
+    while pending:
+        name = pending.pop()
+        if name in found:
+            continue
+        found.add(name)
+        for module in re.findall(r"^(?:from|import) ([a-z_]+)", (tools / name).read_text(),
+                                 re.MULTILINE):
+            if (tools / f"{module}.py").is_file():
+                pending.append(f"{module}.py")
+    return sorted(f"ci/tools/{name}" for name in found)
+
+
+class AsanFilter(unittest.TestCase):
+    """Both ASan jobs run under ci-hang-guard.sh: its code must trigger them."""
+
+    def test_guard_and_its_python_modules_select_asan(self):
+        modules = guard_modules()
+        self.assertEqual(modules, ["ci/tools/ci_child_observer.py",
+                                   "ci/tools/ci_guard_lifecycle.py",
+                                   "ci/tools/ci_hang_capture.py"])
+        for path in ["ci/tools/ci-hang-guard.sh", *modules]:
+            with self.subTest(path=path):
+                self.assertTrue(asan_matches(path), f"{path} change skips ASan")
+
+    def test_unrelated_tools_do_not_select_asan(self):
+        for path in ("ci/tools/ci-gate-verdict.py", "ci/tools/ci_child_termination.py",
+                     "docs/ci_guard_lifecycle.py", "README.md"):
+            with self.subTest(path=path):
+                self.assertFalse(asan_matches(path), f"{path} selected ASan")
+
+
 if __name__ == "__main__":
     unittest.main()
