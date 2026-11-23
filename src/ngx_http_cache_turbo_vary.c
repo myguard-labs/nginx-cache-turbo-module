@@ -1051,8 +1051,19 @@ ngx_http_cache_turbo_vary_apply(ngx_http_request_t *r,
          * one caller per window to be the probe, and this is neither a
          * breaker consult nor a request that should ever become the probe --
          * it is speculative, pre-lookup work that must not perturb the
-         * breaker state machine at all. */
-        if (clcf->vary_marker_revalidate > 0 && !ctx->vary_marker_l2_done
+         * breaker state machine at all.
+         *
+         * CT-HOSTILE-ARGS10000-HIT2-EXPIRED: only arm when an L2 backend can
+         * actually run the revalidation GET (the same backend/get gate
+         * access_l2_marker_get() declines on). Armed without one, access_l1()
+         * skips its fresh/stale serve arms, the marker GET declines, nothing
+         * re-serves the resident node, and every warm auto-Vary HIT whose
+         * marker is >= vary_marker_revalidate old is demoted to an EXPIRED
+         * origin refetch on an L1-only location. With no L2 there is no
+         * authoritative peer generation to revalidate against. */
+        if (clcf->vary_marker_revalidate > 0
+            && clcf->backend != NULL && clcf->backend->get != NULL
+            && !ctx->vary_marker_l2_done
             && !(ngx_http_cache_turbo_breaker_should_consult(clcf)
                  && ngx_http_cache_turbo_brk_state(ngx_http_cache_turbo_zone_sh(z)->breaker_state)
                         == NGX_HTTP_CACHE_TURBO_BREAKER_OPEN))

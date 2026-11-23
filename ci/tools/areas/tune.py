@@ -1104,6 +1104,33 @@ def test_auto_vary_off_ignores_vary(ng: Nginx, origin: Origin) -> None:
     assert origin.hits - base == 1, origin.hits - base
 
 
+def test_auto_vary_l1_only_warm_marker_stays_hit(ng: Nginx, origin: Origin) -> None:
+    """CT-HOSTILE-ARGS10000-HIT2-EXPIRED: on an L1-only location (/avnolock/,
+    no L2 backend, cache_turbo_lock off, default
+    cache_turbo_vary_marker_revalidate 2s) a warm auto-Vary
+    entry well inside cache_turbo_valid must stay a HIT once its marker is
+    older than the revalidation window. There is no L2 generation to
+    revalidate against; arming the revalidation anyway skipped the fresh L1
+    serve arm and refetched from origin as EXPIRED."""
+    path = "/c490warm?v=or"
+    p = "/avnolock" + path
+    hdr = {"Origin": "https://a.example"}
+    base = origin.hits_for(path)
+    _, b1, h1 = fetch(ng.port, p, hdr)
+    _, b2, h2 = fetch(ng.port, p, hdr)
+    assert h1.get("x-ct-status") == "MISS", h1.get("x-ct-status")
+    assert h2.get("x-ct-status") == "HIT" and b1 == b2, (h2, b1, b2)
+    # Past the 2s marker window on ngx_time()'s whole-second clock, far
+    # inside the 30s cache_turbo_valid.
+    time.sleep(3.2)
+    _, b3, h3 = fetch(ng.port, p, hdr)
+    assert h3.get("x-ct-status") == "HIT", (
+        "warm auto-Vary entry demoted after the marker revalidation window "
+        f"with no L2 backend: X-CT-Status={h3.get('x-ct-status')!r}")
+    assert b3 == b1, (b1, b3)
+    assert origin.hits_for(path) - base == 1, origin.hits_for(path) - base
+
+
 def test_auto_vary_shipped_default_splits_encoding(ng: Nginx, origin: Origin) -> None:
     """S231-VARY: `/avdefault/` sets NO cache_turbo_auto_vary directive at all
     -- proves the compiled-in merge default is 1, not just that `on;` works

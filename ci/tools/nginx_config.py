@@ -4118,6 +4118,20 @@ def _conf_11(origin_port, sr_directive) -> str:
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # CT-HOSTILE-ARGS10000-HIT2-EXPIRED: L1-only auto-Vary with the
+        # cold-miss lock OFF. The lock-on CLAIM_FRESH re-lookup re-serves a
+        # fresh node and masks a skipped L1 serve arm; lock off goes straight
+        # to origin, so a warm marker older than the default 2s
+        # cache_turbo_vary_marker_revalidate window is observable here.
+        location /avnolock/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_lock     off;
+            add_header           X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # ADMIN-WARM-AUTH-FORWARD regression guard: non-admin SWR refreshes
         # must keep the representation headers that select their auto-Vary
         # slot. A strict admin-style allowlist here drops Accept-Language and

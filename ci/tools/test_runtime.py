@@ -454,6 +454,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_cookie_uncacheable(ng, origin)
     test_auto_vary_mixed_refused_wins(ng, origin)
     test_auto_vary_off_ignores_vary(ng, origin)
+    test_auto_vary_l1_only_warm_marker_stays_hit(ng, origin)
     test_auto_vary_shipped_default_splits_encoding(ng, origin)
     test_auto_vary_shipped_default_cookie_refused(ng, origin)
     test_preset_window_differs(ng, origin)
