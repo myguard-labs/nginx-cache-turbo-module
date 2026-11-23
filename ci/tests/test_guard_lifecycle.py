@@ -776,25 +776,40 @@ class GuardLifecycleTests(unittest.TestCase):
 
     def test_capture_decision_reads_clock_after_owner_checks(self):
         real_readable = lifecycle._readable
+        real_owned = lifecycle.OwnedProcess
         hard = 1
         cutoff_after_start = hard - 2 * min(2., hard / 5)
         launched = self.directory / 'capture-launched'
-        calls = []
+        delayed = self.directory / 'monitor-delayed'
+        # The owner is a forked process: share state with files, not memory.
+        state = {'first': None, 'command': False, 'delayed': False}
+
+        def owned(*args, **kwargs):
+            process = real_owned(*args, **kwargs)
+            state['command'] = True  # Only the command launch matters here.
+            return process
 
         def readable(*objects):
-            calls.append(time.monotonic())
-            if len(calls) == 2:
-                # Stall the first monitor pass past cleanup; start precedes calls[0].
-                time.sleep(max(0, calls[0] + cutoff_after_start + .05 - time.monotonic()))
+            if state['first'] is None:
+                state['first'] = time.monotonic()  # Precedes nothing but start.
+            elif state['command'] and not state['delayed']:
+                # First monitor poll, after the command launched: stall it past
+                # cleanup. Setup polls are never delayed.
+                state['delayed'] = True
+                delayed.touch()
+                time.sleep(max(0, state['first'] + cutoff_after_start + .05
+                               - time.monotonic()))
             return real_readable(*objects)
 
         def capture(_pid):
             launched.touch()
             return [sys.executable, '-c', 'pass']
 
-        with mock.patch.object(lifecycle, '_readable', side_effect=readable):
+        with mock.patch.object(lifecycle, '_readable', side_effect=readable), \
+                mock.patch.object(lifecycle, 'OwnedProcess', side_effect=owned):
             result = lifecycle.run_owned([sys.executable, '-c', 'import time; time.sleep(60)'],
                                          None, self.pin, soft=0, hard=hard, capture=capture)
+        self.assertTrue(delayed.exists(), 'the monitor poll was never delayed')
         self.assertFalse(launched.exists(), 'capture launched after the cleanup cutoff')
         self.assertEqual((result['status'], result['reason']), (124, 'hard deadline'))
 
@@ -802,14 +817,18 @@ class GuardLifecycleTests(unittest.TestCase):
         # Valid pair whose soft deadline sits inside the last 20 ms poll before
         # cleanup. From the first monitor pass the owner's clock advances only
         # by its requested sleeps (plus a minimal overrun), so scheduler delay
-        # cannot select either outcome.
+        # cannot select either outcome. Command launch marks the transition
+        # into monitoring, so setup polls and sleeps never move the clock.
         hard = 1
         cutoff_after_start = hard - 2 * min(2., hard / 5)
         soft = cutoff_after_start - .015
         lifecycle.validate_deadlines(soft, hard)
         launched = self.directory / 'capture-launched'
-        clock = {'start': None, 'virtual': None, 'passes': 0}
+        sleeps = self.directory / 'monitor-sleeps'
+        # The owner is a forked process: share state with files, not memory.
+        clock = {'start': None, 'virtual': None, 'command': False}
         real_readable = lifecycle._readable
+        real_owned = lifecycle.OwnedProcess
 
         def monotonic():
             if clock['virtual'] is not None:
@@ -822,12 +841,19 @@ class GuardLifecycleTests(unittest.TestCase):
         def sleep(seconds):
             time.sleep(seconds)  # Real, so drained processes still get to exit.
             if clock['virtual'] is not None:
+                with sleeps.open('a') as record:
+                    record.write(f'{seconds!r}\n')
                 clock['virtual'] += seconds + 1e-6
 
+        def owned(*args, **kwargs):
+            process = real_owned(*args, **kwargs)
+            clock['command'] = True
+            return process
+
         def readable(*objects):
-            clock['passes'] += 1
-            if clock['passes'] == 2:
-                # First monitor pass: 4 ms before soft, 19 ms before cleanup.
+            if clock['command'] and clock['virtual'] is None:
+                # First poll after command launch: 4 ms before soft, 19 ms
+                # before cleanup.
                 clock['virtual'] = clock['start'] + cutoff_after_start - .019
             return real_readable(*objects)
 
@@ -838,9 +864,14 @@ class GuardLifecycleTests(unittest.TestCase):
         # Any other clock attribute the owner might use fails instead of mocking.
         fake_time = SimpleNamespace(monotonic=monotonic, sleep=sleep)
         with mock.patch.object(lifecycle, '_readable', side_effect=readable), \
+                mock.patch.object(lifecycle, 'OwnedProcess', side_effect=owned), \
                 mock.patch.object(lifecycle, 'time', fake_time):
             result = lifecycle.run_owned([sys.executable, '-c', 'import time; time.sleep(60)'],
                                          None, self.pin, soft=soft, hard=hard, capture=capture)
+        self.assertTrue(sleeps.exists(), 'the monitor never slept')
+        first = float(sleeps.read_text().splitlines()[0])
+        self.assertAlmostEqual(first, .004, delta=1e-6,
+                               msg='monitor did not sleep to its soft deadline')
         self.assertTrue(launched.exists(), 'pending capture slept past its soft deadline')
         self.assertEqual((result['status'], result['reason']), (124, 'hard deadline'))
 
