@@ -123,6 +123,19 @@ def sibling_cpus(cpus, sysfs="/sys/devices/system/cpu"):
     return sorted(out)
 
 
+def check_layout(server, wrk, sysfs, allowed=None):
+    """Raise ValueError when the server and client CPU sets (with their SMT
+    siblings) overlap, or a requested CPU is outside the allowed affinity."""
+    if allowed is None:
+        allowed = os.sched_getaffinity(0)
+    missing = sorted((set(server) | set(wrk)) - set(allowed))
+    if missing:
+        raise ValueError(f"CPUs not in the allowed affinity: {missing}")
+    shared = sorted(set(sibling_cpus(server, sysfs)) & set(sibling_cpus(wrk, sysfs)))
+    if shared:
+        raise ValueError(f"server and client share a core (CPUs {shared})")
+
+
 def finite(text):
     """float() that refuses nan/inf, which would slip past every comparison."""
     v = float(text)
@@ -309,6 +322,10 @@ def main(argv):
     b.add_argument("--cpus", required=True)
     b.add_argument("--sample", required=True)
     b.add_argument("--kind", required=True)
+    ly = sub.add_parser("check-layout")
+    ly.add_argument("--server", required=True)
+    ly.add_argument("--wrk", required=True)
+    ly.add_argument("--sysfs", default="/sys/devices/system/cpu")
     sc = sub.add_parser("schedule")
     sc.add_argument("--pairs", type=int, required=True)
     sc.add_argument("--sizes", required=True, help="space separated size names")
@@ -335,6 +352,9 @@ def main(argv):
             if args.siblings_only:
                 out = [x for x in out if x not in base]
             print(",".join(str(x) for x in out))
+            return 0
+        if args.cmd == "check-layout":
+            check_layout(expand_cpulist(args.server), expand_cpulist(args.wrk), args.sysfs)
             return 0
         if args.cmd == "schedule":
             for size, side, pair in schedule(args.pairs, args.sizes.split()):

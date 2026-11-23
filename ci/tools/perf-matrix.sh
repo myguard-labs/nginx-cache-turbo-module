@@ -123,7 +123,7 @@ if [ -n "$FROM_SAMPLES" ]; then
     [ -r "$FROM_SAMPLES" ] || die "--from-samples file not readable: $FROM_SAMPLES"
     out_args=()
     if [ -n "$OUT" ]; then
-        mkdir -p "$OUT"
+        mkdir -p "$OUT" || die "cannot create output directory $OUT"
         out_args=(--out "$OUT/matrix.json")
     fi
     idle_args=()
@@ -164,8 +164,10 @@ fi
 # could never fire; refuse rather than risk a false PASS.
 [ -x /usr/bin/time ] || die "/usr/bin/time not found (needed for the client-MASKED check)"
 command -v taskset >/dev/null 2>&1 || die "taskset not found"
+python3 -I -B "$STATS" check-layout --server "$SERVER_CPU" --wrk "$WRK_CPUS" ||
+    die "bad CPU layout (SERVER_CPU=$SERVER_CPU WRK_CPUS=$WRK_CPUS)"
 [ -n "$OUT" ] || OUT="$(mktemp -d)"
-mkdir -p "$OUT/logs"
+mkdir -p "$OUT/logs" || die "cannot create output directory $OUT"
 : >"$OUT/samples.tsv"
 : >"$OUT/idle.tsv"
 
@@ -200,7 +202,7 @@ run_sample() {
     SIZES="$size" MODES=C PASSES=1 WORKERS=1 THREADS="$THREADS" \
         NGINX_CPUS="$SERVER_CPU" WRK_CPUS="$WRK_CPUS" WARMUP="$WARMUP" \
         MODULE="$module" BENCH_TSV="$tsv" \
-        bash "$HERE/bench.sh" "$bin" "$DURATION" "$CONC" >"$log" 2>&1 ||
+        bash "$HERE/bench.sh" "$bin" "$DURATION" "$CONC" </dev/null >"$log" 2>&1 ||
         die "bench.sh failed for $label (see $log)"
     snap "$OUT/.stat.d"
     sleep "$SETTLE"

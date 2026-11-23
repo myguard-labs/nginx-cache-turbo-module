@@ -349,6 +349,21 @@ class WrapperTests(unittest.TestCase):
             out = subprocess.run(base + ["--out", d], capture_output=True, text=True, check=False)
             self.assertEqual(out.returncode, 2, out.stderr)
 
+    def test_check_layout(self):
+        with tempfile.TemporaryDirectory() as d:
+            for c, sib in (("2", "2-3"), ("3", "2-3"), ("4", "4"), ("5", "5")):
+                t = Path(d) / f"cpu{c}" / "topology"
+                t.mkdir(parents=True)
+                (t / "thread_siblings_list").write_text(sib + "\n")
+            allowed = {2, 3, 4, 5}
+            pm.check_layout([2], [4, 5], d, allowed)  # disjoint cores: valid
+            with self.assertRaises(ValueError):  # SMT siblings
+                pm.check_layout([2], [3], d, allowed)
+            with self.assertRaises(ValueError):  # identical CPU
+                pm.check_layout([4], [4], d, allowed)
+            with self.assertRaises(ValueError):  # outside affinity
+                pm.check_layout([2], [4, 5], d, {2, 4})
+
     def test_load_idle_none_is_no_evidence(self):
         self.assertEqual(pm.load_idle(None), [])
         with self.assertRaises(OSError):
