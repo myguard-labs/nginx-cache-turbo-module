@@ -1,5 +1,10 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Bugfix: a Redis simple-string reply other than exactly "+OK" to the
+       cross-node lock SET NX PX (for example "+QUEUED" from a connection
+       left in MULTI) is now treated as a failed lock channel (per-box
+       single-flight, connection closed) instead of a lock win.
+
     *) Bugfix: a non-nil bulk reply to the cross-node lock SET NX PX is now
        treated as a failed lock channel (per-box single-flight, connection
        closed) instead of "peer holds the lock"; only a nil reply makes a
