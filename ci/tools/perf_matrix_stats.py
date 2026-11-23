@@ -158,9 +158,10 @@ def load_samples(path):
 
 
 def load_idle(path):
-    """TSV: sample kind cpu busy_pct. Missing file means no idle evidence."""
+    """TSV: sample kind cpu busy_pct. None means no idle evidence; a path that
+    cannot be opened raises OSError (exit 2), never a silent skip."""
     rows = []
-    if not os.path.exists(path):
+    if path is None:
         return rows
     with open(path, encoding="ascii") as fh:
         for ln, line in enumerate(fh, 1):
@@ -311,7 +312,7 @@ def main(argv):
     sc.add_argument("--sizes", required=True, help="space separated size names")
     a = sub.add_parser("analyze")
     a.add_argument("--samples", required=True)
-    a.add_argument("--idle", default="/nonexistent")
+    a.add_argument("--idle", default=None)
     a.add_argument("--out")
     a.add_argument("--threads", type=int, required=True)
     a.add_argument("--wrk-cpu-count", type=int, required=True)

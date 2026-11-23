@@ -217,7 +217,7 @@ end
 LUA
 fi
 
-"${NGINX_PIN[@]}" "$NGINX" -p "$WORK" -c "$WORK/conf/nginx.conf" &
+${NGINX_PIN[@]+"${NGINX_PIN[@]}"} "$NGINX" -p "$WORK" -c "$WORK/conf/nginx.conf" &
 NGINX_PID=$!
 trap 'kill -QUIT "$NGINX_PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
@@ -286,7 +286,7 @@ prime_keys() {
     # Fast fan-out warmup: hammer the full key range with the rotor for a
     # few seconds using real concurrency instead of one curl at a time.
     WRK_KEYS="$KEYS" WRK_PATH="$path" \
-        "${WRK_PIN[@]}" wrk -t"$THREADS" -c"$CONC" -d3s -s "$WORK/conf/rotor.lua" \
+        ${WRK_PIN[@]+"${WRK_PIN[@]}"} wrk -t"$THREADS" -c"$CONC" -d3s -s "$WORK/conf/rotor.lua" \
             "http://127.0.0.1:$port${path}0" >/dev/null 2>&1 || true
 
     # Verify coverage: sample up to 50 keys spread evenly across the range
@@ -336,19 +336,19 @@ runwrk() {
         if [ -n "$time_bin" ]; then
             out=$("$time_bin" -v -o "$WORK/logs/time.out" \
                   env WRK_KEYS="$KEYS" WRK_PATH="$path" \
-                  "${WRK_PIN[@]}" wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency \
+                  ${WRK_PIN[@]+"${WRK_PIN[@]}"} wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency \
                       -s "$WORK/conf/rotor.lua" "$url" 2>/dev/null)
         else
             out=$(WRK_KEYS="$KEYS" WRK_PATH="$path" \
-                  "${WRK_PIN[@]}" wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency \
+                  ${WRK_PIN[@]+"${WRK_PIN[@]}"} wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency \
                       -s "$WORK/conf/rotor.lua" "$url" 2>/dev/null)
         fi
     else
         if [ -n "$time_bin" ]; then
             out=$("$time_bin" -v -o "$WORK/logs/time.out" \
-                  "${WRK_PIN[@]}" wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency "$url" 2>/dev/null)
+                  ${WRK_PIN[@]+"${WRK_PIN[@]}"} wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency "$url" 2>/dev/null)
         else
-            out=$("${WRK_PIN[@]}" wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency "$url" 2>/dev/null)
+            out=$(${WRK_PIN[@]+"${WRK_PIN[@]}"} wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency "$url" 2>/dev/null)
         fi
     fi
     local rps p50 p99

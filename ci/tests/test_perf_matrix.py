@@ -323,6 +323,18 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(len(p.stdout.splitlines()), 1 + 8 * 2 * 2)
 
+    def test_from_samples_missing_explicit_idle_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            tsv = Path(d) / "s.tsv"
+            tsv.write_text("")
+            p = self.run_wrapper("--from-samples", str(tsv), "--idle", str(Path(d) / "typo.tsv"))
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+
+    def test_load_idle_none_is_no_evidence(self):
+        self.assertEqual(pm.load_idle(None), [])
+        with self.assertRaises(OSError):
+            pm.load_idle("/nonexistent/idle.tsv")
+
     def test_usage_errors(self):
         self.assertEqual(self.run_wrapper("--bogus").returncode, 2)
         self.assertEqual(self.run_wrapper("--dry-run", "--pairs", "x").returncode, 2)
