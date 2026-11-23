@@ -300,7 +300,8 @@ class MutationControl(unittest.TestCase):
 class WrapperTests(unittest.TestCase):
     def run_wrapper(self, *args):
         env = dict(os.environ)
-        env.pop("SERVER_CPU", None)
+        for k in ("SERVER_CPU", "WRK_CPUS", "DURATION", "WARMUP", "CONC", "THREADS"):
+            env.pop(k, None)
         return subprocess.run(
             ["bash", str(WRAPPER), *args], capture_output=True, text=True, env=env, check=False
         )

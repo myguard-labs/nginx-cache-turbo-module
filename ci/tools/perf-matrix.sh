@@ -129,8 +129,8 @@ if [ -n "$FROM_SAMPLES" ]; then
     idle_args=()
     [ -n "$FROM_IDLE" ] && idle_args=(--idle "$FROM_IDLE")
     rc=0
-    python3 -I -B "$STATS" analyze --samples "$FROM_SAMPLES" "${idle_args[@]}" \
-        "${out_args[@]}" "${ANALYZE_OPTS[@]}" || rc=$?
+    python3 -I -B "$STATS" analyze --samples "$FROM_SAMPLES" ${idle_args[@]+"${idle_args[@]}"} \
+        ${out_args[@]+"${out_args[@]}"} "${ANALYZE_OPTS[@]}" || rc=$?
     exit "$rc"
 fi
 
