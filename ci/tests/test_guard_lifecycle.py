@@ -1,0 +1,1171 @@
+"""Harmless Linux process lifecycle controls; no nginx or diagnostic attachments."""
+
+import ctypes
+import json
+import os
+import resource
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from functools import partial
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+GUARD = ROOT / "ci/tools/ci-hang-guard.sh"
+sys.path.insert(0, str(ROOT / "ci/tools"))
+import ci_child_observer as observer
+import ci_guard_lifecycle as lifecycle
+
+FIXTURE = r"""
+import json, os, pathlib, signal, subprocess, sys, time
+if sys.argv[2] == 'stubborn':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen([sys.executable, '-c',
+    'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)'],
+    start_new_session=sys.argv[2] == 'escape')
+ids = {'command': os.getpid(), 'descendant': child.pid, 'owner': os.getppid()}
+ids['starts'] = {str(pid): pathlib.Path('/proc/' + str(pid) + '/stat').read_text()
+                .split(') ')[1].split()[19] for pid in ids.values()}
+target = pathlib.Path(sys.argv[1])
+partial = target.with_suffix('.partial')
+partial.write_text(json.dumps(ids))
+partial.replace(target)
+if sys.argv[2] == 'exit':
+    raise SystemExit(23)
+time.sleep(60)
+"""
+
+# A guard held just before it installs its TERM forwarder. 'term' keeps it there
+# once a launch was attempted, so the controller's TERM lands in that window;
+# 'die' kills the guard there instead.
+RACE_GUARD = r"""
+import json, os, pathlib, signal, subprocess, sys, time
+sys.path.insert(0, sys.argv[1])
+import ci_guard_lifecycle as lifecycle
+directory, mode = pathlib.Path(sys.argv[2]), sys.argv[3]
+launched, marker = directory / 'launched', directory / 'marker'
+guard = os.getpid()
+real_popen, real_signal, real_fork = subprocess.Popen, signal.signal, os.fork
+held = []
+
+def popen(*args, **kwargs):
+    launched.touch()  # Runs in the owner: a command launch was attempted.
+    return real_popen(*args, **kwargs)
+
+def fork():
+    pid = real_fork()
+    if pid:
+        (directory / 'owner.tmp').write_text(str(pid))
+        (directory / 'owner.tmp').replace(directory / 'owner')
+    return pid
+
+def install(number, handler):
+    if os.getpid() == guard and number == signal.SIGTERM and not held:
+        held.append(number)
+        end = time.monotonic() + 1.5
+        while time.monotonic() < end and not launched.exists():
+            time.sleep(.01)
+        if mode == 'die':
+            os.kill(guard, signal.SIGKILL)
+        if launched.exists():
+            time.sleep(10)  # The controller's TERM arrives before the forwarder.
+    return real_signal(number, handler)
+
+subprocess.Popen, signal.signal, os.fork = popen, install, fork
+command = [sys.executable, '-c', 'import os,pathlib,sys,time\n'
+           'p = pathlib.Path(sys.argv[1]); t = p.with_suffix(".tmp")\n'
+           't.write_text(str(os.getpid())); t.replace(p); time.sleep(60)', str(marker)]
+result = lifecycle.run_owned(command, None, lambda pid: None, hard=20)
+print(json.dumps(result), flush=True)
+sys.exit(result['status'])
+"""
+
+
+class GuardLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        # Adopt only this test's orphaned fixture/guardian for cleanup even on RED.
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.prior = ctypes.c_int()
+        self.assertEqual(self.libc.prctl(37, ctypes.byref(self.prior), 0, 0, 0), 0)
+        self.assertEqual(self.libc.prctl(36, 1, 0, 0, 0), 0)
+        # Cleanups run after tearDown, and also when setUp or tearDown raises.
+        self.addCleanup(self.libc.prctl, 36, self.prior.value, 0, 0, 0)
+        self.tmp = tempfile.TemporaryDirectory(prefix='guard-lifecycle-')
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = Path(self.tmp.name)
+        self.handles = {}
+        self.processes = []
+        self.logs = []
+        # Close what the test acquired even when tearDown raises before the end.
+        self.addCleanup(self.release)
+
+    def release(self):
+        for fd in self.handles.values():
+            os.close(fd)
+        for log in self.logs:
+            log.close()
+
+    def tearDown(self):
+        for fd in self.handles.values():
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for process in self.processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+        # KILL is asynchronous: a pinned child is adopted only after its parent
+        # exits. Retry exact pidfd waits until every pinned identity is reaped.
+        pending = list(self.handles.values())
+        end = time.monotonic() + 5
+        while pending and time.monotonic() < end:
+            for fd in list(pending):
+                try:
+                    if (self.reaped_fd(fd)
+                            or os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)):
+                        pending.remove(fd)
+                except ChildProcessError:
+                    pass  # Not adopted yet; its fixture parent is still exiting.
+            if pending:
+                time.sleep(.01)
+        # release() is an addCleanup, so descriptors close even when this fails.
+        unreaped = sorted(pid for pid, fd in self.handles.items() if fd in pending)
+        self.assertEqual(unreaped, [], 'pinned fixture(s) not reaped within 5s')
+
+    @staticmethod
+    def reaped_fd(fd):
+        # pidfd fdinfo distinguishes a reaped identity from a reused numeric PID.
+        return 'Pid:\t-1\n' in Path('/proc/self/fdinfo/' + str(fd)).read_text(encoding='ascii')
+
+    def pin(self, pid, start=None):
+        if pid not in self.handles:
+            try:
+                fd = os.pidfd_open(pid)
+            except ProcessLookupError:
+                return
+            if start is not None:
+                try:
+                    actual = Path('/proc/' + str(pid) + '/stat').read_text().split(') ')[1]
+                    matches = actual.split()[19] == start
+                except FileNotFoundError:
+                    matches = False
+                if not matches:
+                    os.close(fd)
+                    return  # A reused PID never authorizes fixture cleanup.
+            self.handles[pid] = fd
+
+    def pin_fixture(self, ids):
+        for key in ('command', 'descendant', 'owner'):
+            self.pin(ids[key], ids['starts'][str(ids[key])])
+
+    def until(self, predicate, message, timeout=5):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if predicate():
+                return
+            time.sleep(.01)
+        self.fail(message)
+
+    def start(self, mode='stubborn', *, soft=10, hard=20, enabled=True):
+        identity = self.directory / ('ids-' + str(len(self.processes)) + '.json')
+        log = (self.directory / ('guard-' + str(len(self.processes)) + '.log')).open('w+')
+        self.logs.append(log)
+        env = dict(os.environ, CT_OUTCOME_OBSERVE='1' if enabled else '0',
+                   CT_HANG_HARD_SECONDS=str(hard))
+        process = subprocess.Popen(['sh', str(GUARD), str(soft), str(self.directory), '--',
+                                    sys.executable, '-c', FIXTURE, str(identity), mode],
+                                   env=env, stdout=log, stderr=log)
+        self.processes.append(process)
+        self.pin(process.pid)
+        self.until(identity.exists, 'command did not start')
+        ids = json.loads(identity.read_text())
+        self.pin_fixture(ids)
+        return process, ids, log
+
+    def gone(self, ids):
+        # pidfd fdinfo distinguishes a reaped identity from a reused numeric PID.
+        def reaped(key):
+            fd = self.handles.get(ids[key])
+            return fd is None or 'Pid:\t-1\n' in Path('/proc/self/fdinfo/' + str(fd)).read_text()
+
+        self.until(lambda: all(reaped(k) for k in ('command', 'descendant')),
+                   'owned command descendants survived or were not reaped')
+
+    def test_guard_sigkill_cleans_owned_group_and_excludes_neighbour(self):
+        neighbour = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.processes.append(neighbour)
+        self.pin(neighbour.pid)
+        guard, ids, _ = self.start()
+        guard.kill()
+        guard.wait(timeout=5)
+        self.gone(ids)
+        self.assertIsNone(neighbour.poll(), 'cleanup signalled an unrelated neighbour')
+        self.assertFalse(list(self.directory.glob('termination-*/termination.json')),
+                         'killed observer published a completed observation')
+
+    def test_term_and_int_preserve_signal_status_and_cleanup(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=sig):
+                guard, ids, _ = self.start()
+                guard.send_signal(sig)
+                self.assertEqual(guard.wait(timeout=5), 128 + sig)
+                self.gone(ids)
+
+    def test_normal_error_exit_reaps_stubborn_leftover(self):
+        guard, ids, _ = self.start('exit')
+        self.assertEqual(guard.wait(timeout=5), 23)
+        self.gone(ids)
+
+    def test_hard_deadline_and_earlier_capture(self):
+        breadcrumb = self.directory / 'breadcrumb'
+        breadcrumb.write_text('test_inert')
+        old = os.environ.get('CT_TEST_BREADCRUMB')
+        os.environ['CT_TEST_BREADCRUMB'] = str(breadcrumb)
+        try:
+            guard, ids, log = self.start(soft=.1, hard=1)
+        finally:
+            if old is None:
+                os.environ.pop('CT_TEST_BREADCRUMB')
+            else:
+                os.environ['CT_TEST_BREADCRUMB'] = old
+        self.assertEqual(guard.wait(timeout=5), 124)
+        self.gone(ids)
+        self.assertEqual((self.directory / 'hanging-test.txt').read_text(), 'test_inert')
+        log.seek(0)
+        self.assertIn('soft timeout', log.read())
+        record = json.loads(next(self.directory.glob('termination-*/termination.json')).read_text())
+        self.assertEqual(record['returncode'], -signal.SIGKILL)
+
+    def test_escaped_descendant_is_adopted_and_reaped(self):
+        guard, ids, _ = self.start('escape', soft=.1, hard=1)
+        self.assertEqual(guard.wait(timeout=5), 124)
+        self.gone(ids)
+
+    def test_caller_death_triggers_cleanup(self):
+        identity = self.directory / 'parent-ids.json'
+        parent = subprocess.Popen([sys.executable, '-c',
+            ('import os,subprocess,sys,time; p=subprocess.Popen(sys.argv[1:]); '
+             'print(p.pid,flush=True); time.sleep(60)'),
+            'sh', str(GUARD), '10', str(self.directory), '--', sys.executable,
+            '-c', FIXTURE, str(identity), 'stubborn'],
+            # Pin the pair as start() does; an ambient hard bound rejects soft=10.
+            env=dict(os.environ, CT_HANG_HARD_SECONDS='20'),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.processes.append(parent)
+        self.pin(parent.pid)
+        guard_pid = int(parent.stdout.readline())
+        self.pin(guard_pid)
+        parent.stdout.close()
+        self.until(identity.exists, 'command did not start')
+        ids = json.loads(identity.read_text())
+        self.pin_fixture(ids)
+        parent.kill()
+        parent.wait(timeout=5)
+        self.gone(ids)
+        status_file = Path('/proc/' + str(guard_pid) + '/stat')
+        self.until(lambda: status_file.read_text(encoding='ascii').split(') ')[1][0] == 'Z',
+                   'guard failed to finish after parent death')
+        _, status = os.waitpid(guard_pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 125)
+
+    def test_normal_exit_allows_capture_tail_and_preserves_status(self):
+        command_script = ("import pathlib,sys,time\n"
+                          "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.005)\n"
+                          "raise SystemExit(int(sys.argv[2]))")
+        capture_script = ("import pathlib,sys,time; pathlib.Path(sys.argv[1]).touch(); "
+                          "time.sleep(.15); pathlib.Path(sys.argv[2]).write_text('complete')")
+        for status in (0, 23):
+            with self.subTest(status=status):
+                ready = self.directory / ('tail-ready-' + str(status))
+                snapshot = self.directory / ('tail-snapshot-' + str(status))
+                result = lifecycle.run_owned(
+                    [sys.executable, '-c', command_script, str(ready), str(status)],
+                    None, self.pin, soft=0, hard=2,
+                    capture=lambda pid, ready=ready, snapshot=snapshot: [
+                        sys.executable, '-c', capture_script, str(ready), str(snapshot)])
+                self.assertTrue(snapshot.exists(), 'normal command exit truncated diagnostic tail')
+                self.assertEqual(snapshot.read_text(), 'complete')
+                self.assertEqual(result['status'], status)
+                self.assertEqual(result['code'], status)
+
+    def test_capture_launch_failure_preserves_command_and_hard_bound(self):
+        ready = self.directory / 'capture-failed-ready'
+        waiting_command = ("import pathlib,sys,time\n"
+                           "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.005)\n"
+                           "raise SystemExit(23)")
+
+        def capture(_pid):
+            ready.touch()
+            return [str(self.directory / 'missing-capture')]
+
+        exited = lifecycle.OwnedProcess.exited
+
+        def delayed_exited(process):
+            if not getattr(process, 'scheduling_delayed', False):
+                process.scheduling_delayed = True
+                time.sleep(.2)  # The former .15s fixture could finish before capture.
+            return exited(process)
+
+        for command, expected, hard in (
+                (waiting_command, 23, 2),
+                ("import time; time.sleep(60)", 124, 1)):
+            with self.subTest(expected=expected), \
+                    mock.patch.object(lifecycle.OwnedProcess, 'exited', delayed_exited):
+                result = lifecycle.run_owned(
+                    [sys.executable, '-c', command, str(ready)], None, self.pin,
+                    soft=0, hard=hard, capture=capture)
+                self.assertEqual(result['status'], expected,
+                                 'diagnostic launch failure replaced the command outcome')
+                self.assertEqual(result['capture_error'], 'FileNotFoundError')
+                self.assertEqual(result['code'], 23 if expected == 23 else -signal.SIGTERM)
+
+    def test_stubborn_tail_is_bounded_and_preserves_exited_command_status(self):
+        ready = self.directory / 'stubborn-tail-ready'
+        command_script = ("import pathlib,sys,time\n"
+                          "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.005)\n"
+                          "raise SystemExit(23)")
+        capture_script = ("import pathlib,signal,sys,time; "
+                          "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                          "pathlib.Path(sys.argv[1]).touch(); time.sleep(60)")
+        started = time.monotonic()
+        result = lifecycle.run_owned(
+            [sys.executable, '-c', command_script, str(ready)], None, self.pin,
+            soft=0, hard=1,
+            capture=lambda pid: [sys.executable, '-c', capture_script, str(ready)])
+        self.assertLess(time.monotonic() - started, 30, 'stubborn tail exceeded capture deadline')
+        self.assertTrue(ready.exists(), 'capture never started')
+        self.assertEqual(result['reason'], 'command exit')
+        self.assertEqual(result['status'], 23)
+        self.assertEqual(result['code'], 23)
+
+    def test_capture_receives_owner_cleanup_instant(self):
+        record = self.directory / 'capture-clock.json'
+        capture_script = ('import json,os,pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('
+                          'json.dumps([time.monotonic(), os.environ.get("CT_HANG_CLEANUP_AT")]))')
+        soft, hard = .2, 2
+        before = time.monotonic()
+        result = lifecycle.run_owned(
+            [sys.executable, '-c', 'import time; time.sleep(60)'], None, self.pin,
+            soft=soft, hard=hard,
+            capture=lambda pid: [sys.executable, '-c', capture_script, str(record)])
+        after = time.monotonic()
+        self.assertEqual(result['status'], 124)
+        started, cutoff = json.loads(record.read_text())
+        self.assertIsNotNone(cutoff, 'owner did not pass its cleanup instant')
+        reserve = 2 * min(2., hard / 5)
+        # Owner start lies after `before` and at least soft before capture start;
+        # the capture budget therefore cannot absorb its own launch latency.
+        self.assertGreaterEqual(float(cutoff), before + hard - reserve)
+        self.assertLessEqual(float(cutoff), started - soft + hard - reserve)
+        self.assertLessEqual(float(cutoff), after)
+
+    def test_blocked_capture_is_isolated_and_cannot_extend_deadline(self):
+        identity = self.directory / 'capture-command.json'
+        capture_file = self.directory / 'capture.json'
+        capture_script = (
+            'import json,os,pathlib,sys,time; '
+            'pathlib.Path(sys.argv[1]).write_text(json.dumps('
+            '{"pid":os.getpid(),"start":pathlib.Path("/proc/self/stat").read_text()'
+            '.rsplit(") ",1)[1].split()[19],"group":os.getpgrp(),"parent":os.getppid(),'
+            '"command_group":os.getpgid(int(sys.argv[2]))})); time.sleep(60)')
+        result = lifecycle.run_owned(
+            [sys.executable, '-c', FIXTURE, str(identity), 'stubborn'], None, lambda pid: None,
+            soft=0, hard=1,
+            capture=lambda pid: [sys.executable, '-c', capture_script, str(capture_file), str(pid)])
+        ids = json.loads(identity.read_text())
+        diagnostic = json.loads(capture_file.read_text())
+        self.pin_fixture(ids)
+        self.pin(diagnostic['pid'], diagnostic['start'])
+        self.assertEqual(result['status'], 124)
+        self.assertEqual(result['code'], -signal.SIGKILL)
+        self.assertEqual(diagnostic['parent'], ids['owner'])
+        self.assertEqual(diagnostic['command_group'], ids['command'])
+        self.assertEqual(diagnostic['group'], diagnostic['pid'])
+        self.assertNotEqual(diagnostic['group'], diagnostic['command_group'])
+        self.gone(ids)
+        try:
+            current = Path('/proc/' + str(diagnostic['pid']) + '/stat').read_text()
+        except FileNotFoundError:
+            current = None
+        self.assertTrue(current is None or current.rsplit(') ', 1)[1].split()[19]
+                        != diagnostic['start'], 'owned diagnostic survived cleanup')
+
+    def test_owner_sigkill_fails_closed_without_cleanup_claim(self):
+        guard, ids, log = self.start()
+        # This is the explicit guarantee boundary: killing the cleanup owner
+        # itself cannot be repaired by that owner. The test harness releases it.
+        signal.pidfd_send_signal(self.handles[ids['owner']], signal.SIGKILL)
+        self.assertEqual(guard.wait(timeout=5), 125)
+        self.assertFalse(list(self.directory.glob('termination-*/termination.json')))
+        log.seek(0)
+        self.assertIn('TERMINATION UNKNOWN', log.read())
+
+    def test_disabled_observation_still_cleans_up(self):
+        guard, ids, _ = self.start(enabled=False, soft=.1, hard=1)
+        self.assertEqual(guard.wait(timeout=5), 124)
+        self.gone(ids)
+        self.assertFalse(list(self.directory.glob('termination-*')))
+
+    def test_owned_anchor_retained_until_group_signals_end(self):
+        owned = lifecycle.OwnedProcess([sys.executable, '-c', 'pass'])
+        self.pin(owned.pid)
+        self.until(owned.exited, 'private child did not exit')
+        self.assertTrue(Path('/proc/' + str(owned.pid)).exists(), 'wait identity released early')
+        self.assertEqual(os.getpgid(owned.pid), owned.pid)
+        owned.send(signal.SIGTERM)
+        owned.send(signal.SIGKILL)
+        self.assertEqual(owned.reap(), 0)
+        with mock.patch.object(lifecycle.os, 'killpg') as kill:
+            with self.assertRaisesRegex(RuntimeError, 'ownership released'):
+                owned.send(signal.SIGTERM)
+            kill.assert_not_called()
+        self.assertTrue(owned.exited())
+
+    def test_adoption_error_still_escalates_and_fails_closed(self):
+        owned = lifecycle.OwnedProcess([sys.executable, '-c', 'pass'])
+        self.pin(owned.pid)
+        self.until(owned.exited, 'private child did not exit')
+        with mock.patch.object(lifecycle, '_adopted', side_effect=OSError('proc unavailable')), \
+                mock.patch.object(owned, 'send', wraps=owned.send) as sent:
+            result = lifecycle._drain([owned], .01, time.monotonic() + .05)
+        self.assertIsNone(result)
+        self.assertEqual(sent.call_args_list,
+                         [mock.call(signal.SIGTERM), mock.call(signal.SIGKILL)])
+        self.assertTrue(owned.reaped)
+
+    def test_exited_adopted_child_is_reaped_before_signal_permission_check(self):
+        with mock.patch.object(lifecycle, '_children', return_value=[123]), \
+                mock.patch.object(lifecycle.os, 'waitpid', return_value=(123, 0)) as wait, \
+                mock.patch.object(lifecycle.os, 'pidfd_open', return_value=1234) as opened, \
+                mock.patch.object(lifecycle.signal, 'pidfd_send_signal',
+                                  side_effect=PermissionError('privileged zombie')), \
+                mock.patch.object(lifecycle.os, 'close'):
+            self.assertFalse(lifecycle._adopted(set(), signal.SIGTERM))
+        wait.assert_called_once_with(123, os.WNOHANG)
+        opened.assert_not_called()
+
+    def test_signal_permission_failure_still_reaps_adopted_child(self):
+        fd = os.pidfd_open(os.getpid())
+        with mock.patch.object(lifecycle, '_children', return_value=[123]), \
+                mock.patch.object(lifecycle.os, 'waitpid', side_effect=[(0, 0), (123, 0)]) as wait, \
+                mock.patch.object(lifecycle.os, 'pidfd_open', return_value=fd), \
+                mock.patch.object(lifecycle.signal, 'pidfd_send_signal',
+                                  side_effect=PermissionError('privileged child')), \
+                self.assertRaises(PermissionError):
+            lifecycle._adopted(set(), signal.SIGTERM)
+        self.assertEqual(wait.call_count, 2)
+
+    def test_group_signal_failure_does_not_block_other_groups_or_reaping(self):
+        denied = mock.Mock(pid=123, spec=['pid', 'send', 'exited', 'reap'])
+        denied.send.side_effect = PermissionError('privileged group')
+        denied.exited.return_value = True
+        other = mock.Mock(pid=456, spec=['pid', 'send', 'exited', 'reap'])
+        other.exited.return_value = True
+        with mock.patch.object(lifecycle, '_adopted', return_value=False), \
+                mock.patch.object(lifecycle, '_children', return_value=[123, 456]):
+            result = lifecycle._drain([denied, other], .01, time.monotonic() + .1)
+        self.assertIsNone(result)
+        for process in (denied, other):
+            self.assertEqual(process.send.call_args_list,
+                             [mock.call(signal.SIGTERM), mock.call(signal.SIGKILL)])
+            process.reap.assert_called_once_with()
+        self.assertIn('PermissionError', denied.cleanup_error)
+
+    def test_requested_signal_preserves_incomplete_cleanup_status(self):
+        drain = lifecycle._drain
+
+        def incomplete(*args):
+            drain(*args)  # Release the real fixture before injecting failure.
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            def started(pid, sig=sig):
+                self.pin(pid)
+                os.kill(os.getpid(), sig)
+
+            with self.subTest(signal=sig), \
+                    mock.patch.object(lifecycle, '_drain', side_effect=incomplete):
+                result = lifecycle.run_owned([sys.executable, '-c', 'pass'], None, started, hard=1)
+            self.assertEqual(result['status'], 125)
+            self.assertIsNone(result['code'])
+            self.assertEqual(result['reason'], 'cleanup incomplete')
+
+    def test_requested_signal_distinguishes_owner_loss_from_command_exit_125(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            for record in (None, {'status': 125, 'code': 125, 'reason': 'command exit'}):
+                def owner(wire, *_args, record=record):
+                    wire.send(json.dumps({'child': os.getpid()}).encode())
+                    wire.recv(1024)  # The guard's forwarders-ready handshake.
+                    wire.recv(1024)  # Wait until the guard has recorded the signal.
+                    if record is not None:
+                        wire.send(json.dumps(record).encode())
+
+                def started(pid, sig=sig):
+                    self.pin(pid)
+                    os.kill(os.getpid(), sig)
+
+                with self.subTest(signal=sig, record=record), \
+                        mock.patch.object(lifecycle, '_owner', side_effect=owner):
+                    result = lifecycle.run_owned(['never-started'], None, started, hard=1)
+                self.assertEqual(result['status'], 125 if record is None else 128 + sig)
+                self.assertEqual(result['code'], None if record is None else 125)
+                expected_reason = 'owner lost' if record is None else 'command exit'
+                self.assertEqual(result['reason'], expected_reason)
+
+    def test_owner_exit_with_signal_packet_unread_keeps_status(self):
+        # Closing with the forwarded packet unread resets the pair (ECONNRESET),
+        # reported before a queued completion record.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            for record in (None, {'status': 125, 'code': 125, 'reason': 'command exit'}):
+                def owner(wire, *_args, record=record):
+                    wire.send(json.dumps({'child': os.getpid()}).encode())
+                    wire.recv(1024)  # The guard's forwarders-ready handshake.
+                    poller = select.poll()
+                    poller.register(wire, select.POLLIN)
+                    poller.poll(5000)  # The signal packet arrived; leave it unread.
+                    if record is not None:
+                        wire.send(json.dumps(record).encode())
+
+                def started(pid, sig=sig):
+                    self.pin(pid)
+                    os.kill(os.getpid(), sig)
+                    # Return only after the owner closed, so the next read sees the reset.
+                    poller = select.poll()
+                    poller.register(self.handles[pid], select.POLLIN)
+                    self.assertTrue(poller.poll(5000), 'owner did not exit')
+
+                with self.subTest(signal=sig, record=record):
+                    with mock.patch.object(lifecycle, '_owner', side_effect=owner):
+                        result = lifecycle.run_owned(['never-started'], None, started, hard=1)
+                    self.assertEqual(result['status'], 125 if record is None else 128 + sig)
+                    self.assertEqual(result['code'], None if record is None else 125)
+                    expected_reason = 'owner lost' if record is None else 'command exit'
+                    self.assertEqual(result['reason'], expected_reason)
+
+    def test_owner_setup_failure_does_not_launch(self):
+        library = mock.Mock()
+        library.prctl.return_value = -1
+        with mock.patch.object(lifecycle.ctypes, 'CDLL', return_value=library):
+            result = lifecycle.run_owned(['never-start'], None, lambda pid: None)
+        self.assertEqual(result['status'], 125)
+        self.assertIsNone(result['code'])
+
+    def test_external_child_reaper_is_refused_before_launch(self):
+        for handler in (signal.SIG_IGN, lambda number, frame: None):
+            with self.subTest(handler=handler), \
+                    mock.patch.object(lifecycle.signal, 'getsignal', return_value=handler):
+                result = lifecycle.run_owned(['never-start'], None, lambda pid: None)
+            self.assertEqual(result['status'], 125)
+            self.assertIsNone(result['code'])
+            self.assertEqual(result['reason'], 'external child reaper')
+
+    def test_caller_identity_missing_or_changed_does_not_launch(self):
+        with mock.patch.object(lifecycle.os, 'pidfd_open', side_effect=OSError('unavailable')):
+            result = lifecycle.run_owned(['never-start'], None, lambda pid: None)
+        self.assertEqual(result['status'], 125)
+        self.assertIsNone(result['code'])
+        fd = os.pidfd_open(os.getpid())
+        with mock.patch.object(lifecycle.os, 'pidfd_open', return_value=fd), \
+                mock.patch.object(lifecycle.os, 'getppid', side_effect=[1, 2]):
+            result = lifecycle.run_owned(['never-start'], None, lambda pid: None)
+        self.assertEqual(result['reason'], 'caller changed')
+        self.assertEqual(result['status'], 125)
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+
+    def test_ownership_setup_failures_close_descriptors_and_report_unknown(self):
+        for operation in ('socketpair', 'fork'):
+            caller = os.pidfd_open(os.getpid())
+            sockets = []
+            original = lifecycle.socket.socketpair
+
+            def socketpair(*args, operation=operation, original=original, sockets=sockets):
+                if operation == 'socketpair':
+                    raise OSError('controlled socketpair failure')
+                pair = original(*args)
+                sockets.extend(pair)
+                return pair
+
+            with self.subTest(operation=operation), \
+                    mock.patch.object(lifecycle.os, 'pidfd_open', return_value=caller), \
+                    mock.patch.object(lifecycle.socket, 'socketpair', side_effect=socketpair), \
+                    mock.patch.object(lifecycle.os, 'fork',
+                                      side_effect=OSError('controlled fork failure')) as fork, \
+                    mock.patch.object(observer, '_report') as report:
+                status = observer.observe(self.directory, ['never-start'])
+            self.assertEqual(status, 125)
+            self.assertIn('TERMINATION UNKNOWN', report.call_args.args[0])
+            self.assertIn('ownership setup failed', report.call_args.args[0])
+            self.assertFalse(list(self.directory.glob('termination-*/termination.json')))
+            self.assertEqual(fork.call_count, int(operation == 'fork'))
+            self.assertTrue(all(sock.fileno() == -1 for sock in sockets))
+            with self.assertRaises(OSError):
+                os.fstat(caller)
+
+    def test_pin_rejects_changed_diagnostic_start_before_cleanup(self):
+        fd = os.open('/dev/null', os.O_RDONLY)
+        with mock.patch.object(lifecycle.os, 'pidfd_open', return_value=fd), \
+                mock.patch.object(Path, 'read_text', return_value='1 (fixture) S ' +
+                                  '0 ' * 19 + 'replacement'):
+            self.pin(12345, 'original')
+        self.assertNotIn(12345, self.handles)
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+
+    def test_deadline_api_boundary_and_nonfinite_rejection(self):
+        lifecycle.validate_deadlines(0, 1)
+        lifecycle.validate_deadlines(.599, 1)
+        for soft, hard in ((.6, 1), (1, 1), (-1, 1), (float('nan'), 1),
+                           (None, 0), (None, float('inf')), (None, float('nan'))):
+            with self.subTest(soft=soft, hard=hard), \
+                    self.assertRaisesRegex(ValueError, 'invalid guard deadline'):
+                lifecycle.run_owned(['never-start'], None, lambda pid: None,
+                                    soft=soft, hard=hard)
+
+    def test_expired_hard_deadline_does_not_launch(self):
+        # The smallest positive bound rounds start + hard back to start.
+        marker = self.directory / 'expired-should-not-run'
+        started = []
+
+        def on_start(pid):
+            started.append(pid)
+            self.pin(pid)
+
+        result = lifecycle.run_owned(
+            [sys.executable, '-c', 'import pathlib,sys; pathlib.Path(sys.argv[1]).touch()',
+             str(marker)], None, on_start, hard=5e-324)
+        self.assertEqual(started, [], 'command launched after its hard deadline')
+        self.assertEqual(result, {'status': 124, 'code': None, 'reason': 'hard deadline'})
+        self.assertFalse(marker.exists())
+
+    def test_stop_recorded_during_setup_does_not_launch(self):
+        real = ctypes.CDLL(None, use_errno=True)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            marker = self.directory / f'stopped-{sig}-should-not-run'
+            started = []
+
+            def prctl(*args, sig=sig):
+                # Deliver the stop inside the owner's setup, after its handlers exist.
+                os.kill(os.getpid(), sig)
+                return real.prctl(*args)
+
+            def on_start(pid, started=started):
+                started.append(pid)
+                self.pin(pid)
+
+            library = mock.Mock()
+            library.prctl.side_effect = prctl
+            with self.subTest(signal=sig), \
+                    mock.patch.object(lifecycle.ctypes, 'CDLL', return_value=library):
+                result = lifecycle.run_owned(
+                    [sys.executable, '-c', 'import pathlib,sys; pathlib.Path(sys.argv[1]).touch()',
+                     str(marker)], None, on_start, hard=10)
+                self.assertEqual(started, [], 'command launched after a recorded stop')
+                self.assertEqual(result, {'status': 128 + sig, 'code': None,
+                                          'reason': 'owner signal'})
+                self.assertFalse(marker.exists())
+
+    def test_guard_signal_forwarded_during_setup_does_not_launch(self):
+        real_readable = lifecycle._readable
+        real_signal = signal.signal
+        guard = os.getpid()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            for caller_dead in (False, True):
+                marker = self.directory / f'forwarded-{sig}-{caller_dead}-should-not-run'
+                started = []
+                sent = []
+                checked = []
+
+                def install(number, handler, sig=sig, sent=sent):
+                    previous = real_signal(number, handler)
+                    # The guard installs its INT forwarder last; then signal it once.
+                    if os.getpid() == guard and number == signal.SIGINT and not sent:
+                        sent.append(number)
+                        os.kill(guard, sig)
+                    return previous
+
+                def readable(*objects, caller_dead=caller_dead, checked=checked):
+                    if not checked:  # The owner's prelaunch check.
+                        checked.append(True)
+                        end = time.monotonic() + 5
+                        while (objects[0] not in real_readable(objects[0])
+                               and time.monotonic() < end):
+                            time.sleep(.005)
+                        ready = real_readable(*objects)
+                        return ready + [objects[1]] if caller_dead else ready
+                    return real_readable(*objects)
+
+                def on_start(pid, started=started):
+                    started.append(pid)
+                    self.pin(pid)
+
+                with self.subTest(signal=sig, caller_dead=caller_dead), \
+                        mock.patch.object(lifecycle.signal, 'signal', side_effect=install), \
+                        mock.patch.object(lifecycle, '_readable', side_effect=readable):
+                    result = lifecycle.run_owned(
+                        [sys.executable, '-c',
+                         'import pathlib,sys; pathlib.Path(sys.argv[1]).touch()',
+                         str(marker)], None, on_start, hard=10)
+                    self.assertEqual(sent, [signal.SIGINT])
+                    self.assertEqual(started, [], 'command launched after a forwarded stop')
+                    # Caller death still wins; only a queued stop packet is a stop.
+                    expected = ({'status': 125, 'code': None, 'reason': 'owner I/O failure'}
+                                if caller_dead else
+                                {'status': 128 + sig, 'code': None, 'reason': 'guard signal'})
+                    self.assertEqual(result, expected)
+                    self.assertFalse(marker.exists())
+
+    def test_command_waits_for_guard_signal_forwarders(self):
+        # A guard descheduled after fork must not let the command start first:
+        # a TERM sent on its readiness would then kill the unprepared guard.
+        for mode in ('term', 'die'):
+            with self.subTest(mode=mode):
+                directory = self.directory / mode
+                directory.mkdir()
+                guard = subprocess.Popen(
+                    [sys.executable, '-c', RACE_GUARD, str(ROOT / 'ci/tools'), str(directory), mode],
+                    stdout=subprocess.PIPE, text=True)
+                self.processes.append(guard)
+                self.addCleanup(guard.stdout.close)
+                self.pin(guard.pid)
+                owner_file = directory / 'owner'
+                self.until(owner_file.exists, 'owner was not forked')
+                owner = int(owner_file.read_text())
+                self.pin(owner)
+                if mode == 'term':
+                    marker = directory / 'marker'
+                    self.until(marker.exists, 'command did not start', timeout=10)
+                    command = int(marker.read_text())
+                    self.pin(command)
+                    guard.send_signal(signal.SIGTERM)
+                    output, _ = guard.communicate(timeout=10)
+                    self.assertEqual(guard.returncode, 128 + signal.SIGTERM,
+                                     'TERM reached the guard before its forwarder existed')
+                    result = json.loads(output)
+                    self.assertEqual(result['reason'], 'guard signal')
+                    self.assertIsNotNone(result['code'], 'no cleanup receipt')
+                    self.assertTrue(self.reaped_fd(self.handles[command]))
+                else:
+                    self.assertEqual(guard.wait(timeout=10), -signal.SIGKILL)
+                    poller = select.poll()
+                    poller.register(self.handles[owner], select.POLLIN)
+                    self.assertTrue(poller.poll(5000), 'owner outlived its dead guard')
+                    self.assertFalse((directory / 'launched').exists(),
+                                     'owner launched the command before its guard was ready')
+
+    def test_missing_child_enumeration_does_not_launch(self):
+        marker = self.directory / 'no-children-should-not-run'
+        started = []
+
+        def on_start(pid):
+            started.append(pid)
+            self.pin(pid)
+
+        with mock.patch.object(lifecycle, '_children',
+                               side_effect=FileNotFoundError('no procfs children')):
+            result = lifecycle.run_owned(
+                [sys.executable, '-c', 'import pathlib,sys; pathlib.Path(sys.argv[1]).touch()',
+                 str(marker)], None, on_start, hard=2)
+        self.assertEqual(started, [], 'command launched without child enumeration')
+        self.assertEqual(result, {'status': 125, 'code': None, 'reason': 'owner I/O failure'})
+        self.assertFalse(marker.exists())
+
+    def test_capture_decision_reads_clock_after_owner_checks(self):
+        real_readable = lifecycle._readable
+        real_owned = lifecycle.OwnedProcess
+        hard = 1
+        cutoff_after_start = hard - 2 * min(2., hard / 5)
+        launched = self.directory / 'capture-launched'
+        delayed = self.directory / 'monitor-delayed'
+        # The owner is a forked process: share state with files, not memory.
+        state = {'first': None, 'command': False, 'delayed': False}
+
+        def owned(*args, **kwargs):
+            process = real_owned(*args, **kwargs)
+            state['command'] = True  # Only the command launch matters here.
+            return process
+
+        def readable(*objects):
+            if state['first'] is None:
+                state['first'] = time.monotonic()  # Precedes nothing but start.
+            elif state['command'] and not state['delayed']:
+                # First monitor poll, after the command launched: stall it past
+                # cleanup. Setup polls are never delayed.
+                state['delayed'] = True
+                delayed.touch()
+                time.sleep(max(0, state['first'] + cutoff_after_start + .05
+                               - time.monotonic()))
+            return real_readable(*objects)
+
+        def capture(_pid):
+            launched.touch()
+            return [sys.executable, '-c', 'pass']
+
+        with mock.patch.object(lifecycle, '_readable', side_effect=readable), \
+                mock.patch.object(lifecycle, 'OwnedProcess', side_effect=owned):
+            result = lifecycle.run_owned([sys.executable, '-c', 'import time; time.sleep(60)'],
+                                         None, self.pin, soft=0, hard=hard, capture=capture)
+        self.assertTrue(delayed.exists(), 'the monitor poll was never delayed')
+        self.assertFalse(launched.exists(), 'capture launched after the cleanup cutoff')
+        self.assertEqual((result['status'], result['reason']), (124, 'hard deadline'))
+
+    def test_pending_capture_wakes_at_soft_deadline_before_cutoff(self):
+        # Valid pair whose soft deadline sits inside the last 20 ms poll before
+        # cleanup. From the first monitor pass the owner's clock advances only
+        # by its requested sleeps (plus a minimal overrun), so scheduler delay
+        # cannot select either outcome. Command launch marks the transition
+        # into monitoring, so setup polls and sleeps never move the clock.
+        hard = 1
+        cutoff_after_start = hard - 2 * min(2., hard / 5)
+        soft = cutoff_after_start - .015
+        lifecycle.validate_deadlines(soft, hard)
+        launched = self.directory / 'capture-launched'
+        sleeps = self.directory / 'monitor-sleeps'
+        # The owner is a forked process: share state with files, not memory.
+        clock = {'start': None, 'virtual': None, 'command': False}
+        real_readable = lifecycle._readable
+        real_owned = lifecycle.OwnedProcess
+
+        def monotonic():
+            if clock['virtual'] is not None:
+                return clock['virtual']
+            now = time.monotonic()
+            if clock['start'] is None:
+                clock['start'] = now  # The owner's first reading is its start.
+            return now
+
+        def sleep(seconds):
+            time.sleep(seconds)  # Real, so drained processes still get to exit.
+            if clock['virtual'] is not None:
+                with sleeps.open('a') as record:
+                    record.write(f'{seconds!r}\n')
+                clock['virtual'] += seconds + 1e-6
+
+        def owned(*args, **kwargs):
+            process = real_owned(*args, **kwargs)
+            clock['command'] = True
+            return process
+
+        def readable(*objects):
+            if clock['command'] and clock['virtual'] is None:
+                # First poll after command launch: 4 ms before soft, 19 ms
+                # before cleanup.
+                clock['virtual'] = clock['start'] + cutoff_after_start - .019
+            return real_readable(*objects)
+
+        def capture(_pid):
+            launched.touch()
+            return [sys.executable, '-c', 'pass']
+
+        # Any other clock attribute the owner might use fails instead of mocking.
+        fake_time = SimpleNamespace(monotonic=monotonic, sleep=sleep)
+        with mock.patch.object(lifecycle, '_readable', side_effect=readable), \
+                mock.patch.object(lifecycle, 'OwnedProcess', side_effect=owned), \
+                mock.patch.object(lifecycle, 'time', fake_time):
+            result = lifecycle.run_owned([sys.executable, '-c', 'import time; time.sleep(60)'],
+                                         None, self.pin, soft=soft, hard=hard, capture=capture)
+        self.assertTrue(sleeps.exists(), 'the monitor never slept')
+        first = float(sleeps.read_text().splitlines()[0])
+        self.assertAlmostEqual(first, .004, delta=1e-6,
+                               msg='monitor did not sleep to its soft deadline')
+        self.assertTrue(launched.exists(), 'pending capture slept past its soft deadline')
+        self.assertEqual((result['status'], result['reason']), (124, 'hard deadline'))
+
+    def test_teardown_reaps_fixture_adopted_after_slow_owner_exit(self):
+        # KILL is asynchronous: model an owner that is still exiting when
+        # teardown first waits for its command, which is adopted only later.
+        owner = subprocess.Popen(
+            [sys.executable, '-c',
+             ('import subprocess,sys,time; c=subprocess.Popen([sys.executable,"-c",'
+              '"import time; time.sleep(60)"]); print(c.pid,flush=True); time.sleep(60)')],
+            stdout=subprocess.PIPE, text=True)
+        self.processes.append(owner)
+        command = int(owner.stdout.readline())
+        owner.stdout.close()
+        probe = os.pidfd_open(command)
+        self.addCleanup(os.close, probe)
+        self.pin(command)  # Outer cleanup still reaps a leaked adoptee on RED.
+        inner = type(self)(self._testMethodName)
+        inner.setUp()
+        self.addCleanup(inner.doCleanups)  # Its descriptors and directory close there.
+        inner.pin(command)
+        inner.pin(owner.pid)
+        owner_fd = inner.handles[owner.pid]
+        real = signal.pidfd_send_signal
+        timers = []
+
+        def send(fd, sig):
+            if fd != owner_fd:
+                return real(fd, sig)
+            timers.append(threading.Timer(.3, os.kill, (owner.pid, sig)))
+            timers[-1].start()
+            return None
+
+        with mock.patch.object(signal, 'pidfd_send_signal', side_effect=send):
+            inner.tearDown()
+        for timer in timers:
+            timer.join()
+        self.assertEqual(len(timers), 1)
+        self.assertTrue(self.reaped_fd(probe), 'teardown left an adopted fixture unreaped')
+
+    def test_descriptors_above_select_limit_still_own_command(self):
+        # select() rejects descriptors >= FD_SETSIZE (1024); ownership must not.
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        need = 1100
+        if soft < need:
+            if hard != resource.RLIM_INFINITY and hard < need:
+                self.skipTest(f'RLIMIT_NOFILE hard limit {hard} < {need}')
+            resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        filler = []
+        self.addCleanup(lambda: [os.close(fd) for fd in filler])
+        while True:
+            fd = os.open('/dev/null', os.O_RDONLY | os.O_CLOEXEC)
+            filler.append(fd)
+            if fd >= 1023:
+                break  # Every later descriptor is above the select() limit.
+        marker = self.directory / 'high-fd-ran'
+        started = []
+
+        def on_start(pid):
+            started.append(pid)
+            self.pin(pid)
+
+        result = lifecycle.run_owned(
+            [sys.executable, '-c', 'import pathlib,sys; pathlib.Path(sys.argv[1]).touch()',
+             str(marker)], None, on_start, hard=10)
+        self.assertEqual(result, {'status': 0, 'code': 0, 'reason': 'command exit'})
+        self.assertEqual(len(started), 1)
+        self.assertTrue(marker.exists())
+
+    def test_readable_reports_closed_descriptor_as_error(self):
+        fd = os.open('/dev/null', os.O_RDONLY)
+        os.close(fd)
+        with self.assertRaises(OSError):
+            lifecycle._readable(fd)
+
+    def test_invalid_deadline_does_not_launch(self):
+        marker = self.directory / 'should-not-run'
+        for hard in ('nan', 'inf', '-1', '0', '.1', 'bad'):
+            with self.subTest(hard=hard):
+                env = dict(os.environ, CT_HANG_HARD_SECONDS=hard)
+                result = subprocess.run(['sh', str(GUARD), '.1', str(self.directory), '--',
+                                         sys.executable, '-c',
+                                         'from pathlib import Path; Path(' +
+                                         repr(str(marker)) + ').touch()'],
+                                        env=env, capture_output=True, timeout=5, check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(marker.exists())
+
+
+class AdoptedCleanupTests(unittest.TestCase):
+    def test_adopted_skips_anchors_and_tracks_waited_children(self):
+        for first_wait in (0, 202):
+            with (
+                self.subTest(first_wait=first_wait),
+                mock.patch.object(lifecycle, '_children', return_value=[101, 202, 303]),
+                mock.patch.object(lifecycle.os, 'pidfd_open', side_effect=[1202, 1303]) as opened,
+                mock.patch.object(lifecycle.signal, 'pidfd_send_signal') as sent,
+                mock.patch.object(lifecycle.os, 'waitpid',
+                                  side_effect=([(0, 0), (0, 0), (303, 0)] if first_wait == 0
+                                               else [(202, 0), (303, 0)])) as waited,
+                mock.patch.object(lifecycle.os, 'close') as closed,
+            ):
+                self.assertEqual(lifecycle._adopted({101}, signal.SIGKILL), first_wait == 0)
+            expected_open = [mock.call(202)] if first_wait == 0 else []
+            self.assertEqual(opened.call_args_list, expected_open)
+            self.assertEqual(sent.call_args_list,
+                             [mock.call(1202, signal.SIGKILL)] if first_wait == 0 else [])
+            expected_wait = [mock.call(202, os.WNOHANG)] * (2 if first_wait == 0 else 1)
+            self.assertEqual(waited.call_args_list, expected_wait + [mock.call(303, os.WNOHANG)])
+            self.assertEqual(closed.call_args_list, [mock.call(1202)] if first_wait == 0 else [])
+
+    def test_adopted_error_still_visits_and_reaps_later_child(self):
+        for operation in ('open', 'signal', 'wait', 'close'):
+            waits = []
+
+            def fail(value, *_args, operation=operation, boundary=None, waits=waits):
+                if value in (202, 1202) and operation == boundary:
+                    raise PermissionError('controlled child failure')
+                if boundary == 'wait':
+                    waits.append(value)
+                    # 303 is still running when checked, then reaped after its KILL.
+                    return (303, 0) if waits.count(303) == 2 else (0, 0)
+                return value + 1000 if boundary == 'open' else (0, 0)
+
+            with (
+                self.subTest(operation=operation),
+                mock.patch.object(lifecycle, '_children', return_value=[101, 202, 303]),
+                mock.patch.object(lifecycle.os, 'pidfd_open',
+                                  side_effect=partial(fail, boundary='open')) as opened,
+                mock.patch.object(lifecycle.signal, 'pidfd_send_signal',
+                                  side_effect=partial(fail, boundary='signal')) as sent,
+                mock.patch.object(lifecycle.os, 'waitpid',
+                                  side_effect=partial(fail, boundary='wait')) as waited,
+                mock.patch.object(lifecycle.os, 'close',
+                                  side_effect=partial(fail, boundary='close')) as closed,
+                self.assertRaisesRegex(PermissionError, 'controlled child failure'),
+            ):
+                lifecycle._adopted({101}, signal.SIGKILL)
+            self.assertEqual(opened.call_args_list,
+                             ([mock.call(303)] if operation == 'wait'
+                              else [mock.call(202), mock.call(303)]))
+            sent.assert_any_call(1303, signal.SIGKILL)
+            self.assertEqual([call for call in waited.call_args_list if call.args[0] == 303],
+                             [mock.call(303, os.WNOHANG)] * 2,
+                             'the later child was inspected but not reaped after its signal')
+            closed.assert_any_call(1303)
+            if operation in ('open', 'wait'):
+                self.assertNotIn(mock.call(1202), closed.call_args_list)
+            else:
+                closed.assert_any_call(1202)
+
+    def test_adopted_scan_stops_at_its_cutoff_and_reports_pending(self):
+        with mock.patch.object(lifecycle, '_children', return_value=[101, 202, 303]), \
+                mock.patch.object(lifecycle.os, 'waitpid') as waited, \
+                mock.patch.object(lifecycle.os, 'pidfd_open') as opened:
+            late = lifecycle._adopted({101}, signal.SIGTERM, time.monotonic() - 1)
+        self.assertTrue(late, 'unvisited children must stay pending')
+        waited.assert_not_called()
+        opened.assert_not_called()
+
+    def test_term_scan_stops_at_grace_but_kill_reaches_every_child(self):
+        alive = {202, 303}
+        sent = []
+
+        def signalled(fd, sig):
+            sent.append((fd - 1000, sig))
+            if sig == signal.SIGKILL:
+                alive.discard(fd - 1000)
+
+        def waitpid(pid, _flags):
+            return (0, 0) if pid in alive else (pid, 0)
+
+        owned = mock.Mock(pid=101)
+        owned.exited.return_value = True
+        owned.reap.return_value = 0
+        with mock.patch.object(lifecycle, '_children',
+                               side_effect=lambda: [101, *sorted(alive)]), \
+                mock.patch.object(lifecycle.os, 'pidfd_open', side_effect=lambda pid: pid + 1000), \
+                mock.patch.object(lifecycle.signal, 'pidfd_send_signal', side_effect=signalled), \
+                mock.patch.object(lifecycle.os, 'waitpid', side_effect=waitpid), \
+                mock.patch.object(lifecycle.os, 'close'):
+            result = lifecycle._drain([owned], 0, time.monotonic() + 1)
+        self.assertEqual(result, [0])
+        self.assertEqual(sent, [(202, signal.SIGKILL), (303, signal.SIGKILL)],
+                         'TERM scan ran past its grace cutoff or KILL missed a child')
+
+    def test_drain_retains_error_after_children_are_eventually_reaped(self):
+        owned = mock.Mock(pid=101)
+        owned.exited.return_value = True
+        owned.reap.return_value = 0
+
+        def pidfd(pid):
+            if pid == 202:
+                raise PermissionError('controlled child failure')
+            return pid + 1000
+
+        # A generous grace keeps the TERM scan before its cutoff even on a stalled runner;
+        # the pass ends as soon as the children are gone, so the value never delays the test.
+        # The failed child 202 stays listed until a later scan reaps it.
+        children = [[101, 202, 303], [101, 202], [101], [101], [101]]
+        with mock.patch.object(lifecycle, '_children', side_effect=children), \
+                mock.patch.object(lifecycle.os, 'pidfd_open', side_effect=pidfd), \
+                mock.patch.object(lifecycle.signal, 'pidfd_send_signal') as sent, \
+                mock.patch.object(lifecycle.os, 'waitpid',
+                                  side_effect=[(0, 0), (0, 0), (303, 0), (202, 0)]) as waited, \
+                mock.patch.object(lifecycle.os, 'close') as closed:
+            result = lifecycle._drain([owned], 30, time.monotonic() + 60)
+        self.assertIsNone(result)
+        sent.assert_called_once_with(1303, signal.SIGTERM)
+        # The last call is the later scan that reaps the child whose pidfd failed.
+        self.assertEqual(waited.call_args_list, [mock.call(202, os.WNOHANG),
+                                                 mock.call(303, os.WNOHANG),
+                                                 mock.call(303, os.WNOHANG),
+                                                 mock.call(202, os.WNOHANG)])
+        closed.assert_called_once_with(1303)
+        self.assertEqual(owned.send.call_args_list,
+                         [mock.call(signal.SIGTERM), mock.call(signal.SIGKILL)])
+        owned.reap.assert_called_once_with()
+
+
+class SubreaperRestoreTests(unittest.TestCase):
+    """A failing lifecycle fixture must not leave this worker adopting orphans."""
+
+    def test_fixture_failure_restores_subreaper(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        prior = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(prior), 0, 0, 0), 0)
+        self.addCleanup(libc.prctl, 36, prior.value, 0, 0, 0)
+
+        class Probe(GuardLifecycleTests):
+            def runTest(self):
+                # A fixture that outlives its wait makes tearDown raise early.
+                stuck = mock.Mock()
+                stuck.poll.return_value = None
+                stuck.wait.side_effect = subprocess.TimeoutExpired('controlled fixture', 5)
+                self.processes.append(stuck)
+
+        for phase in ('setUp', 'tearDown'):
+            with self.subTest(phase=phase):
+                self.assertEqual(libc.prctl(36, 0, 0, 0, 0), 0)
+                probe = Probe()
+                result = unittest.TestResult()
+                if phase == 'setUp':
+                    with mock.patch.object(tempfile, 'TemporaryDirectory',
+                                           side_effect=OSError('controlled setup failure')):
+                        probe.run(result)
+                else:
+                    probe.run(result)
+                    probe.tmp.cleanup()
+                self.assertEqual(len(result.errors), 1, result.errors)
+                self.assertIn('controlled', result.errors[0][1])
+                state = ctypes.c_int()
+                self.assertEqual(libc.prctl(37, ctypes.byref(state), 0, 0, 0), 0)
+                self.assertEqual(state.value, 0, phase + ' failure left the subreaper enabled')
+
+    def test_teardown_failure_still_closes_fixture_resources(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(child.wait, 5)
+        self.addCleanup(child.kill)
+
+        class Probe(GuardLifecycleTests):
+            def runTest(self):
+                self.pin(child.pid)
+                self.logs.append((self.directory / 'guard.log').open('w+'))
+                # A fixture that outlives its wait makes tearDown raise early.
+                stuck = mock.Mock()
+                stuck.poll.return_value = None
+                stuck.wait.side_effect = subprocess.TimeoutExpired('controlled fixture', 5)
+                self.processes.append(stuck)
+
+        def pidfd_open(fd):
+            try:
+                return os.readlink('/proc/self/fd/' + str(fd)) == 'anon_inode:[pidfd]'
+            except FileNotFoundError:
+                return False
+
+        probe = Probe()
+        result = unittest.TestResult()
+        probe.run(result)
+        fd, log = probe.handles[child.pid], probe.logs[0]
+        # Release leaks on RED without closing a descriptor reused since.
+        self.addCleanup(lambda: pidfd_open(fd) and os.close(fd))
+        self.addCleanup(log.close)
+        self.addCleanup(probe.tmp.cleanup)
+        self.assertEqual(len(result.errors), 1, result.errors)
+        self.assertIn('controlled', result.errors[0][1])
+        self.assertFalse(pidfd_open(fd), 'teardown failure left a pinned pidfd open')
+        self.assertTrue(log.closed, 'teardown failure left a guard log open')
+        self.assertFalse(Path(probe.tmp.name).exists(), 'teardown failure left the directory')
+
+
+if __name__ == '__main__':
+    unittest.main()

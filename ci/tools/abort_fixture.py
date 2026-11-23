@@ -2434,7 +2434,7 @@ SHUTDOWN_TIMEOUT_MS = 100
 # Long enough that the shutdown timer always fires inside the park, even on a
 # loaded host where the reload takes a while to reach the old worker: the
 # SIGHUP-to-close latency measured about 0.2s plain and ASan, which the
-# shutdown-arm line reports per key (close-minus-reload) against the scaled
+# shutdown-arm line reports per key (close-minus-park) against the scaled
 # delay minus 0.1s. Short enough that, scaled for a sanitizer (x2), it stays
 # under the sites' 2s L2 timeout: at 1.0s unscaled the ASan reply landed on
 # the timeout and the graceful control got no cache answer.
@@ -2490,9 +2490,14 @@ def _peer_closed(sock: socket.socket) -> bool:
                for _, events in poller.poll(0))
 
 
+def close_since_park(closed_at: float | None, parked_at: float) -> float | None:
+    """Measure the observed close from the reply deadline's park origin."""
+    return None if closed_at is None else closed_at - parked_at
+
+
 def late_closes(closes: Sequence[float | None], limit: float) -> list[str]:
     """One message per key whose idle-client close was not seen or came at or
-    past `limit` (seconds after the reload). The shutdown arms fail on these
+    past `limit` (seconds after the park). The shutdown arms fail on these
     and describe_close_latency marks the line "over" from the same list."""
     return [f"key {i}: idle client close "
             + ("not seen" if c is None else f"at {c * 1000:+.1f}ms")
@@ -2503,16 +2508,16 @@ def late_closes(closes: Sequence[float | None], limit: float) -> list[str]:
 def describe_close_latency(closes: Sequence[float | None],
                            limit: float) -> str:
     """The shutdown timer's evidence: per key, when the old worker closed the
-    idle client connection, seconds after the reload, against `limit` (the
+    idle client connection, seconds after the park, against `limit` (the
     scaled reply delay minus SHUTDOWN_CLOSE_MARGIN). "over" marks a run where
     a close was not seen or came at or past it (late_closes), which also
     fails the arm."""
     if not closes:
-        return "close-minus-reload=n/a"
+        return "close-minus-park=n/a"
     keys = ",".join(f"k{i}:" + ("none" if c is None else f"{c * 1000:+.1f}ms")
                     for i, c in enumerate(closes))
     over = " over" if late_closes(closes, limit) else ""
-    return f"close-minus-reload={keys}/{limit * 1000:.1f}ms{over}"
+    return f"close-minus-park={keys}/{limit * 1000:.1f}ms{over}"
 
 
 def describe_own_timer(marks: Sequence[tuple[float | None, float | None]]
@@ -2565,7 +2570,7 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
     scale = sanitizer_time_scale()
     problems: list[str] = []
     landings: list[Landing] = []
-    # Per key, the idle HTTP/1 client's close seen after the reload, on the
+    # Per key, the idle HTTP/1 client's close seen after the park, on the
     # arms with a shutdown timer.
     closes: list[float | None] = []
     # Per key on the early_teardown arm: exit and reply minus the op's timer.
@@ -2621,8 +2626,7 @@ def run_shutdown_test(ng: Nginx, origin: Origin, site: AbortSite,
             if track_close:
                 if closed_at is None and h1 is not None and _peer_closed(h1.sock):
                     closed_at = time.monotonic()
-                closes.append(None if closed_at is None
-                              else closed_at - reloaded_at)
+                closes.append(close_since_park(closed_at, parked_at))
             anchor.settle()
             if arm == "graceful" and h1 is not None:
                 try:
