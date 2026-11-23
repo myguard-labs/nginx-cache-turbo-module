@@ -304,3 +304,54 @@ def test_build_invocation_is_mode_and_flavor_limited(flavor, mode, expected):
     assert len(calls) == len(expected), calls
     for call, want in zip(calls, expected, strict=True):
         assert call.startswith(want), (call, want)
+
+
+
+@pytest.mark.parametrize("index", range(len(sp.EDITS)))
+def test_extra_pristine_anchor_on_patched_tree_is_drift(tree, index):
+    assert sp.apply(tree) == "applied"
+    name, anchor, _new = sp.EDITS[index]
+    path = tree / name
+    # A second pristine anchor outside the edited function: the replacement is
+    # still present exactly once, so only the anchor surplus reveals the drift.
+    path.write_text(path.read_text() + "\n/* stray */\n" + anchor)
+    before = snapshot(tree)
+    with pytest.raises(ValueError, match="anchor drift in " + str(name)):
+        sp.apply(tree)
+    assert snapshot(tree) == before
+
+
+def test_extra_loop_anchor_on_patched_tree_refuses_without_writes(tree):
+    assert sp.apply(tree) == "applied"
+    path = tree / sp.CYCLE_C
+    path.write_text(path.read_text() + "\n" + sp.LOOP_ANCHOR)
+    before = snapshot(tree)
+    with pytest.raises(ValueError, match="anchor drift in " + str(sp.CYCLE_C)):
+        sp.apply(tree)
+    assert snapshot(tree) == before
+
+
+def test_extra_wait_anchor_on_patched_tree_refuses_without_writes(tree):
+    assert sp.apply(tree) == "applied"
+    path = tree / sp.EPOLL_C
+    path.write_text(path.read_text() + "\n" + sp.WAIT_ANCHOR)
+    before = snapshot(tree)
+    with pytest.raises(ValueError, match="anchor drift in " + str(sp.EPOLL_C)):
+        sp.apply(tree)
+    assert snapshot(tree) == before
+
+
+def test_unchanged_patched_tree_stays_patched_and_idempotent(tree):
+    assert sp.apply(tree) == "applied"
+    before = snapshot(tree)
+    assert sp.apply(tree) == "already patched"
+    assert snapshot(tree) == before
+    assert run_check(tree, "patched").returncode == 0
+
+
+def test_pristine_tree_is_still_pristine(tree):
+    before = snapshot(tree)
+    assert run_check(tree, "pristine").returncode == 0
+    assert sp.apply(tree) == "applied"
+    assert sp.apply(tree) == "already patched"
+    assert snapshot(tree) != before
