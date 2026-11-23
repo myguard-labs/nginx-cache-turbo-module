@@ -113,3 +113,4 @@ ci/tests/unit/test_vary_marker_fastpath.c	none	ut vary_marker_fastpath -
 ci/tools/ci-gate-verdict.py|ci/tests/test_ci_gate_verdict.py|.github/workflows/ci.yml	none	python3 ci/tests/test_ci_gate_verdict.py
 ci/tests/test_fault_gate.py|ci/tools/fault_only_tests.py|ci/tools/lint-fault-gate.py	none	python3 ci/tests/test_fault_gate.py
 ci/tools/check-hardening.sh|ci/tests/test_check_hardening.py	none	python3 ci/tests/test_check_hardening.py
+ci/tools/ci_guard_lifecycle.py|ci/tools/ci_child_observer.py|ci/tools/ci_hang_capture.py|ci/tools/ci-hang-guard.sh|ci/tests/test_guard_lifecycle.py|ci/tests/test_child_termination.py|ci/tests/test_hang_guard_capture.py|ci/tests/test_workflow_outcome.py	none	python3 -m unittest ci.tests.test_guard_lifecycle ci.tests.test_child_termination ci.tests.test_hang_guard_capture ci.tests.test_workflow_outcome

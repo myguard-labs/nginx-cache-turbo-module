@@ -114,6 +114,15 @@ class GateTests(unittest.TestCase):
         for item in baseline:
             self.assertTrue((ROOT / item[1]).is_file())
 
+    def test_real_gcc_analyzer_finds_double_free(self):
+        self.source.write_text("int f(void) { return 1; }\n")
+        self.assertEqual(gate.run(self.root, self.db, self.base), 0)
+        self.source.write_text(
+            "#include <stdlib.h>\n"
+            "void f(void) { void *p = malloc(10); free(p); free(p); }\n"
+        )
+        self.assertEqual(gate.run(self.root, self.db, self.base), 1)
+
     def test_warning_flags(self):
         entry = json.loads(self.db.read_text())
         entry[0]["arguments"][1:1] = [

@@ -1,4 +1,4 @@
-# sync-sha: 9ecf04f5f18e4ecfb1aff05d2a0f399dda7db06266837d9f1d06e2e54bae54ca
+# sync-sha: d28a70e6eddb1b1622b61ec0b6ece70825ed8793a6049b5c3e52a58d12710f54
 name: CI
 
 # Single entry point for the PR suite. The checks below used to be independent
@@ -110,7 +110,7 @@ jobs:
           # filter naming only the former monolithic runtime driver would stop triggering ASan the
           # moment a test moved into an area module -- coverage lost silently,
           # on every later PR, with nothing red to notice.
-          if grep -qE '^(src/|ci/tools/(ci-build\.sh|test_runtime\.py|test_runtime_base\.py|abort_fixture\.py|hostile_peer\.py|origin\.py|nginx_config\.py|areas/|ci-hang-guard\.sh|assert-fixtures\.sh)|\.github/actions/build-cache/|\.github/workflows/(asan|ci)\.yml)' <<< "$changed"; then
+          if grep -qE '^(src/|ci/tools/(ci-build\.sh|test_runtime\.py|test_runtime_base\.py|abort_fixture\.py|hostile_peer\.py|origin\.py|nginx_config\.py|areas/|ci-hang-guard\.sh|ci_child_observer\.py|ci_guard_lifecycle\.py|ci_hang_capture\.py|assert-fixtures\.sh)|\.github/actions/build-cache/|\.github/workflows/(asan|ci)\.yml)' <<< "$changed"; then
             echo "asan=true" >> "$GITHUB_OUTPUT"
           else
             echo "asan=false" >> "$GITHUB_OUTPUT"
