@@ -382,6 +382,41 @@ class HangCaptureTests(unittest.TestCase):
                          'an unopenable output skipped the log snapshot')
         self.assertTrue((artifacts / 'gdb-nginx-102.txt').is_dir())
 
+    def test_debugger_output_close_failure_keeps_other_targets_and_logs(self):
+        self.process(102, 101, 'nginx')  # Masters sort last, so 102 is debugged first.
+        original = diagnostics.Path.open
+
+        class FailingClose:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def write(self, text):
+                return self.stream.write(text)
+
+            def fileno(self):  # Popen needs a real descriptor to start the debugger.
+                return self.stream.fileno()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                self.stream.close()
+                raise OSError(errno.ENOSPC, 'No space left on device')
+
+        def opened(path, *args, **kwargs):
+            stream = original(path, *args, **kwargs)
+            return FailingClose(stream) if path.name == 'gdb-nginx-102.txt' else stream
+
+        with mock.patch.object(diagnostics.Path, 'open', opened):
+            result, artifacts = self.capture(passive=True)
+        self.assertIn('gdb output failed pid=102', result.stderr)
+        self.assertEqual((artifacts / 'gdb-nginx-102.txt').read_text(), 'fixture backtrace\n',
+                         'the failing target never ran its debugger')
+        self.assertEqual((artifacts / 'gdb-nginx-101.txt').read_text(), 'fixture backtrace\n',
+                         'a failed close skipped the next debugger')
+        self.assertEqual((artifacts / 'error-1.log').read_text(), 'owned diagnostic\n',
+                         'a failed close skipped the log snapshot')
+
     def test_rotation_during_debugger_preserves_selected_log_inode(self):
         opened = []
         original = diagnostics.error_logs

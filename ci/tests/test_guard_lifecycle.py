@@ -908,6 +908,41 @@ class AdoptedCleanupTests(unittest.TestCase):
             else:
                 closed.assert_any_call(1202)
 
+    def test_adopted_scan_stops_at_its_cutoff_and_reports_pending(self):
+        with mock.patch.object(lifecycle, '_children', return_value=[101, 202, 303]), \
+                mock.patch.object(lifecycle.os, 'waitpid') as waited, \
+                mock.patch.object(lifecycle.os, 'pidfd_open') as opened:
+            late = lifecycle._adopted({101}, signal.SIGTERM, time.monotonic() - 1)
+        self.assertTrue(late, 'unvisited children must stay pending')
+        waited.assert_not_called()
+        opened.assert_not_called()
+
+    def test_term_scan_stops_at_grace_but_kill_reaches_every_child(self):
+        alive = {202, 303}
+        sent = []
+
+        def signalled(fd, sig):
+            sent.append((fd - 1000, sig))
+            if sig == signal.SIGKILL:
+                alive.discard(fd - 1000)
+
+        def waitpid(pid, _flags):
+            return (0, 0) if pid in alive else (pid, 0)
+
+        owned = mock.Mock(pid=101)
+        owned.exited.return_value = True
+        owned.reap.return_value = 0
+        with mock.patch.object(lifecycle, '_children',
+                               side_effect=lambda: [101, *sorted(alive)]), \
+                mock.patch.object(lifecycle.os, 'pidfd_open', side_effect=lambda pid: pid + 1000), \
+                mock.patch.object(lifecycle.signal, 'pidfd_send_signal', side_effect=signalled), \
+                mock.patch.object(lifecycle.os, 'waitpid', side_effect=waitpid), \
+                mock.patch.object(lifecycle.os, 'close'):
+            result = lifecycle._drain([owned], 0, time.monotonic() + 1)
+        self.assertEqual(result, [0])
+        self.assertEqual(sent, [(202, signal.SIGKILL), (303, signal.SIGKILL)],
+                         'TERM scan ran past its grace cutoff or KILL missed a child')
+
     def test_drain_retains_error_after_children_are_eventually_reaped(self):
         owned = mock.Mock(pid=101)
         owned.exited.return_value = True
@@ -918,14 +953,16 @@ class AdoptedCleanupTests(unittest.TestCase):
                 raise PermissionError('controlled child failure')
             return pid + 1000
 
-        children = [[101, 202, 303], [101], [101], [101]]
+        # A generous grace keeps the TERM scan before its cutoff even on a stalled runner;
+        # the pass ends as soon as the children are gone, so the value never delays the test.
+        children = [[101, 202, 303], [101], [101], [101], [101]]
         with mock.patch.object(lifecycle, '_children', side_effect=children), \
                 mock.patch.object(lifecycle.os, 'pidfd_open', side_effect=pidfd), \
                 mock.patch.object(lifecycle.signal, 'pidfd_send_signal') as sent, \
                 mock.patch.object(lifecycle.os, 'waitpid',
                                   side_effect=[(0, 0), (0, 0), (303, 0)]) as waited, \
                 mock.patch.object(lifecycle.os, 'close') as closed:
-            result = lifecycle._drain([owned], 0, time.monotonic() + 1)
+            result = lifecycle._drain([owned], 30, time.monotonic() + 60)
         self.assertIsNone(result)
         sent.assert_called_once_with(1303, signal.SIGTERM)
         self.assertEqual(waited.call_args_list, [mock.call(202, os.WNOHANG),

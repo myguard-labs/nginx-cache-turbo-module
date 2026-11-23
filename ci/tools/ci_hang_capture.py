@@ -275,39 +275,45 @@ def capture(root, directory, soft):
                 print(f'ci-hang-guard: gdb output unavailable pid={pid}: {error}',
                       file=sys.stderr)
                 continue
-            with stream:
-                try:
-                    # GDB accepts only numeric PIDs. Recheck the retained pidfd
-                    # and start identity immediately before launch; PID reuse
-                    # during sudo/timeout/GDB startup remains a residual window.
-                    if (exited(fd)
-                            or process_stat(PROC / str(pid) / 'stat') != identity):
-                        stream.write('debugger skipped: process identity changed\n')
-                        continue
-                    # Measure after preflight, so its latency is charged to the budget.
-                    now = time.monotonic()
-                    allowance = min(10., max(0., until - now) / (len(processes) - index))
-                    if allowance <= .25:
-                        stream.write('debugger skipped: capture budget exhausted\n')
-                        continue
-                    # timeout runs at gdb's privilege and --foreground retains
-                    # the capture group. Killing only a sudo leader is not a
-                    # cleanup mechanism for its privileged debugger child.
-                    status = debug([
-                        *privilege, 'timeout', '--foreground', '--signal=TERM',
-                        '--kill-after=0.1s', f'{allowance - .2:.6f}s',
-                        'gdb', '-batch', '-p', str(pid), '-ex', 'set pagination off',
-                        '-ex', 'info threads', '-ex', 'thread apply all bt full',
-                        '-ex', 'print ngx_cycle->free_connection_n',
-                        '-ex', 'print ngx_cycle->connection_n', '-ex', 'detach', '-ex', 'quit',
-                    ], stream, now + allowance)
-                    # The inner timer can end gdb just before our own wait expires.
-                    if status in TIMER_EXPIRED:
+            try:
+                with stream:
+                    try:
+                        # GDB accepts only numeric PIDs. Recheck the retained pidfd
+                        # and start identity immediately before launch; PID reuse
+                        # during sudo/timeout/GDB startup remains a residual window.
+                        if (exited(fd)
+                                or process_stat(PROC / str(pid) / 'stat') != identity):
+                            stream.write('debugger skipped: process identity changed\n')
+                            continue
+                        # Measure after preflight, so its latency is charged to the budget.
+                        now = time.monotonic()
+                        allowance = min(10., max(0., until - now) / (len(processes) - index))
+                        if allowance <= .25:
+                            stream.write('debugger skipped: capture budget exhausted\n')
+                            continue
+                        # timeout runs at gdb's privilege and --foreground retains
+                        # the capture group. Killing only a sudo leader is not a
+                        # cleanup mechanism for its privileged debugger child.
+                        status = debug([
+                            *privilege, 'timeout', '--foreground', '--signal=TERM',
+                            '--kill-after=0.1s', f'{allowance - .2:.6f}s',
+                            'gdb', '-batch', '-p', str(pid), '-ex', 'set pagination off',
+                            '-ex', 'info threads', '-ex', 'thread apply all bt full',
+                            '-ex', 'print ngx_cycle->free_connection_n',
+                            '-ex', 'print ngx_cycle->connection_n', '-ex', 'detach', '-ex', 'quit',
+                        ], stream, now + allowance)
+                        # The inner timer can end gdb just before our own wait expires.
+                        if status in TIMER_EXPIRED:
+                            stream.write('debugger exceeded capture budget\n')
+                    except subprocess.TimeoutExpired:
                         stream.write('debugger exceeded capture budget\n')
-                except subprocess.TimeoutExpired:
-                    stream.write('debugger exceeded capture budget\n')
-                except OSError as error:
-                    stream.write(f'debugger unavailable: {error}\n')
+                    except OSError as error:
+                        stream.write(f'debugger unavailable: {error}\n')
+            except OSError as error:
+                # A buffered write can fail at flush on close (for example ENOSPC).
+                # Report on stderr: this stream is the one that just failed.
+                print(f'ci-hang-guard: gdb output failed pid={pid}: {error}',
+                      file=sys.stderr)
         # Every debugger completes before any shutdown signal. pidfds still name
         # the discovery identities even if a target exited and its PID was reused.
         if shutdown:

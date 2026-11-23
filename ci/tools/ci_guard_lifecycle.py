@@ -90,13 +90,20 @@ def _children():
     return [int(pid) for pid in Path(f"/proc/self/task/{os.getpid()}/children").read_text(encoding="ascii").split()]
 
 
-def _adopted(anchors, sig):
-    """Signal/reap adopted owned descendants without releasing group anchors."""
+def _adopted(anchors, sig, until=None):
+    """Signal/reap adopted owned descendants without releasing group anchors.
+
+    A scan given ``until`` stops at that instant and reports the unvisited
+    children as pending; the unbounded KILL scan still reaches every one.
+    """
     pending = False
     failure = None
     for pid in _children():
         if pid in anchors:
             continue
+        if until is not None and time.monotonic() >= until:
+            pending = True
+            break
         # A direct unreaped child cannot have its PID reused under this owner.
         try:
             waited, _ = os.waitpid(pid, os.WNOHANG)
@@ -123,10 +130,10 @@ def _drain(processes, grace, deadline):
     anchors = {p.pid for p in processes}
     failed = False
 
-    def adopted(sig):
+    def adopted(sig, until=None):
         nonlocal failed
         try:
-            return _adopted(anchors, sig)
+            return _adopted(anchors, sig, until)
         except OSError:
             failed = True
             return True  # Still send KILL to retained groups after a /proc/pidfd error.
@@ -142,7 +149,8 @@ def _drain(processes, grace, deadline):
                     process.cleanup_error = f"{type(error).__name__}: {error}"
         end = min(deadline, time.monotonic() + grace)
         while True:
-            pending = adopted(sig)
+            # Only TERM stops at its grace cutoff, so KILL starts on time.
+            pending = adopted(sig, end if sig == signal.SIGTERM else None)
             if all(p.exited() for p in processes) and not pending:
                 # Other group members may still be alive even if the leader died.
                 # Always perform the KILL phase before releasing its identity.
