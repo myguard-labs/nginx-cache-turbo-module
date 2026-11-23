@@ -158,6 +158,14 @@ def test_partially_transformed_tree_is_refused(tree):
      ("    events = epoll_wait(ep, event_list,"
       " (int) nevents, timer);\n    err = (events"),
      "epoll wait does not use the saved mask"),
+    # Empty epoll guard followed by an unconditional mask block.
+    (sp.CYCLE_C, "if (ngx_event_flags & NGX_USE_EPOLL_EVENT) {",
+     "if (ngx_event_flags & NGX_USE_EPOLL_EVENT) {\n    }\n\n    {",
+     "epoll guard does not contain the mask operation"),
+    # Detached conditional: second wait runs unconditionally.
+    (sp.EPOLL_C, "    } else {\n        events = epoll_wait(",
+     "    }\n    if (0) {\n    } else {\n        events = epoll_wait(",
+     "epoll wait does not use the saved mask"),
 ])
 def test_check_catches_broken_transform(tree, name, old, new, finding):
     assert sp.apply(tree) == "applied"

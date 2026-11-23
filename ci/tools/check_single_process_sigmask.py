@@ -35,6 +35,12 @@ EPOLL_START = (
     "ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer,"
     " ngx_uint_t flags)\n{\n"
 )
+GUARD_OPEN = "if (ngx_event_flags & NGX_USE_EPOLL_EVENT) {"
+GUARD_BODY = (
+    "sigprocmask(SIG_BLOCK, &set, &ngx_single_wait_mask) == -1",
+    "ngx_single_wait_masked = 1;",
+)
+WAIT_OPEN = "if (ngx_single_wait_masked) {"
 SIGNALS = (
     "SIGINT",
     "ngx_signal_value(NGX_RECONFIGURE_SIGNAL)",
@@ -51,6 +57,26 @@ def body(text: str, start: str) -> str | None:
     begin = text.index(start)
     end = text.find("\n}\n", begin)
     return None if end < 0 else text[begin:end]
+
+
+def braced(text: str, opener: str, start: int = 0) -> tuple[str, int] | None:
+    """Inner text and end offset of the brace block that `opener` ends with.
+
+    `opener` must end in `{`. Returns None when it is absent or unbalanced.
+    """
+    begin = text.find(opener, start)
+    if begin < 0:
+        return None
+    first = begin + len(opener)
+    depth = 1
+    for pos in range(first, len(text)):
+        if text[pos] == "{":
+            depth += 1
+        elif text[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[first:pos], pos + 1
+    return None
 
 
 def ordered(text: str, parts: tuple[str, ...], unique: tuple[str, ...]) -> bool:
@@ -86,8 +112,14 @@ def _check_loop(cycle: str) -> list[str]:
         "    for ( ;; ) {",
     )):
         problems.append("single-process loop is not epoll-guarded and masked")
+    guard = braced(single, GUARD_OPEN)
+    inner = guard[0] if guard else ""
+    # Token order alone accepts an empty guard followed by an unconditional
+    # mask block: the mask operation must sit inside the guard braces.
+    if guard is None or any(part not in inner for part in GUARD_BODY):
+        problems.append("epoll guard does not contain the mask operation")
     for sig in SIGNALS:
-        if single.count(f"sigaddset(&set, {sig});") != 1:
+        if inner.count(f"sigaddset(&set, {sig});") != 1:
             problems.append(f"single-process mask does not block {sig}")
     return problems
 
@@ -111,21 +143,24 @@ def _check_wait(epoll_source: str) -> list[str]:
     epoll = body(epoll_source, EPOLL_START)
     if epoll is None:
         return ["ngx_epoll_process_events() boundary not found once"]
-    if ordered(epoll, (
-        "if (ngx_single_wait_masked) {",
-        ("events = epoll_pwait(ep, event_list, (int) nevents, timer,\n"
-         "                             &ngx_single_wait_mask);"),
-        "} else {",
-        "events = epoll_wait(ep, event_list, (int) nevents, timer);",
-        "err = (events == -1) ? ngx_errno : 0;",
-    ), unique=(
-        "ngx_single_wait_masked",
-        "= epoll_pwait(",
-        "= epoll_wait(",
-        "err = (events == -1) ? ngx_errno : 0;",
-    )):
-        return []
-    return ["epoll wait does not use the saved mask when masked"]
+    problems = []
+    first = braced(epoll, WAIT_OPEN)
+    if first is None or first[0].count("= epoll_pwait(") != 1 \
+            or "&ngx_single_wait_mask);" not in first[0]:
+        problems.append("epoll wait does not use the saved mask when masked")
+    else:
+        # The else must be the same conditional's, and the error assignment
+        # must follow the whole conditional; a second unconditional wait or a
+        # detached `if (0) {} else {}` breaks that.
+        tail = epoll[first[1]:]
+        other = braced(tail, " else {") if tail.startswith(" else {") else None
+        if other is None or other[0].count("= epoll_wait(") != 1 \
+                or not tail[other[1]:].lstrip().startswith(
+                    "\n    err = (events == -1) ? ngx_errno : 0;".lstrip()) \
+                or epoll.count("= epoll_wait(") != 1 \
+                or epoll.count("= epoll_pwait(") != 1:
+            problems.append("epoll wait does not use the saved mask when masked")
+    return problems
 
 
 def _references(root: Path) -> list[Path]:
