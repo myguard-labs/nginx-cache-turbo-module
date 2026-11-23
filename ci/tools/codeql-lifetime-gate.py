@@ -14,6 +14,16 @@ RULES = {
 
 
 def finding(result):
+    """Return the line-insensitive identity (rule, uri, message).
+
+    CodeQL's cpp SARIF carries no enclosing-function logicalLocation, and the
+    gate reads no sources, so a source-context hash is unavailable. The query
+    messages name the enclosing function (park-callback-unchecked) or the
+    variable and releasing callee (use-after-request-release), so rule + file +
+    message survives unrelated edits above a site while a new finding with a
+    different message in the same file still fails. Line and column are
+    validated but excluded; Counter multiplicity still rejects extra copies.
+    """
     rule = result["ruleId"]
     location = result["locations"][0]["physicalLocation"]
     region = location["region"]
@@ -27,7 +37,7 @@ def finding(result):
     for position in (line, column):
         if not isinstance(position, int) or isinstance(position, bool) or position < 1:
             raise ValueError("invalid finding identity")
-    return rule, uri, line, column, message
+    return rule, uri, message
 
 
 def inventory(tool):

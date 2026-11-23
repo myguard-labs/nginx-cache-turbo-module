@@ -14,10 +14,10 @@ FIRST = "myguard/nginx-lifetime/use-after-request-release"
 SECOND = "myguard/nginx-lifetime/park-callback-unchecked"
 
 
-def result(rule=FIRST, line=4):
-    return {"ruleId": rule, "message": {"text": "unsafe read"}, "locations": [{
-        "physicalLocation": {"artifactLocation": {"uri": "src/a.c"},
-                             "region": {"startLine": line, "startColumn": 2}}}]}
+def result(rule=FIRST, line=4, message="unsafe read in f", column=2, uri="src/a.c"):
+    return {"ruleId": rule, "message": {"text": message}, "locations": [{
+        "physicalLocation": {"artifactLocation": {"uri": uri},
+                             "region": {"startLine": line, "startColumn": column}}}]}
 
 
 def sarif(results):
@@ -40,17 +40,15 @@ class Gate(unittest.TestCase):
         baseline = json.loads((ROOT / "ci/codeql/nginx-lifetime/baseline.json").read_text())
         self.assertEqual(run(document, baseline).returncode, 0)
         self.assertEqual(run(document, []).returncode, 1)
-        for field in ("path", "line", "column", "message"):
+        for field in ("path", "message"):
             with self.subTest(field=field):
                 changed = json.loads(json.dumps(document))
                 item = changed["runs"][0]["results"][0]
                 location = item["locations"][0]["physicalLocation"]
                 if field == "path":
                     location["artifactLocation"]["uri"] += "x"
-                elif field == "message":
-                    item["message"]["text"] += "x"
                 else:
-                    location["region"]["start" + field.title()] += 1
+                    item["message"]["text"] += "x"
                 self.assertEqual(run(changed, baseline).returncode, 1)
         document["runs"][0]["results"].append(result())
         self.assertEqual(run(document, baseline).returncode, 1)
@@ -80,8 +78,47 @@ class Gate(unittest.TestCase):
         self.assertEqual(run(sarif([]), []).returncode, 0)
         self.assertEqual(run(sarif([result()]), [result()]).returncode, 0)
 
+    def test_shifted_line_and_column_keep_accepted_finding(self):
+        for shift in (1, 22, 5000):
+            with self.subTest(shift=shift):
+                moved = result(line=4 + shift, column=9)
+                self.assertEqual(run(sarif([moved]), [result()]).returncode, 0)
+                self.assertEqual(run(sarif([result()]), [moved]).returncode, 0)
+        document = json.loads((ROOT / "ci/tests/codeql-lifetime-action.sarif").read_text())
+        baseline = json.loads((ROOT / "ci/codeql/nginx-lifetime/baseline.json").read_text())
+        for item in document["runs"][0]["results"]:
+            item["locations"][0]["physicalLocation"]["region"]["startLine"] += 22
+        self.assertEqual(run(document, baseline).returncode, 0)
+
+    def test_same_file_new_finding_still_fails_after_shift(self):
+        accepted = result(message="read in lock_finish")
+        added = result(line=90, message="read in other_finish")
+        proc = run(sarif([result(line=30, message="read in lock_finish"), added]), [accepted])
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("other_finish", proc.stdout)
+        self.assertNotIn("lock_finish", proc.stdout)
+        # same rule/message in another file is not accepted by this baseline
+        moved_file = result(uri="src/b.c", message="read in lock_finish")
+        self.assertEqual(run(sarif([moved_file]), [accepted]).returncode, 1)
+        # a different rule with the same message is not accepted either
+        self.assertEqual(run(sarif([result(SECOND)]), [accepted]).returncode, 1)
+
+    def test_multiplicity_survives_line_shift(self):
+        shifted = [result(line=40), result(line=50)]
+        self.assertEqual(run(sarif(shifted), [result()]).returncode, 1)
+        self.assertEqual(run(sarif(shifted), [result(), result(line=9)]).returncode, 0)
+        self.assertEqual(run(sarif([result(line=40)]), [result(), result(line=9)]).returncode, 0)
+
+    def test_malformed_identity_errors(self):
+        cases = {"line0": result(line=0), "column0": result(column=0),
+                 "line-bool": result(line=True), "line-str": result(line="4"),
+                 "message-empty": result(message=""), "uri-empty": result(uri="")}
+        for name, bad in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(run(sarif([bad]), []).returncode, 2)
+                self.assertEqual(run(sarif([]), [bad]).returncode, 2)
+
     def test_new_and_duplicate_findings_fail(self):
-        self.assertEqual(run(sarif([result(line=5)]), [result()]).returncode, 1)
         self.assertEqual(run(sarif([result(), result()]), [result()]).returncode, 1)
         self.assertEqual(run(sarif([result(SECOND)]), []).returncode, 1)
 
