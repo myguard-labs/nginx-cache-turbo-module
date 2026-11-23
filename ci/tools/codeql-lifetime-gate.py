@@ -2,7 +2,9 @@
 """Fail on new CodeQL lifetime findings or incomplete SARIF evidence."""
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -13,7 +15,55 @@ RULES = {
 }
 
 
-def finding(result):
+class Sources:
+    """Read source lines under one root; any unreadable evidence is an error."""
+
+    def __init__(self, root):
+        self.root = Path(root).resolve()
+        self.cache = {}
+
+    def line(self, uri, number):
+        path = (self.root / uri).resolve()
+        if self.root != path and self.root not in path.parents:
+            raise ValueError("source path escapes the source root: " + uri)
+        if path not in self.cache:
+            # CodeQL numbers lines by \n, \r\n and \r only; str.splitlines()
+            # also splits on form feed and other separators and would shift.
+            text = path.read_bytes().decode("utf-8", errors="replace")
+            lines = re.split(r"\r\n|\r|\n", text)
+            if lines and lines[-1] == "":
+                lines.pop()
+            self.cache[path] = lines
+        lines = self.cache[path]
+        if number > len(lines):
+            raise ValueError("line %d is outside %s" % (number, uri))
+        return lines[number - 1]
+
+
+def context_hash(text):
+    """sha256 of the whitespace-normalized source line."""
+    return hashlib.sha256(" ".join(text.split()).encode()).hexdigest()
+
+
+def finding(result, sources=None):
+    """Return the line-insensitive identity (rule, uri, message, context hash).
+
+    The context hash is the sha256 of the whitespace-normalized source text at
+    the finding's startLine, read under --source-root. Baseline entries carry
+    it as `contextHash` because their line numbers go stale after shifts; SARIF
+    results are hashed from the checked-out source. Line and column are
+    validated but not keyed, so unrelated edits above a site keep it accepted,
+    while an edited accepted line, a new site with different text, or a new
+    message is a new finding. An unreadable file or an out-of-range line is
+    invalid evidence (exit 2).
+
+    Still indistinguishable: two sites with the same rule, file, message and
+    identical normalized line text (for example two identical reads of one
+    variable after the same release call); Counter multiplicity still rejects
+    an extra copy, but not an equal-count swap between such twins. Only the
+    flagged line is hashed: neighbouring lines would make every nearby edit a
+    false new finding.
+    """
     rule = result["ruleId"]
     location = result["locations"][0]["physicalLocation"]
     region = location["region"]
@@ -27,7 +77,13 @@ def finding(result):
     for position in (line, column):
         if not isinstance(position, int) or isinstance(position, bool) or position < 1:
             raise ValueError("invalid finding identity")
-    return rule, uri, line, column, message
+    if sources is None:
+        digest = result["contextHash"]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("invalid baseline contextHash")
+    else:
+        digest = context_hash(sources.line(uri, line))
+    return rule, uri, message, digest
 
 
 def inventory(tool):
@@ -92,7 +148,7 @@ def validate_reference(result, inventories, tool):
         raise ValueError("conflicting legacy rule index")
 
 
-def evaluate(sarif, baseline, expected=None):
+def evaluate(sarif, baseline, expected=None, root="."):
     if (sarif["version"] != "2.1.0" or not isinstance(sarif["runs"], list)
             or len(sarif["runs"]) != 1):
         raise ValueError("expected one SARIF 2.1.0 run")
@@ -105,7 +161,8 @@ def evaluate(sarif, baseline, expected=None):
         raise TypeError("results and baseline must be lists")
     for result in run["results"]:
         validate_reference(result, inventories, run["tool"])
-    current = Counter(finding(result) for result in run["results"])
+    sources = Sources(root)
+    current = Counter(finding(result, sources) for result in run["results"])
     accepted = Counter(finding(result) for result in baseline)
     if expected and not any(key[0] == expected for key in current):
         raise ValueError("expected fixture rule did not report: " + expected)
@@ -116,17 +173,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sarif", type=Path)
     parser.add_argument("baseline", type=Path)
+    parser.add_argument("--source-root", type=Path, default=Path("."),
+                        help="checkout root holding the analyzed sources")
     parser.add_argument("--expect-rule", choices=sorted(RULES))
     args = parser.parse_args()
     try:
         sarif = json.loads(args.sarif.read_text())
         baseline = json.loads(args.baseline.read_text())
-        new = evaluate(sarif, baseline, args.expect_rule)
+        new = evaluate(sarif, baseline, args.expect_rule, args.source_root)
     except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
         print("ERROR: invalid or incomplete lifetime evidence:", exc, file=sys.stderr)
         return 2
     for identity, count in sorted(new.items()):
-        print("NEW", count, *identity)
+        print("NEW", count, *identity[:3])
     return 1 if new else 0
 
 

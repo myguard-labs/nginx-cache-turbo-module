@@ -19,7 +19,8 @@
           }
         }
       }
-    ]
+    ],
+    "contextHash": "71495391a642a5bbf3265ca8e2b6b0febc39767686d297b9a3ec52f81b8cd67a"
   },
   {
     "ruleId": "myguard/nginx-lifetime/park-callback-unchecked",
@@ -41,7 +42,8 @@
           }
         }
       }
-    ]
+    ],
+    "contextHash": "71495391a642a5bbf3265ca8e2b6b0febc39767686d297b9a3ec52f81b8cd67a"
   },
   {
     "ruleId": "myguard/nginx-lifetime/park-callback-unchecked",
@@ -63,7 +65,8 @@
           }
         }
       }
-    ]
+    ],
+    "contextHash": "71495391a642a5bbf3265ca8e2b6b0febc39767686d297b9a3ec52f81b8cd67a"
   },
   {
     "ruleId": "myguard/nginx-lifetime/park-callback-unchecked",
@@ -85,6 +88,7 @@
           }
         }
       }
-    ]
+    ],
+    "contextHash": "71495391a642a5bbf3265ca8e2b6b0febc39767686d297b9a3ec52f81b8cd67a"
   }
 ]
