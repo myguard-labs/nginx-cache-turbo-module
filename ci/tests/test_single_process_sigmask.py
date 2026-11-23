@@ -158,6 +158,27 @@ def test_partially_transformed_tree_is_refused(tree):
      ("    events = epoll_wait(ep, event_list,"
       " (int) nevents, timer);\n    err = (events"),
      "epoll wait does not use the saved mask"),
+    # Flag set in the sigprocmask() failure branch instead of the success one.
+    (sp.CYCLE_C,
+     ('                          "sigprocmask() failed");\n\n'
+      '        } else {\n            ngx_single_wait_masked = 1;\n'),
+     ('                          "sigprocmask() failed");\n'
+      '            ngx_single_wait_masked = 1;\n\n        } else {\n'),
+     "not set only in the sigprocmask() success branch"),
+    # Flag set in both branches.
+    (sp.CYCLE_C, "sigprocmask() failed\");\n",
+     "sigprocmask() failed\");\n            ngx_single_wait_masked = 1;\n",
+     "not set only in the sigprocmask() success branch"),
+    # Failure-branch assignment spelled without whitespace.
+    (sp.CYCLE_C, '                          "sigprocmask() failed");\n',
+     ('                          "sigprocmask() failed");\n'
+      '            ngx_single_wait_masked=1;\n'),
+     "not set only in the sigprocmask() success branch"),
+    # Extra flag assignment after the if/else, still inside the guard.
+    (sp.CYCLE_C, "            ngx_single_wait_masked = 1;\n        }\n",
+     ("            ngx_single_wait_masked = 1;\n        }\n"
+      "        ngx_single_wait_masked = 1;\n"),
+     "not set only in the sigprocmask() success branch"),
     # Empty epoll guard followed by an unconditional mask block.
     (sp.CYCLE_C, "if (ngx_event_flags & NGX_USE_EPOLL_EVENT) {",
      "if (ngx_event_flags & NGX_USE_EPOLL_EVENT) {\n    }\n\n    {",
@@ -176,6 +197,39 @@ def test_check_catches_broken_transform(tree, name, old, new, finding):
     red = run_check(tree, "patched")
     assert red.returncode == 1
     assert finding in red.stderr
+
+
+@pytest.mark.parametrize("line", [
+    "        sigemptyset(&set);\n",
+    "        sigaddset(&set, SIGINT);\n",
+    "        sigaddset(&set, ngx_signal_value(NGX_TERMINATE_SIGNAL));\n",
+])
+def test_check_requires_full_set_before_sigprocmask(tree, line):
+    assert sp.apply(tree) == "applied"
+    path = tree / sp.CYCLE_C
+    text = path.read_text()
+    assert text.count(line) == 1
+    # Move the statement below the sigprocmask() conditional, inside the guard.
+    tail = "            ngx_single_wait_masked = 1;\n        }\n"
+    assert text.count(tail) == 1
+    path.write_text(text.replace(line, "", 1).replace(tail, tail + line, 1))
+    red = run_check(tree, "patched")
+    assert red.returncode == 1
+    assert "signal set is not fully built before sigprocmask()" in red.stderr
+
+
+def test_check_requires_sigemptyset_before_sigaddset(tree):
+    assert sp.apply(tree) == "applied"
+    path = tree / sp.CYCLE_C
+    text = path.read_text()
+    empty = "        sigemptyset(&set);\n"
+    last = "        sigaddset(&set, ngx_signal_value(NGX_SHUTDOWN_SIGNAL));\n"
+    assert text.count(empty) == 1 and text.count(last) == 1
+    # sigemptyset() after the adds, still before sigprocmask(): clears the set.
+    path.write_text(text.replace(empty, "", 1).replace(last, last + empty, 1))
+    red = run_check(tree, "patched")
+    assert red.returncode == 1
+    assert "signal set is not fully built before sigprocmask()" in red.stderr
 
 
 def test_check_rejects_correction_use_outside_edited_files(tree):

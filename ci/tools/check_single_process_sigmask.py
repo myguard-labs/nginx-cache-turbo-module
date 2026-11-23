@@ -21,6 +21,7 @@ Exit 0 when the tree matches, 1 with every finding otherwise, 2 on usage.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -36,10 +37,12 @@ EPOLL_START = (
     " ngx_uint_t flags)\n{\n"
 )
 GUARD_OPEN = "if (ngx_event_flags & NGX_USE_EPOLL_EVENT) {"
-GUARD_BODY = (
-    "sigprocmask(SIG_BLOCK, &set, &ngx_single_wait_mask) == -1",
-    "ngx_single_wait_masked = 1;",
-)
+MASK_CALL = "sigprocmask(SIG_BLOCK, &set, &ngx_single_wait_mask) == -1"
+MASK_OPEN = "if (" + MASK_CALL + ") {"
+FLAG_SET = "ngx_single_wait_masked = 1;"
+GUARD_BODY = (MASK_CALL, FLAG_SET)
+FLAG_ASSIGN = re.compile(r"\bngx_single_wait_masked\s*=[^=]")
+FLAG_ON = re.compile(r"\bngx_single_wait_masked\s*=\s*1\s*;")
 WAIT_OPEN = "if (ngx_single_wait_masked) {"
 SIGNALS = (
     "SIGINT",
@@ -121,6 +124,35 @@ def _check_loop(cycle: str) -> list[str]:
     for sig in SIGNALS:
         if inner.count(f"sigaddset(&set, {sig});") != 1:
             problems.append(f"single-process mask does not block {sig}")
+    problems += _check_mask_order(inner)
+    return problems
+
+
+def _check_mask_order(inner: str) -> list[str]:
+    """The set is built before sigprocmask(); the flag is its success branch."""
+    call = inner.find(MASK_CALL)
+    if call < 0:
+        return []  # the missing call is already reported by the guard check
+    before = inner[:call]
+    problems = []
+    empty = before.find("sigemptyset(&set);")
+    if before.count("sigemptyset(&set);") != 1 or any(
+            before.count(f"sigaddset(&set, {sig});") != 1
+            or before.find(f"sigaddset(&set, {sig});") < empty
+            for sig in SIGNALS):
+        problems.append(
+            "signal set is not fully built before sigprocmask()")
+    failure = braced(inner, MASK_OPEN)
+    tail = inner[failure[1]:] if failure else ""
+    success = braced(tail, " else {") if tail.startswith(" else {") else None
+    # Count assignments by token, not by one exact spelling.
+    if failure is None or success is None \
+            or FLAG_ASSIGN.search(failure[0]) \
+            or len(FLAG_ON.findall(success[0])) != 1 \
+            or len(FLAG_ASSIGN.findall(inner)) != 1:
+        problems.append(
+            "ngx_single_wait_masked is not set only in the sigprocmask()"
+            " success branch")
     return problems
 
 
