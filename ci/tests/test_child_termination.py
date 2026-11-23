@@ -16,6 +16,7 @@ from unittest import mock
 REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "ci/tools"))
 import ci_child_observer as observer
+import ci_guard_lifecycle as lifecycle
 
 IDENTITY = {"run_id": "a" * 32, "observer_pid": 12, "child_pid": 34}
 
@@ -145,6 +146,30 @@ class TerminationTests(unittest.TestCase):
                 self.assertIn("TERMINATION UNKNOWN", output.getvalue())
                 self.assertFalse(list(pathlib.Path(directory).glob("*/termination.json")))
 
+    def test_signal_and_incomplete_cleanup_preserve_unknown_failure(self):
+        run_owned = observer.run_owned
+        drain = lifecycle._drain
+
+        def incomplete(*args):
+            drain(*args)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            def run(command, env, on_start, sig=sig, **kwargs):
+                def started(pid):
+                    on_start(pid)
+                    os.kill(os.getpid(), sig)
+                return run_owned(command, env, started, **kwargs)
+
+            with self.subTest(signal=sig), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(observer, 'run_owned', side_effect=run), \
+                    mock.patch.object(lifecycle, '_drain', side_effect=incomplete), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                status = observer.observe(directory, [sys.executable, '-c', 'pass'], hard=1)
+                self.assertFalse(list(pathlib.Path(directory).glob('*/termination.json')))
+            self.assertEqual(status, 125)
+            self.assertIn('TERMINATION UNKNOWN', output.getvalue())
+            self.assertIn('reason=cleanup incomplete', output.getvalue())
+
     def test_report_io_error_preserves_command_status(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch("builtins.print", side_effect=BrokenPipeError()):
@@ -154,7 +179,7 @@ class TerminationTests(unittest.TestCase):
     def test_start_failure_and_cli_usage(self):
         with tempfile.TemporaryDirectory() as directory:
             for error, code in ((FileNotFoundError(), 127), (PermissionError(), 126)):
-                with mock.patch.object(observer.subprocess, "Popen", side_effect=error), \
+                with mock.patch("ci_guard_lifecycle.subprocess.Popen", side_effect=error), \
                         contextlib.redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(observer.observe(directory, ["missing"]), code)
                 self.assertIn("UNKNOWN", output.getvalue())
@@ -165,7 +190,9 @@ class TerminationTests(unittest.TestCase):
     def test_guard_disabled_and_enabled_paths_preserve_exit(self):
         for enabled in (False, True):
             with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
-                env = dict(os.environ, CT_OUTCOME_OBSERVE="1" if enabled else "0")
+                # Pin a valid pair; an inherited CI hard bound would reject this soft.
+                env = dict(os.environ, CT_OUTCOME_OBSERVE="1" if enabled else "0",
+                           CT_HANG_HARD_SECONDS="1000299")
                 result = subprocess.run(["sh", str(REPO / "ci/tools/ci-hang-guard.sh"),
                                          "999999", directory, "--", sys.executable,
                                          "-c", "raise SystemExit(7)"],
@@ -231,6 +258,27 @@ print(json.dumps({'decision': decision, 'status': str(status), 'pid': os.getpid(
         step = text.split("      - name: Run runtime suite\n", 1)[1].split("      - name:", 1)[0]
         self.assertIn('CT_OUTCOME_OBSERVE: "1"', step)
         self.assertIn('--outcome-dir "$GITHUB_WORKSPACE/ci-hang-artifacts"', step)
+
+
+class StandaloneDeadlineTests(unittest.TestCase):
+    def test_default_and_override_are_explicit_finite_bounds(self):
+        for arguments, expected in ((['artifacts', '--', 'command'], 600.),
+                                    (['--hard-seconds', '1800', 'artifacts', '--', 'command'], 1800.)):
+            with self.subTest(arguments=arguments), \
+                    mock.patch.object(sys, 'argv', ['observer', *arguments]), \
+                    mock.patch.object(observer, 'observe', return_value=23) as observe:
+                self.assertEqual(observer.main(), 23)
+                observe.assert_called_once_with('artifacts', ['command'], hard=expected)
+
+    def test_invalid_standalone_deadline_or_missing_command_cannot_launch(self):
+        for arguments in (['--hard-seconds', 'inf', 'artifacts', '--', 'command'],
+                          ['--hard-seconds', '0', 'artifacts', '--', 'command'],
+                          ['artifacts', '--']):
+            with self.subTest(arguments=arguments), \
+                    mock.patch.object(sys, 'argv', ['observer', *arguments]), \
+                    mock.patch.object(observer, 'observe') as observe:
+                self.assertEqual(observer.main(), 2)
+                observe.assert_not_called()
 
 
 if __name__ == "__main__":

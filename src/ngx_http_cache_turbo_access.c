@@ -1718,10 +1718,10 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
          * actually lives. Skipping both serve arms here is what makes the
          * fall-through happen: this object node itself is untouched (no
          * status/SIE/breaker state is set the way the genuinely-expired arm
-         * below does), so a fail-open L2 GET failure still resolves back to
-         * serving this exact node on the object-GET phase right after the
-         * marker consult -- same fresh/stale object, just reached one phase
-         * later than usual.
+         * below does), so a declined or failed revalidation GET makes
+         * access_l2() re-run this function with the latch cleared
+         * (CT-VARY-REVAL-L2-DECLINE-DEMOTE) and serve this exact node --
+         * same fresh/stale object, just reached one phase later than usual.
          *
          * Two flags, not one: vary_marker_revalidate is set by THIS pass's
          * own vary_apply() a few lines above and does NOT survive a park --
@@ -1882,7 +1882,7 @@ ngx_http_cache_turbo_access_l1(ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_cache_turbo_access_l2_marker_get(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
-    ngx_http_cache_turbo_zone_t *z, ngx_int_t *out_rc)
+    ngx_http_cache_turbo_zone_t *z, ngx_int_t *out_rc, ngx_uint_t *reserve)
 {
     ngx_int_t   rc;
     u_char      saved_key[32];
@@ -2004,6 +2004,21 @@ ngx_http_cache_turbo_access_l2_marker_get(ngx_http_request_t *r,
      * to consume -- key_hash/l2_done are untouched, fall through exactly as
      * an L1 marker miss with no L2 configured always has. */
     ngx_memcpy(ctx->key_hash, saved_key, 32);
+
+    /* CT-VARY-REVAL-L2-DECLINE-DEMOTE: a revalidation GET that could not
+     * launch (connect backoff, refused connect, alloc failure) left
+     * access_l1() having skipped its fresh/stale serve arms for nothing.
+     * Nothing is in flight, so drop the latch and the tried flag (no result
+     * will ever land for consume() to read) and ask access_l2() to re-run
+     * the L1 serve. vary_marker_l2_done stays set, so that pass's
+     * vary_apply() does not re-arm the revalidation. */
+    if (revalidate) {
+        ctx->vary_marker_revalidate = 0;
+        ctx->vary_marker_revalidate_inflight = 0;
+        ctx->vary_marker_l2_tried = 0;
+        *reserve = 1;
+    }
+
     return NGX_DECLINED;
 }
 
@@ -2062,7 +2077,7 @@ ngx_http_cache_turbo_access_l2_marker_resolve(ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
-    ngx_http_cache_turbo_zone_t *z, uint32_t *hashp)
+    ngx_http_cache_turbo_zone_t *z, uint32_t *hashp, ngx_uint_t *reserve)
 {
     ngx_int_t                        bits = 0;
     ngx_uint_t                       gen = 0;
@@ -2121,6 +2136,14 @@ ngx_http_cache_turbo_access_l2_marker_consume(ngx_http_request_t *r,
      * untouched -- only a transport failure short-circuits the next phase. */
     if (ctx->l2_result == NGX_ERROR) {
         ctx->vary_marker_l2_down = 1;
+
+        /* CT-VARY-REVAL-L2-DECLINE-DEMOTE: a revalidation whose GET failed
+         * has no authoritative answer, so it fails open to the resident L1
+         * node; access_l2() re-runs the L1 serve now that the latch is
+         * cleared above. */
+        if (revalidate) {
+            *reserve = 1;
+        }
     }
 
     /* codex-review P3-5: an L1 marker can appear WHILE this request's own
@@ -2698,6 +2721,8 @@ ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx,
     ngx_http_cache_turbo_zone_t *z, uint32_t hash, ngx_int_t *out_rc)
 {
+    ngx_uint_t  reserve = 0;
+
     /* P3-5 PHASE -1/0: consume the result of a previously-parked marker GET (a
      * no-op on every entry except the resume of that specific park), then --
      * only on a genuine L1 marker miss with auto_vary on -- try the L2-backed
@@ -2706,15 +2731,31 @@ ngx_http_cache_turbo_access_l2(ngx_http_request_t *r,
      * marker consult resolves one. Both are no-ops (return immediately) on
      * the warm-marker path: vary_marker_l1_miss is never set there, so this
      * costs the warm path nothing beyond the two flag reads. */
-    if (ngx_http_cache_turbo_access_l2_marker_consume(r, clcf, ctx, z, &hash)
+    if (ngx_http_cache_turbo_access_l2_marker_consume(r, clcf, ctx, z, &hash,
+            &reserve)
         != NGX_OK)
     {
         *out_rc = NGX_ERROR;
         return NGX_DONE;
     }
 
-    if (ngx_http_cache_turbo_access_l2_marker_get(r, clcf, ctx, z, out_rc)
+    if (ngx_http_cache_turbo_access_l2_marker_get(r, clcf, ctx, z, out_rc,
+            &reserve)
         == NGX_DONE)
+    {
+        return NGX_DONE;
+    }
+
+    /* CT-VARY-REVAL-L2-DECLINE-DEMOTE: the marker revalidation armed by
+     * vary_apply() made access_l1() skip its fresh/stale serve arms, and its
+     * GET then declined or failed. Fail open: re-run the L1 phase once with
+     * the revalidation latch cleared so the resident node is served as it
+     * would have been without the revalidation. vary_marker_l2_done keeps
+     * that pass from re-arming, so this cannot loop. A genuinely expired
+     * node falls through again to the object GET below as before. */
+    if (reserve
+        && ngx_http_cache_turbo_access_l1(r, clcf, ctx, z, &hash, out_rc)
+           == NGX_DONE)
     {
         return NGX_DONE;
     }
