@@ -138,6 +138,9 @@ case "$PAIRS" in '' | *[!0-9]*) die "--pairs must be a positive integer" ;; esac
 PAIRS=$((10#$PAIRS)) # base 10, so "08" is not an octal error
 [ "$PAIRS" -ge 1 ] || die "--pairs must be >= 1"
 
+SCHEDULE="$(python3 -I -B "$STATS" schedule --pairs "$PAIRS" --sizes "$SIZES_LIST")" ||
+    die "cannot build the schedule (check --pairs/--sizes)"
+
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "# perf-matrix dry run: pairs=$PAIRS sizes=\"$SIZES_LIST\" server_cpu=$SERVER_CPU wrk_cpus=$WRK_CPUS threads=$THREADS warmup=${WARMUP}s measured=${DURATION}s conc=$CONC"
     n=0
@@ -151,7 +154,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
             module="$CAND_MODULE"
         fi
         echo "$n $size/$side/pair$pair: SIZES=$size MODES=C PASSES=1 WORKERS=1 THREADS=$THREADS NGINX_CPUS=$SERVER_CPU WRK_CPUS=$WRK_CPUS WARMUP=$WARMUP MODULE=${module:-} bash ci/tools/bench.sh ${bin:-<${side}-bin>} $DURATION $CONC"
-    done < <(python3 -I -B "$STATS" schedule --pairs "$PAIRS" --sizes "$SIZES_LIST")
+    done <<<"$SCHEDULE"
     exit 0
 fi
 
@@ -222,7 +225,7 @@ run_sample() {
 
 while IFS=$'\t' read -r size side pair; do
     run_sample "$side" "$size" "$pair"
-done < <(python3 -I -B "$STATS" schedule --pairs "$PAIRS" --sizes "$SIZES_LIST")
+done <<<"$SCHEDULE"
 
 rc=0
 python3 -I -B "$STATS" analyze --samples "$OUT/samples.tsv" --idle "$OUT/idle.tsv" \

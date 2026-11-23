@@ -108,7 +108,9 @@ def busy_pct(before, after, cpus):
             raise ValueError(f"cpu{c} missing from /proc/stat snapshot")
         dt = after[c][1] - before[c][1]
         db = after[c][0] - before[c][0]
-        rows.append((c, 0.0 if dt <= 0 else 100.0 * db / dt))
+        if dt <= 0:
+            raise ValueError(f"cpu{c}: no elapsed ticks between snapshots")
+        rows.append((c, 100.0 * db / dt))
     return rows
 
 
@@ -316,11 +318,11 @@ def main(argv):
     a.add_argument("--out")
     a.add_argument("--threads", type=int, required=True)
     a.add_argument("--wrk-cpu-count", type=int, required=True)
-    a.add_argument("--mask-pct", type=float, default=80.0)
-    a.add_argument("--idle-max-busy-pct", type=float, default=10.0)
-    a.add_argument("--hit-min-pct", type=float, default=99.9)
-    a.add_argument("--margin-pct", type=float, default=3.0)
-    a.add_argument("--mad-mult", type=float, default=3.0)
+    a.add_argument("--mask-pct", type=finite, default=80.0)
+    a.add_argument("--idle-max-busy-pct", type=finite, default=10.0)
+    a.add_argument("--hit-min-pct", type=finite, default=99.9)
+    a.add_argument("--margin-pct", type=finite, default=3.0)
+    a.add_argument("--mad-mult", type=finite, default=3.0)
     a.add_argument("--min-pairs", type=int, default=3)
     args = ap.parse_args(argv)
     try:
@@ -362,8 +364,12 @@ def main(argv):
         return EXIT_USAGE
     text = json.dumps(result, indent=2, sort_keys=True)
     if args.out:
-        with open(args.out, "w", encoding="ascii") as fh:
-            fh.write(text + "\n")
+        try:
+            with open(args.out, "w", encoding="ascii") as fh:
+                fh.write(text + "\n")
+        except OSError as e:
+            print(f"perf_matrix_stats: {e}", file=sys.stderr)
+            return EXIT_USAGE
     print(text)
     return code
 

@@ -197,6 +197,8 @@ class ProcStatTests(unittest.TestCase):
             self.assertEqual(r, [(2, 75.0)])
             with self.assertRaises(ValueError):
                 pm.busy_pct(pm.read_cpu_ticks(a, [2]), pm.read_cpu_ticks(b, [2]), [3])
+            with self.assertRaises(ValueError):  # no elapsed ticks is not "idle"
+                pm.busy_pct(pm.read_cpu_ticks(a, [2]), pm.read_cpu_ticks(a, [2]), [2])
 
     def test_siblings(self):
         with tempfile.TemporaryDirectory() as d:
@@ -300,7 +302,10 @@ class MutationControl(unittest.TestCase):
 class WrapperTests(unittest.TestCase):
     def run_wrapper(self, *args):
         env = dict(os.environ)
-        for k in ("SERVER_CPU", "WRK_CPUS", "DURATION", "WARMUP", "CONC", "THREADS"):
+        for k in (
+            "SERVER_CPU", "WRK_CPUS", "DURATION", "WARMUP", "CONC", "THREADS", "MASK_PCT",
+            "IDLE_MAX_BUSY_PCT", "HIT_MIN_PCT", "MARGIN_PCT", "MAD_MULT", "IDLE_WINDOW", "SETTLE",
+        ):
             env.pop(k, None)
         return subprocess.run(
             ["bash", str(WRAPPER), *args], capture_output=True, text=True, env=env, check=False
@@ -329,6 +334,20 @@ class WrapperTests(unittest.TestCase):
             tsv.write_text("")
             p = self.run_wrapper("--from-samples", str(tsv), "--idle", str(Path(d) / "typo.tsv"))
             self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+
+    def test_empty_sizes_is_usage_error(self):
+        self.assertEqual(self.run_wrapper("--dry-run", "--sizes", "").returncode, 2)
+
+    def test_nonfinite_threshold_and_unwritable_out_exit_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            tsv = Path(d) / "s.tsv"
+            tsv.write_text("")
+            base = [sys.executable, "-I", "-B", str(TOOL), "analyze", "--samples", str(tsv),
+                    "--threads", "4", "--wrk-cpu-count", "4"]
+            bad = subprocess.run(base + ["--margin-pct", "inf"], capture_output=True, text=True, check=False)
+            self.assertEqual(bad.returncode, 2, bad.stderr)
+            out = subprocess.run(base + ["--out", d], capture_output=True, text=True, check=False)
+            self.assertEqual(out.returncode, 2, out.stderr)
 
     def test_load_idle_none_is_no_evidence(self):
         self.assertEqual(pm.load_idle(None), [])
