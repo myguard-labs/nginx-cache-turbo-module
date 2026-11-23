@@ -87,8 +87,9 @@ semantics. Each accepted identity is the rule, path, message and a `contextHash`
 `--source-root`, default the checkout root); line and column are not keyed, so
 shifts above a site stay accepted while an edited line, a new site or a new
 message is a new finding. An unreadable file or out-of-range line exits 2. Two
-sites with identical rule, path, message and line text stay indistinguishable. The gate accepts query
-inventories in the SARIF driver or extensions and rejects ambiguous references,
+sites with identical rule, path, message and line text stay indistinguishable.
+The gate accepts query inventories in the SARIF driver or extensions and
+rejects ambiguous references,
 missing or malformed results, a missing query, analysis errors, and any
 additional finding. The fixture tests and a separate fixture database exercise
 the 9c32123 shape and require the gate to reject it. The monthly `codeql.yml`
