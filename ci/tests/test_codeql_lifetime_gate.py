@@ -117,8 +117,12 @@ class Gate(unittest.TestCase):
 
     def test_invalid_rule_references_and_inventories(self):
         original = json.loads(FIXTURE.read_text())
-        empty = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, empty, True)
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        fixture_root(root, original)
+        # Valid sources: the unmutated fixture reaches the comparison (rc 1),
+        # so rc 2 below can only come from reference/inventory validation.
+        self.assertEqual(run(original, [], root=root).returncode, 1)
         for mutation in ("duplicate", "missing", "index", "id", "component", "malformed"):
             with self.subTest(mutation=mutation):
                 document = json.loads(json.dumps(original))
@@ -136,7 +140,7 @@ class Gate(unittest.TestCase):
                     run_data["results"][0]["rule"]["toolComponent"]["index"] = 0
                 else:
                     run_data["tool"]["extensions"] = {}
-                self.assertEqual(run(document, [], root=empty).returncode, 2)
+                self.assertEqual(run(document, [], root=root).returncode, 2)
 
     def test_empty_and_exact_baseline_pass(self):
         self.assertEqual(run(sarif([]), []).returncode, 0)
