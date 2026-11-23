@@ -82,8 +82,12 @@ SARIF. These reads precede the check and are accepted as existing findings;
 the check does not protect the preceding copies, and three callbacks also read
 `r->connection` before it. The walk callback returns early when detached before
 reaching its check. Keeping these declarations in place preserves release object
-semantics. Each accepted identity includes the rule, path, line, column and
-message; any change produces a new finding for review. The gate accepts query
+semantics. Each accepted identity is the rule, path, message and a `contextHash`
+(sha256 of the whitespace-normalized source line at the finding, read from
+`--source-root`, default the checkout root); line and column are not keyed, so
+shifts above a site stay accepted while an edited line, a new site or a new
+message is a new finding. An unreadable file or out-of-range line exits 2. Two
+sites with identical rule, path, message and line text stay indistinguishable. The gate accepts query
 inventories in the SARIF driver or extensions and rejects ambiguous references,
 missing or malformed results, a missing query, analysis errors, and any
 additional finding. The fixture tests and a separate fixture database exercise
