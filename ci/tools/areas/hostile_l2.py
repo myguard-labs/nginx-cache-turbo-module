@@ -22,7 +22,7 @@ body" is asserted).  /ra/ runs without keepalive so every L2 op sends the
 preamble and the armed AUTH/SELECT always fires; there is no pool to desync,
 so its P4 reduces to "the faulted connection is closed".
 
-Every case is judged on the same six properties (PROPS):
+Every case is judged on the same seven properties (PROPS):
 
   P1-origin   the client gets the origin's latest body for the path, no
               X-Cache header (a planted L2 body is caught by its hash).
@@ -42,6 +42,14 @@ Every case is judged on the same six properties (PROPS):
   P6-errlog   error.log lines written during the case stay under a cap, no
               line exceeds 2 KiB or echoes the hostile payload marker, and no
               crit/alert/emerg line appears.
+  P7-lock     lock family only: the request parked for a peer's fill (zone
+              lock_waits delta 1) exactly when the lock SET reply was the nil
+              "$-1" (Case.lock_held), the one answer by which SET NX PX says
+              a peer holds the key.  "+OK" wins the regen; every other reply
+              -- a non-nil bulk, a bad length, -ERR, a timeout -- is a failed
+              lock channel and degrades to per-box single-flight, never to
+              waiting out lock_timeout for a fill nobody owns
+              (HARD-L-READLOCK-BULK).
 
 A case whose armed command never reaches the peer did not exercise its fault:
 it fails H-fired (outside PROPS), which no KNOWN_RED row can waive.
@@ -87,7 +95,7 @@ from test_runtime_base import *
 from test_runtime_base import _admin_stat, _errlog_window_start
 
 PROPS = ("P1-origin", "P2-no-l1", "P3-sanitizer", "P4-closed", "P5-latency",
-         "P6-errlog")
+         "P6-errlog", "P7-lock")
 
 TIMEOUT_MS = 300          # cache_turbo_redis timeout= on every location
 #                           but the re-arm probes' /rs/ and /ms/
@@ -153,6 +161,9 @@ class Case:
     # store on the pooled connection).  A parser that rejects the reply closes
     # the connection, so the store goes out on another one.
     expect_reuse: bool = False
+    # Lock family only (P7-lock): the reply means "a peer holds the lock", so
+    # the request must wait for that peer's fill; False: it must not wait.
+    lock_held: bool = False
 
 
 @dataclass
@@ -201,15 +212,18 @@ def _common(fam: str, ok: bytes) -> list[Case]:
     mid-reply close/RST, drip and never-reply.  `ok` is the command's valid
     reply."""
     up = fam.upper()
-    # SET, the lock SET and the purge DEL read their reply through the
-    # framing drain: a complete, cleanly framed reply -- `-ERR` included --
-    # leaves the stream at a reply boundary and the connection poolable by
-    # contract (src/ngx_http_cache_turbo_redis.c read_drain, the
-    # TODO-UNLINK-REPLY-WINDOW comment at the `*p == '-'` arm).  The GET parser
+    # SET and the purge DEL read their reply through the framing drain: a
+    # complete, cleanly framed reply -- `-ERR` included -- leaves the stream
+    # at a reply boundary and the connection poolable by contract
+    # (src/ngx_http_cache_turbo_redis.c read_drain, the
+    # TODO-UNLINK-REPLY-WINDOW comment at the `*p == '-'` arm).  The lock
+    # reader (read_lock) pools a framed -ERR too, but closes on a reply type
+    # SET NX PX never sends (integer, array, non-nil bulk).  The GET parser
     # and the SCAN/SSCAN walk close on any wrong type; the preamble fails the
     # op on `-` and /ra/ has no pool.  For a framed wrong type only the
     # desync half of P4 applies on the drain path.
     strict = fam not in ("set", "lock", "del")
+    strict_type = fam not in ("set", "del")
     scan = fam in ("scan", "sscan")
     bulky = fam == "get"
     # A bad length header is sent where the command's reply has one: the
@@ -240,10 +254,10 @@ def _common(fam: str, ok: bytes) -> list[Case]:
         # DEL's own reply is an integer: it gets a simple string instead.
         Case(f"{up}-TYPE-SIMPLE", fam, _s(b"+OK\r\n"), expect_close=False)
         if fam == "del" else
-        Case(f"{up}-TYPE-INT", fam, _s(b":1\r\n"), expect_close=strict,
+        Case(f"{up}-TYPE-INT", fam, _s(b":1\r\n"), expect_close=strict_type,
              admin=fail),
-        Case(f"{up}-TYPE-NULLARR", fam, _s(b"*-1\r\n"), expect_close=strict,
-             admin=fail),
+        Case(f"{up}-TYPE-NULLARR", fam, _s(b"*-1\r\n"),
+             expect_close=strict_type, admin=fail),
         Case(f"{up}-TYPE-RESP3-NULL", fam, _s(b"_\r\n"), admin=fail),
         Case(f"{up}-TYPE-PUSH", fam,
              _s(b">2\r\n$7\r\nmessage\r\n$7\r\n" + MARK + b"\r\n"),
@@ -277,8 +291,17 @@ def _common(fam: str, ok: bytes) -> list[Case]:
         cases.append(Case(f"{up}-TYPE-NIL", fam, _s(b"$-1\r\n"),
                           expect_close=False))
     elif fam == "lock":
-        cases.append(Case(f"{up}-TYPE-BULK", fam, _s(_bulk(b"OK")),
-                          expect_close=False))
+        # SET NX PX (no GET option) answers "+OK" or the nil "$-1"; a non-nil
+        # bulk is another command's reply on a desynced stream, never "held".
+        cases += [
+            Case(f"{up}-TYPE-BULK", fam, _s(_bulk(b"OK"))),
+            Case(f"{up}-TYPE-BULK-EMPTY", fam, _s(_bulk(b""))),
+            Case(f"{up}-HELD-NIL", fam, _s(b"$-1\r\n"), expect_close=False,
+                 lock_held=True,
+                 note="a peer holds the lock: wait for its fill"),
+            Case(f"{up}-ACQUIRED-OK", fam, _s(b"+OK\r\n"),
+                 expect_close=False, note="lock won: regenerate now"),
+        ]
     elif scan:
         cases += [
             Case(f"{up}-TYPE-NIL", fam, _s(b"$-1\r\n"), admin=fail),
@@ -900,6 +923,21 @@ def probe_wire_problem(cmds: list[hp.Command], probe_wire: bytes,
     return None
 
 
+def lock_verdict_problem(case: Case, waits_delta: int) -> str | None:
+    """P7-lock: a lock-family request waits for a peer's fill (one zone
+    lock_waits tick) only when its lock SET reply said a peer holds it.
+    cold_wait counts a request once, so the held delta is exactly 1."""
+    if case.family != "lock":
+        return None
+    if waits_delta == (1 if case.lock_held else 0):
+        return None
+    if case.lock_held:
+        return (f"nil lock reply not honoured: lock_waits delta {waits_delta}"
+                " (want exactly 1: one park for the peer's fill)")
+    return ("failed lock reply read as peer-held: lock_waits delta "
+            f"{waits_delta} (parked for a fill nobody owns)")
+
+
 def validate_only(only: set[str] | None, ids: list[str]) -> None:
     unknown = sorted((only or set()) - set(ids))
     if unknown:
@@ -925,6 +963,7 @@ def _run_case(rig: _Rig, case: Case, planted: Planted | None,
         st, body, _ = fetch(rig.node.port, path, timeout=bound + 5.0)
         assert st == 200, f"{case.id}: seed {path}: {st}"
     hits0 = _admin_stat(rig.node, "l2_hits", "/_hl")
+    waits0 = _admin_stat(rig.node, "lock_waits", "/_hl")
     log0 = _errlog_window_start(rig.node)
     san0 = _sanitizer_count(rig)
     workers0 = rig.worker_pids()
@@ -955,6 +994,12 @@ def _run_case(rig: _Rig, case: Case, planted: Planted | None,
             fail["P1-origin"] = (f"status={st} x-cache={hdrs.get('x-cache')} "
                                  f"body={body[:80]!r} "
                                  f"origin_bodies={len(bodies)}")
+        # P7: measured over the faulted request alone (the repeat and the
+        # probe below run lock SETs of their own).
+        lock_problem = lock_verdict_problem(
+            case, _admin_stat(rig.node, "lock_waits", "/_hl") - waits0)
+        if lock_problem:
+            fail["P7-lock"] = lock_problem
     # The L2 store (SET) is issued after the response: wait for the fault.
     deadline = time.monotonic() + bound
     while armed.fire is None and time.monotonic() < deadline:

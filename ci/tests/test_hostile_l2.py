@@ -158,6 +158,48 @@ def test_unfired_known_red_case_is_not_waived() -> None:
     assert hl.HARNESS_PROP not in hl.PROPS
 
 
+def test_lock_reply_verdict_cases() -> None:
+    """HARD-L-READLOCK-BULK: SET NX PX answers "+OK" or the nil "$-1"; only
+    the nil is "a peer holds the lock".  A non-nil bulk (and an integer or an
+    array) is outside that grammar: not held, and not poolable."""
+    lock = {c.id: c for c in CASES if c.family == "lock"}
+    held = [cid for cid, c in lock.items() if c.lock_held]
+    assert held == ["LOCK-HELD-NIL"]
+    planted = hl.Planted(b"", b"", b"", key=b"hl:k")
+    assert lock["LOCK-HELD-NIL"].step(planted).reply == b"$-1\r\n"
+    assert lock["LOCK-ACQUIRED-OK"].step(planted).reply == b"+OK\r\n"
+    for cid, reply in (("LOCK-TYPE-BULK", b"$2\r\nOK\r\n"),
+                       ("LOCK-TYPE-BULK-EMPTY", b"$0\r\n\r\n")):
+        assert lock[cid].step(planted).reply == reply
+        assert lock[cid].expect_close, cid
+    for cid in ("LOCK-TYPE-INT", "LOCK-TYPE-NULLARR", "LOCK-LEN-NEG2",
+                "LOCK-LEN-NONDIGIT", "LOCK-LEN-OVER-INT64"):
+        assert lock[cid].expect_close and not lock[cid].lock_held, cid
+    # A framed -ERR stays poolable; SET/DEL wrong types keep the drain rule.
+    assert not lock["LOCK-TYPE-ERR"].expect_close
+    for fam in ("SET", "DEL"):
+        assert not next(c for c in CASES
+                        if c.id == f"{fam}-TYPE-NULLARR").expect_close
+    assert not any(c.lock_held for c in CASES if c.family != "lock")
+    assert "P7-lock" in hl.PROPS
+
+
+@pytest.mark.parametrize(("cid", "delta", "bad"), [
+    ("LOCK-HELD-NIL", 1, False),        # nil honoured: parked for the fill
+    ("LOCK-HELD-NIL", 0, True),         # fail-open: went to the origin
+    ("LOCK-HELD-NIL", 2, True),         # one request counted twice
+    ("LOCK-TYPE-BULK", 0, False),       # foreign reply: per-box regen
+    ("LOCK-TYPE-BULK", 1, True),        # read as held (the old behaviour)
+    ("LOCK-LEN-NEG2", 1, True),
+    ("LOCK-ACQUIRED-OK", 0, False),
+    ("LOCK-ACQUIRED-OK", 2, True),
+    ("SET-TYPE-NIL", 3, False),         # not a lock case: no verdict
+])
+def test_lock_verdict_problem(cid: str, delta: int, bad: bool) -> None:
+    c = next(c for c in CASES if c.id == cid)
+    assert (hl.lock_verdict_problem(c, delta) is not None) == bad
+
+
 def test_mcget_crlf_split_must_be_accepted() -> None:
     c = next(c for c in CASES if c.id == "MCGET-CRLF-SPLIT")
     assert c.expect_reuse and not c.expect_close
