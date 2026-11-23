@@ -89,6 +89,24 @@ if [ "$FLAVOR" = nginx ] && [ "$VERSION" = 1.22.1 ]; then
     python3 "$MODULE_DIR/ci/tools/legacy_http2_order.py" "$ROOT/$DIR"
 fi
 
+# ASan CI build only: close nginx core's single-process check->wait signal
+# window, which loses a SIGTERM handled just before epoll_wait(-1) and hangs
+# the --single-process suite's stop (CT-ASAN-SP-SIGTERM-STOP-HANG; rationale
+# and the non-epoll guard in ci/tools/single_process_sigmask.py). Every other
+# nginx mode must build stock core, so a shared BUILD_ROOT tree that an asan
+# build already transformed is refused instead of silently reused. Angie
+# trees are never transformed.
+if [ "$FLAVOR" = nginx ]; then
+    if [ "$MODE" = asan ]; then
+        python3 "$MODULE_DIR/ci/tools/single_process_sigmask.py" "$ROOT/$DIR"
+        python3 "$MODULE_DIR/ci/tools/check_single_process_sigmask.py" \
+            --expect patched "$ROOT/$DIR"
+    else
+        python3 "$MODULE_DIR/ci/tools/check_single_process_sigmask.py" \
+            --expect pristine "$ROOT/$DIR"
+    fi
+fi
+
 # ccache: cache object compiles across CI runs (50-80% compile cut on a warm
 # cache). Auto-detected on PATH so a local build without ccache still works.
 # nginx honors --with-cc; the base build uses the default `cc`, the asan/coverage
