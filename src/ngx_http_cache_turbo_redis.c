@@ -5044,7 +5044,7 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
  * Lock (SET NX PX) reply reader. The reply is tiny (+OK / $-1 / -ERR), so a
  * single recv into the scratch buffer suffices. THREE outcomes (codex
  * follow-up — a Redis outage must not look like "peer holds the lock"):
- *   '+' (+OK)         -> NGX_OK       lock acquired, we own the regen
+ *   exactly "+OK"     -> NGX_OK       lock acquired, we own the regen
  *   exactly "$-1"     -> NGX_DECLINED key already held by a peer: wait/serve stale
  *   timeout/EOF/-ERR/ -> NGX_ERROR    lock channel unusable: degrade to per-box
  *   any other reply                   single-flight (regenerate locally), never
@@ -5139,8 +5139,16 @@ ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
          * fill nobody owns (and, if the late "+OK" was ours, every node
          * waited out the lock's PX); it is a protocol failure like -ERR:
          * NGX_ERROR, per-box single-flight. Unlike a framed -ERR, the stream
-         * offset is suspect, so the connection is not pooled. */
-        if (op->recv[0] == '+') {
+         * offset is suspect, so the connection is not pooled.
+         * HARD-L-READLOCK-PLUS: the same holds for a simple string other than
+         * the exact "+OK" ("+QUEUED" from a connection left in MULTI, "+OKX"):
+         * reading it as a win claimed a lock this request may not hold and
+         * pooled a stream whose next commands a MULTI would only queue. The
+         * framing above guarantees recv holds the whole reply, so a split
+         * "+O" + "K\r\n" is still decided here, never on a prefix. */
+        if (op->recv_len == sizeof("+OK" CRLF) - 1
+            && ngx_memcmp(op->recv, "+OK" CRLF, sizeof("+OK" CRLF) - 1) == 0)
+        {
             rc = NGX_OK;                   /* lock acquired */
         } else if (op->recv_len == sizeof("$-1" CRLF) - 1
                    && ngx_memcmp(op->recv, "$-1" CRLF,

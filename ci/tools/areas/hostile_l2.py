@@ -45,11 +45,12 @@ Every case is judged on the same seven properties (PROPS):
   P7-lock     lock family only: the request parked for a peer's fill (zone
               lock_waits delta 1) exactly when the lock SET reply was the nil
               "$-1" (Case.lock_held), the one answer by which SET NX PX says
-              a peer holds the key.  "+OK" wins the regen; every other reply
-              -- a non-nil bulk, a bad length, -ERR, a timeout -- is a failed
-              lock channel and degrades to per-box single-flight, never to
+              a peer holds the key.  Only the exact "+OK" wins the regen;
+              every other reply -- a non-nil bulk, another simple string
+              ("+QUEUED"), a bad length, -ERR, a timeout -- is a failed lock
+              channel and degrades to per-box single-flight, never to
               waiting out lock_timeout for a fill nobody owns
-              (HARD-L-READLOCK-BULK).
+              (HARD-L-READLOCK-BULK, HARD-L-READLOCK-PLUS).
 
 A case whose armed command never reaches the peer did not exercise its fault:
 it fails H-fired (outside PROPS), which no KNOWN_RED row can waive.
@@ -300,7 +301,22 @@ def _common(fam: str, ok: bytes) -> list[Case]:
                  lock_held=True,
                  note="a peer holds the lock: wait for its fill"),
             Case(f"{up}-ACQUIRED-OK", fam, _s(b"+OK\r\n"),
-                 expect_close=False, note="lock won: regenerate now"),
+                 expect_close=False, expect_reuse=True,
+                 note="lock won: regenerate now"),
+            # HARD-L-READLOCK-PLUS: only the exact "+OK" is a win.  Accepting
+            # it pools the connection (expect_reuse), which is the one outside
+            # trace of the win; a split "+O" | "K\r" | "\n" is still a win.
+            Case(f"{up}-ACQUIRED-OK-SPLIT", fam,
+                 _s(b"+OK\r\n", chunk=2, delay=0.05), expect_close=False,
+                 expect_reuse=True, note="+O, K CR, LF: a win, pooled"),
+            # Any other simple string is a failed lock channel: per-box
+            # single-flight and a closed connection ("+QUEUED" means a MULTI
+            # is open on it).  The split one must not be decided on "+QUE".
+            Case(f"{up}-SIMPLE-QUEUED", fam, _s(b"+QUEUED\r\n")),
+            Case(f"{up}-SIMPLE-QUEUED-SPLIT", fam,
+                 _s(b"+QUEUED\r\n", chunk=4, delay=0.05)),
+            Case(f"{up}-SIMPLE-OKX", fam, _s(b"+OKX\r\n")),
+            Case(f"{up}-SIMPLE-OK-JUNK", fam, _s(b"+OK " + MARK + b"\r\n")),
         ]
     elif scan:
         cases += [

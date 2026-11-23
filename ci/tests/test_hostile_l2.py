@@ -184,6 +184,46 @@ def test_lock_reply_verdict_cases() -> None:
     assert "P7-lock" in hl.PROPS
 
 
+def _wire_reads(step: hl.hp.Step) -> list[bytes]:
+    """The reads the peer's chunked send hands nginx (one per chunk)."""
+    n = step.chunk or len(step.reply) or 1
+    return [step.reply[i:i + n] for i in range(0, len(step.reply), n)]
+
+
+def test_lock_simple_string_verdict_cases() -> None:
+    """HARD-L-READLOCK-PLUS: only the exact "+OK" is a lock win.  The win is
+    observable only as a pooled connection, so the win cases demand reuse;
+    every other simple string must close the connection and never park."""
+    lock = {c.id: c for c in CASES if c.family == "lock"}
+    planted = hl.Planted(b"", b"", b"", key=b"hl:k")
+    for cid in ("LOCK-ACQUIRED-OK", "LOCK-ACQUIRED-OK-SPLIT"):
+        c = lock[cid]
+        assert c.step(planted).reply == b"+OK\r\n", cid
+        assert c.expect_reuse and not c.expect_close and not c.lock_held, cid
+    # Boundary: the win arrives as "+O" first, then the rest in later reads.
+    split = lock["LOCK-ACQUIRED-OK-SPLIT"].step(planted)
+    assert _wire_reads(split) == [b"+O", b"K\r", b"\n"]
+    assert split.delay * len(_wire_reads(split)) < hl.TIMEOUT_MS / 1000
+    for cid, reply in (("LOCK-SIMPLE-QUEUED", b"+QUEUED\r\n"),
+                       ("LOCK-SIMPLE-QUEUED-SPLIT", b"+QUEUED\r\n"),
+                       ("LOCK-SIMPLE-OKX", b"+OKX\r\n"),
+                       ("LOCK-SIMPLE-OK-JUNK", b"+OK " + hl.MARK + b"\r\n")):
+        c = lock[cid]
+        assert c.step(planted).reply == reply, cid
+        assert c.expect_close and not c.expect_reuse and not c.lock_held, cid
+    # "+QUE" alone is not a complete reply: the verdict waits for the rest.
+    queued = lock["LOCK-SIMPLE-QUEUED-SPLIT"].step(planted)
+    assert _wire_reads(queued)[0] == b"+QUE"
+    assert queued.delay * len(_wire_reads(queued)) < hl.TIMEOUT_MS / 1000
+
+
+def test_wire_reads_helper() -> None:
+    assert _wire_reads(hl.hp.Step(reply=b"+OK\r\n")) == [b"+OK\r\n"]
+    assert _wire_reads(hl.hp.Step(reply=b"abcde", chunk=2)) == [
+        b"ab", b"cd", b"e"]
+    assert _wire_reads(hl.hp.Step(reply=b"")) == []
+
+
 @pytest.mark.parametrize(("cid", "delta", "bad"), [
     ("LOCK-HELD-NIL", 1, False),        # nil honoured: parked for the fill
     ("LOCK-HELD-NIL", 0, True),         # fail-open: went to the origin
@@ -193,6 +233,8 @@ def test_lock_reply_verdict_cases() -> None:
     ("LOCK-LEN-NEG2", 1, True),
     ("LOCK-ACQUIRED-OK", 0, False),
     ("LOCK-ACQUIRED-OK", 2, True),
+    ("LOCK-SIMPLE-QUEUED", 0, False),   # failed channel: per-box regen
+    ("LOCK-SIMPLE-QUEUED", 1, True),    # read as held
     ("SET-TYPE-NIL", 3, False),         # not a lock case: no verdict
 ])
 def test_lock_verdict_problem(cid: str, delta: int, bad: bool) -> None:
@@ -203,7 +245,11 @@ def test_lock_verdict_problem(cid: str, delta: int, bad: bool) -> None:
 def test_mcget_crlf_split_must_be_accepted() -> None:
     c = next(c for c in CASES if c.id == "MCGET-CRLF-SPLIT")
     assert c.expect_reuse and not c.expect_close
-    assert not any(x.expect_reuse for x in CASES if x.id != c.id)
+    # Reuse is demanded only where accepting the reply is the property under
+    # test: this split miss and the lock wins (HARD-L-READLOCK-PLUS).
+    reuse = {x.id for x in CASES if x.expect_reuse}
+    assert reuse == {c.id, "LOCK-ACQUIRED-OK", "LOCK-ACQUIRED-OK-SPLIT"}
+    assert not any(x.expect_close for x in CASES if x.expect_reuse)
 
 
 def test_fire_publishes_command_and_time_together() -> None:
