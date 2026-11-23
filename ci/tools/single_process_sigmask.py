@@ -125,9 +125,16 @@ def _read(source_root: Path, name: Path) -> str:
 
 
 def _state(text: str, anchor: str, replacement: str) -> str:
-    """Classify one edit as patched, pristine, or drift."""
+    """Classify one edit as patched, pristine, or drift.
+
+    Patched means the replacement occurs once and the anchor occurs only as
+    often as the replacement itself contributes it (once for the retaining
+    edits, zero for WAIT). Any extra pristine anchor elsewhere is drift.
+    """
     if text.count(replacement) == 1:
-        return "patched"
+        if text.count(anchor) == replacement.count(anchor):
+            return "patched"
+        return "drift"
     if replacement not in text and text.count(anchor) == 1:
         return "pristine"
     return "drift"
