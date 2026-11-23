@@ -907,6 +907,8 @@ class HangCaptureTests(unittest.TestCase):
                     launched.append(real(*args, **kwargs))
                 finally:
                     signal.signal(signal.SIGTERM, previous)
+                # A debug() that fails to kill the TERM-ignoring child must not leak it.
+                self.addCleanup(self.stop_child, launched[-1])
                 return launched[-1]
 
             started = diagnostics.time.monotonic()

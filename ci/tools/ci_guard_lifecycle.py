@@ -5,6 +5,7 @@ DRAINING -> REAPED only after TERM/KILL and waits on owned children. A dedicated
 subreaper owns the command and diagnostics in separate sessions. It watches a
 CLOEXEC socket for guard death and a pidfd for caller death; neither is a PID
 rediscovery. A nondefault SIGCHLD reaper is refused before launching anything.
+The command starts only after the guard reports its TERM/INT forwarders.
 Command/session leaders remain unreaped until the final group
 signal, preventing PGID reuse. Adopted children are signalled through pidfds.
 Diagnostics never become command descendants. On ordinary command exit, an
@@ -193,15 +194,26 @@ def _owner(wire, caller_fd, command, env, soft, hard, capture):
         if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
             raise OSError(ctypes.get_errno(), "cannot own orphaned descendants")
         _children()  # Cleanup needs procfs child enumeration; fail before launch.
-        # Do not launch if the caller/guard has already died during setup.
-        ready = _readable(wire, caller_fd)
-        if ready == [wire]:
-            data = wire.recv(1024)
-            if data:  # A TERM/INT forwarded during setup is a stop, not a fault.
-                result.update(status=128 + json.loads(data)["signal"], reason="guard signal")
-                return
-        if ready:
-            raise OSError("parent unavailable before launch")
+        # Launch only after the guard reports both signal forwarders installed,
+        # so a TERM/INT sent on the command's readiness reaches a forwarder.
+        # Never launch if the caller/guard has died first.
+        guard_ready = False
+        while True:
+            ready = _readable(wire, caller_fd)
+            if ready == [wire]:
+                data = wire.recv(1024)
+                if data:
+                    record = json.loads(data)
+                    if "signal" in record:  # A TERM/INT forwarded during setup is a stop.
+                        result.update(status=128 + record["signal"], reason="guard signal")
+                        return
+                    guard_ready = True
+                    continue  # Also take a stop queued behind the handshake.
+            if ready:
+                raise OSError("parent unavailable before launch")
+            if guard_ready or stop or time.monotonic() >= deadline - 2 * grace:
+                break
+            time.sleep(.005)
         # A tiny bound can round deadline to start; never launch into cleanup.
         if time.monotonic() >= deadline - 2 * grace:
             result.update(status=124, reason="hard deadline")
@@ -335,6 +347,11 @@ def run_owned(command, env, on_start, *, soft=None, hard=600., capture=None):
 
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous[sig] = signal.signal(sig, forward)
+        try:
+            # The owner launches nothing before this: both forwarders now exist.
+            parent_wire.send(json.dumps({"ready": True}).encode())
+        except OSError:
+            pass  # Owner loss is reported by the read loop below.
         while True:
             try:
                 data = parent_wire.recv(4096)

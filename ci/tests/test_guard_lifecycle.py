@@ -42,6 +42,51 @@ if sys.argv[2] == 'exit':
 time.sleep(60)
 """
 
+# A guard held just before it installs its TERM forwarder. 'term' keeps it there
+# once a launch was attempted, so the controller's TERM lands in that window;
+# 'die' kills the guard there instead.
+RACE_GUARD = r"""
+import json, os, pathlib, signal, subprocess, sys, time
+sys.path.insert(0, sys.argv[1])
+import ci_guard_lifecycle as lifecycle
+directory, mode = pathlib.Path(sys.argv[2]), sys.argv[3]
+launched, marker = directory / 'launched', directory / 'marker'
+guard = os.getpid()
+real_popen, real_signal, real_fork = subprocess.Popen, signal.signal, os.fork
+held = []
+
+def popen(*args, **kwargs):
+    launched.touch()  # Runs in the owner: a command launch was attempted.
+    return real_popen(*args, **kwargs)
+
+def fork():
+    pid = real_fork()
+    if pid:
+        (directory / 'owner.tmp').write_text(str(pid))
+        (directory / 'owner.tmp').replace(directory / 'owner')
+    return pid
+
+def install(number, handler):
+    if os.getpid() == guard and number == signal.SIGTERM and not held:
+        held.append(number)
+        end = time.monotonic() + 1.5
+        while time.monotonic() < end and not launched.exists():
+            time.sleep(.01)
+        if mode == 'die':
+            os.kill(guard, signal.SIGKILL)
+        if launched.exists():
+            time.sleep(10)  # The controller's TERM arrives before the forwarder.
+    return real_signal(number, handler)
+
+subprocess.Popen, signal.signal, os.fork = popen, install, fork
+command = [sys.executable, '-c', 'import os,pathlib,sys,time\n'
+           'p = pathlib.Path(sys.argv[1]); t = p.with_suffix(".tmp")\n'
+           't.write_text(str(os.getpid())); t.replace(p); time.sleep(60)', str(marker)]
+result = lifecycle.run_owned(command, None, lambda pid: None, hard=20)
+print(json.dumps(result), flush=True)
+sys.exit(result['status'])
+"""
+
 
 class GuardLifecycleTests(unittest.TestCase):
     def setUp(self):
@@ -454,6 +499,7 @@ class GuardLifecycleTests(unittest.TestCase):
             for record in (None, {'status': 125, 'code': 125, 'reason': 'command exit'}):
                 def owner(wire, *_args, record=record):
                     wire.send(json.dumps({'child': os.getpid()}).encode())
+                    wire.recv(1024)  # The guard's forwarders-ready handshake.
                     wire.recv(1024)  # Wait until the guard has recorded the signal.
                     if record is not None:
                         wire.send(json.dumps(record).encode())
@@ -477,6 +523,7 @@ class GuardLifecycleTests(unittest.TestCase):
             for record in (None, {'status': 125, 'code': 125, 'reason': 'command exit'}):
                 def owner(wire, *_args, record=record):
                     wire.send(json.dumps({'child': os.getpid()}).encode())
+                    wire.recv(1024)  # The guard's forwarders-ready handshake.
                     poller = select.poll()
                     poller.register(wire, select.POLLIN)
                     poller.poll(5000)  # The signal packet arrived; leave it unread.
@@ -671,6 +718,44 @@ class GuardLifecycleTests(unittest.TestCase):
                                 {'status': 128 + sig, 'code': None, 'reason': 'guard signal'})
                     self.assertEqual(result, expected)
                     self.assertFalse(marker.exists())
+
+    def test_command_waits_for_guard_signal_forwarders(self):
+        # A guard descheduled after fork must not let the command start first:
+        # a TERM sent on its readiness would then kill the unprepared guard.
+        for mode in ('term', 'die'):
+            with self.subTest(mode=mode):
+                directory = self.directory / mode
+                directory.mkdir()
+                guard = subprocess.Popen(
+                    [sys.executable, '-c', RACE_GUARD, str(ROOT / 'ci/tools'), str(directory), mode],
+                    stdout=subprocess.PIPE, text=True)
+                self.processes.append(guard)
+                self.addCleanup(guard.stdout.close)
+                self.pin(guard.pid)
+                owner_file = directory / 'owner'
+                self.until(owner_file.exists, 'owner was not forked')
+                owner = int(owner_file.read_text())
+                self.pin(owner)
+                if mode == 'term':
+                    marker = directory / 'marker'
+                    self.until(marker.exists, 'command did not start', timeout=10)
+                    command = int(marker.read_text())
+                    self.pin(command)
+                    guard.send_signal(signal.SIGTERM)
+                    output, _ = guard.communicate(timeout=10)
+                    self.assertEqual(guard.returncode, 128 + signal.SIGTERM,
+                                     'TERM reached the guard before its forwarder existed')
+                    result = json.loads(output)
+                    self.assertEqual(result['reason'], 'guard signal')
+                    self.assertIsNotNone(result['code'], 'no cleanup receipt')
+                    self.assertTrue(self.reaped_fd(self.handles[command]))
+                else:
+                    self.assertEqual(guard.wait(timeout=10), -signal.SIGKILL)
+                    poller = select.poll()
+                    poller.register(self.handles[owner], select.POLLIN)
+                    self.assertTrue(poller.poll(5000), 'owner outlived its dead guard')
+                    self.assertFalse((directory / 'launched').exists(),
+                                     'owner launched the command before its guard was ready')
 
     def test_missing_child_enumeration_does_not_launch(self):
         marker = self.directory / 'no-children-should-not-run'
@@ -955,19 +1040,22 @@ class AdoptedCleanupTests(unittest.TestCase):
 
         # A generous grace keeps the TERM scan before its cutoff even on a stalled runner;
         # the pass ends as soon as the children are gone, so the value never delays the test.
-        children = [[101, 202, 303], [101], [101], [101], [101]]
+        # The failed child 202 stays listed until a later scan reaps it.
+        children = [[101, 202, 303], [101, 202], [101], [101], [101]]
         with mock.patch.object(lifecycle, '_children', side_effect=children), \
                 mock.patch.object(lifecycle.os, 'pidfd_open', side_effect=pidfd), \
                 mock.patch.object(lifecycle.signal, 'pidfd_send_signal') as sent, \
                 mock.patch.object(lifecycle.os, 'waitpid',
-                                  side_effect=[(0, 0), (0, 0), (303, 0)]) as waited, \
+                                  side_effect=[(0, 0), (0, 0), (303, 0), (202, 0)]) as waited, \
                 mock.patch.object(lifecycle.os, 'close') as closed:
             result = lifecycle._drain([owned], 30, time.monotonic() + 60)
         self.assertIsNone(result)
         sent.assert_called_once_with(1303, signal.SIGTERM)
+        # The last call is the later scan that reaps the child whose pidfd failed.
         self.assertEqual(waited.call_args_list, [mock.call(202, os.WNOHANG),
                                                  mock.call(303, os.WNOHANG),
-                                                 mock.call(303, os.WNOHANG)])
+                                                 mock.call(303, os.WNOHANG),
+                                                 mock.call(202, os.WNOHANG)])
         closed.assert_called_once_with(1303)
         self.assertEqual(owned.send.call_args_list,
                          [mock.call(signal.SIGTERM), mock.call(signal.SIGKILL)])
