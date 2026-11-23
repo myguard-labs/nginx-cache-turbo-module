@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,26 @@ def tree(root, files):
         path.write_text("\n".join(body) + "\n")
 
 
+FIXTURE = ROOT / "ci/tests/codeql-lifetime-action.sarif"
+BASELINE = ROOT / "ci/codeql/nginx-lifetime/baseline.json"
+# The text every accepted baseline site flags (whitespace-normalised, as the
+# gate hashes it). Fixture tests write it into a temp source root at each
+# fixture line, so no test depends on the text at a fixed line of live src/.
+FLAGGED = "ngx_http_request_t *r = op->request;"
+
+
+def fixture_root(root, document, shift=0):
+    """Temp source root where each fixture result's line holds FLAGGED."""
+    files = {}
+    for item in document["runs"][0]["results"]:
+        place = item["locations"][0]["physicalLocation"]
+        uri = place["artifactLocation"]["uri"]
+        files.setdefault(uri, {})[place["region"]["startLine"]] = FLAGGED
+    for uri, lines in files.items():
+        tree(root, {uri: {number + shift: FLAGGED for number in lines}})
+    return root
+
+
 def run(document, baseline, *args, files=None, root=None):
     files = files if files is not None else {
         "src/a.c": {4: TEXT, 9: TEXT, 30: TEXT, 40: TEXT, 50: TEXT, 90: "use2(r);",
@@ -66,27 +87,38 @@ def run(document, baseline, *args, files=None, root=None):
 
 
 class Gate(unittest.TestCase):
+    def test_baseline_hash_matches_flagged_constant(self):
+        # A baseline/constant mismatch must fail loudly, not silently pass.
+        baseline = json.loads(BASELINE.read_text())
+        self.assertTrue(baseline)
+        for entry in baseline:
+            self.assertEqual(entry["contextHash"], digest(FLAGGED))
+
     def test_action_extension_inventory(self):
-        document = json.loads((ROOT / "ci/tests/codeql-lifetime-action.sarif").read_text())
-        baseline = json.loads((ROOT / "ci/codeql/nginx-lifetime/baseline.json").read_text())
-        self.assertEqual(run(document, baseline, root=ROOT).returncode, 0)
-        self.assertEqual(run(document, [], root=ROOT).returncode, 1)
-        for field in ("path", "message"):
-            with self.subTest(field=field):
-                changed = json.loads(json.dumps(document))
-                item = changed["runs"][0]["results"][0]
-                location = item["locations"][0]["physicalLocation"]
-                if field == "path":
-                    location["artifactLocation"]["uri"] = "src/ngx_http_cache_turbo_redis.c"
-                else:
-                    item["message"]["text"] += "x"
-                self.assertEqual(run(changed, baseline, root=ROOT).returncode, 1)
-        document["runs"][0]["results"].append(result(
-            uri="src/ngx_http_cache_turbo_memcached.c", line=1336, message="new"))
-        self.assertEqual(run(document, baseline, root=ROOT).returncode, 1)
+        document = json.loads(FIXTURE.read_text())
+        baseline = json.loads(BASELINE.read_text())
+        with tempfile.TemporaryDirectory() as temp:
+            root = fixture_root(temp, document)
+            self.assertEqual(run(document, baseline, root=root).returncode, 0)
+            self.assertEqual(run(document, [], root=root).returncode, 1)
+            for field in ("path", "message"):
+                with self.subTest(field=field):
+                    changed = json.loads(json.dumps(document))
+                    item = changed["runs"][0]["results"][0]
+                    location = item["locations"][0]["physicalLocation"]
+                    if field == "path":
+                        location["artifactLocation"]["uri"] = "src/ngx_http_cache_turbo_redis.c"
+                    else:
+                        item["message"]["text"] += "x"
+                    self.assertEqual(run(changed, baseline, root=root).returncode, 1)
+            document["runs"][0]["results"].append(result(
+                uri="src/ngx_http_cache_turbo_memcached.c", line=1336, message="new"))
+            self.assertEqual(run(document, baseline, root=root).returncode, 1)
 
     def test_invalid_rule_references_and_inventories(self):
-        original = json.loads((ROOT / "ci/tests/codeql-lifetime-action.sarif").read_text())
+        original = json.loads(FIXTURE.read_text())
+        empty = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty, True)
         for mutation in ("duplicate", "missing", "index", "id", "component", "malformed"):
             with self.subTest(mutation=mutation):
                 document = json.loads(json.dumps(original))
@@ -104,7 +136,7 @@ class Gate(unittest.TestCase):
                     run_data["results"][0]["rule"]["toolComponent"]["index"] = 0
                 else:
                     run_data["tool"]["extensions"] = {}
-                self.assertEqual(run(document, [], root=ROOT).returncode, 2)
+                self.assertEqual(run(document, [], root=empty).returncode, 2)
 
     def test_empty_and_exact_baseline_pass(self):
         self.assertEqual(run(sarif([]), []).returncode, 0)
@@ -116,17 +148,35 @@ class Gate(unittest.TestCase):
                 files = {"src/a.c": {4 + shift if shift < 5000 else 5004: TEXT}}
                 moved = result(line=4 + shift, column=9)
                 self.assertEqual(run(sarif([moved]), [accepted()], files=files).returncode, 0)
-        document = json.loads((ROOT / "ci/tests/codeql-lifetime-action.sarif").read_text())
-        baseline = json.loads((ROOT / "ci/codeql/nginx-lifetime/baseline.json").read_text())
+        document = json.loads(FIXTURE.read_text())
+        baseline = json.loads(BASELINE.read_text())
+        shifted = json.loads(json.dumps(document))
+        for item in shifted["runs"][0]["results"]:
+            item["locations"][0]["physicalLocation"]["region"]["startLine"] += 22
         with tempfile.TemporaryDirectory() as temp:
+            root = fixture_root(temp, document, shift=22)
+            self.assertEqual(run(shifted, baseline, root=root).returncode, 0)
+
+    def test_fixture_checks_ignore_live_src_edits(self):
+        # Regression: an unrelated edit above a frozen fixture line in the
+        # live src/ must not change the fixture verdict. Simulate it by copying
+        # the real files and inserting blank lines at the top of redis.c.
+        document = json.loads(FIXTURE.read_text())
+        baseline = json.loads(BASELINE.read_text())
+        with tempfile.TemporaryDirectory() as temp:
+            live = Path(temp) / "live"
+            (live / "src").mkdir(parents=True)
             for name in ("memcached", "redis"):
-                text = (ROOT / ("src/ngx_http_cache_turbo_%s.c" % name)).read_text()
-                (Path(temp) / "src").mkdir(exist_ok=True)
-                (Path(temp) / ("src/ngx_http_cache_turbo_%s.c" % name)).write_text(
-                    "/* shifted */\n" * 22 + text)
-            for item in document["runs"][0]["results"]:
-                item["locations"][0]["physicalLocation"]["region"]["startLine"] += 22
-            self.assertEqual(run(document, baseline, root=temp).returncode, 0)
+                name = "src/ngx_http_cache_turbo_%s.c" % name
+                shutil.copy(ROOT / name, live / name)
+            redis = live / "src/ngx_http_cache_turbo_redis.c"
+            redis.write_text("\n" * 50 + redis.read_text())
+            # the hazard: keying the frozen fixture on the edited live tree
+            self.assertEqual(run(document, baseline, root=live).returncode, 1)
+            # the design: the fixture root is built from the constant
+            root = fixture_root(Path(temp) / "fixture", document)
+            self.assertEqual(run(document, baseline, root=root).returncode, 0)
+            self.assertEqual(run(document, [], root=root).returncode, 1)
 
     def test_replacement_in_same_function_fails(self):
         # An accepted site is fixed; a new site with the same rule, file and
@@ -227,6 +277,29 @@ class Gate(unittest.TestCase):
         proc = subprocess.run([sys.executable, str(GATE), "/missing", "/missing"],
                               capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 2)
+
+
+class FixtureStep(unittest.TestCase):
+    def test_workflow_fixture_step_is_new_never_out_of_range(self):
+        # The workflow gates the query fixture's own SARIF (its results point
+        # into the fixture file, read from the checkout) against an empty
+        # baseline. Replay that shape: any in-range line gives NEW/rc=1 and no
+        # src/ edit can reach it; the step passes no baseline-line dependency.
+        uri = "ci/codeql/nginx-lifetime/test/UseAfterRequestRelease/test.c"
+        last = len((ROOT / uri).read_text().splitlines())
+        self.assertGreaterEqual(last, 1)
+        workflow = (ROOT / ".github/workflows/codeql-lifetime.yml").read_text()
+        self.assertIn("lifetime-empty-baseline.json", workflow)
+        for line in (1, last):
+            with self.subTest(line=line):
+                proc = run(sarif([result(uri=uri, line=line)]), [], "--expect-rule", FIRST,
+                           root=ROOT)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("NEW 1 " + FIRST, proc.stdout)
+        # a fixture shrunk below the SARIF line is the only rc=2 path: it is
+        # an incomplete-evidence error, not a NEW row
+        self.assertEqual(run(sarif([result(uri=uri, line=last + 1000)]), [],
+                             root=ROOT).returncode, 2)
 
 
 class ImpactFilter(unittest.TestCase):
