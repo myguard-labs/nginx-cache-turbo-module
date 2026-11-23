@@ -136,6 +136,9 @@ class GuardLifecycleTests(unittest.TestCase):
                     pass  # Not adopted yet; its fixture parent is still exiting.
             if pending:
                 time.sleep(.01)
+        # release() is an addCleanup, so descriptors close even when this fails.
+        unreaped = sorted(pid for pid, fd in self.handles.items() if fd in pending)
+        self.assertEqual(unreaped, [], 'pinned fixture(s) not reaped within 5s')
 
     @staticmethod
     def reaped_fd(fd):
