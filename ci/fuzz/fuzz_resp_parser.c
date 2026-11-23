@@ -597,8 +597,10 @@ static u_char  resp_reader_bufs[2];    /* stand-ins for preamble / command */
  * (in_preamble 0, recv_len 0, send == command, write handler installed and
  * posted once) and a failed one has done none of that; the lock reader
  * finishes exactly once with NGX_OK/NGX_DECLINED/NGX_ERROR and only a framed
- * reply (clean) may give anything but NGX_ERROR; the S231 first-reply backoff
- * clear happens exactly once iff the op was unconnected and a byte arrived. */
+ * reply (clean) may give anything but NGX_ERROR, and a clean reply is "+..."
+ * (NGX_OK), exactly "$-1" (NGX_DECLINED) or "-..." (NGX_ERROR); the S231
+ * first-reply backoff clear happens exactly once iff the op was unconnected
+ * and a byte arrived. */
 static void
 drive_reader(unsigned lock, const u_char *r, size_t len,
     const ngx_fuzz_stream_t *s, ngx_uint_t nreplies, unsigned unconnected,
@@ -683,6 +685,28 @@ drive_reader(unsigned lock, const u_char *r, size_t len,
         }
         if (!op->clean && out->verdict != NGX_ERROR) {
             __builtin_trap();              /* verdict from an unframed reply */
+        }
+        /* HARD-L-READLOCK-BULK: SET NX PX answers "+OK", the nil "$-1" or
+         * -ERR. Only that exact nil is "a peer holds it" (any other reply
+         * read as held parks the request for a fill nobody owns), and only
+         * those three in-grammar replies leave the stream poolable. */
+        if (op->clean) {
+            ngx_int_t  want;
+
+            if (op->recv[0] == '+') {
+                want = NGX_OK;
+            } else if (op->recv_len == sizeof("$-1\r\n") - 1
+                       && memcmp(op->recv, "$-1\r\n", op->recv_len) == 0)
+            {
+                want = NGX_DECLINED;
+            } else if (op->recv[0] == '-') {
+                want = NGX_ERROR;
+            } else {
+                __builtin_trap();          /* pooled after a foreign reply */
+            }
+            if (out->verdict != want) {
+                __builtin_trap();          /* lock verdict off the grammar */
+            }
         }
 
     } else if (ngx_fuzz_rec.fails != 0) {

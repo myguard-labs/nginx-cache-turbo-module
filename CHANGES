@@ -1,5 +1,10 @@
 Changes with the nginx-cache-turbo-module (unreleased)
 
+    *) Bugfix: a non-nil bulk reply to the cross-node lock SET NX PX is now
+       treated as a failed lock channel (per-box single-flight, connection
+       closed) instead of "peer holds the lock"; only a nil reply makes a
+       request wait for a peer's fill.
+
     *) Bugfix: when the L2 backend is configured but unreachable (refused
        connect, connect backoff, a failed GET) and cache_turbo_lock is off,
        a fresh auto-Vary entry whose Vary marker is older than

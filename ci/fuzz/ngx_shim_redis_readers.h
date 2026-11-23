@@ -26,6 +26,8 @@
 
 #include <sys/types.h>      /* ssize_t */
 
+#include "ngx_shim.h"         /* ngx_int_t, NGX_OK, the op struct */
+
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define NGX_FUZZ_ASAN  1
@@ -97,6 +99,11 @@ struct ngx_connection_s {
 #define ngx_log_error(level, log, err, ...)  ((void) 0)
 
 #define ngx_add_timer(ev, timer)  ((void) (ev), (void) (timer))
+
+/* read_lock matches the exact nil reply. Verbatim from nginx
+ * src/core/ngx_core.h and src/core/ngx_string.h. */
+#define CRLF  "\r\n"
+#define ngx_memcmp(s1, s2, n)  memcmp(s1, s2, n)
 
 typedef struct {
     int  fuzz_unused;

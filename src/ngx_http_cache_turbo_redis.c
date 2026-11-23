@@ -5045,12 +5045,13 @@ ngx_http_cache_turbo_redis_get_finish(ngx_http_cache_turbo_redis_op_t *op,
  * single recv into the scratch buffer suffices. THREE outcomes (codex
  * follow-up — a Redis outage must not look like "peer holds the lock"):
  *   '+' (+OK)         -> NGX_OK       lock acquired, we own the regen
- *   '$' ($-1 nil)     -> NGX_DECLINED key already held by a peer: wait/serve stale
- *   timeout/EOF/-ERR  -> NGX_ERROR    lock channel unusable: degrade to per-box
- *                                     single-flight (regenerate locally), never
+ *   exactly "$-1"     -> NGX_DECLINED key already held by a peer: wait/serve stale
+ *   timeout/EOF/-ERR/ -> NGX_ERROR    lock channel unusable: degrade to per-box
+ *   any other reply                   single-flight (regenerate locally), never
  *                                     suppress the refresh on a dead Redis.
  * Only a real nil reply ($-1) means a peer genuinely holds the lock; every
- * transport/protocol failure now maps to NGX_ERROR so the caller falls back
+ * transport/protocol failure -- a non-nil bulk included, which SET NX PX
+ * without GET never returns -- maps to NGX_ERROR so the caller falls back
  * instead of freezing the whole fleet on stale during an outage.
  */
 static void
@@ -5079,8 +5080,8 @@ ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
      * as its own reply type byte). read_drain already frames for exactly this
      * reason; the lock reader was not updated with it. ka_save's boundary peek
      * only catches the tail once it has ALREADY arrived, so it does not close
-     * this. The +/$/else verdict is unchanged and still reads the first byte,
-     * which framing guarantees is present. */
+     * this. The verdict below reads the whole framed reply, which framing
+     * guarantees is present. */
     for ( ;; ) {
         if (op->recv_len >= sizeof(op->recv)) {
             /* A SET NX PX reply is "+OK\r\n", "$-1\r\n" or a short -ERR; it
@@ -5128,11 +5129,32 @@ ngx_http_cache_turbo_redis_read_lock(ngx_event_t *rev)
             return;
         }
 
-        op->clean = 1;                     /* reply framed: connection poolable */
-        ngx_http_cache_turbo_redis_lock_finish(op,
-            op->recv[0] == '+' ? NGX_OK :
-            op->recv[0] == '$' ? NGX_DECLINED : /* nil: a peer holds the lock */
-            NGX_ERROR);                         /* -ERR / garbage: unusable */
+        /* HARD-L-READLOCK-BULK: SET NX PX (no GET option) replies "+OK" when
+         * the key was set and a nil bulk when NX refused it; a server error is
+         * the only other legal answer. Only that exact nil means a peer holds
+         * the lock. A non-nil bulk, an integer or an array is outside the
+         * command's reply grammar -- typically a reply that belongs to
+         * another command on a desynced stream, while our own answer may
+         * still be in flight. Reading it as "held" parked this request for a
+         * fill nobody owns (and, if the late "+OK" was ours, every node
+         * waited out the lock's PX); it is a protocol failure like -ERR:
+         * NGX_ERROR, per-box single-flight. Unlike a framed -ERR, the stream
+         * offset is suspect, so the connection is not pooled. */
+        if (op->recv[0] == '+') {
+            rc = NGX_OK;                   /* lock acquired */
+        } else if (op->recv_len == sizeof("$-1" CRLF) - 1
+                   && ngx_memcmp(op->recv, "$-1" CRLF,
+                                 sizeof("$-1" CRLF) - 1) == 0)
+        {
+            rc = NGX_DECLINED;             /* nil: a peer holds the lock */
+        } else {
+            rc = NGX_ERROR;                /* -ERR / foreign reply: unusable */
+        }
+
+        if (rc != NGX_ERROR || op->recv[0] == '-') {
+            op->clean = 1;                 /* in-grammar reply: poolable */
+        }
+        ngx_http_cache_turbo_redis_lock_finish(op, rc);
         return;
     }
 }
