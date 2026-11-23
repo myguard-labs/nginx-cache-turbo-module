@@ -51,6 +51,15 @@
 #           before). KEYS=1 shows +-25% run-to-run spread on a busy box;
 #           PASSES>1 reports median plus min/max spread so a modest
 #           contention win isn't lost in the noise of a single sample.
+#   MODES   space list from {A,B,C,D} to run        (default: A B C, plus D
+#           when REDIS is set). ci/tools/perf-matrix.sh sets "C".
+#   NGINX_CPUS  taskset CPU list for the nginx master+workers (default: unpinned)
+#   WRK_CPUS    taskset CPU list for every wrk process       (default: unpinned)
+#   WARMUP  seconds of the discarded warmup pass   (default: DURATION)
+#   BENCH_TSV  file to append one machine-readable row per measured pass of a
+#           mode with an admin endpoint (C/D): size mode pass rps p50 p99
+#           wrk_cpu_pct hits misses stale  (counter deltas over that pass)
+#           (default: unset, nothing written)
 #
 # Release binary + dynamic module, the shipped artifact:
 #   eval "$(ci/tools/ci-build.sh nginx 1.31.1 nginx)"   # sets binary= module=
@@ -74,6 +83,14 @@ WORKERS="${WORKERS:-auto}"   # nginx worker_processes value (default preserves p
 PASSES="${PASSES:-1}"        # measured passes per size/mode; report median + min/max
 case "$PASSES" in ''|*[!0-9]*) echo "FATAL: PASSES must be a positive integer" >&2; exit 2;; esac
 PASSES=$((10#$PASSES))
+NGINX_CPUS="${NGINX_CPUS:-}"
+WRK_CPUS="${WRK_CPUS:-}"
+WARMUP="${WARMUP:-$DURATION}"
+BENCH_TSV="${BENCH_TSV:-}"
+WRK_PIN=()
+[ -n "$WRK_CPUS" ] && WRK_PIN=(taskset -c "$WRK_CPUS")
+NGINX_PIN=()
+[ -n "$NGINX_CPUS" ] && NGINX_PIN=(taskset -c "$NGINX_CPUS")
 [ "$PASSES" -ge 1 ] || { echo "FATAL: PASSES must be >= 1" >&2; exit 2; }
 
 command -v wrk >/dev/null 2>&1 || {
@@ -200,7 +217,7 @@ end
 LUA
 fi
 
-"$NGINX" -p "$WORK" -c "$WORK/conf/nginx.conf" &
+${NGINX_PIN[@]+"${NGINX_PIN[@]}"} "$NGINX" -p "$WORK" -c "$WORK/conf/nginx.conf" &
 NGINX_PID=$!
 trap 'kill -QUIT "$NGINX_PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
@@ -269,7 +286,7 @@ prime_keys() {
     # Fast fan-out warmup: hammer the full key range with the rotor for a
     # few seconds using real concurrency instead of one curl at a time.
     WRK_KEYS="$KEYS" WRK_PATH="$path" \
-        wrk -t"$THREADS" -c"$CONC" -d3s -s "$WORK/conf/rotor.lua" \
+        ${WRK_PIN[@]+"${WRK_PIN[@]}"} wrk -t"$THREADS" -c"$CONC" -d3s -s "$WORK/conf/rotor.lua" \
             "http://127.0.0.1:$port${path}0" >/dev/null 2>&1 || true
 
     # Verify coverage: sample up to 50 keys spread evenly across the range
@@ -311,7 +328,7 @@ prime_keys() {
 # always warned wrk can saturate a client core and mask the effect we're
 # trying to measure, but nothing recorded it until now.
 runwrk() {
-    local url="$1" path="${2:-}" out cpu_pct
+    local url="$1" path="${2:-}" out cpu_pct dur="${3:-$DURATION}"
     local time_bin="/usr/bin/time"
     [ -x "$time_bin" ] || time_bin=""
 
@@ -319,19 +336,19 @@ runwrk() {
         if [ -n "$time_bin" ]; then
             out=$("$time_bin" -v -o "$WORK/logs/time.out" \
                   env WRK_KEYS="$KEYS" WRK_PATH="$path" \
-                  wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency \
+                  ${WRK_PIN[@]+"${WRK_PIN[@]}"} wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency \
                       -s "$WORK/conf/rotor.lua" "$url" 2>/dev/null)
         else
             out=$(WRK_KEYS="$KEYS" WRK_PATH="$path" \
-                  wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency \
+                  ${WRK_PIN[@]+"${WRK_PIN[@]}"} wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency \
                       -s "$WORK/conf/rotor.lua" "$url" 2>/dev/null)
         fi
     else
         if [ -n "$time_bin" ]; then
             out=$("$time_bin" -v -o "$WORK/logs/time.out" \
-                  wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency "$url" 2>/dev/null)
+                  ${WRK_PIN[@]+"${WRK_PIN[@]}"} wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency "$url" 2>/dev/null)
         else
-            out=$(wrk -t"$THREADS" -c"$CONC" -d"${DURATION}s" --latency "$url" 2>/dev/null)
+            out=$(${WRK_PIN[@]+"${WRK_PIN[@]}"} wrk -t"$THREADS" -c"$CONC" -d"${dur}s" --latency "$url" 2>/dev/null)
         fi
     fi
     local rps p50 p99
@@ -355,6 +372,7 @@ modes=(A B C)
 ports=("A:$A" "B:$B" "C:$C")
 admin=("A:" "B:" "C:/_cache_c")
 [ -n "$REDIS" ] && { modes+=(D); ports+=("D:$D"); admin+=("D:/_cache_d"); }
+if [ -n "${MODES:-}" ]; then read -ra modes <<<"$MODES"; fi
 
 declare -A PORT ADMIN
 for kv in "${ports[@]}"; do PORT[${kv%%:*}]=${kv#*:}; done
@@ -396,7 +414,7 @@ for size in $SIZES; do
         fi
 
         # Discard one warmup pass (JIT TCP windows / shm fault-in).
-        runwrk "$url" "$path" >/dev/null
+        runwrk "$url" "$path" "$WARMUP" >/dev/null
 
         rps_list="" p50_list="" p99_list="" cpu_list=""
         for (( pass=0; pass<PASSES; pass++ )); do
@@ -420,6 +438,11 @@ for size in $SIZES; do
                 if [ "$tot" -gt 0 ]; then
                     local_hit=$(awk "BEGIN{printf \"%.1f\", 100*($dh+$ds)/$tot}")
                 fi
+            fi
+
+            if [ -n "$ap" ] && [ -n "$BENCH_TSV" ]; then
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$size" "$m" "$pass" "$rps" "$p50" "$p99" "$cpu" "$dh" "$dm" "$ds" >>"$BENCH_TSV"
             fi
 
             rps_list="$rps_list $rps"
